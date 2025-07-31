@@ -1,101 +1,104 @@
 # Agentic Rollout Library
 
-A flexible and powerful library for creating agent rollouts that can work independently or integrate seamlessly with [VERL (Versatile Environment for Reinforcement Learning)](https://github.com/volcengine/verl). This library provides a comprehensive framework for building multi-step agentic trajectories with tool integration, customizable agents, and extensive trajectory management capabilities.
+> [English Version](README_EN.md) | 中文版
 
-## 🌟 Key Features
+一个灵活强大的智能体rollout库，既可以独立使用，也可以与 [VERL (Versatile Environment for Reinforcement Learning)](https://github.com/volcengine/verl) 无缝集成。该库提供了一个全面的框架，用于构建具有工具集成、可定制智能体和广泛轨迹管理功能的多步智能体轨迹。
 
-### 🤖 Dual Usage Modes
-- **Standalone Usage**: Complete independent functionality without VERL dependencies
-- **VERL Integration**: Seamless integration as `verl.workers.rollout` rollout method
-- **Flexible Architecture**: Graceful fallback when VERL is not available
+## 🌟 核心特性
 
-### 🧠 Advanced Agent Framework
-- **Base Agent System**: Abstract base class for custom agent implementations
-- **ReAct Agents**: Built-in ReAct (Reasoning + Acting) agents with tool integration
-- **Custom Agents**: Easy-to-extend framework for specialized agent behaviors
-- **Trajectory Management**: Complete trajectory tracking with serialization support
+### 🤖 双重使用模式
+- **独立使用**：无需VERL依赖的完整独立功能
+- **VERL集成**：作为 `verl.workers.rollout` rollout方法的无缝集成
+- **灵活架构**：当VERL不可用时优雅降级
 
-### 🛠️ Unified Tool Framework
-- **VERL Compatibility**: Seamless integration with VERL tools when available
-- **Standalone Operation**: Full functionality without VERL dependencies
-- **Core Tools**: Calculator, file editor, bash executor, and search tools
-- **Tool Registry**: Centralized tool management and discovery
-- **Custom Tools**: Easy framework for developing new tools
-- **Security Features**: Safe execution with configurable restrictions
+### 🧠 高级智能体框架
+- **基础智能体系统**：用于自定义智能体实现的抽象基类
+- **ReAct智能体**：内置ReAct（推理+行动）智能体，支持工具集成
+- **自定义智能体**：易于扩展的专业化智能体行为框架
+- **轨迹管理**：完整的轨迹跟踪和序列化支持
 
-### 🔌 LLM Client Flexibility
-- **OpenAI SDK Compatible**: Standard OpenAI API protocol support
-- **Multiple Providers**: Support for various model names and base URLs
-- **Claude Integration**: Specialized Claude API client implementation
-- **Custom LLM Functions**: Easy integration of custom LLM backends
+### 🛠️ 统一工具框架
+- **VERL兼容性**：当VERL可用时与VERL工具无缝集成
+- **独立运行**：无VERL依赖的完整功能
+- **核心工具**：计算器、文件编辑器、bash执行器和搜索工具
+- **工具注册表**：集中化工具管理和发现
+- **自定义工具**：开发新工具的简易框架
+- **安全特性**：具有可配置限制的安全执行
 
-## 📁 Project Structure
+### 🔌 LLM客户端灵活性
+- **OpenAI SDK兼容**：标准OpenAI API协议支持
+- **多提供商支持**：支持各种模型名称和基础URL
+- **Claude集成**：专门的Claude API客户端实现
+- **自定义LLM函数**：轻松集成自定义LLM后端
+
+## 📁 项目结构
 
 ```
 agentic_rollout_library/
-├── workers/                          # Core library modules
+├── workers/                          # 核心库模块
 │   ├── __init__.py
-│   ├── agentic_rollout.py           # Main rollout implementation
-│   ├── core/                        # Core framework components
-│   │   ├── base_agent.py           # Abstract base agent class
-│   │   ├── base_tool.py            # Unified tool framework
-│   │   ├── tool_registry.py        # Tool management system
-│   │   ├── tool_schemas.py         # Tool schema definitions
-│   │   ├── registry.py             # Agent registry system
-│   │   └── trajectory.py           # Trajectory data structures
-│   ├── agents/                      # Built-in agent implementations
-│   │   ├── react_agent.py          # ReAct agent implementation
-│   │   ├── coding_agent.py         # Specialized coding agent
-│   │   └── tool_agent.py           # Tool-focused agent
-│   └── tools/                       # Core tool implementations
-│       ├── calculator_tool.py      # Mathematical computations
-│       ├── bash_executor_tool.py   # Safe command execution
-│       ├── file_editor_tool.py     # File operations
-│       └── search_tool.py          # Text and file search
-├── examples/                        # Usage examples and demos
-│   ├── basic_usage.py              # Basic standalone usage
-│   ├── advanced_integration.py     # Advanced integration examples
-│   ├── claude_integration/         # Claude API integration demo
-│   ├── k8s_swe_agent/             # Kubernetes SWE agent implementation
-│   ├── trajectory_client/          # Trajectory client utilities
-│   └── config/                     # Configuration templates
-└── README.md                       # This file
+│   ├── agentic_rollout.py           # 主要rollout实现
+│   ├── core/                        # 核心框架组件
+│   │   ├── base_agent.py           # 抽象基础智能体类
+│   │   ├── base_tool.py            # 统一工具框架
+│   │   ├── tool_registry.py        # 工具管理系统
+│   │   ├── tool_schemas.py         # 工具模式定义
+│   │   ├── registry.py             # 智能体注册系统
+│   │   └── trajectory.py           # 轨迹数据结构
+│   ├── agents/                      # 内置智能体实现
+│   │   ├── react_agent.py          # ReAct智能体实现
+│   │   ├── coding_agent.py         # 专业化编程智能体
+│   │   └── tool_agent.py           # 工具专用智能体
+│   └── tools/                       # 核心工具实现
+│       ├── calculator_tool.py      # 数学计算
+│       ├── bash_executor_tool.py   # 安全命令执行
+│       ├── file_editor_tool.py     # 文件操作
+│       └── search_tool.py          # 文本和文件搜索
+├── examples/                        # 使用示例和演示
+│   ├── basic_usage.py              # 基础独立使用
+│   ├── advanced_integration.py     # 高级集成示例
+│   ├── core_tools_demo.py          # 核心工具演示
+│   ├── tool_integration_demo.py    # 工具集成演示
+│   └── config/                     # 配置模板
+└── README.md                       # 本文件
 ```
 
-## 🚀 Quick Start
+## 🚀 快速开始
 
-### Installation
+### 安装
 
-Since this library is designed to work with or without VERL, installation depends on your use case:
+由于该库设计为可以与VERL一起使用或不使用VERL，安装方式取决于你的使用场景：
 
-**Option 1: Standalone Usage (Recommended)**
+**选项1：独立使用（推荐）**
 ```bash
-# Clone the repository
+# 克隆仓库
 git clone <repository-url>
 cd agentic_rollout_library
 
-# Install basic dependencies
+# 安装基础依赖
 pip install pydantic pyyaml asyncio
 ```
 
-**Option 2: With VERL Integration**
+**选项2：与VERL集成**
 ```bash
-# Ensure VERL is installed first
+# 确保首先安装VERL
 export PYTHONPATH="/path/to/verl:$PYTHONPATH"
 
-# Clone and setup
+# 克隆并设置
 git clone <repository-url>
 cd agentic_rollout_library
 ```
 
-### Basic Usage Example
+### 基础使用示例
 
 ```python
 import asyncio
-from workers.agentic_rollout import AgenticRollout, AgenticRolloutConfig
-from workers.core.trajectory import Trajectory, TrajectoryStep, StepType
+from workers import (
+    AgenticRollout, AgenticRolloutConfig,
+    CalculatorTool, get_global_tool_registry, register_tool
+)
 
-# Create configuration
+# 创建配置
 config = AgenticRolloutConfig(
     agent_type="react",
     max_steps=10,
@@ -103,83 +106,86 @@ config = AgenticRolloutConfig(
     temperature=0.7
 )
 
-# Define your LLM function (OpenAI SDK compatible)
+# 定义你的LLM函数（OpenAI SDK兼容）
 async def llm_generate_func(messages, max_tokens=512, temperature=0.7, **kwargs):
-    # Your LLM implementation here
-    # Works with OpenAI, Claude, or any compatible API
+    # 你的LLM实现代码
+    # 适用于OpenAI、Claude或任何兼容API
     pass
 
-# Create rollout instance
+# 注册工具
+register_tool(CalculatorTool, {"debug": True})
+
+# 创建rollout实例
 rollout = AgenticRollout(config=config, llm_generate_func=llm_generate_func)
 
-# Run trajectory
-prompt_data = {"content": "Solve this math problem: What is 15 * 24?"}
+# 运行轨迹
+prompt_data = {"content": "计算15 * 24的结果是什么？"}
 trajectory = await rollout.agent.run_trajectory(
     prompt=prompt_data,
     llm_generate_func=llm_generate_func,
     request_id="math_example"
 )
 
-print(f"Final response: {trajectory.get_final_response()}")
-print(f"Total steps: {len(trajectory.steps)}")
+print(f"最终响应: {trajectory.get_final_response()}")
+print(f"总步数: {len(trajectory.steps)}")
 ```
 
-## 📖 Usage Examples
+## 📖 使用示例
 
-### 1. Standalone Agent with Tools
+### 1. 带工具的独立智能体
+
+```python
+from workers import (
+    AgenticRollout, AgenticRolloutConfig,
+    CalculatorTool, FileEditorTool, BashExecutorTool,
+    get_global_tool_registry, register_tool
+)
+
+# 注册多个工具
+register_tool(CalculatorTool, {"precision": 10})
+register_tool(FileEditorTool, {"max_file_size": 1024*1024})
+register_tool(BashExecutorTool, {"timeout": 30})
+
+# 创建智能体配置
+config = AgenticRolloutConfig(agent_type="react", max_steps=8)
+rollout = AgenticRollout(config=config, llm_generate_func=your_llm_func)
+
+# 运行复杂任务
+result = await rollout.agent.run_trajectory(
+    prompt={"content": "创建一个Python脚本来计算斐波那契数列的前10项"},
+    llm_generate_func=your_llm_func,
+    request_id="fibonacci_task"
+)
+```
+
+### 2. 自定义智能体实现
 
 ```python
 from workers.core.base_agent import BaseAgent
 from workers.core.trajectory import Trajectory, TrajectoryStep, StepType
 
-class CalculatorTool:
-    async def execute(self, expression: str):
-        # Safe evaluation of mathematical expressions
-        return {"result": eval(expression), "expression": expression}
-
-# Create agent with tools
-config = AgenticRolloutConfig(agent_type="react", max_steps=5)
-rollout = AgenticRollout(config=config, llm_generate_func=your_llm_func)
-
-# Add tools
-rollout.tools = {"calculator": CalculatorTool()}
-rollout.agent.set_tools(rollout.tools)
-
-# Run with tool usage
-result = await rollout.agent.run_trajectory(
-    prompt={"content": "Calculate the square root of 144"},
-    llm_generate_func=your_llm_func,
-    request_id="calc_example"
-)
-```
-
-### 2. Custom Agent Implementation
-
-```python
-from workers.core.base_agent import BaseAgent
-
 class CustomReasoningAgent(BaseAgent):
     async def run_trajectory(self, prompt, llm_generate_func, request_id, **kwargs):
         trajectory = Trajectory(request_id=request_id)
         
-        # Add initial observation
+        # 添加初始观察
         obs_step = TrajectoryStep(
             step_type=StepType.OBSERVATION,
             content=str(prompt.get('content', prompt))
         )
         trajectory.add_step(obs_step)
         
-        # Custom reasoning logic
+        # 自定义推理逻辑
         while self.should_continue(trajectory):
-            # Generate LLM response
+            # 生成LLM响应
             messages = self.format_messages_for_llm(trajectory)
             response = await llm_generate_func(messages)
             
-            # Parse and add step
+            # 解析并添加步骤
             step = self.parse_llm_output(response)
             trajectory.add_step(step)
             
-            # Handle tool calls if needed
+            # 如需要，处理工具调用
             if step.tool_name:
                 result_step = await self.execute_tool_call(
                     step.tool_name, step.tool_args, trajectory
@@ -189,25 +195,25 @@ class CustomReasoningAgent(BaseAgent):
         self.finalize_trajectory(trajectory)
         return trajectory
 
-# Use custom agent
+# 使用自定义智能体
 agent = CustomReasoningAgent(max_steps=8)
 ```
 
-### 3. VERL Integration
+### 3. VERL集成
 
-When VERL is available, the library automatically integrates:
+当VERL可用时，库会自动集成：
 
 ```python
-# This works automatically when VERL is installed
+# 当安装了VERL时，这会自动工作
 from verl.workers.rollout.agentic_rollout import AgenticRollout
 from verl.protocol import DataProto
 
-# Use as a VERL rollout worker
+# 作为VERL rollout worker使用
 rollout = AgenticRollout(config, llm_generate_func, tokenizer)
 output_data = await rollout.generate_sequences(input_prompts)
 ```
 
-### 4. Multi-Model Support
+### 4. 多模型支持
 
 ```python
 # OpenAI API
@@ -223,112 +229,332 @@ async def openai_llm_func(messages, **kwargs):
 
 # Claude API
 async def claude_llm_func(messages, **kwargs):
-    from examples.claude_integration.claude_llm_client import ClaudeAPIClient
+    from workers.tools.claude_llm_client import ClaudeAPIClient
     client = ClaudeAPIClient(api_key="your-key")
     return await client.generate(messages, **kwargs)
 
-# Use with any compatible LLM
+# 与任何兼容LLM一起使用
 rollout = AgenticRollout(config=config, llm_generate_func=claude_llm_func)
 ```
 
-## 🔧 Configuration
+## 🔧 配置
 
-### AgenticRolloutConfig Options
+### AgenticRolloutConfig 选项
 
 ```python
 config = AgenticRolloutConfig(
-    # Agent settings
-    agent_type="react",                    # Agent type: "react", "coding", "tool"
-    max_steps=10,                         # Maximum trajectory steps
-    max_tokens_per_step=512,              # Max tokens per generation
-    temperature=0.7,                      # LLM sampling temperature
+    # 智能体设置
+    agent_type="react",                    # 智能体类型: "react", "coding", "tool"
+    max_steps=10,                         # 最大轨迹步数
+    max_tokens_per_step=512,              # 每步最大token数
+    temperature=0.7,                      # LLM采样温度
     
-    # Tool configuration
-    tools_config={                        # Tool-specific settings
+    # 工具配置
+    tools_config={                        # 工具特定设置
         "calculator": {"precision": 10},
         "search": {"max_results": 5}
     },
     
-    # Performance settings
-    batch_size=1,                         # Batch processing size
-    concurrent_requests=4,                # Concurrent request limit
+    # 性能设置
+    batch_size=1,                         # 批处理大小
+    concurrent_requests=4,                # 并发请求限制
     
-    # Output settings
-    include_trajectory_in_output=True,    # Include full trajectory
-    save_trajectories=True,               # Save to disk
-    trajectory_save_path="./trajectories" # Save location
+    # 输出设置
+    include_trajectory_in_output=True,    # 输出中包含完整轨迹
+    save_trajectories=True,               # 保存轨迹到磁盘
+    trajectory_save_path="./trajectories" # 保存位置
 )
 ```
 
-### Environment Variables
+### 环境变量
 
 ```bash
-# LLM API Configuration
+# LLM API配置
 export OPENAI_API_KEY="your-openai-key"
 export OPENAI_BASE_URL="https://api.openai.com/v1"
 
 export ANTHROPIC_API_KEY="your-claude-key"
 export ANTHROPIC_BASE_URL="https://api.anthropic.com"
 
-# Library Configuration
+# 库配置
 export AGENTIC_LOG_LEVEL="INFO"
 export AGENTIC_SAVE_TRAJECTORIES="true"
 ```
 
-## 🛠️ Advanced Features
+## 🛠️ 核心工具详解
 
-### Trajectory Analysis
+### 计算器工具 (CalculatorTool)
+高级数学计算工具，支持：
+- 表达式求值和安全AST解析
+- 基础算术运算
+- 科学函数（三角函数、对数等）
+- 列表统计运算
+- 计算历史跟踪
 
 ```python
-# Analyze trajectory performance
+from workers import CalculatorTool, register_tool
+
+register_tool(CalculatorTool, {"precision": 10})
+# 支持: "2 + 3 * 4", "sqrt(16) + factorial(4)", "sin(pi/2)"
+```
+
+### Bash执行器工具 (BashExecutorTool)
+安全的bash命令执行，具有：
+- 危险命令安全过滤
+- 超时保护
+- 输出捕获和流式传输
+- 工作目录支持
+
+```python
+from workers import BashExecutorTool, register_tool
+
+register_tool(BashExecutorTool, {
+    "timeout": 30,
+    "blocked_commands": ["rm", "sudo"]
+})
+```
+
+### 文件编辑器工具 (FileEditorTool)
+全面的文件操作，支持：
+- 文件和目录查看
+- 文件创建和编辑
+- 唯一性检查的字符串替换
+- 特定行的文本插入
+- 编辑历史和撤销功能
+
+```python
+from workers import FileEditorTool, register_tool
+
+register_tool(FileEditorTool, {
+    "max_file_size": 1024*1024,
+    "allowed_extensions": [".py", ".txt", ".md"]
+})
+```
+
+### 搜索工具 (SearchTool)
+强大的搜索功能，包括：
+- 文件中的文本搜索，支持正则表达式
+- 文件名模式匹配
+- 目录结构搜索
+- 上下文行显示
+
+```python
+from workers import SearchTool, register_tool
+
+register_tool(SearchTool, {
+    "max_results": 100,
+    "search_extensions": [".py", ".js", ".md"]
+})
+```
+
+## 📊 示例和演示
+
+`examples/` 目录包含全面的演示：
+
+- **`basic_usage.py`**: 基础使用模式
+- **`advanced_integration.py`**: 高级集成示例  
+- **`core_tools_demo.py`**: 核心工具系统演示
+- **`tool_integration_demo.py`**: 完整工具集成演示
+- **`config/`**: 不同场景的配置模板
+
+运行示例：
+```bash
+cd examples
+
+# 基础功能
+python basic_usage.py
+
+# 工具系统演示
+python core_tools_demo.py
+
+# 完整集成演示
+python tool_integration_demo.py
+```
+
+## 🤝 与VERL的集成
+
+当VERL可用时，该库提供：
+
+1. **无缝集成**：作为drop-in rollout方法工作
+2. **协议兼容性**：完整的DataProto支持
+3. **工具继承**：继承VERL的工具生态系统
+4. **性能特性**：利用VERL的优化特性
+
+```python
+# 在VERL环境中
+from verl.workers.rollout import AgenticRollout
+
+# 在VERL训练管道中使用
+rollout_config = {
+    "rollout_type": "agentic",
+    "agent_config": {
+        "agent_type": "react",
+        "max_steps": 10
+    }
+}
+```
+
+## 🔍 架构概览
+
+### 核心组件
+
+1. **BaseAgent**: 带轨迹管理的抽象智能体接口
+2. **AgenticRollout**: 具有VERL兼容性的主要rollout编排器
+3. **轨迹系统**: 完整的步骤跟踪和序列化
+4. **工具框架**: 具有异步支持的灵活工具集成
+5. **注册系统**: 动态智能体和工具注册
+
+### 设计原则
+
+- **模块化架构**: 清晰的关注点分离
+- **异步优先**: 全面的async/await支持
+- **可扩展设计**: 易于添加新智能体、工具和集成
+- **生产就绪**: 全面的错误处理和日志记录
+- **性能专注**: 并发处理和高效资源使用
+
+## 🧪 测试
+
+```bash
+# 运行基础测试
+python examples/test_agentic_rollout.py
+
+# 运行验证测试
+python examples/validation_tests.py
+
+# 测试特定组件
+python examples/test_coding_agent.py
+```
+
+## 🎯 应用场景
+
+### 数学和科学计算
+```python
+# 复杂计算任务
+trajectory = await agent.run_trajectory(
+    prompt={"content": "计算正态分布的95%置信区间，均值为100，标准差为15"},
+    llm_generate_func=llm_func
+)
+```
+
+### 代码开发和测试
+```python
+# 软件开发工作流
+trajectory = await agent.run_trajectory(
+    prompt={"content": "创建一个快速排序算法的Python实现并编写单元测试"},
+    llm_generate_func=llm_func
+)
+```
+
+### 文件处理和分析
+```python
+# 文档分析任务
+trajectory = await agent.run_trajectory(
+    prompt={"content": "分析这个项目目录，找出所有Python文件的导入依赖关系"},
+    llm_generate_func=llm_func
+)
+```
+
+### 系统管理自动化
+```python
+# 系统运维任务
+trajectory = await agent.run_trajectory(
+    prompt={"content": "检查系统磁盘使用情况，如果超过80%使用率则清理临时文件"},
+    llm_generate_func=llm_func
+)
+```
+
+## 📝 贡献
+
+1. Fork仓库
+2. 创建功能分支 (`git checkout -b feature/amazing-feature`)
+3. 提交更改 (`git commit -m 'Add amazing feature'`)
+4. 推送到分支 (`git push origin feature/amazing-feature`)
+5. 开启Pull Request
+
+### 开发指南
+
+- 遵循Python类型约定
+- 添加全面的docstring
+- 在docstring中包含示例用法
+- 为新功能编写测试
+- 保持向后兼容性
+
+## 🔧 高级特性
+
+### 轨迹分析
+
+```python
+# 分析轨迹性能
 trajectory = await agent.run_trajectory(...)
 
-# Get trajectory statistics
-print(f"Total steps: {len(trajectory.steps)}")
-print(f"Tool calls: {len(trajectory.get_tool_calls())}")
-print(f"Final reward: {trajectory.get_total_reward()}")
+# 获取轨迹统计
+print(f"总步数: {len(trajectory.steps)}")
+print(f"工具调用: {len(trajectory.get_tool_calls())}")
+print(f"最终奖励: {trajectory.get_total_reward()}")
 
-# Export trajectory
+# 导出轨迹
 trajectory_dict = trajectory.to_dict()
-with open("trajectory.json", "w") as f:
-    json.dump(trajectory_dict, f, indent=2)
+with open("trajectory.json", "w", encoding="utf-8") as f:
+    json.dump(trajectory_dict, f, indent=2, ensure_ascii=False)
 ```
 
-### Custom Tool Integration
+### 自定义工具集成
 
 ```python
-class WebSearchTool:
-    def __init__(self, api_key):
-        self.api_key = api_key
+from workers.core.base_tool import AgenticBaseTool
+from workers.core.tool_schemas import create_openai_tool_schema, ToolResult
+
+class WebSearchTool(AgenticBaseTool):
+    def __init__(self, config=None):
+        super().__init__(config)
+        self.api_key = self.config.get("api_key")
     
-    async def execute(self, query: str, max_results: int = 5):
-        # Implement web search logic
+    def get_openai_tool_schema(self):
+        return create_openai_tool_schema(
+            name="web_search",
+            description="在网络上搜索信息",
+            parameters={
+                "query": {"type": "string", "description": "搜索查询"},
+                "max_results": {"type": "integer", "description": "最大结果数", "default": 5}
+            },
+            required=["query"]
+        )
+    
+    async def execute_tool(self, instance_id, parameters, **kwargs):
+        query = parameters["query"]
+        max_results = parameters.get("max_results", 5)
+        
+        # 实现网络搜索逻辑
         results = await self.search_web(query)
-        return {
-            "query": query,
-            "results": results[:max_results],
-            "found": len(results)
-        }
+        
+        return ToolResult(
+            success=True,
+            result={
+                "query": query,
+                "results": results[:max_results],
+                "found": len(results)
+            }
+        )
 
-# Register tool
-tools = {"web_search": WebSearchTool(api_key="your-key")}
-rollout.agent.set_tools(tools)
+# 注册工具
+from workers import register_tool
+register_tool(WebSearchTool, {"api_key": "your-key"})
 ```
 
-### Batch Processing
+### 批处理
 
 ```python
-# Process multiple prompts concurrently
+# 并发处理多个提示
 prompts = [
-    {"content": "Solve math problem: 15 * 24"},
-    {"content": "Write Python code to sort a list"},
-    {"content": "Explain quantum computing"}
+    {"content": "解决数学问题: 15 * 24"},
+    {"content": "编写Python代码对列表进行排序"},
+    {"content": "解释量子计算的基本原理"}
 ]
 
 config = AgenticRolloutConfig(concurrent_requests=3)
 rollout = AgenticRollout(config=config, llm_generate_func=llm_func)
 
-# Process batch
+# 处理批次
 trajectories = []
 for i, prompt in enumerate(prompts):
     trajectory = await rollout.agent.run_trajectory(
@@ -339,121 +565,80 @@ for i, prompt in enumerate(prompts):
     trajectories.append(trajectory)
 ```
 
-## 📊 Examples and Demos
+## ⚡ 性能优化
 
-The `examples/` directory contains comprehensive demonstrations:
-
-- **`basic_usage.py`**: Fundamental usage patterns
-- **`claude_integration/`**: Complete Claude API integration with ReAct agents
-- **`k8s_swe_agent/`**: Kubernetes-powered software engineering agent
-- **`trajectory_client/`**: Trajectory management and analysis utilities
-- **`config/`**: Configuration templates for different scenarios
-
-To run examples:
-```bash
-cd examples
-python basic_usage.py
-
-# Claude integration (requires API key)
-cd claude_integration
-export ANTHROPIC_API_KEY="your-key"
-python simple_claude_example.py
-```
-
-## 🤝 Integration with VERL
-
-When VERL is available, this library provides:
-
-1. **Seamless Integration**: Works as a drop-in rollout method
-2. **Protocol Compatibility**: Full DataProto support
-3. **Tool Inheritance**: Inherits VERL's tool ecosystem
-4. **Performance Features**: Leverages VERL's optimization features
-
+### 并发设置
 ```python
-# In VERL environment
-from verl.workers.rollout import AgenticRollout
-
-# Use in VERL training pipeline
-rollout_config = {
-    "rollout_type": "agentic",
-    "agent_config": {
-        "agent_type": "react",
-        "max_steps": 10
-    }
-}
+config = AgenticRolloutConfig(
+    concurrent_requests=4,      # 并发请求数
+    max_steps=10,              # 限制步数防止无限循环
+    max_tokens_per_step=512,   # 控制生成长度
+    batch_size=2               # 批处理大小
+)
 ```
 
-## 🔍 Architecture Overview
-
-### Core Components
-
-1. **BaseAgent**: Abstract agent interface with trajectory management
-2. **AgenticRollout**: Main rollout orchestrator with VERL compatibility
-3. **Trajectory System**: Complete step tracking and serialization
-4. **Tool Framework**: Flexible tool integration with async support
-5. **Registry System**: Dynamic agent and tool registration
-
-### Design Principles
-
-- **Modular Architecture**: Clear separation of concerns
-- **Async-First**: Full async/await support throughout
-- **Extensible Design**: Easy to add new agents, tools, and integrations
-- **Production Ready**: Comprehensive error handling and logging
-- **Performance Focused**: Concurrent processing and efficient resource usage
-
-## 🧪 Testing
-
-```bash
-# Run basic tests
-python examples/test_agentic_rollout.py
-
-# Run validation tests
-python examples/validation_tests.py
-
-# Test specific components
-python examples/test_coding_agent.py
+### 内存管理
+```python
+config = AgenticRolloutConfig(
+    save_trajectories=False,           # 不保存到磁盘节省空间
+    include_trajectory_in_output=True, # 仅在内存中保持轨迹
+    trajectory_save_path=None          # 禁用文件保存
+)
 ```
 
-## 📝 Contributing
+## 🆘 故障排除
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+### 常见问题
 
-### Development Guidelines
+1. **智能体未找到**: 确保智能体类型正确注册
+2. **工具执行失败**: 检查工具配置和可用性
+3. **无限循环**: 调整 `max_steps` 和终止条件
+4. **内存问题**: 减少 `concurrent_requests` 或 `max_tokens_per_step`
 
-- Follow Python typing conventions
-- Add comprehensive docstrings
-- Include example usage in docstrings
-- Write tests for new features
-- Maintain backward compatibility
+### 调试
 
-## 📄 License
+启用详细日志记录：
+```python
+import logging
+logging.basicConfig(level=logging.DEBUG)
 
-This project follows the same license as the VERL library.
+# 或只为特定组件启用
+logging.getLogger("workers.tools").setLevel(logging.DEBUG)
+```
 
-## ❓ FAQ
+保存轨迹用于分析：
+```python
+config = AgenticRolloutConfig(
+    save_trajectories=True,
+    trajectory_save_path="./debug_trajectories"
+)
+```
 
-**Q: Can I use this library without VERL?**
-A: Yes! The library is designed to work completely independently and gracefully handles VERL's absence.
+## 📄 许可证
 
-**Q: What LLM providers are supported?**
-A: Any provider that follows the OpenAI SDK protocol. We provide examples for OpenAI, Claude, and custom implementations.
+该项目遵循与VERL库相同的许可证。
 
-**Q: How do I add custom tools?**
-A: Create a class with an async `execute` method and register it with your agent using `agent.set_tools()`.
+## ❓ 常见问题
 
-**Q: Can I use this for production workloads?**
-A: Yes, the library includes comprehensive error handling, logging, and performance optimizations suitable for production use.
+**Q: 我可以在没有VERL的情况下使用这个库吗？**
+A: 可以！该库设计为完全独立工作，并在VERL不可用时优雅降级。
 
-## 🆘 Support
+**Q: 支持哪些LLM提供商？**
+A: 任何遵循OpenAI SDK协议的提供商。我们为OpenAI、Claude和自定义实现提供示例。
 
-- 📖 Check the [examples directory](./examples/) for usage patterns
-- 🐛 Report issues in the project's issue tracker
-- 💬 Join community discussions for questions and feature requests
+**Q: 如何添加自定义工具？**
+A: 创建一个带有async `execute_tool` 方法的类，并使用 `register_tool()` 注册到智能体。
+
+**Q: 我可以将此用于生产工作负载吗？**
+A: 可以，该库包含适合生产使用的全面错误处理、日志记录和性能优化。
+
+## 🆘 支持
+
+- 📖 查看 [examples目录](./examples/) 了解使用模式
+- 📖 查看 [中文示例文档](./examples/README_CN.md) 了解详细用法
+- 🐛 在项目的issue tracker中报告问题
+- 💬 加入社区讨论以获取问题和功能请求的帮助
 
 ---
 
-**Made with ❤️ for the AI Agent Community**
+**为AI智能体社区倾心打造 ❤️**
