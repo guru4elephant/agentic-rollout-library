@@ -67,27 +67,47 @@ agentic_rollout_library/
 
 ### 安装
 
-由于该库设计为可以与VERL一起使用或不使用VERL，安装方式取决于你的使用场景：
+该库已配置了完整的Python包管理，支持通过pip直接安装，包括自动安装kodo依赖（用于K8s控制和执行逻辑）。
 
-**选项1：独立使用（推荐）**
+**选项1：从源码安装（推荐）**
 ```bash
 # 克隆仓库
 git clone <repository-url>
-cd agentic_rollout_library
+cd agentic-rollout-library
 
-# 安装基础依赖
-pip install pydantic pyyaml asyncio
+# 安装包及所有依赖（包括kodo）
+pip install -e .
+
+# 或者安装开发依赖
+pip install -e ".[dev]"
 ```
 
-**选项2：与VERL集成**
+**选项2：创建虚拟环境安装**
+```bash
+# 创建虚拟环境
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# 或者 venv\Scripts\activate  # Windows
+
+# 安装包
+pip install -e .
+```
+
+**选项3：与VERL集成**
 ```bash
 # 确保首先安装VERL
 export PYTHONPATH="/path/to/verl:$PYTHONPATH"
 
-# 克隆并设置
+# 克隆并安装
 git clone <repository-url>
-cd agentic_rollout_library
+cd agentic-rollout-library
+pip install -e .
 ```
+
+**依赖说明：**
+- 主要依赖会自动安装，包括 `pydantic>=2.0.0` 和 `typing-extensions>=4.0.0`
+- **kodo依赖**会从 `https://github.com/baidubce/kodo.git` 自动安装，用于K8s控制和执行逻辑
+- 开发依赖包括测试和代码质量工具
 
 ### 基础使用示例
 

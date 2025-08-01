@@ -66,27 +66,47 @@ agentic_rollout_library/
 
 ### Installation
 
-Since this library is designed to work with or without VERL, installation depends on your use case:
+This library is configured with complete Python package management, supporting direct installation via pip, including automatic installation of kodo dependency (for K8s control and execution logic).
 
-**Option 1: Standalone Usage (Recommended)**
+**Option 1: Install from Source (Recommended)**
 ```bash
 # Clone the repository
 git clone <repository-url>
-cd agentic_rollout_library
+cd agentic-rollout-library
 
-# Install basic dependencies
-pip install pydantic pyyaml asyncio
+# Install package with all dependencies (including kodo)
+pip install -e .
+
+# Or install with development dependencies
+pip install -e ".[dev]"
 ```
 
-**Option 2: With VERL Integration**
+**Option 2: Virtual Environment Installation**
+```bash
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# or venv\Scripts\activate  # Windows
+
+# Install package
+pip install -e .
+```
+
+**Option 3: With VERL Integration**
 ```bash
 # Ensure VERL is installed first
 export PYTHONPATH="/path/to/verl:$PYTHONPATH"
 
-# Clone and setup
+# Clone and install
 git clone <repository-url>
-cd agentic_rollout_library
+cd agentic-rollout-library
+pip install -e .
 ```
+
+**Dependency Notes:**
+- Core dependencies are automatically installed, including `pydantic>=2.0.0` and `typing-extensions>=4.0.0`
+- **kodo dependency** is automatically installed from `https://github.com/baidubce/kodo.git` for K8s control and execution logic
+- Development dependencies include testing and code quality tools
 
 ### Basic Usage Example
 
