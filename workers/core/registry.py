@@ -56,3 +56,33 @@ def clear_registry():
     """Clear the agent registry (mainly for testing)."""
     global _AGENT_REGISTRY
     _AGENT_REGISTRY = {}
+
+
+class AgentRegistry:
+    """Registry class for managing agent types."""
+    
+    def __init__(self):
+        """Initialize agent registry."""
+        self._registry = _AGENT_REGISTRY
+    
+    def register(self, name: str, agent_class: Type) -> None:
+        """Register an agent class."""
+        if name in self._registry:
+            raise ValueError(f"Agent '{name}' is already registered")
+        self._registry[name] = agent_class
+    
+    def get(self, name: str) -> Optional[Type]:
+        """Get an agent class by name."""
+        return self._registry.get(name)
+    
+    def list(self) -> Dict[str, Type]:
+        """List all registered agents."""
+        return self._registry.copy()
+    
+    def clear(self) -> None:
+        """Clear the registry."""
+        self._registry.clear()
+
+
+# Global registry instance
+_global_agent_registry = AgentRegistry()

@@ -164,7 +164,15 @@ Think step by step and use the available tools when necessary."""
             tool = self.tools[tool_name]
             
             # Execute the tool
-            result = await tool.execute(**tool_args)
+            if hasattr(tool, 'execute_tool'):
+                # This is a BaseAgenticTool - use the new interface
+                import uuid
+                instance_id = str(uuid.uuid4())
+                tool_result = await tool.execute_tool(instance_id, tool_args)
+                result = tool_result.result if tool_result.success else f"Tool error: {tool_result.error}"
+            else:
+                # Legacy tool interface
+                result = await tool.execute(**tool_args)
             
             # Create result step
             result_step = TrajectoryStep(

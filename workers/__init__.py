@@ -22,6 +22,18 @@ from .agents.tool_agent import ToolAgent
 # Core tools
 from .tools import CalculatorTool, BashExecutorTool, FileEditorTool, SearchTool
 
+# Utils
+from .utils import LLMAPIClient
+
+# K8s tools (conditionally import if kodo is available)
+try:
+    from .tools import K8sBashExecutorTool, K8sFileEditorTool, K8sSearchTool, K8S_TOOLS_AVAILABLE
+except ImportError:
+    K8sBashExecutorTool = None
+    K8sFileEditorTool = None
+    K8sSearchTool = None
+    K8S_TOOLS_AVAILABLE = False
+
 __all__ = [
     # Core rollout system
     "AgenticRollout",
@@ -57,4 +69,15 @@ __all__ = [
     "BashExecutorTool",
     "FileEditorTool", 
     "SearchTool",
+    
+    # Utils
+    "LLMAPIClient",
 ]
+
+# Add K8s tools to exports if available
+if K8S_TOOLS_AVAILABLE:
+    __all__.extend([
+        "K8sBashExecutorTool",
+        "K8sFileEditorTool",
+        "K8sSearchTool",
+    ])

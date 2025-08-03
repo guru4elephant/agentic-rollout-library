@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 """
-Bash executor tool for running terminal commands.
-Supports both local execution and remote K8s pod execution.
-Based on R2E's execute_bash but adapted for the core tool framework.
+K8s Bash executor tool for running terminal commands in Kubernetes pods.
+Based on bash_executor_tool.py but adapted to execute commands in K8s pods using kodo.
 """
 
-import subprocess
-import sys
-import logging
 import asyncio
-from typing import Any, Dict, List, Optional
-
-# Optional K8s support
+import logging
+from typing import Any, Dict, List
 try:
     from kodo import KubernetesManager
-    K8S_AVAILABLE = True
 except ImportError:
     KubernetesManager = None
-    K8S_AVAILABLE = False
 
 from ..core.base_tool import AgenticBaseTool
 from ..core.tool_schemas import OpenAIFunctionToolSchema, ToolResult, create_openai_tool_schema
@@ -25,8 +18,8 @@ from ..core.tool_schemas import OpenAIFunctionToolSchema, ToolResult, create_ope
 logger = logging.getLogger(__name__)
 
 
-class BashExecutorTool(AgenticBaseTool):
-    """Tool for executing bash commands safely."""
+class K8sBashExecutorTool(AgenticBaseTool):
+    """Tool for executing bash commands in Kubernetes pods."""
     
     # Commands that are blocked for security reasons
     DEFAULT_BLOCKED_COMMANDS = [
@@ -35,20 +28,15 @@ class BashExecutorTool(AgenticBaseTool):
     ]
     
     def __init__(self, config: Dict = None):
-        """Initialize bash executor tool."""
-        # Set execution mode and K8s config FIRST, before calling super().__init__
+        """Initialize K8s bash executor tool."""
+        if KubernetesManager is None:
+            raise ImportError("kodo library is required for K8s tools. Please install it from https://github.com/baidubce/kodo.git")
+        
+        # Set K8s configuration first before calling super().__init__
         config = config or {}
-        self.execution_mode = config.get("execution_mode", "local")
-        self.pod_name = config.get("pod_name")
+        self.pod_name = config.get("pod_name", "swebench-xarray-pod")
         self.namespace = config.get("namespace", "default")
         self.kubeconfig_path = config.get("kubeconfig_path", None)
-        
-        # Validate K8s configuration if needed
-        if self.execution_mode == "k8s":
-            if not K8S_AVAILABLE:
-                raise ImportError("kodo library is required for K8s execution mode. Please install it from https://github.com/baidubce/kodo.git")
-            if not self.pod_name:
-                raise ValueError("pod_name is required when execution_mode is 'k8s'")
         
         super().__init__(config)
         
@@ -59,24 +47,23 @@ class BashExecutorTool(AgenticBaseTool):
         self.allow_dangerous = self.config.get("allow_dangerous", False)
         self.timeout = self.config.get("timeout", 30)  # 30 second default timeout
         self.execution_history = {}
+        
+        # Initialize K8s manager
         self.k8s_manager = None
     
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
-        """Return OpenAI tool schema for bash executor."""
-        # Description is the same regardless of execution mode
-        execution_context = f" (executing in {self.execution_mode} mode)" if self.execution_mode != "local" else ""
-        
+        """Return OpenAI tool schema for K8s bash executor."""
         return create_openai_tool_schema(
-            name="bash_executor",
-            description=f"Execute bash commands in the terminal{execution_context}. Use with caution as this can modify system state.",
+            name="k8s_bash_executor",
+            description=f"Execute bash commands in Kubernetes pod '{self.pod_name}'. Use with caution as this can modify system state within the pod.",
             parameters={
                 "command": {
                     "type": "string",
-                    "description": "The bash command to execute (e.g., 'ls -la', 'python script.py', 'grep pattern file.txt')"
+                    "description": "The bash command to execute in the K8s pod (e.g., 'ls -la', 'python script.py', 'grep pattern file.txt')"
                 },
                 "working_directory": {
                     "type": "string",
-                    "description": "Optional working directory for command execution"
+                    "description": "Optional working directory for command execution within the pod"
                 },
                 "timeout": {
                     "type": "number",
@@ -95,7 +82,7 @@ class BashExecutorTool(AgenticBaseTool):
         self.execution_history[instance_id] = []
     
     async def execute_tool(self, instance_id: str, parameters: Dict[str, Any], **kwargs) -> ToolResult:
-        """Execute bash command."""
+        """Execute bash command in K8s pod."""
         try:
             command = parameters["command"].strip()
             working_dir = parameters.get("working_directory")
@@ -110,18 +97,21 @@ class BashExecutorTool(AgenticBaseTool):
                     error=security_result["reason"]
                 )
             
-            # Execute command based on execution mode
-            if self.execution_mode == "k8s":
-                result = await self._run_k8s_command(command, timeout, capture_output, working_dir)
-            else:
-                result = await self._run_local_command(command, working_dir, timeout, capture_output)
+            # Prepend cd command if working directory is specified
+            if working_dir:
+                command = f"cd {working_dir} && {command}"
+            
+            # Execute command in K8s pod
+            result = await self._run_k8s_command(command, timeout, capture_output)
             
             # Record execution
             execution_record = {
                 "command": command,
                 "working_directory": working_dir,
                 "return_code": result["return_code"],
-                "success": result["return_code"] == 0
+                "success": result["return_code"] == 0,
+                "pod_name": self.pod_name,
+                "namespace": self.namespace
             }
             
             if instance_id in self.execution_history:
@@ -134,12 +124,15 @@ class BashExecutorTool(AgenticBaseTool):
                         "stdout": result["stdout"],
                         "stderr": result["stderr"],
                         "return_code": result["return_code"],
-                        "command": command
+                        "command": command,
+                        "pod_name": self.pod_name,
+                        "namespace": self.namespace
                     },
                     metrics={
                         "return_code": result["return_code"],
                         "stdout_length": len(result["stdout"]),
-                        "stderr_length": len(result["stderr"])
+                        "stderr_length": len(result["stderr"]),
+                        "execution_location": f"{self.namespace}/{self.pod_name}"
                     }
                 )
             else:
@@ -150,12 +143,14 @@ class BashExecutorTool(AgenticBaseTool):
                         "stdout": result["stdout"],
                         "stderr": result["stderr"],
                         "return_code": result["return_code"],
-                        "command": command
+                        "command": command,
+                        "pod_name": self.pod_name,
+                        "namespace": self.namespace
                     }
                 )
                 
         except Exception as e:
-            logger.error(f"Bash execution failed: {e}")
+            logger.error(f"K8s bash execution failed: {e}")
             return ToolResult(success=False, error=str(e))
     
     def _check_command_security(self, command: str) -> Dict[str, Any]:
@@ -200,75 +195,6 @@ class BashExecutorTool(AgenticBaseTool):
         
         return {"safe": True, "reason": "Command passed security checks"}
     
-    async def _run_local_command(self, command: str, working_dir: str = None, 
-                               timeout: float = 30, capture_output: bool = True) -> Dict[str, Any]:
-        """Run bash command and return results."""
-        try:
-            # Prepare subprocess arguments
-            kwargs = {
-                "shell": True,
-                "timeout": timeout,
-                "cwd": working_dir
-            }
-            
-            if capture_output:
-                # Use newer parameters for Python 3.7+
-                try:
-                    result = subprocess.run(
-                        command,
-                        capture_output=True,
-                        text=True,
-                        **kwargs
-                    )
-                except TypeError:
-                    # Fallback for Python 3.5-3.6
-                    result = subprocess.run(
-                        command,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        universal_newlines=True,
-                        **kwargs
-                    )
-                
-                return {
-                    "stdout": result.stdout or "",
-                    "stderr": result.stderr or "",
-                    "return_code": result.returncode
-                }
-            else:
-                # Run without capturing output
-                result = subprocess.run(command, **kwargs)
-                return {
-                    "stdout": "",
-                    "stderr": "",
-                    "return_code": result.returncode
-                }
-                
-        except subprocess.TimeoutExpired:
-            return {
-                "stdout": "",
-                "stderr": f"Command timed out after {timeout} seconds",
-                "return_code": -1
-            }
-        except Exception as e:
-            return {
-                "stdout": "",
-                "stderr": f"Execution error: {str(e)}",
-                "return_code": -1
-            }
-    
-    def add_blocked_command(self, command: str) -> None:
-        """Add a command to the blocked list."""
-        self.blocked_commands.add(command)
-    
-    def remove_blocked_command(self, command: str) -> None:
-        """Remove a command from the blocked list."""
-        self.blocked_commands.discard(command)
-    
-    def get_blocked_commands(self) -> List[str]:
-        """Get list of blocked commands."""
-        return list(self.blocked_commands)
-    
     def _get_k8s_manager(self):
         """Get or create K8s manager instance."""
         if self.k8s_manager is None:
@@ -279,13 +205,9 @@ class BashExecutorTool(AgenticBaseTool):
         return self.k8s_manager
 
     async def _run_k8s_command(self, command: str, timeout: float = 30, 
-                              capture_output: bool = True, working_dir: Optional[str] = None) -> Dict[str, Any]:
+                              capture_output: bool = True) -> Dict[str, Any]:
         """Run bash command in K8s pod and return results."""
         try:
-            # Prepend cd command if working directory is specified
-            if working_dir:
-                command = f"cd {working_dir} && {command}"
-            
             k8s_mgr = self._get_k8s_manager()
             
             # Execute command in pod using kodo API
@@ -305,24 +227,26 @@ class BashExecutorTool(AgenticBaseTool):
                 "return_code": -1
             }
     
-    def get_execution_info(self) -> Dict[str, Any]:
-        """Get information about the execution environment."""
-        info = {
-            "execution_mode": self.execution_mode,
-            "timeout": self.timeout,
-            "blocked_commands_count": len(self.blocked_commands),
-            "allow_dangerous": self.allow_dangerous
+    def add_blocked_command(self, command: str) -> None:
+        """Add a command to the blocked list."""
+        self.blocked_commands.add(command)
+    
+    def remove_blocked_command(self, command: str) -> None:
+        """Remove a command from the blocked list."""
+        self.blocked_commands.discard(command)
+    
+    def get_blocked_commands(self) -> List[str]:
+        """Get list of blocked commands."""
+        return list(self.blocked_commands)
+    
+    def get_pod_info(self) -> Dict[str, str]:
+        """Get information about the target pod."""
+        return {
+            "pod_name": self.pod_name,
+            "namespace": self.namespace,
+            "kubeconfig_path": self.kubeconfig_path or "default"
         }
-        
-        if self.execution_mode == "k8s":
-            info.update({
-                "pod_name": self.pod_name,
-                "namespace": self.namespace,
-                "kubeconfig_path": self.kubeconfig_path or "default"
-            })
-        
-        return info
-
+    
     async def _cleanup_instance(self, instance_id: str, **kwargs) -> None:
         """Clean up instance-specific data."""
         if instance_id in self.execution_history:

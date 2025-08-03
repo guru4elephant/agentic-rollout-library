@@ -14,16 +14,24 @@
 ### 🧠 高级智能体框架
 - **基础智能体系统**：用于自定义智能体实现的抽象基类
 - **ReAct智能体**：内置ReAct（推理+行动）智能体，支持工具集成
-- **自定义智能体**：易于扩展的专业化智能体行为框架
+- **GeneralAgent**：通用ReAct智能体，支持配置化系统提示和终止条件
+- **智能体工厂**：基于类名和配置创建智能体实例
 - **轨迹管理**：完整的轨迹跟踪和序列化支持
 
 ### 🛠️ 统一工具框架
 - **VERL兼容性**：当VERL可用时与VERL工具无缝集成
 - **独立运行**：无VERL依赖的完整功能
-- **核心工具**：计算器、文件编辑器、bash执行器和搜索工具
+- **核心工具**：计算器、文件编辑器、bash执行器、搜索工具和finish工具
+- **工具工厂**：基于类名和配置创建工具实例
 - **工具注册表**：集中化工具管理和发现
 - **自定义工具**：开发新工具的简易框架
 - **安全特性**：具有可配置限制的安全执行
+
+### 🏭 工厂模式系统
+- **ToolFactory**：基于类名创建工具，支持配置参数传递
+- **AgentFactory**：基于类名创建智能体，支持配置参数传递
+- **自动加载**：自动模块加载和类缓存
+- **批量创建**：支持批量创建多个工具或智能体实例
 
 ### 🔌 LLM客户端灵活性
 - **OpenAI SDK兼容**：标准OpenAI API协议支持
@@ -108,6 +116,42 @@ pip install -e .
 - 主要依赖会自动安装，包括 `pydantic>=2.0.0` 和 `typing-extensions>=4.0.0`
 - **kodo依赖**会从 `https://github.com/baidubce/kodo.git` 自动安装，用于K8s控制和执行逻辑
 - 开发依赖包括测试和代码质量工具
+
+## 📁 项目结构
+
+```
+agentic-rollout-library/
+├── README.md                    # 项目主文档
+├── docs/                        # 详细文档目录
+│   ├── README.md               # 文档索引
+│   ├── GENERAL_AGENT_README.md # GeneralAgent使用指南
+│   └── FACTORY_PATTERN_README.md # 工厂模式指南
+├── tests/                       # 测试和示例目录  
+│   ├── README.md               # 测试说明
+│   ├── test_*.py               # 单元测试
+│   └── *_example.py            # 使用示例
+├── workers/                     # 核心代码目录
+│   ├── agents/                 # 智能体实现
+│   │   ├── general_agent.py    # 通用ReAct智能体
+│   │   └── react_agent.py      # 基础ReAct智能体
+│   ├── core/                   # 核心框架
+│   │   ├── agent_factory.py    # 智能体工厂
+│   │   ├── tool_factory.py     # 工具工厂
+│   │   ├── base_agent.py       # 智能体基类
+│   │   └── base_tool.py        # 工具基类
+│   └── tools/                  # 工具实现
+│       ├── calculator_tool.py  # 计算器工具
+│       ├── finish_tool.py      # 任务完成工具
+│       └── ...                 # 其他工具
+└── examples/                    # 完整应用示例
+```
+
+## 📚 文档导航
+
+- **[详细文档](docs/README.md)** - 完整的文档索引和指南
+- **[GeneralAgent使用指南](docs/GENERAL_AGENT_README.md)** - 通用智能体详细文档
+- **[工厂模式指南](docs/FACTORY_PATTERN_README.md)** - 基于配置的创建模式文档
+- **[测试和示例](tests/README.md)** - 测试运行指南和代码示例
 
 ### 基础使用示例
 

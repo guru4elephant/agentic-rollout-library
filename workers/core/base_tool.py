@@ -50,6 +50,28 @@ class BaseAgenticTool(ABC):
         """Return the OpenAI tool schema for this tool."""
         pass
     
+    def get_description(self) -> str:
+        """
+        Get tool description for system prompts.
+        
+        By default, returns the stringified JSON schema.
+        Override this method to provide custom descriptions.
+        
+        Returns:
+            Tool description string
+        """
+        schema = self.get_openai_tool_schema()
+        # Convert Pydantic model to dict if needed
+        if hasattr(schema, 'model_dump'):
+            schema_dict = schema.model_dump()
+        elif hasattr(schema, 'dict'):
+            schema_dict = schema.dict()
+        else:
+            schema_dict = schema
+        
+        # Return formatted JSON schema as default description
+        return json.dumps(schema_dict, indent=2, ensure_ascii=False)
+    
     async def create_instance(self, instance_id: Optional[str] = None, **kwargs) -> str:
         """
         Create a tool instance.
