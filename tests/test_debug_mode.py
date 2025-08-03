@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # API配置
 API_KEY = os.getenv("LLM_API_KEY", "your-api-key-here")
 BASE_URL = os.getenv("LLM_BASE_URL", "your-base-url-here")
-MODEL_NAME = "gpt-4.1"
+MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4")
 
 async def test_debug_mode():
     """测试GeneralAgent的debug模式"""

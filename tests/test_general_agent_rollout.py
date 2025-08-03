@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # API配置
 API_KEY = os.getenv("LLM_API_KEY", "your-api-key-here")
 BASE_URL = os.getenv("LLM_BASE_URL", "your-base-url-here")
-MODEL_NAME = "gpt-4.1"
+MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4")
 
 # 自定义系统提示词（包含必要的ReAct格式说明）
 CUSTOM_SYSTEM_PROMPT = """You are an advanced AI coding assistant specializing in software development tasks within Kubernetes environments.

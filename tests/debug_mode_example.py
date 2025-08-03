@@ -17,7 +17,7 @@ from workers.utils import create_llm_client
 # API配置
 API_KEY = os.getenv("LLM_API_KEY", "your-api-key-here")
 BASE_URL = os.getenv("LLM_BASE_URL", "your-base-url-here")
-MODEL_NAME = "claude-sonnet-4-20250514"
+MODEL_NAME = os.getenv("LLM_MODEL_NAME", "claude-3-sonnet")
 
 
 def setup_logging(debug: bool = False):

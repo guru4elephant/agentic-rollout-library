@@ -18,7 +18,7 @@ from workers.utils import create_llm_client
 # LLM configuration
 API_KEY = os.getenv("LLM_API_KEY", "your-api-key-here")
 BASE_URL = os.getenv("LLM_BASE_URL", "your-base-url-here")
-MODEL_NAME = "gpt-4.1"
+MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4")
 
 
 def create_r2e_agent_for_k8s():
