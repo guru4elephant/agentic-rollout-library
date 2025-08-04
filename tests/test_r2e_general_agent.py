@@ -8,6 +8,13 @@ import asyncio
 import sys
 import os
 
+# Try to load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # Load .env file from current directory
+except ImportError:
+    pass  # python-dotenv not installed, skip
+
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -31,7 +38,9 @@ BASE_URL = os.getenv("LLM_BASE_URL", "your-base-url-here")
 #MODEL_NAME = os.getenv("LLM_MODEL_NAME", "claude-3-sonnet")
 #MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4")
 MODEL_NAME = os.getenv("LLM_MODEL_NAME", "claude-3-sonnet")
-
+print(API_KEY)
+print(BASE_URL)
+print(MODEL_NAME)
 
 # Custom tool descriptions for R2E style
 CUSTOM_TOOL_DESCRIPTIONS = {
@@ -221,7 +230,8 @@ async def test_r2e_general_agent_k8s():
     k8s_config = {
         "execution_mode": "k8s",
         "pod_name": "swebench-xarray-pod",
-        "namespace": "default"
+        "namespace": os.getenv("K8S_NAMESPACE", "default"),
+        "kubeconfig_path": os.getenv("KUBECONFIG", None)  # Will use default kubeconfig if not set
     }
     
     # Create R2E tools with K8S configuration
@@ -246,6 +256,7 @@ async def test_r2e_general_agent_k8s():
     print(f"✅ Created {len(tools)} R2E tools")
     print(f"   Pod: {k8s_config['pod_name']}")
     print(f"   Namespace: {k8s_config['namespace']}")
+    print(f"   Kubeconfig: {k8s_config.get('kubeconfig_path') or 'default'}")
     
     # Display tool schemas
     print("\n📋 Tool Schemas:")
