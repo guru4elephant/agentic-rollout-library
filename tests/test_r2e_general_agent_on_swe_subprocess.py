@@ -170,23 +170,32 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
         try:
             # Start pod
             logger.info(f"Starting pod: {pod_name}")
-            pod = global_pod = kodo_runner.start_container(
-                image,
-                name=pod_name,
-                environment={
-                    "PYTHONPATH": "/testbed",
-                    "SWE_INSTANCE_ID": instance_id,
-                    "http_proxy": "http://agent.baidu.com:8891",
-                    "https_proxy": "http://agent.baidu.com:8891",
-                    "PIP_INDEX_URL": "http://pip.baidu.com/pypi/simple",
-                    "PIP_TRUSTED_HOST": "pip.baidu.com"
-                }
-            )
+            logger.info(f"Using image: {image}")
             
-            logger.info(f"Pod {pod_name} started successfully")
+            try:
+                pod = global_pod = kodo_runner.start_container(
+                    image,
+                    name=pod_name,
+                    environment={
+                        "PYTHONPATH": "/testbed",
+                        "SWE_INSTANCE_ID": instance_id,
+                        "http_proxy": "http://agent.baidu.com:8891",
+                        "https_proxy": "http://agent.baidu.com:8891",
+                        "PIP_INDEX_URL": "http://pip.baidu.com/pypi/simple",
+                        "PIP_TRUSTED_HOST": "pip.baidu.com"
+                    }
+                )
+                logger.info(f"Pod {pod_name} started successfully")
+            except Exception as pod_error:
+                logger.error(f"Failed to start pod {pod_name}: {pod_error}")
+                logger.error(f"Image: {image}")
+                logger.error(f"Namespace: {namespace}")
+                raise
             
             # Wait for pod to be ready
+            logger.info(f"Waiting for pod {pod_name} to be ready...")
             await asyncio.sleep(3)
+            logger.info(f"Pod {pod_name} should be ready now")
             
             # Setup environment
             kodo_runner.execute_command(pod, f"ln -s /opt/miniconda3/envs/testbed /root/.venv")
@@ -242,12 +251,21 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
             
             # Run agent
             logger.info("Running agent to solve the issue...")
-            llm_client = create_llm_client(
-                api_key=API_KEY,
-                base_url=BASE_URL,
-                model=actual_model_name,
-                debug=True
-            )
+            logger.info(f"LLM Configuration: model={actual_model_name}, max_tokens={max_tokens}")
+            
+            try:
+                llm_client = create_llm_client(
+                    api_key=API_KEY,
+                    base_url=BASE_URL,
+                    model=actual_model_name,
+                    debug=True
+                )
+            except Exception as e:
+                logger.error(f"Failed to create LLM client: {e}")
+                logger.error(f"API_KEY present: {bool(API_KEY)}")
+                logger.error(f"BASE_URL: {BASE_URL}")
+                logger.error(f"Model: {actual_model_name}")
+                raise
             
             # Override the generate method to use custom max_tokens
             original_generate = llm_client.generate
@@ -283,11 +301,29 @@ Follow these steps to resolve the issue:
             # Track timing for statistics
             import time as timing
             
-            result = await agent.run_trajectory(
-                prompt=prompt,
-                llm_generate_func=llm_client.generate,
-                request_id=f"swe_{instance_id}"
-            )
+            try:
+                logger.info(f"Starting trajectory execution for {instance_id}")
+                result = await agent.run_trajectory(
+                    prompt=prompt,
+                    llm_generate_func=llm_client.generate,
+                    request_id=f"swe_{instance_id}"
+                )
+            except Exception as traj_error:
+                logger.error(f"Trajectory execution failed: {type(traj_error).__name__}: {traj_error}")
+                # Check for specific error types
+                error_msg = str(traj_error).lower()
+                if 'response ended prematurely' in error_msg:
+                    logger.error("This appears to be a network/API connection issue.")
+                    logger.error("Possible causes:")
+                    logger.error("  1. API endpoint timeout or connection reset")
+                    logger.error("  2. Request size too large")
+                    logger.error("  3. Network instability")
+                    logger.error(f"  4. Model endpoint issue (model: {actual_model_name})")
+                elif 'timeout' in error_msg:
+                    logger.error("Request timed out. Consider increasing timeout or using a faster model.")
+                elif 'rate limit' in error_msg:
+                    logger.error("Rate limit exceeded. Consider reducing concurrency or adding delays.")
+                raise
             
             logger.info(f"Agent completed: {result.is_completed}")
             
@@ -434,14 +470,51 @@ Follow these steps to resolve the issue:
                 return None
                 
         except Exception as e:
-            logger.error(f"Error processing instance {instance_id}: {e}")
+            # Get detailed error information
             import traceback
-            traceback.print_exc()
+            import sys
+            
+            # Get the full traceback
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+            full_traceback = ''.join(tb_lines)
+            
+            # Log detailed error information
+            logger.error(f"Error processing instance {instance_id}: {type(e).__name__}: {e}")
+            logger.error(f"Error type: {exc_type}")
+            logger.error(f"Error details: {exc_value}")
+            logger.error(f"Full traceback:\n{full_traceback}")
+            
+            # Also print to console for immediate visibility
+            print(f"\n{'='*80}")
+            print(f"ERROR in instance {instance_id}")
+            print(f"Error type: {type(e).__name__}")
+            print(f"Error message: {str(e)}")
+            print(f"Full traceback:")
+            print(full_traceback)
+            print(f"{'='*80}\n")
+            
+            # Prepare detailed error data
+            error_details = {
+                'error_type': type(e).__name__,
+                'error_message': str(e),
+                'traceback': full_traceback,
+                'last_checkpoint': 'unknown'
+            }
+            
+            # Try to identify where the error occurred
+            if 'pod started successfully' in full_traceback:
+                error_details['last_checkpoint'] = 'pod_startup'
+            elif 'Running agent' in full_traceback:
+                error_details['last_checkpoint'] = 'agent_execution'
+            elif 'Generating patch' in full_traceback:
+                error_details['last_checkpoint'] = 'patch_generation'
             
             result_data = {
                 'success': False,
                 'instance_id': instance_id,
                 'error': str(e),
+                'error_details': error_details,
                 'stats': stats if 'stats' in locals() else {}
             }
             
@@ -832,11 +905,37 @@ process_single_instance('{instance_data_file}', '{output_file}', '{model_name}',
             if process.returncode != 0:
                 logger.error(f"[{index+1}/{total}] Subprocess for {instance_id} failed with return code {process.returncode}")
                 if stderr:
-                    logger.error(f"Stderr: {stderr.decode()[:500]}")  # Limit stderr output
+                    stderr_text = stderr.decode()
+                    # Show more of stderr for debugging
+                    logger.error(f"Stderr output (first 2000 chars):")
+                    logger.error(stderr_text[:2000])
+                    
+                    # Try to extract specific error information
+                    if 'Response ended prematurely' in stderr_text:
+                        logger.error("Network/API error detected - Response ended prematurely")
+                    if 'traceback' in stderr_text.lower():
+                        # Find and show the actual error
+                        lines = stderr_text.split('\n')
+                        for i, line in enumerate(lines):
+                            if 'Traceback' in line:
+                                # Show the traceback and following lines
+                                traceback_end = min(i + 20, len(lines))
+                                logger.error("Python traceback found:")
+                                for j in range(i, traceback_end):
+                                    logger.error(f"  {lines[j]}")
+                                break
+                
+                if stdout:
+                    stdout_text = stdout.decode()
+                    if stdout_text.strip():
+                        logger.info(f"Stdout output (first 1000 chars):")
+                        logger.info(stdout_text[:1000])
+                
                 return {
                     'success': False,
                     'instance_id': instance_id,
-                    'error': f'Process failed with return code {process.returncode}'
+                    'error': f'Process failed with return code {process.returncode}',
+                    'stderr': stderr.decode()[:2000] if stderr else None
                 }
             
         except asyncio.TimeoutError:
