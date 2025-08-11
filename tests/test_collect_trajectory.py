@@ -49,8 +49,8 @@ logger = logging.getLogger(__name__)
 
 # LLM configuration
 API_KEY = os.getenv("LLM_API_KEY", "your-api-key-here")
-BASE_URL = os.getenv("LLM_BASE_URL", "http://10.231.136.51:8080")
-MODEL_NAME = os.getenv("LLM_MODEL_NAME", "swe-8676-0807-19")
+BASE_URL = os.getenv("LLM_BASE_URL", "xxx")
+MODEL_NAME = os.getenv("LLM_MODEL_NAME", "xxx")
 print(f"API_KEY: {API_KEY}")
 print(f"BASE_URL: {BASE_URL}")
 print(f"MODEL_NAME: {MODEL_NAME}")
@@ -818,8 +818,8 @@ async def process_instances_from_json(
     # K8S configuration (pod_name will be set dynamically for each instance)
     k8s_config = {
         "execution_mode": "k8s",
-        "namespace": "qianfan-train-cpu-ns",
-        "kubeconfig_path": "/mnt/cfs_bj_mt/tianlun-2/tools/config_cpu"
+        "namespace": "xxx",
+        "kubeconfig_path": "xxx"
     }
     
     print(f"🔧 K8S Configuration:")
