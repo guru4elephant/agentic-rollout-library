@@ -37,6 +37,7 @@ class R2ESearchTool(AgenticBaseTool):
         self.pod_name = config.get("pod_name")
         self.namespace = config.get("namespace", "default")
         self.kubeconfig_path = config.get("kubeconfig_path", None)
+        self.working_dir = config.get("working_dir", "/testbed")  # R2E default working directory
         
         super().__init__(config)
         
@@ -105,6 +106,17 @@ The file or directory to search in. Defaults to . if not specified.
         try:
             search_term = parameters["search_term"]
             path = parameters.get("path", ".")
+            
+            # Safety check: prevent searching from root or system directories
+            dangerous_paths = ["/", "/etc", "/usr", "/bin", "/sbin", "/var", "/sys", "/proc"]
+            if path in dangerous_paths:
+                # Redirect to working directory instead
+                logger.warning(f"Search from {path} is not allowed, redirecting to working directory")
+                path = self.working_dir
+                return ToolResult(
+                    success=False,
+                    error=f"Searching from '{parameters.get('path', '.')}' is not allowed as it may timeout. Please search in a specific directory like {self.working_dir} instead."
+                )
             
             # Choose execution mode
             if self.execution_mode == "k8s":
@@ -281,8 +293,12 @@ The file or directory to search in. Defaults to . if not specified.
         try:
             k8s_mgr = self._get_k8s_manager()
             
+            # Prepend cd to working directory
+            # Don't wrap in bash -c or add extra escaping - let kodo handle it
+            full_command = f"cd {self.working_dir} && {command}"
+            
             # Execute command in pod using kodo API
-            output, exit_code = k8s_mgr.execute_command(self.pod_name, command)
+            output, exit_code = k8s_mgr.execute_command(self.pod_name, full_command)
             
             # Convert exit_code to int if it's a string
             if isinstance(exit_code, str):
@@ -309,16 +325,55 @@ The file or directory to search in. Defaults to . if not specified.
             
         except Exception as e:
             logger.error(f"K8s command execution failed: {e}")
+            # Check if it's an ApiException or connection issue
+            error_str = str(e)
+            if "ApiException" in error_str or "connection" in error_str.lower():
+                logger.error(f"K8s API error - pod may not be ready or connection issue: {error_str}")
             return {
                 "success": False,
                 "stdout": "",
-                "stderr": str(e),
+                "stderr": error_str,
                 "return_code": -1
             }
     
     async def _search_k8s(self, search_term: str, path_str: str, python_only: bool) -> ToolResult:
         """Search in K8s pod with optimized command execution."""
         try:
+            # First check if we can execute commands in the pod
+            test_cmd = "echo 'TEST'"
+            test_result = await self._exec_command(test_cmd)
+            if not test_result["success"] and "ApiException" in test_result.get("stderr", ""):
+                # Pod is not ready or K8s API issue
+                return ToolResult(
+                    success=False,
+                    error=f"K8s pod execution failed. Pod '{self.pod_name}' may not be ready or there's a connection issue. Error: {test_result.get('stderr', '')}"
+                )
+            # Handle path normalization for K8s environment
+            # We need to ensure paths work correctly in the pod's working directory
+            logger.debug(f"Original path: {path_str}, working_dir: {self.working_dir}")
+            
+            if not path_str or path_str == "" or path_str == ".":
+                # Empty or current directory
+                path_str = "."
+            elif path_str.startswith("./"):
+                # Already properly formatted relative path
+                pass  # Keep as is
+            elif path_str.startswith(self.working_dir):
+                # Full path starting with working_dir (e.g., /testbed/django/db)
+                # This is OK, keep as absolute path
+                pass  # Keep as is
+            elif path_str.startswith("/"):
+                # Absolute path NOT starting with working_dir (e.g., /django/db)
+                # This is likely meant to be relative to working_dir
+                # Convert to relative: /django/db -> ./django/db
+                path_str = "." + path_str
+            else:
+                # Plain relative path without prefix (e.g., django/db)
+                # Add ./ prefix for clarity
+                path_str = "./" + path_str
+            
+            logger.debug(f"Normalized path: {path_str}")
+            
             # Escape single quotes in search term and path
             escaped_term = search_term.replace("'", "'\"'\"'")
             escaped_path = path_str.replace("'", "'\"'\"'")
@@ -330,44 +385,61 @@ The file or directory to search in. Defaults to . if not specified.
             # 3. Execute the appropriate search command
             # 4. Return results in a parseable format
             
-            if python_only:
-                # For Python-only search in directories
-                combined_cmd = f"""
-if [ ! -e '{escaped_path}' ]; then
-    echo "ERROR: Path not found"
-    exit 1
-elif [ -f '{escaped_path}' ]; then
-    echo "TYPE: file"
-    grep -n '{escaped_term}' '{escaped_path}' 2>/dev/null || echo "NO_MATCHES"
-elif [ -d '{escaped_path}' ]; then
-    echo "TYPE: directory"
-    find '{escaped_path}' -type f -name '*.py' | head -100 | while read -r file; do
-        if grep -l '{escaped_term}' "$file" 2>/dev/null; then
-            echo "$file"
-        fi
-    done | head -100 || echo "NO_MATCHES"
-else
-    echo "ERROR: Unknown path type"
-    exit 1
-fi
-"""
+            # Simplified approach: check path existence first
+            # Use [ ] instead of test for better compatibility
+            check_cmd = f"[ -e '{escaped_path}' ] && echo 'EXISTS' || echo 'NOT_EXISTS'"
+            check_result = await self._exec_command(check_cmd)
+            
+            # Check if command execution failed
+            if not check_result["success"] and check_result.get("exit_code") == -1:
+                return ToolResult(
+                    success=False,
+                    error=f"Command execution failed: {check_result.get('stderr', 'Unknown error')}"
+                )
+            
+            if check_result.get("stdout", "").strip() == "NOT_EXISTS":
+                # Show the actual path in the working directory context
+                if path_str == ".":
+                    actual_path = self.working_dir
+                elif path_str.startswith("./"):
+                    actual_path = f"{self.working_dir}/{path_str[2:]}"
+                elif path_str.startswith(self.working_dir):
+                    actual_path = path_str
+                else:
+                    actual_path = f"{self.working_dir}/{path_str}"
+                return ToolResult(success=False, error=f"Path not found: {actual_path}")
+            
+            # Check if it's a file or directory
+            type_cmd = f"[ -f '{escaped_path}' ] && echo 'FILE' || echo 'DIR'"
+            type_result = await self._exec_command(type_cmd)
+            
+            # Check if command execution failed
+            if not type_result["success"] and type_result.get("exit_code") == -1:
+                return ToolResult(
+                    success=False,
+                    error=f"Command execution failed while checking path type: {type_result.get('stderr', 'Unknown error')}"
+                )
+            is_file = type_result.get("stdout", "").strip() == "FILE"
+            
+            if is_file:
+                # Search in single file
+                search_cmd = f"grep -n '{escaped_term}' '{escaped_path}' 2>/dev/null || echo 'NO_MATCHES'"
+                combined_cmd = f"echo 'TYPE: file' && {search_cmd}"
             else:
-                # For general search (all files)
-                combined_cmd = f"""
-if [ ! -e '{escaped_path}' ]; then
-    echo "ERROR: Path not found"
-    exit 1
-elif [ -f '{escaped_path}' ]; then
-    echo "TYPE: file"
-    grep -n '{escaped_term}' '{escaped_path}' 2>/dev/null || echo "NO_MATCHES"
-elif [ -d '{escaped_path}' ]; then
-    echo "TYPE: directory"
-    grep -r -l '{escaped_term}' '{escaped_path}' 2>/dev/null | head -100 || echo "NO_MATCHES"
-else
-    echo "ERROR: Unknown path type"
-    exit 1
-fi
-"""
+                # Search in directory
+                if python_only:
+                    # For Python files only
+                    search_cmd = (
+                        f"find '{escaped_path}' -maxdepth 5 -type f -name '*.py' 2>/dev/null | "
+                        f"head -100 | xargs -I{{}} grep -l '{escaped_term}' {{}} 2>/dev/null | head -100"
+                    )
+                else:
+                    # For all files
+                    search_cmd = (
+                        f"find '{escaped_path}' -maxdepth 5 -type f -size -10M 2>/dev/null | "
+                        f"head -200 | xargs -I{{}} grep -l '{escaped_term}' {{}} 2>/dev/null | head -100"
+                    )
+                combined_cmd = f"echo 'TYPE: directory' && ({search_cmd} || echo 'NO_MATCHES')"
             
             # Execute the combined command
             result = await self._exec_command(combined_cmd)
@@ -376,9 +448,24 @@ fi
                 error_output = result.get("stdout", "").strip()
                 if error_output.startswith("ERROR:"):
                     error_msg = error_output.replace("ERROR:", "").strip()
-                    return ToolResult(success=False, error=f"{error_msg}: {path_str}")
+                    # Show the actual path in the working directory context
+                    if path_str == ".":
+                        actual_path = self.working_dir
+                    elif path_str.startswith("./"):
+                        actual_path = f"{self.working_dir}/{path_str[2:]}"
+                    elif path_str.startswith(self.working_dir):
+                        actual_path = path_str
+                    else:
+                        actual_path = f"{self.working_dir}/{path_str}"
+                    return ToolResult(success=False, error=f"{error_msg}: {actual_path}")
                 else:
-                    return ToolResult(success=False, error=f"Command execution failed: {result.get('stderr', '')}")
+                    # Include more diagnostic information
+                    stderr_msg = result.get('stderr', '').strip()
+                    stdout_msg = result.get('stdout', '').strip()[:200]  # First 200 chars for debugging
+                    return ToolResult(
+                        success=False, 
+                        error=f"Command execution failed. stderr: {stderr_msg}, stdout preview: {stdout_msg}"
+                    )
             
             # Parse the output
             output_lines = result["stdout"].strip().split('\n')

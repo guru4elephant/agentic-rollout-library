@@ -51,6 +51,7 @@ class R2EFileEditorTool(AgenticBaseTool):
         self.pod_name = config.get("pod_name")
         self.namespace = config.get("namespace", "default")
         self.kubeconfig_path = config.get("kubeconfig_path", None)
+        self.working_dir = config.get("working_dir", "/testbed")  # R2E default working directory
         
         super().__init__(config)
         
@@ -171,9 +172,20 @@ Required for the insert command. The new_str will be inserted after the line num
             path = parameters["path"]
             
             if command == "view":
+                view_range = parameters.get("view_range")
+                # Parse view_range if it's a string
+                if view_range and isinstance(view_range, str):
+                    try:
+                        # Handle string representation like "[406, 450]"
+                        import ast
+                        view_range = ast.literal_eval(view_range)
+                    except (ValueError, SyntaxError):
+                        logger.warning(f"Failed to parse view_range string: {view_range}")
+                        view_range = None
+                
                 return await self._view(
                     path, 
-                    parameters.get("view_range"),
+                    view_range,
                     parameters.get("concise", False)
                 )
             elif command == "create":
@@ -226,6 +238,16 @@ Required for the insert command. The new_str will be inserted after the line num
     async def _view_local(self, path_str: str, view_range: Optional[List[int]], concise: bool) -> ToolResult:
         """View file or directory locally."""
         try:
+            # Parse view_range if it's a string
+            if view_range and isinstance(view_range, str):
+                try:
+                    # Handle string representation like "[406, 450]"
+                    import ast
+                    view_range = ast.literal_eval(view_range)
+                except (ValueError, SyntaxError):
+                    logger.warning(f"Failed to parse view_range string: {view_range}")
+                    view_range = None
+            
             path = Path(path_str)
             
             if not path.exists():
@@ -492,10 +514,66 @@ Required for the insert command. The new_str will be inserted after the line num
     async def _view_k8s(self, path_str: str, view_range: Optional[List[int]], concise: bool) -> ToolResult:
         """View file or directory in K8s pod."""
         try:
-            # Check if path exists
-            exists_check = await self._exec_command(f"test -e '{path_str}' && echo 'exists' || echo 'not_exists'")
-            if exists_check["stdout"].strip() != "exists":
-                return ToolResult(success=False, error=f"Path does not exist: {path_str}")
+            # Parse view_range if it's a string
+            if view_range and isinstance(view_range, str):
+                try:
+                    # Handle string representation like "[406, 450]"
+                    import ast
+                    view_range = ast.literal_eval(view_range)
+                except (ValueError, SyntaxError):
+                    logger.warning(f"Failed to parse view_range string: {view_range}")
+                    view_range = None
+            
+            # Handle path normalization for K8s environment (same as r2e_search_tool)
+            logger.debug(f"Original path: {path_str}, working_dir: {self.working_dir}")
+            
+            if not path_str or path_str == "" or path_str == ".":
+                # Empty or current directory
+                path_str = "."
+            elif path_str.startswith("./"):
+                # Already properly formatted relative path
+                pass  # Keep as is
+            elif path_str.startswith(self.working_dir):
+                # Full path starting with working_dir (e.g., /testbed/django/db)
+                # This is OK, keep as absolute path
+                pass  # Keep as is
+            elif path_str.startswith("/"):
+                # Absolute path NOT starting with working_dir (e.g., /django/db)
+                # This is likely meant to be relative to working_dir
+                # Convert to relative: /django/db -> ./django/db
+                path_str = "." + path_str
+            else:
+                # Plain relative path without prefix (e.g., django/db)
+                # Add ./ prefix for clarity
+                path_str = "./" + path_str
+            
+            logger.debug(f"Normalized path: {path_str}")
+            
+            # Check if path exists - special handling for current directory
+            if path_str == "." or path_str == "./":
+                # Current directory always exists after cd
+                exists = True
+                command_failed = False
+            else:
+                exists_check = await self._exec_command(f"test -e '{path_str}' && echo 'exists' || echo 'not_exists'")
+                # Check if command execution itself failed (e.g., ApiException)
+                if not exists_check["success"] and "ApiException" in exists_check.get("stderr", ""):
+                    return ToolResult(success=False, error=f"Command execution failed: {exists_check.get('stderr', 'Unknown error')}")
+                exists = exists_check["stdout"].strip() == "exists"
+                command_failed = not exists_check["success"] and exists_check["exit_code"] == -1
+                
+            if not exists and not command_failed:
+                # Show the actual path being checked in the working directory context
+                if path_str == "." or path_str == "./":
+                    actual_path = self.working_dir
+                elif path_str.startswith("./"):
+                    actual_path = f"{self.working_dir}/{path_str[2:]}"
+                elif path_str.startswith(self.working_dir):
+                    actual_path = path_str
+                else:
+                    actual_path = f"{self.working_dir}/{path_str}"
+                logger.debug(f"Path check failed for '{path_str}', actual path: {actual_path}")
+                return ToolResult(success=False, error=f"Path does not exist: {actual_path}")
             
             # Check if directory
             is_dir_check = await self._exec_command(f"test -d '{path_str}' && echo 'dir' || echo 'file'")
@@ -538,12 +616,18 @@ Required for the insert command. The new_str will be inserted after the line num
                 output = f"Here's the result of running `cat -n` on the file: {path_str}:\n"
                 
                 if view_range and len(view_range) == 2:
-                    start_line = view_range[0] - 1  # Convert to 0-based index
+                    # view_range uses 1-based line numbers (user-facing)
+                    start_line = view_range[0]  # Keep as 1-based
                     end_line = view_range[1] if view_range[1] != -1 else len(lines)
                     
-                    # Validate range
-                    if 0 <= start_line < len(lines):
-                        for i in range(start_line, min(end_line, len(lines))):
+                    # Validate range (1-based)
+                    if 1 <= start_line <= len(lines):
+                        # Convert to 0-based for array indexing
+                        start_idx = start_line - 1
+                        end_idx = min(end_line, len(lines))
+                        
+                        for i in range(start_idx, end_idx):
+                            # Display with correct 1-based line number
                             output += f"{i+1:6d} {lines[i]}\n"
                     else:
                         output += "[Invalid view range]\n"
@@ -559,9 +643,15 @@ Required for the insert command. The new_str will be inserted after the line num
                 
                 # Calculate actual displayed lines count
                 if view_range and len(view_range) == 2:
-                    start_line = view_range[0] - 1
+                    # view_range uses 1-based line numbers
+                    start_line = view_range[0]
                     end_line = view_range[1] if view_range[1] != -1 else len(lines)
-                    displayed_lines = max(0, min(end_line, len(lines)) - max(0, start_line))
+                    # Ensure valid range
+                    if 1 <= start_line <= len(lines):
+                        actual_end = min(end_line, len(lines))
+                        displayed_lines = actual_end - start_line + 1
+                    else:
+                        displayed_lines = 0
                 else:
                     displayed_lines = len(lines)
                 
@@ -581,10 +671,29 @@ Required for the insert command. The new_str will be inserted after the line num
     async def _create_k8s(self, path_str: str, file_text: str) -> ToolResult:
         """Create file in K8s pod."""
         try:
+            # Handle path normalization for K8s environment
+            if not path_str or path_str == "" or path_str == ".":
+                return ToolResult(success=False, error="Cannot create file without a specific path")
+            elif path_str.startswith("./"):
+                pass  # Keep as is
+            elif path_str.startswith(self.working_dir):
+                pass  # Keep as is
+            elif path_str.startswith("/"):
+                path_str = "." + path_str
+            else:
+                path_str = "./" + path_str
+            
             # Check if exists
             exists_check = await self._exec_command(f"test -e '{path_str}' && echo 'exists' || echo 'not_exists'")
             if exists_check["stdout"].strip() == "exists":
-                return ToolResult(success=False, error=f"File already exists at: {path_str}")
+                # Show the actual path in the working directory context
+                if path_str.startswith("./"):
+                    actual_path = f"{self.working_dir}/{path_str[2:]}"
+                elif path_str.startswith(self.working_dir):
+                    actual_path = path_str
+                else:
+                    actual_path = f"{self.working_dir}/{path_str}"
+                return ToolResult(success=False, error=f"File already exists at: {actual_path}")
             
             # Create parent directories
             parent_dir = os.path.dirname(path_str)
@@ -616,10 +725,29 @@ Required for the insert command. The new_str will be inserted after the line num
     async def _str_replace_k8s(self, path_str: str, old_str: str, new_str: str) -> ToolResult:
         """Replace string in K8s pod."""
         try:
+            # Handle path normalization for K8s environment
+            if not path_str or path_str == "" or path_str == ".":
+                return ToolResult(success=False, error="Cannot replace in file without a specific path")
+            elif path_str.startswith("./"):
+                pass  # Keep as is
+            elif path_str.startswith(self.working_dir):
+                pass  # Keep as is
+            elif path_str.startswith("/"):
+                path_str = "." + path_str
+            else:
+                path_str = "./" + path_str
+            
             # Read file
             cat_result = await self._exec_command(f"cat '{path_str}'")
             if not cat_result["success"]:
-                return ToolResult(success=False, error=f"Failed to read file: {cat_result['stderr']}")
+                # Show the actual path in the working directory context
+                if path_str.startswith("./"):
+                    actual_path = f"{self.working_dir}/{path_str[2:]}"
+                elif path_str.startswith(self.working_dir):
+                    actual_path = path_str
+                else:
+                    actual_path = f"{self.working_dir}/{path_str}"
+                return ToolResult(success=False, error=f"Failed to read file {actual_path}: {cat_result['stderr']}")
             
             file_content = cat_result["stdout"].expandtabs()
             old_str = old_str.expandtabs()
@@ -628,11 +756,25 @@ Required for the insert command. The new_str will be inserted after the line num
             # Check occurrences
             occurrences = file_content.count(old_str)
             if occurrences == 0:
-                return ToolResult(success=False, error=f"No occurrences of '{old_str}' found in {path_str}")
+                # Show the actual path in the working directory context
+                if path_str.startswith("./"):
+                    actual_path = f"{self.working_dir}/{path_str[2:]}"
+                elif path_str.startswith(self.working_dir):
+                    actual_path = path_str
+                else:
+                    actual_path = f"{self.working_dir}/{path_str}"
+                return ToolResult(success=False, error=f"No occurrences of '{old_str}' found in {actual_path}")
             if occurrences > 1:
+                # Show the actual path in the working directory context
+                if path_str.startswith("./"):
+                    actual_path = f"{self.working_dir}/{path_str[2:]}"
+                elif path_str.startswith(self.working_dir):
+                    actual_path = path_str
+                else:
+                    actual_path = f"{self.working_dir}/{path_str}"
                 return ToolResult(
                     success=False,
-                    error=f"Multiple occurrences of '{old_str}' found in {path_str}. Please ensure it is unique."
+                    error=f"Multiple occurrences of '{old_str}' found in {actual_path}. Please ensure it is unique."
                 )
             
             # Replace
@@ -664,10 +806,29 @@ Required for the insert command. The new_str will be inserted after the line num
     async def _insert_k8s(self, path_str: str, insert_line: int, new_str: str) -> ToolResult:
         """Insert text in K8s pod."""
         try:
+            # Handle path normalization for K8s environment
+            if not path_str or path_str == "" or path_str == ".":
+                return ToolResult(success=False, error="Cannot insert in file without a specific path")
+            elif path_str.startswith("./"):
+                pass  # Keep as is
+            elif path_str.startswith(self.working_dir):
+                pass  # Keep as is
+            elif path_str.startswith("/"):
+                path_str = "." + path_str
+            else:
+                path_str = "./" + path_str
+            
             # Read file
             cat_result = await self._exec_command(f"cat '{path_str}'")
             if not cat_result["success"]:
-                return ToolResult(success=False, error=f"Failed to read file: {cat_result['stderr']}")
+                # Show the actual path in the working directory context
+                if path_str.startswith("./"):
+                    actual_path = f"{self.working_dir}/{path_str[2:]}"
+                elif path_str.startswith(self.working_dir):
+                    actual_path = path_str
+                else:
+                    actual_path = f"{self.working_dir}/{path_str}"
+                return ToolResult(success=False, error=f"Failed to read file {actual_path}: {cat_result['stderr']}")
             
             old_text = cat_result["stdout"].expandtabs()
             new_str = new_str.expandtabs()
@@ -675,9 +836,16 @@ Required for the insert command. The new_str will be inserted after the line num
             
             # Validate line number
             if insert_line < 0 or insert_line > len(file_lines):
+                # Show the actual path in the working directory context
+                if path_str.startswith("./"):
+                    actual_path = f"{self.working_dir}/{path_str[2:]}"
+                elif path_str.startswith(self.working_dir):
+                    actual_path = path_str
+                else:
+                    actual_path = f"{self.working_dir}/{path_str}"
                 return ToolResult(
                     success=False,
-                    error=f"Invalid insert_line {insert_line}. Must be in [0, {len(file_lines)}]."
+                    error=f"Invalid insert_line {insert_line} for {actual_path}. Must be in [0, {len(file_lines)}]."
                 )
             
             # Insert
@@ -872,7 +1040,11 @@ Required for the insert command. The new_str will be inserted after the line num
         """Execute command in K8s pod."""
         try:
             k8s_mgr = self._get_k8s_manager()
-            output, exit_code = k8s_mgr.execute_command(self.pod_name, command)
+            # Prepend cd to working directory for K8s execution
+            # Note: File operations typically don't need timeout, but we add cd for consistency
+            full_command = f"cd {self.working_dir} && {command}"
+            logger.debug(f"Executing command in pod {self.pod_name}: {full_command}")
+            output, exit_code = k8s_mgr.execute_command(self.pod_name, full_command)
             
             # Convert exit_code to int if it's a string
             if isinstance(exit_code, str):
@@ -899,10 +1071,14 @@ Required for the insert command. The new_str will be inserted after the line num
             }
         except Exception as e:
             logger.error(f"K8s command execution failed: {e}", exc_info=True)
+            error_str = str(e)
+            # Check if it's an ApiException
+            if "ApiException" in error_str:
+                logger.error(f"K8s API error - pod {self.pod_name} may not be ready or connection issue")
             return {
                 "success": False,
                 "stdout": "",
-                "stderr": str(e),
+                "stderr": error_str,
                 "exit_code": -1
             }
     

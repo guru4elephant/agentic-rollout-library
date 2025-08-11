@@ -31,7 +31,7 @@ try:
         R2ESubmitTool
     )
     R2E_TOOLS_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     R2EBashExecutorTool = None
     R2ESearchTool = None
     R2EFileEditorTool = None
@@ -39,24 +39,28 @@ except ImportError:
     R2ESubmitTool = None
     R2E_TOOLS_AVAILABLE = False
 
-# Import R2E configurations
-from .r2e_configs import (
-    CUSTOM_TOOL_DESCRIPTIONS,
-    parse_xml_action_custom,
-    CustomDescriptionWrapper,
-    generate_custom_system_prompt
-)
+# Import R2E configurations separately to avoid circular imports
+try:
+    from .r2e_configs import (
+        CUSTOM_TOOL_DESCRIPTIONS,
+        parse_xml_action_custom,
+        CustomDescriptionWrapper,
+        generate_custom_system_prompt
+    )
+    R2E_CONFIGS_AVAILABLE = True
+except ImportError:
+    CUSTOM_TOOL_DESCRIPTIONS = None
+    parse_xml_action_custom = None
+    CustomDescriptionWrapper = None
+    generate_custom_system_prompt = None
+    R2E_CONFIGS_AVAILABLE = False
 
 __all__ = [
     'CalculatorTool',
     'BashExecutorTool', 
     'FileEditorTool',
     'SearchTool',
-    'FinishTool',
-    'CUSTOM_TOOL_DESCRIPTIONS',
-    'parse_xml_action_custom',
-    'CustomDescriptionWrapper',
-    'generate_custom_system_prompt'
+    'FinishTool'
 ]
 
 # Add K8s tools to __all__ if available
@@ -75,4 +79,13 @@ if R2E_TOOLS_AVAILABLE:
         'R2EFileEditorTool',
         'R2EStrReplaceEditorTool',
         'R2ESubmitTool'
+    ])
+
+# Add R2E configs to __all__ if available
+if R2E_CONFIGS_AVAILABLE:
+    __all__.extend([
+        'CUSTOM_TOOL_DESCRIPTIONS',
+        'parse_xml_action_custom',
+        'CustomDescriptionWrapper',
+        'generate_custom_system_prompt'
     ])
