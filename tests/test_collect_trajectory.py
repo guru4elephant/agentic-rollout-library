@@ -49,8 +49,8 @@ logger = logging.getLogger(__name__)
 
 # LLM configuration
 API_KEY = os.getenv("LLM_API_KEY", "your-api-key-here")
-BASE_URL = os.getenv("LLM_BASE_URL", "xxx")
-MODEL_NAME = os.getenv("LLM_MODEL_NAME", "xxx")
+BASE_URL = os.getenv("LLM_BASE_URL", "http://10.231.136.51:8080")
+MODEL_NAME = os.getenv("LLM_MODEL_NAME", "swe-8676-0807-19")
 print(f"API_KEY: {API_KEY}")
 print(f"BASE_URL: {BASE_URL}")
 print(f"MODEL_NAME: {MODEL_NAME}")
@@ -965,121 +965,6 @@ def collect_validation_statistics(output_dir: str) -> Dict[str, Any]:
     return validation_stats
 
 
-async def test_r2e_general_agent_k8s(output_dir: str = "./trajectories"):
-    """Test GeneralAgent with R2E tools in K8S execution mode (original function).
-    
-    Args:
-        output_dir: Directory to save trajectory files
-    """
-    print("\n" + "="*80)
-    print("🚀 Testing GeneralAgent with R2E Tools (K8S Execution)")
-    print("="*80)
-    
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    print(f"\n📁 Trajectory output directory: {output_dir}")
-    
-    # K8S configuration (for test mode - no pod creation, just tool validation)
-    k8s_config = {
-        "execution_mode": "k8s",
-        "namespace": "qianfan-train-cpu-ns",
-        "kubeconfig_path": "/mnt/cfs_bj_mt/tianlun-2/tools/config_cpu"   # Will use default kubeconfig if not set
-    }
-    
-    # Create R2E tools with K8S configuration
-    print("\n📦 Creating R2E tools for K8S execution...")
-    
-    # Load configuration from YAML file
-    config_path = "../config/r2egym/edit_fn_calling.yaml"
-    config = load_config_from_yaml(config_path)
-    
-    # Use system prompt from YAML config
-    system_prompt = config.get("system_prompt", "")
-    
-    # Prepare the task prompt
-    task_prompt = f"""
-Please analyze and fix the following issue in the repository at /testbed:
-
-Repository: test-repo
-Image: test-image
-
-Problem Statement:
-This is a test issue to verify the R2E GeneralAgent functionality in K8S environment.
-
-Please explore the repository structure, understand the codebase, and demonstrate the agent's capabilities.
-When you're done, call the finish function to submit your solution.
-"""
-    
-    # Use instance prompt from YAML config if available
-    if "instance_prompt" in config:
-        instance_prompt_template = config["instance_prompt"]
-        # Replace placeholder with test problem statement
-        test_problem = "This is a test issue to verify the R2E GeneralAgent functionality in K8S environment."
-        task_prompt = instance_prompt_template.replace("{problem_statement}", test_problem)
-    
-    # Create base tools
-    base_tools = {
-        "r2e_bash_executor": create_tool("R2EBashExecutor", k8s_config.copy()),
-        "r2e_file_editor": create_tool("R2EFileEditor", k8s_config.copy()),
-        "r2e_search": create_tool("R2ESearch", k8s_config.copy()),
-        "r2e_submit": create_tool("R2ESubmit", {})
-    }
-    
-    # Wrap tools with custom descriptions
-    tools = {}
-    for tool_name, tool in base_tools.items():
-        if tool_name in CUSTOM_TOOL_DESCRIPTIONS:
-            tools[tool_name] = CustomDescriptionWrapper(tool, CUSTOM_TOOL_DESCRIPTIONS[tool_name])
-        else:
-            tools[tool_name] = tool
-    
-    print(f"✅ Created {len(tools)} R2E tools")
-    print(f"   Pod: Not specified (for tool validation only)")
-    print(f"   Namespace: {k8s_config['namespace']}")
-    print(f"   Kubeconfig: {k8s_config.get('kubeconfig_path') or 'default'}")
-    
-    # Display tool schemas
-    print("\n📋 Tool Schemas:")
-    for name, tool in tools.items():
-        schema = tool.get_openai_tool_schema()
-        if hasattr(schema, 'model_dump'):
-            schema_dict = schema.model_dump()
-        else:
-            schema_dict = schema.dict()
-        func = schema_dict.get('function', {})
-        print(f"  - {name}: {func.get('description', '')[:60]}...")
-    
-    # Create GeneralAgent with R2E tools
-    print("\n🤖 Creating GeneralAgent with R2E tools...")
-    
-    # Create agent instance with termination tool and custom XML parser
-    agent = GeneralAgent(
-        max_rounds=30,  # More rounds for complex issues
-        debug=False,  # Disable debug output for cleaner logs
-        termination_tool_names=["r2e_submit"],  # Mark r2e_submit as termination tool
-        action_parser=parse_xml_action_custom,  # Use custom XML action parser
-        system_prompt=system_prompt  # Use system prompt from YAML config
-    )
-    agent.set_tools(tools)
-    
-    # Print the actual system prompt being used
-    print("\n" + "="*80)
-    print("📋 Agent System Prompt:")
-    print("="*80)
-    agent.create_system_prompt()
-    print("="*80)
-
-    #exit(0)
-    print("✅ GeneralAgent created successfully")
-    
-    print("\n" + "="*80)
-    print("🎉 R2E GeneralAgent K8S test completed!")
-    print("="*80)
-    print("✅ Agent and tools created successfully")
-    print("📝 Use 'process' mode with JSON file to run actual tasks")
-    print("="*80)
-
-
 async def main():
     """Main function with command line argument parsing."""
     parser = argparse.ArgumentParser(description="Test R2E GeneralAgent with trajectory saving")
@@ -1099,10 +984,7 @@ async def main():
     print("🧪 R2E GeneralAgent Test Suite")
     print(f"📁 Output directory: {args.output_dir}")
     
-    if args.mode == "test":
-        print("Running in test mode (original functionality)")
-        await test_r2e_general_agent_k8s(output_dir=args.output_dir)
-    elif args.mode == "process":
+    if args.mode == "process":
         if not args.json_file:
             print("❌ Error: --json-file is required for 'process' mode")
             sys.exit(1)
