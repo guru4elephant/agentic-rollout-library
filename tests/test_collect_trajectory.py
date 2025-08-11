@@ -990,7 +990,7 @@ async def test_r2e_general_agent_k8s(output_dir: str = "./trajectories"):
     print("\n📦 Creating R2E tools for K8S execution...")
     
     # Load configuration from YAML file
-    config_path = "/Users/rikkixu/code/0810/agentic-rollout-library/config/r2egym/edit_fn_calling.yaml"
+    config_path = "../config/r2egym/edit_fn_calling.yaml"
     config = load_config_from_yaml(config_path)
     
     # Use system prompt from YAML config
