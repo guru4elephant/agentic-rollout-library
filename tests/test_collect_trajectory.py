@@ -9,6 +9,7 @@ import asyncio
 import sys
 import os
 import json
+import yaml
 from datetime import datetime
 import argparse
 
@@ -37,8 +38,7 @@ from workers.core.trajectory import TrajectoryStep, StepType
 from workers.tools.r2e_configs import (
     CUSTOM_TOOL_DESCRIPTIONS,
     parse_xml_action_custom,
-    CustomDescriptionWrapper,
-    generate_custom_system_prompt
+    CustomDescriptionWrapper
 )
 import logging
 import re
@@ -49,11 +49,31 @@ logger = logging.getLogger(__name__)
 
 # LLM configuration
 API_KEY = os.getenv("LLM_API_KEY", "your-api-key-here")
-BASE_URL = os.getenv("LLM_BASE_URL", "http://10.231.136.51:8080")
-MODEL_NAME = os.getenv("LLM_MODEL_NAME", "swe-8676-0807-0")
+BASE_URL = os.getenv("LLM_BASE_URL", "xxx")
+MODEL_NAME = os.getenv("LLM_MODEL_NAME", "xxx")
 print(f"API_KEY: {API_KEY}")
 print(f"BASE_URL: {BASE_URL}")
 print(f"MODEL_NAME: {MODEL_NAME}")
+
+
+def load_config_from_yaml(config_path: str) -> Dict[str, Any]:
+    """Load configuration from YAML file.
+    
+    Args:
+        config_path: Path to the YAML configuration file
+        
+    Returns:
+        Dictionary containing the configuration
+    """
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        
+        logger.info(f"Loaded configuration from {config_path}")
+        return config
+    except Exception as e:
+        logger.error(f"Failed to load configuration from {config_path}: {e}")
+        raise
 
 
 def load_instances_from_json(json_file_path: str) -> List[Dict[str, Any]]:
@@ -170,6 +190,80 @@ def generate_trajectory_filename(base_name: str, extension: str) -> str:
     return f"{base_name}.{extension}"
 
 
+async def apply_patch(patch_content: str, k8s_config: Dict[str, Any]) -> bool:
+    """Apply a git patch to the codebase.
+    
+    Args:
+        patch_content: The patch content as a string
+        k8s_config: K8S configuration for tool execution
+        
+    Returns:
+        True if patch was applied successfully, False otherwise
+    """
+    try:
+        # Create bash executor tool for applying patch
+        bash_tool = create_tool("R2EBashExecutor", k8s_config.copy())
+        
+        # Save patch to a temporary file
+        save_patch_command = f"""cat > /tmp/patch.diff << 'EOF'
+{patch_content}
+EOF"""
+        
+        result = await bash_tool.execute_tool(
+            instance_id="apply_patch_save",
+            parameters={"command": save_patch_command}
+        )
+        
+        if not result.success:
+            logger.error(f"Failed to save patch file: {result.error}")
+            return False
+        
+        # Apply the patch using git apply
+        apply_command = "cd /testbed && git apply /tmp/patch.diff"
+        result = await bash_tool.execute_tool(
+            instance_id="apply_patch_git",
+            parameters={"command": apply_command}
+        )
+        
+        if result.success:
+            exit_code = result.result.get("return_code", -1)
+            if exit_code == 0:
+                logger.info("Patch applied successfully with git apply")
+                return True
+            else:
+                logger.warning(f"git apply failed with exit code {exit_code}, trying patch command...")
+        else:
+            logger.warning(f"git apply failed: {result.error}, trying patch command...")
+        
+        # If git apply fails, try using patch command
+        patch_command = "cd /testbed && patch -p1 < /tmp/patch.diff"
+        result = await bash_tool.execute_tool(
+            instance_id="apply_patch_patch",
+            parameters={"command": patch_command}
+        )
+        
+        if result.success:
+            exit_code = result.result.get("return_code", -1)
+            if exit_code == 0:
+                logger.info("Patch applied successfully with patch command")
+                return True
+            else:
+                logger.error(f"patch command failed with exit code {exit_code}")
+                # Log the output for debugging
+                output = result.result.get("stdout", "")
+                error = result.result.get("stderr", "")
+                logger.error(f"patch stdout: {output}")
+                logger.error(f"patch stderr: {error}")
+        else:
+            logger.error(f"patch command failed: {result.error}")
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"Exception during patch application: {e}")
+        return False
+
+
 async def process_single_instance(
     instance: Dict[str, Any], 
     base_output_dir: str,
@@ -283,13 +377,16 @@ async def process_single_instance(
         # Create GeneralAgent with R2E tools
         logger.info("Creating GeneralAgent with R2E tools...")
         
-        # Generate custom system prompt with variables
-        custom_system_prompt = generate_custom_system_prompt(
-            tools,
-            task_description=f"analyze and fix the issue in repository {repo}",
-            working_directory="/testbed",
-            additional_instructions="\n- Focus on the specific issue described\n- Make minimal changes to fix the issue\n- Ensure your changes don't break existing functionality"
-        )
+        # Load configuration from YAML file
+        config_path = "/mnt/cfs_bj_mt/xuruijie/collect_traj/agentic-rollout-library/config/r2egym/edit_fn_calling.yaml"
+        config = load_config_from_yaml(config_path)
+        
+        # Use system prompt and instance prompt from YAML config
+        system_prompt = config.get("system_prompt", "")
+        instance_prompt_template = config.get("instance_prompt", "")
+        
+        # Generate instance prompt by replacing placeholder
+        instance_prompt = instance_prompt_template.replace("{problem_statement}", problem_statement)
         
         # Create agent instance with termination tool and custom XML parser
         agent = GeneralAgent(
@@ -297,24 +394,26 @@ async def process_single_instance(
             debug=False,  # Disable debug output for cleaner logs
             termination_tool_names=["r2e_submit"],  # Mark r2e_submit as termination tool
             action_parser=parse_xml_action_custom,  # Use custom XML action parser
-            system_prompt=custom_system_prompt  # Pass custom prompt in constructor
+            system_prompt=system_prompt  # Use system prompt from YAML config
         )
         agent.set_tools(tools)
         
         logger.info("GeneralAgent created successfully")
         
-        # Prepare the task prompt with issue details
-        task_prompt = f"""
-Please analyze and fix the following issue in the repository at /testbed:
-
-Repository: {repo}
-Image: {image_name}
-
-Problem Statement:
-{problem_statement}
-
-First explore the repository structure, understand the codebase, locate the relevant files, and then make the necessary changes to fix the issue. When you're done, call the finish function to submit your solution.
-"""
+        # Apply patch before running agent (if available)
+        patch_content = instance.get("patch", "")
+        if patch_content:
+            logger.info(f"🩹 Applying patch before running agent...")
+            patch_applied = await apply_patch(patch_content, k8s_config_with_pod)
+            if patch_applied:
+                logger.info(f"✅ Patch applied successfully before agent execution")
+            else:
+                logger.error(f"❌ Failed to apply patch before agent execution")
+        else:
+            logger.info(f"ℹ️  No patch found in instance data")
+        
+        # Use instance prompt from YAML config
+        task_prompt = instance_prompt
         
         logger.info("Executing agent...")
         
@@ -337,7 +436,7 @@ First explore the repository structure, understand the codebase, locate the rele
         logger.info(f"Completed: {result.is_completed}")
         
         # Validate code changes if validation data is available
-        validation_result = await validate_code_changes(instance, instance_output_dir, k8s_config_with_pod)
+        validation_result = await validate_code_changes(instance, instance_output_dir, k8s_config_with_pod, pod, kodo_runner)
         
         # Determine status based on validation results
         # If no validation tests, consider it a success
@@ -408,29 +507,6 @@ First explore the repository structure, understand the codebase, locate the rele
         with open(metadata_file, 'w') as f:
             json.dump(metadata, f, indent=2)
         logger.info(f"📝 Saved metadata to: {metadata_file}")
-        
-        # 🔄 Restore original image state after trajectory generation
-        logger.info(f"🔄 Restoring original image state for {instance_id}...")
-        try:
-            # Reset all changes to restore original state
-            reset_result = kodo_runner.execute_command(
-                pod,
-                "cd /testbed && git reset --hard HEAD && git clean -fd"
-            )
-            logger.info(f"✅ Successfully restored original image state for {instance_id}")
-            
-            # Verify the restoration
-            status_result = kodo_runner.execute_command(
-                pod,
-                "cd /testbed && git status --porcelain"
-            )
-            if not status_result[0].strip():
-                logger.info(f"✅ Verified: No uncommitted changes remain in {instance_id}")
-            else:
-                logger.warning(f"⚠️  Warning: Some changes may remain in {instance_id}: {status_result[0]}")
-                
-        except Exception as restore_error:
-            logger.error(f"❌ Failed to restore original image state for {instance_id}: {restore_error}")
         
         return True
         
@@ -505,44 +581,22 @@ First explore the repository structure, understand the codebase, locate the rele
         return False
         
     finally:
-        # 🔄 Restore original image state before cleanup (even if processing failed)
+        # Clean up pod (aligned with test_r2e_general_agent_on_swe.py approach)
         if pod and kodo_runner:
             try:
-                logger.info(f"🔄 Restoring original image state before cleanup for {instance_id}...")
-                # Reset all changes to restore original state
-                reset_result = kodo_runner.execute_command(
-                    pod,
-                    "cd /testbed && git reset --hard HEAD && git clean -fd"
-                )
-                logger.info(f"✅ Successfully restored original image state for {instance_id}")
-                
-                # Verify the restoration
-                status_result = kodo_runner.execute_command(
-                    pod,
-                    "cd /testbed && git status --porcelain"
-                )
-                if not status_result[0].strip():
-                    logger.info(f"✅ Verified: No uncommitted changes remain in {instance_id}")
-                else:
-                    logger.warning(f"⚠️  Warning: Some changes may remain in {instance_id}: {status_result[0]}")
-                    
-            except Exception as restore_error:
-                logger.error(f"❌ Failed to restore original image state for {instance_id}: {restore_error}")
-        
-        # Clean up pod
-        if pod and kodo_runner:
-            try:
-                logger.info(f"🧹 Cleaning up pod {pod_name}...")
+                logger.info(f"Stopping container/pod: {pod_name}")
                 kodo_runner.stop_container(pod)
-                logger.info(f"✅ Pod {pod_name} stopped successfully")
+                logger.info(f"Container/pod {pod_name} stopped successfully")
             except Exception as e:
-                logger.error(f"❌ Error stopping pod {pod_name}: {e}")
+                logger.error(f"Error stopping container/pod: {e}")
 
 
 async def validate_code_changes(
     instance: Dict[str, Any], 
     instance_output_dir: str,
-    k8s_config: Dict[str, Any]
+    k8s_config: Dict[str, Any],
+    pod=None,
+    kodo_runner=None
 ) -> Optional[Dict[str, Any]]:
     """Validate code changes by running tests specified in the instance.
     
@@ -550,6 +604,8 @@ async def validate_code_changes(
         instance: Instance data dictionary
         instance_output_dir: Output directory for this instance
         k8s_config: K8S configuration
+        pod: K8S pod object for executing commands
+        kodo_runner: Kodo runner for pod management
         
     Returns:
         Validation results dictionary or None if no validation data
@@ -704,49 +760,6 @@ async def validate_code_changes(
             logger.info(f"   FAIL_TO_PASS: {summary['fail_to_pass']['passed']}/{summary['fail_to_pass']['total']} ({summary['fail_to_pass']['success_rate']:.1f}%)")
         if pass_to_pass_tests:
             logger.info(f"   PASS_TO_PASS: {summary['pass_to_pass']['passed']}/{summary['pass_to_pass']['total']} ({summary['pass_to_pass']['success_rate']:.1f}%)")
-        
-        # Restore repository to original state after validation
-        logger.info("🔄 Restoring repository to original state after validation...")
-        try:
-            # Get base_commit from instance if available
-            base_commit = instance.get("base_commit", None)
-            
-            if base_commit:
-                # Reset to base_commit to restore original state
-                logger.info(f"Resetting repository to base_commit: {base_commit}")
-                reset_output, reset_exit_code = kodo_runner.execute_command(
-                    pod, 
-                    f"cd /testbed && git reset --hard {base_commit}"
-                )
-                if int(reset_exit_code) == 0:
-                    logger.info("✅ Repository restored to base_commit successfully")
-                else:
-                    logger.warning(f"⚠️ Failed to reset to base_commit: {reset_output}")
-            else:
-                # If no base_commit, clean up any staged changes
-                logger.info("Cleaning up staged changes")
-                clean_output, clean_exit_code = kodo_runner.execute_command(
-                    pod, 
-                    "cd /testbed && git reset --hard HEAD"
-                )
-                if int(clean_exit_code) == 0:
-                    logger.info("✅ Repository cleaned up successfully")
-                else:
-                    logger.warning(f"⚠️ Failed to clean repository: {clean_output}")
-            
-            # Additional cleanup: remove any untracked files
-            logger.info("Cleaning up untracked files...")
-            clean_untracked_output, clean_untracked_exit_code = kodo_runner.execute_command(
-                pod, 
-                "cd /testbed && git clean -fd"
-            )
-            if int(clean_untracked_exit_code) == 0:
-                logger.info("✅ Untracked files cleaned up successfully")
-            else:
-                logger.warning(f"⚠️ Failed to clean untracked files: {clean_untracked_exit_code}")
-                
-        except Exception as e:
-            logger.error(f"❌ Error during repository restoration: {e}")
         
         return validation_results
         
@@ -976,6 +989,34 @@ async def test_r2e_general_agent_k8s(output_dir: str = "./trajectories"):
     # Create R2E tools with K8S configuration
     print("\n📦 Creating R2E tools for K8S execution...")
     
+    # Load configuration from YAML file
+    config_path = "/Users/rikkixu/code/0810/agentic-rollout-library/config/r2egym/edit_fn_calling.yaml"
+    config = load_config_from_yaml(config_path)
+    
+    # Use system prompt from YAML config
+    system_prompt = config.get("system_prompt", "")
+    
+    # Prepare the task prompt
+    task_prompt = f"""
+Please analyze and fix the following issue in the repository at /testbed:
+
+Repository: test-repo
+Image: test-image
+
+Problem Statement:
+This is a test issue to verify the R2E GeneralAgent functionality in K8S environment.
+
+Please explore the repository structure, understand the codebase, and demonstrate the agent's capabilities.
+When you're done, call the finish function to submit your solution.
+"""
+    
+    # Use instance prompt from YAML config if available
+    if "instance_prompt" in config:
+        instance_prompt_template = config["instance_prompt"]
+        # Replace placeholder with test problem statement
+        test_problem = "This is a test issue to verify the R2E GeneralAgent functionality in K8S environment."
+        task_prompt = instance_prompt_template.replace("{problem_statement}", test_problem)
+    
     # Create base tools
     base_tools = {
         "r2e_bash_executor": create_tool("R2EBashExecutor", k8s_config.copy()),
@@ -1011,21 +1052,13 @@ async def test_r2e_general_agent_k8s(output_dir: str = "./trajectories"):
     # Create GeneralAgent with R2E tools
     print("\n🤖 Creating GeneralAgent with R2E tools...")
     
-    # Generate custom system prompt with variables
-    custom_system_prompt = generate_custom_system_prompt(
-        tools,
-        task_description="analyze and fix issues in the repository",
-        working_directory="/testbed",
-        additional_instructions="\n- Be concise in your responses\n- Focus on the specific issue at hand"
-    )
-    
     # Create agent instance with termination tool and custom XML parser
     agent = GeneralAgent(
-        max_rounds=15,
-        debug=True,  # Enable agent debug output
+        max_rounds=30,  # More rounds for complex issues
+        debug=False,  # Disable debug output for cleaner logs
         termination_tool_names=["r2e_submit"],  # Mark r2e_submit as termination tool
         action_parser=parse_xml_action_custom,  # Use custom XML action parser
-        system_prompt=custom_system_prompt  # Pass custom prompt in constructor
+        system_prompt=system_prompt  # Use system prompt from YAML config
     )
     agent.set_tools(tools)
     
