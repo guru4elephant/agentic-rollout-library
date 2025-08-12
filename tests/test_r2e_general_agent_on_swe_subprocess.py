@@ -34,7 +34,7 @@ BASE_URL = os.getenv("LLM_BASE_URL", "your-base-url-here")
 MODEL_NAME = os.getenv("LLM_MODEL_NAME", "claude-3-sonnet")
 
 
-def process_single_instance(instance_data_file: str, output_file: str, model_name: str = None, log_file: str = None) -> None:
+def process_single_instance(instance_data_file: str, output_file: str, model_name: str = None, log_file: str = None, base_url: str = None) -> None:
     """
     Process a single instance in a subprocess.
     This function will be called by subprocess.run().
@@ -44,6 +44,7 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
         output_file: Path to save the patch result
         model_name: Model name to use (with index if load balancing)
         log_file: Path to save the subprocess logs
+        base_url: LLM base URL to use (overrides environment variable)
     """
     import sys
     import os
@@ -110,6 +111,7 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
     output_dir = data['output_dir']
     enable_profiling = data['enable_profiling']
     max_tokens = data.get('max_tokens', 16000)  # Get max_tokens from data
+    provided_base_url = data.get('base_url', None)  # Get base_url from data
     
     instance_id = instance.get("instance_id", "unknown")
     issue = instance.get("problem_statement", "")
@@ -118,6 +120,8 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
     
     # Use provided model name or default
     actual_model_name = model_name or MODEL_NAME
+    # Use provided base_url or environment variable or default
+    actual_base_url = base_url or provided_base_url or BASE_URL
     
     logger.info(f"Process {os.getpid()}: Processing instance {instance_id} with model {actual_model_name}")
     
@@ -162,44 +166,92 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
         )
         global_kodo_runner = kodo_runner
         
-        # Create pod name
-        pod_name = f"swe-{instance_id.lower().replace('/', '-').replace('_', '-')[:40]}"
+        # Create pod name with unique identifier to avoid conflicts
+        try:
+            import uuid
+            unique_suffix = str(uuid.uuid4())[:8]  # Use first 8 chars of UUID
+        except ImportError:
+            # Fallback to timestamp + process ID if uuid not available
+            import time
+            unique_suffix = f"{int(time.time()) % 1000000:06d}-{os.getpid() % 100:02d}"
+        
+        # Keep pod name reasonable length (max 63 chars for K8s)
+        instance_part = instance_id.lower().replace('/', '-').replace('_', '-')[:35]
+        pod_name = f"swe-{instance_part}-{unique_suffix}"
         global_pod_name = pod_name
         pod = None
         
         try:
-            # Start pod
-            logger.info(f"Starting pod: {pod_name}")
-            pod = global_pod = kodo_runner.start_container(
-                image,
-                name=pod_name,
-                environment={
-                    "PYTHONPATH": "/testbed",
-                    "SWE_INSTANCE_ID": instance_id,
-                    "http_proxy": "http://agent.baidu.com:8891",
-                    "https_proxy": "http://agent.baidu.com:8891",
-                    "PIP_INDEX_URL": "http://pip.baidu.com/pypi/simple",
-                    "PIP_TRUSTED_HOST": "pip.baidu.com"
-                }
-            )
+            # Start pod with retry logic
+            logger.info(f"Starting pod: {pod_name} (unique suffix: {unique_suffix})")
+            logger.info(f"Using image: {image}")
             
-            logger.info(f"Pod {pod_name} started successfully")
+            max_retries = 3
+            retry_delay = 5
+            pod = None
+            
+            for attempt in range(max_retries):
+                try:
+                    pod = global_pod = kodo_runner.start_container(
+                        image,
+                        name=pod_name,
+                        environment={
+                            "PYTHONPATH": "/testbed",
+                            "SWE_INSTANCE_ID": instance_id,
+                            "http_proxy": "http://agent.baidu.com:8891",
+                            "https_proxy": "http://agent.baidu.com:8891",
+                            "PIP_INDEX_URL": "http://pip.baidu.com/pypi/simple",
+                            "PIP_TRUSTED_HOST": "pip.baidu.com"
+                        }
+                    )
+                    logger.info(f"Pod {pod_name} started successfully on attempt {attempt + 1}")
+                    break
+                except Exception as pod_error:
+                    error_msg = str(pod_error)
+                    logger.error(f"Attempt {attempt + 1}/{max_retries} failed to start pod {pod_name}: {error_msg}")
+                    
+                    # Check for specific errors
+                    if "Response ended prematurely" in error_msg or "ProtocolError" in error_msg:
+                        logger.warning("Network/Protocol error detected, will retry...")
+                    elif "already exists" in error_msg:
+                        # This should be rare now with unique suffixes
+                        logger.warning(f"Pod {pod_name} already exists (unexpected with UUID), attempting cleanup...")
+                        try:
+                            kodo_runner.stop_container(pod_name)
+                            await asyncio.sleep(2)
+                        except:
+                            pass
+                    
+                    if attempt < max_retries - 1:
+                        logger.info(f"Retrying in {retry_delay} seconds...")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        logger.error(f"Failed to start pod after {max_retries} attempts")
+                        logger.error(f"Image: {image}")
+                        logger.error(f"Namespace: {namespace}")
+                        raise
             
             # Wait for pod to be ready
+            logger.info(f"Waiting for pod {pod_name} to be ready...")
             await asyncio.sleep(3)
+            logger.info(f"Pod {pod_name} should be ready now")
             
             # Setup environment
             kodo_runner.execute_command(pod, f"ln -s /opt/miniconda3/envs/testbed /root/.venv")
             
             # Create agent with R2E tools
+            # R2E assumes working directory is /testbed
+            working_dir = "/testbed"
             k8s_config = {
                 "execution_mode": "k8s",
                 "pod_name": pod_name,
                 "namespace": namespace,
-                "kubeconfig_path": kubeconfig_path
+                "kubeconfig_path": kubeconfig_path,
+                "working_dir": working_dir  # Important: R2E tools need to know the working directory
             }
             
-            # Create R2E tools
+            # Create R2E tools with working directory
             base_tools = {
                 "r2e_bash_executor": create_tool("R2EBashExecutor", k8s_config.copy()),
                 "r2e_file_editor": create_tool("R2EFileEditor", k8s_config.copy()),
@@ -207,13 +259,88 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
                 "r2e_submit": create_tool("R2ESubmit", {})
             }
             
-            # Wrap tools with custom descriptions
+            # Create a wrapper class to log tool executions
+            class LoggingToolWrapper:
+                def __init__(self, tool, tool_name):
+                    self.tool = tool
+                    self.tool_name = tool_name
+                    self.execution_count = 0
+                
+                async def execute_tool(self, instance_id, tool_args):
+                    self.execution_count += 1
+                    import time
+                    start_time = time.time()
+                    
+                    # Log tool invocation
+                    logger.info(f"\n{'='*60}")
+                    logger.info(f"TOOL EXECUTION #{self.execution_count}: {self.tool_name}")
+                    logger.info(f"{'='*60}")
+                    logger.info(f"Instance: {instance_id}")
+                    logger.info(f"Tool: {self.tool_name}")
+                    logger.info(f"Arguments:")
+                    for key, value in tool_args.items():
+                        if isinstance(value, str) and len(value) > 1000:
+                            logger.info(f"  {key}: [String with {len(value)} characters]")
+                            logger.info(f"    Preview: {value[:200]}...")
+                        else:
+                            logger.info(f"  {key}: {value}")
+                    
+                    try:
+                        # Execute the tool
+                        result = await self.tool.execute_tool(instance_id, tool_args)
+                        execution_time = time.time() - start_time
+                        
+                        # Log successful execution
+                        logger.info(f"\nExecution Result:")
+                        logger.info(f"  Status: SUCCESS")
+                        logger.info(f"  Execution Time: {execution_time:.2f} seconds")
+                        
+                        if hasattr(result, 'result'):
+                            result_str = str(result.result)
+                            if len(result_str) > 2000:
+                                logger.info(f"  Output: [Result with {len(result_str)} characters]")
+                                logger.info(f"  Output Preview (first 500 chars):")
+                                logger.info(f"    {result_str[:500]}...")
+                                logger.info(f"  Output Preview (last 500 chars):")
+                                logger.info(f"    ...{result_str[-500:]}")
+                            else:
+                                logger.info(f"  Output: {result_str}")
+                        
+                        logger.info(f"{'='*60}\n")
+                        return result
+                        
+                    except Exception as e:
+                        execution_time = time.time() - start_time
+                        
+                        # Log error
+                        logger.error(f"\nExecution Result:")
+                        logger.error(f"  Status: FAILED")
+                        logger.error(f"  Execution Time: {execution_time:.2f} seconds")
+                        logger.error(f"  Error Type: {type(e).__name__}")
+                        logger.error(f"  Error Message: {str(e)}")
+                        
+                        import traceback
+                        logger.error(f"  Traceback:")
+                        for line in traceback.format_exc().split('\n'):
+                            logger.error(f"    {line}")
+                        
+                        logger.error(f"{'='*60}\n")
+                        raise
+                
+                def __getattr__(self, name):
+                    return getattr(self.tool, name)
+            
+            # Wrap tools with logging and custom descriptions
             tools = {}
             for tool_name, tool in base_tools.items():
+                # First wrap with logging
+                logged_tool = LoggingToolWrapper(tool, tool_name)
+                
+                # Then wrap with custom description if available
                 if tool_name in CUSTOM_TOOL_DESCRIPTIONS:
-                    tools[tool_name] = CustomDescriptionWrapper(tool, CUSTOM_TOOL_DESCRIPTIONS[tool_name])
+                    tools[tool_name] = CustomDescriptionWrapper(logged_tool, CUSTOM_TOOL_DESCRIPTIONS[tool_name])
                 else:
-                    tools[tool_name] = tool
+                    tools[tool_name] = logged_tool
             
             # Generate custom system prompt
             custom_system_prompt = generate_custom_system_prompt(
@@ -242,21 +369,126 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
             
             # Run agent
             logger.info("Running agent to solve the issue...")
-            llm_client = create_llm_client(
-                api_key=API_KEY,
-                base_url=BASE_URL,
-                model=actual_model_name,
-                debug=True
-            )
+            logger.info(f"LLM Configuration: model={actual_model_name}, base_url={actual_base_url}, max_tokens={max_tokens}")
             
-            # Override the generate method to use custom max_tokens
+            try:
+                llm_client = create_llm_client(
+                    api_key=API_KEY,
+                    base_url=actual_base_url,
+                    model=actual_model_name,
+                    debug=True
+                )
+            except Exception as e:
+                logger.error(f"Failed to create LLM client: {e}")
+                logger.error(f"API_KEY present: {bool(API_KEY)}")
+                logger.error(f"BASE_URL: {actual_base_url}")
+                logger.error(f"Model: {actual_model_name}")
+                raise
+            
+            # Override the generate method to use custom max_tokens and log LLM calls
             original_generate = llm_client.generate
-            async def generate_with_custom_tokens(messages, **kwargs):
+            llm_call_count = 0
+            
+            async def generate_with_logging(messages, **kwargs):
+                nonlocal llm_call_count
+                llm_call_count += 1
+                
                 # Use our custom max_tokens if not already specified
                 if 'max_tokens' not in kwargs:
                     kwargs['max_tokens'] = max_tokens
-                return await original_generate(messages, **kwargs)
-            llm_client.generate = generate_with_custom_tokens
+                
+                # Log LLM call
+                logger.info(f"\n{'~'*60}")
+                logger.info(f"LLM CALL #{llm_call_count}")
+                logger.info(f"{'~'*60}")
+                logger.info(f"Model: {actual_model_name}")
+                logger.info(f"Max Tokens: {kwargs.get('max_tokens', 'default')}")
+                logger.info(f"Temperature: {kwargs.get('temperature', 'default')}")
+                logger.info(f"Messages: {len(messages)} messages")
+                
+                # Log all messages for better debugging
+                logger.info(f"\nConversation History:")
+                for idx, msg in enumerate(messages):
+                    role = msg.get('role', 'unknown')
+                    content = msg.get('content', '')
+                    logger.info(f"\n  Message #{idx+1} - Role: {role}")
+                    logger.info(f"  Content Length: {len(content)} characters")
+                    
+                    if role == 'system':
+                        # System message - log first 500 chars
+                        if len(content) > 500:
+                            logger.info(f"  Content Preview: {content[:500]}...")
+                        else:
+                            logger.info(f"  Content: {content}")
+                    elif role == 'user':
+                        # User message - log first 1000 chars
+                        if len(content) > 1000:
+                            logger.info(f"  Content Preview: {content[:1000]}...")
+                        else:
+                            logger.info(f"  Content: {content}")
+                    elif role == 'assistant':
+                        # Assistant message - log first 2000 chars (more detail for debugging)
+                        if len(content) > 2000:
+                            logger.info(f"  Content Preview: {content[:2000]}...")
+                            # Also check if there are tool calls
+                            if '<function=' in content:
+                                import re
+                                tools_called = re.findall(r'<function=([^>]+)>', content)
+                                if tools_called:
+                                    logger.info(f"  Tools Called: {', '.join(tools_called)}")
+                        else:
+                            logger.info(f"  Content: {content}")
+                
+                import time
+                start_time = time.time()
+                
+                try:
+                    response = await original_generate(messages, **kwargs)
+                    execution_time = time.time() - start_time
+                    
+                    # Log response with full content
+                    logger.info(f"\nLLM Response:")
+                    logger.info(f"  Status: SUCCESS")
+                    logger.info(f"  Response Time: {execution_time:.2f} seconds")
+                    
+                    if isinstance(response, str):
+                        logger.info(f"  Response Length: {len(response)} characters")
+                        logger.info(f"  Response Content:")
+                        
+                        # Log full response content with proper formatting
+                        response_lines = response.split('\n')
+                        for i, line in enumerate(response_lines):
+                            if i < 100:  # Log first 100 lines in full
+                                logger.info(f"    {line}")
+                            elif i == 100:
+                                logger.info(f"    ... ({len(response_lines) - 100} more lines omitted)")
+                                break
+                        
+                        # Also log a summary of what the LLM is trying to do
+                        if '<function=' in response:
+                            # Extract function calls
+                            import re
+                            function_calls = re.findall(r'<function=([^>]+)>', response)
+                            if function_calls:
+                                logger.info(f"  LLM Actions: Calling tools: {', '.join(function_calls)}")
+                        elif 'thought>' in response.lower() or 'reasoning>' in response.lower():
+                            logger.info(f"  LLM Actions: Thinking/Reasoning")
+                        elif 'answer>' in response.lower() or 'response>' in response.lower():
+                            logger.info(f"  LLM Actions: Providing answer")
+                    
+                    logger.info(f"{'~'*60}\n")
+                    return response
+                    
+                except Exception as e:
+                    execution_time = time.time() - start_time
+                    logger.error(f"\nLLM Response:")
+                    logger.error(f"  Status: FAILED")
+                    logger.error(f"  Response Time: {execution_time:.2f} seconds")
+                    logger.error(f"  Error: {e}")
+                    logger.error(f"{'~'*60}\n")
+                    raise
+            
+            llm_client.generate = generate_with_logging
             
             prompt = f"""
 Consider the following github issue:
@@ -283,13 +515,99 @@ Follow these steps to resolve the issue:
             # Track timing for statistics
             import time as timing
             
-            result = await agent.run_trajectory(
-                prompt=prompt,
-                llm_generate_func=llm_client.generate,
-                request_id=f"swe_{instance_id}"
-            )
+            try:
+                logger.info(f"\n{'#'*80}")
+                logger.info(f"# STARTING TRAJECTORY EXECUTION")
+                logger.info(f"# Instance: {instance_id}")
+                logger.info(f"# Model: {actual_model_name}")
+                logger.info(f"# Max Tokens: {max_tokens}")
+                logger.info(f"# Request ID: swe_{instance_id}")
+                logger.info(f"{'#'*80}\n")
+                
+                # Track trajectory steps
+                step_count = 0
+                
+                # Create a custom callback to log trajectory steps
+                original_run = agent.run_trajectory
+                async def logged_run_trajectory(*args, **kwargs):
+                    nonlocal step_count
+                    # Run the original trajectory
+                    result = await original_run(*args, **kwargs)
+                    
+                    # Log trajectory summary
+                    logger.info(f"\n{'#'*80}")
+                    logger.info(f"# TRAJECTORY COMPLETED")
+                    logger.info(f"# Total Steps: {len(result.steps)}")
+                    logger.info(f"# Completed: {result.is_completed}")
+                    logger.info(f"{'#'*80}\n")
+                    
+                    return result
+                
+                agent.run_trajectory = logged_run_trajectory
+                
+                result = await agent.run_trajectory(
+                    prompt=prompt,
+                    llm_generate_func=llm_client.generate,
+                    request_id=f"swe_{instance_id}"
+                )
+            except Exception as traj_error:
+                logger.error(f"\n{'!'*80}")
+                logger.error(f"! TRAJECTORY EXECUTION FAILED")
+                logger.error(f"! Error Type: {type(traj_error).__name__}")
+                logger.error(f"! Error Message: {traj_error}")
+                logger.error(f"{'!'*80}\n")
+                
+                # Check for specific error types
+                error_msg = str(traj_error).lower()
+                if 'response ended prematurely' in error_msg:
+                    logger.error("This appears to be a network/API connection issue.")
+                    logger.error("Possible causes:")
+                    logger.error("  1. API endpoint timeout or connection reset")
+                    logger.error("  2. Request size too large")
+                    logger.error("  3. Network instability")
+                    logger.error(f"  4. Model endpoint issue (model: {actual_model_name})")
+                elif 'timeout' in error_msg:
+                    logger.error("Request timed out. Consider increasing timeout or using a faster model.")
+                elif 'rate limit' in error_msg:
+                    logger.error("Rate limit exceeded. Consider reducing concurrency or adding delays.")
+                raise
             
             logger.info(f"Agent completed: {result.is_completed}")
+            logger.info(f"Total trajectory steps: {len(result.steps)}")
+            
+            # Check if agent reached max rounds without calling termination tool
+            reached_max_rounds = len(result.steps) >= 50 * 2  # Rough estimate: 50 rounds * 2 steps per round
+            called_submit = any(
+                step.tool_name == "r2e_submit" 
+                for step in result.steps 
+                if hasattr(step, 'tool_name')
+            )
+            
+            if not called_submit and reached_max_rounds:
+                logger.warning(f"⚠️ Agent reached max rounds (50) without calling r2e_submit")
+                logger.warning(f"⚠️ Patch will still be generated from current changes")
+            elif called_submit:
+                logger.info(f"✓ Agent called r2e_submit - normal termination")
+            else:
+                logger.info(f"Agent stopped after {len(result.steps)} steps")
+            
+            # Log trajectory steps summary
+            logger.info(f"\n{'='*80}")
+            logger.info(f"TRAJECTORY SUMMARY")
+            logger.info(f"{'='*80}")
+            logger.info(f"Instance: {instance_id}")
+            logger.info(f"Completed: {result.is_completed}")
+            logger.info(f"Total Steps: {len(result.steps)}")
+            
+            # Count step types
+            step_types_count = {}
+            for step in result.steps:
+                step_type = step.step_type.value if hasattr(step.step_type, 'value') else str(step.step_type)
+                step_types_count[step_type] = step_types_count.get(step_type, 0) + 1
+            
+            logger.info(f"Step Types:")
+            for step_type, count in step_types_count.items():
+                logger.info(f"  {step_type}: {count}")
             
             # Collect statistics from the trajectory
             stats = {
@@ -297,7 +615,11 @@ Follow these steps to resolve the issue:
                 'trajectory_length': len(result.steps),
                 'tool_calls': [],
                 'llm_calls': [],
-                'is_completed': result.is_completed
+                'is_completed': result.is_completed,
+                'step_types': step_types_count,
+                'called_submit': called_submit,
+                'reached_max_rounds': reached_max_rounds,
+                'termination_reason': 'submit_called' if called_submit else ('max_rounds' if reached_max_rounds else 'other')
             }
             
             # Count rounds (each action is a round)
@@ -336,8 +658,9 @@ Follow these steps to resolve the issue:
             trajectory_dir = os.path.join(output_dir, "trajectories")
             os.makedirs(trajectory_dir, exist_ok=True)
             
-            safe_instance_id = instance_id.replace('/', '_').replace('__', '-')
-            trajectory_file = os.path.join(trajectory_dir, f"{safe_instance_id}_{timestamp}.jsonl")
+            # Use original instance_id format for file naming (just replace / with __ for filesystem compatibility)
+            file_safe_instance_id = instance_id.replace('/', '__')
+            trajectory_file = os.path.join(trajectory_dir, f"{file_safe_instance_id}_{timestamp}.jsonl")
             dump_trajectory(result, trajectory_file, format="jsonl")
             logger.info(f"Saved trajectory to: {trajectory_file}")
             
@@ -350,12 +673,12 @@ Follow these steps to resolve the issue:
                     os.makedirs(profiler_dir, exist_ok=True)
                     
                     # Save profiler data
-                    profiler_file = os.path.join(profiler_dir, f"{safe_instance_id}_{timestamp}_profile.json")
+                    profiler_file = os.path.join(profiler_dir, f"{file_safe_instance_id}_{timestamp}_profile.json")
                     profiler.export_events(profiler_file)
                     logger.info(f"Saved profiler data to: {profiler_file}")
                     
                     # Generate timeline visualization
-                    timeline_file = os.path.join(profiler_dir, f"{safe_instance_id}_{timestamp}_timeline.html")
+                    timeline_file = os.path.join(profiler_dir, f"{file_safe_instance_id}_{timestamp}_timeline.html")
                     visualizer = ProfilerVisualizer({
                         "summary": profiler.get_summary(),
                         "events": [event.to_dict() for event in profiler.events]
@@ -366,7 +689,10 @@ Follow these steps to resolve the issue:
                     logger.error(f"Failed to save profiler data: {e}")
             
             # Get patch
-            logger.info("Generating patch...")
+            logger.info(f"\n{'='*80}")
+            logger.info(f"PATCH GENERATION")
+            logger.info(f"{'='*80}")
+            logger.info("Adding all changes to git...")
             kodo_runner.execute_command(pod, "cd /testbed && git add -A")
             
             # Generate patch based on base_commit if provided, otherwise use --cached
@@ -382,13 +708,23 @@ Follow these steps to resolve the issue:
             
             if int(exit_code) == 0:
                 patch = output.strip()
-                logger.info(f"Generated patch ({len(patch)} chars)")
+                logger.info(f"Patch generated successfully")
+                logger.info(f"Patch size: {len(patch)} characters")
+                
+                # Log patch preview
+                if patch:
+                    lines = patch.split('\n')
+                    logger.info(f"Patch preview (first 10 lines):")
+                    for line in lines[:10]:
+                        logger.info(f"  {line}")
+                    if len(lines) > 10:
+                        logger.info(f"  ... ({len(lines) - 10} more lines)")
                 
                 # Save patch
                 patches_dir = os.path.join(output_dir, "patches")
                 os.makedirs(patches_dir, exist_ok=True)
                 
-                patch_filepath = os.path.join(patches_dir, f"{safe_instance_id}_{timestamp}.patch")
+                patch_filepath = os.path.join(patches_dir, f"{file_safe_instance_id}_{timestamp}.patch")
                 with open(patch_filepath, 'w', encoding='utf-8') as f:
                     f.write(patch)
                 logger.info(f"Saved patch to: {patch_filepath}")
@@ -434,14 +770,51 @@ Follow these steps to resolve the issue:
                 return None
                 
         except Exception as e:
-            logger.error(f"Error processing instance {instance_id}: {e}")
+            # Get detailed error information
             import traceback
-            traceback.print_exc()
+            import sys
+            
+            # Get the full traceback
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+            full_traceback = ''.join(tb_lines)
+            
+            # Log detailed error information
+            logger.error(f"Error processing instance {instance_id}: {type(e).__name__}: {e}")
+            logger.error(f"Error type: {exc_type}")
+            logger.error(f"Error details: {exc_value}")
+            logger.error(f"Full traceback:\n{full_traceback}")
+            
+            # Also print to console for immediate visibility
+            print(f"\n{'='*80}")
+            print(f"ERROR in instance {instance_id}")
+            print(f"Error type: {type(e).__name__}")
+            print(f"Error message: {str(e)}")
+            print(f"Full traceback:")
+            print(full_traceback)
+            print(f"{'='*80}\n")
+            
+            # Prepare detailed error data
+            error_details = {
+                'error_type': type(e).__name__,
+                'error_message': str(e),
+                'traceback': full_traceback,
+                'last_checkpoint': 'unknown'
+            }
+            
+            # Try to identify where the error occurred
+            if 'pod started successfully' in full_traceback:
+                error_details['last_checkpoint'] = 'pod_startup'
+            elif 'Running agent' in full_traceback:
+                error_details['last_checkpoint'] = 'agent_execution'
+            elif 'Generating patch' in full_traceback:
+                error_details['last_checkpoint'] = 'patch_generation'
             
             result_data = {
                 'success': False,
                 'instance_id': instance_id,
                 'error': str(e),
+                'error_details': error_details,
                 'stats': stats if 'stats' in locals() else {}
             }
             
@@ -480,12 +853,14 @@ class SubprocessSWEBenchRunner:
                  model_index_range: Optional[Tuple[int, int]] = None,
                  timeout_seconds: int = 600,  # Default 10 minutes timeout
                  max_tokens: int = 16000,  # Maximum tokens for model output
+                 base_url: str = None,  # LLM base URL
                  local_mode: bool = False):  # Local mode for debugging
         """Initialize the runner.
         
         Args:
             timeout_seconds: Maximum time in seconds for each instance (default: 600 = 10 minutes)
             max_tokens: Maximum tokens for model output (default: 16000)
+            base_url: LLM base URL (optional, overrides environment variable)
             local_mode: If True, run instances locally instead of in subprocess
         """
         self.namespace = namespace
@@ -497,6 +872,7 @@ class SubprocessSWEBenchRunner:
         self.model_index_range = model_index_range
         self.timeout_seconds = timeout_seconds
         self.max_tokens = max_tokens
+        self.base_url = base_url
         self.local_mode = local_mode
         self.patches = {}
         
@@ -537,7 +913,8 @@ class SubprocessSWEBenchRunner:
                 'kubeconfig_path': self.kubeconfig_path,
                 'output_dir': self.output_dir,
                 'enable_profiling': self.enable_profiling,
-                'max_tokens': self.max_tokens  # Add max_tokens to instance data
+                'max_tokens': self.max_tokens,  # Add max_tokens to instance data
+                'base_url': self.base_url  # Add base_url to instance data
             }
             
             # Save instance data to temp file
@@ -551,13 +928,14 @@ class SubprocessSWEBenchRunner:
             # Create async task for subprocess or local execution
             if self.local_mode:
                 # Local mode: run directly without subprocess
-                task = self._run_local_instance(i, len(instances), instance_data_file, output_file, actual_model_name)
+                task = self._run_local_instance(i, len(instances), instance_data_file, output_file, actual_model_name, self.base_url)
             else:
                 # Subprocess mode: run in separate process with logging
                 instance_id = instance.get('instance_id', f'instance_{i}')
-                safe_instance_id = instance_id.replace('/', '_').replace('__', '-')
-                log_file = os.path.join(self.output_dir, "logs", f"{safe_instance_id}.log")
-                task = self._run_subprocess(i, len(instances), instance_data_file, output_file, actual_model_name, log_file)
+                # Use original instance_id format for log file naming (just replace / with __ for filesystem compatibility)
+                file_safe_instance_id = instance_id.replace('/', '__')
+                log_file = os.path.join(self.output_dir, "logs", f"{file_safe_instance_id}.log")
+                task = self._run_subprocess(i, len(instances), instance_data_file, output_file, actual_model_name, log_file, self.base_url)
             tasks.append(task)
         
         # Run tasks with concurrency limit
@@ -591,7 +969,12 @@ class SubprocessSWEBenchRunner:
             'total_llm_time': 0.0,
             'rounds': {'min': float('inf'), 'max': 0, 'total': 0, 'count': 0},
             'trajectory_lengths': {'min': float('inf'), 'max': 0, 'total': 0, 'count': 0},
-            'throughput': {'start_time': start_time, 'completed': 0}
+            'throughput': {'start_time': start_time, 'completed': 0},
+            'termination_stats': {
+                'submit_called': 0,
+                'max_rounds_reached': 0,
+                'other': 0
+            }
         }
         
         # Process each result and update statistics
@@ -647,6 +1030,12 @@ class SubprocessSWEBenchRunner:
                         global_stats['trajectory_lengths']['max'] = max(global_stats['trajectory_lengths']['max'], length)
                         global_stats['trajectory_lengths']['total'] += length
                         global_stats['trajectory_lengths']['count'] += 1
+                    
+                    # Update termination statistics
+                    if 'termination_reason' in stats:
+                        reason = stats['termination_reason']
+                        if reason in global_stats['termination_stats']:
+                            global_stats['termination_stats'][reason] += 1
                 
                 if result.get('success'):
                     self.patches[result['instance_id']] = result.get('patch', '')
@@ -724,6 +1113,19 @@ class SubprocessSWEBenchRunner:
             logger.info(f"  Trajectory length: min={global_stats['trajectory_lengths']['min']}, "
                       f"max={global_stats['trajectory_lengths']['max']}, avg={avg_trajectory_length:.1f}")
         
+        # Termination reasons
+        logger.info(f"\n🏁 Termination Reasons:")
+        term_stats = global_stats['termination_stats']
+        total_terminations = sum(term_stats.values())
+        if total_terminations > 0:
+            logger.info(f"  Normal (r2e_submit called): {term_stats['submit_called']} ({term_stats['submit_called']/total_terminations*100:.1f}%)")
+            logger.info(f"  Max rounds reached: {term_stats['max_rounds_reached']} ({term_stats['max_rounds_reached']/total_terminations*100:.1f}%)")
+            logger.info(f"  Other: {term_stats['other']} ({term_stats['other']/total_terminations*100:.1f}%)")
+            
+            if term_stats['max_rounds_reached'] > 0:
+                logger.warning(f"  ⚠️ {term_stats['max_rounds_reached']} instances reached max rounds without calling r2e_submit")
+                logger.warning(f"  ⚠️ These patches were generated from partial work")
+        
         logger.info(f"{'='*80}")
         
         # Save comprehensive summary
@@ -735,6 +1137,7 @@ class SubprocessSWEBenchRunner:
             "timeout_instances": timeout_count,
             "timeout_seconds": self.timeout_seconds,
             "max_tokens": self.max_tokens,
+            "base_url": self.base_url,
             "local_mode": self.local_mode,
             "successful_instance_ids": successful_instances,
             "failed_instance_ids": failed_instances,
@@ -744,6 +1147,7 @@ class SubprocessSWEBenchRunner:
             "max_concurrent": self.max_concurrent,
             "model_name": self.model_name,
             "model_index_range": self.model_index_range,
+            "base_url": self.base_url,
             "profiling_enabled": self.enable_profiling,
             "statistics": {
                 "throughput": {
@@ -772,6 +1176,11 @@ class SubprocessSWEBenchRunner:
                         "min": global_stats['trajectory_lengths']['min'] if global_stats['trajectory_lengths']['count'] > 0 else None,
                         "max": global_stats['trajectory_lengths']['max'] if global_stats['trajectory_lengths']['count'] > 0 else None,
                         "avg": avg_trajectory_length
+                    },
+                    "termination_reasons": {
+                        "submit_called": global_stats['termination_stats']['submit_called'],
+                        "max_rounds_reached": global_stats['termination_stats']['max_rounds_reached'],
+                        "other": global_stats['termination_stats']['other']
                     }
                 }
             }
@@ -792,7 +1201,7 @@ class SubprocessSWEBenchRunner:
         shutil.rmtree(temp_dir)
         
     async def _run_subprocess(self, index: int, total: int, instance_data_file: str, 
-                             output_file: str, model_name: str, log_file: str = None) -> Optional[Dict]:
+                             output_file: str, model_name: str, log_file: str = None, base_url: str = None) -> Optional[Dict]:
         """Run a single instance in a subprocess with timeout."""
         # Load instance data to get instance_id
         with open(instance_data_file, 'rb') as f:
@@ -811,7 +1220,7 @@ class SubprocessSWEBenchRunner:
 import sys
 sys.path.insert(0, '{os.path.dirname(os.path.dirname(__file__))}')
 from tests.test_r2e_general_agent_on_swe_subprocess import process_single_instance
-process_single_instance('{instance_data_file}', '{output_file}', '{model_name}', '{log_file if log_file else ""}')
+process_single_instance('{instance_data_file}', '{output_file}', '{model_name}', '{log_file if log_file else ""}', '{base_url if base_url else ""}')
 """
         ]
         
@@ -832,11 +1241,37 @@ process_single_instance('{instance_data_file}', '{output_file}', '{model_name}',
             if process.returncode != 0:
                 logger.error(f"[{index+1}/{total}] Subprocess for {instance_id} failed with return code {process.returncode}")
                 if stderr:
-                    logger.error(f"Stderr: {stderr.decode()[:500]}")  # Limit stderr output
+                    stderr_text = stderr.decode()
+                    # Show more of stderr for debugging
+                    logger.error(f"Stderr output (first 2000 chars):")
+                    logger.error(stderr_text[:2000])
+                    
+                    # Try to extract specific error information
+                    if 'Response ended prematurely' in stderr_text:
+                        logger.error("Network/API error detected - Response ended prematurely")
+                    if 'traceback' in stderr_text.lower():
+                        # Find and show the actual error
+                        lines = stderr_text.split('\n')
+                        for i, line in enumerate(lines):
+                            if 'Traceback' in line:
+                                # Show the traceback and following lines
+                                traceback_end = min(i + 20, len(lines))
+                                logger.error("Python traceback found:")
+                                for j in range(i, traceback_end):
+                                    logger.error(f"  {lines[j]}")
+                                break
+                
+                if stdout:
+                    stdout_text = stdout.decode()
+                    if stdout_text.strip():
+                        logger.info(f"Stdout output (first 1000 chars):")
+                        logger.info(stdout_text[:1000])
+                
                 return {
                     'success': False,
                     'instance_id': instance_id,
-                    'error': f'Process failed with return code {process.returncode}'
+                    'error': f'Process failed with return code {process.returncode}',
+                    'stderr': stderr.decode()[:2000] if stderr else None
                 }
             
         except asyncio.TimeoutError:
@@ -872,7 +1307,7 @@ process_single_instance('{instance_data_file}', '{output_file}', '{model_name}',
             }
     
     async def _run_local_instance(self, index: int, total: int, instance_data_file: str,
-                                 output_file: str, model_name: str) -> Optional[Dict]:
+                                 output_file: str, model_name: str, base_url: str = None) -> Optional[Dict]:
         """Run a single instance locally (without subprocess) for debugging."""
         # Load instance data to get instance_id
         with open(instance_data_file, 'rb') as f:
@@ -883,7 +1318,7 @@ process_single_instance('{instance_data_file}', '{output_file}', '{model_name}',
         
         try:
             # Run the instance processing directly
-            process_single_instance(instance_data_file, output_file, model_name, None)
+            process_single_instance(instance_data_file, output_file, model_name, None, base_url)
             
             # Read result
             if os.path.exists(output_file):
@@ -932,6 +1367,8 @@ async def main():
                        help="Timeout in seconds for each instance (default: 600 = 10 minutes)")
     parser.add_argument("--max-tokens", type=int, default=16000,
                        help="Maximum tokens for model output (default: 16000)")
+    parser.add_argument("--base-url", type=str, default=None,
+                       help="LLM base URL (overrides environment variable)")
     parser.add_argument("--local-mode", action="store_true",
                        help="Run in local mode without subprocess for debugging")
     
@@ -970,6 +1407,7 @@ async def main():
         model_index_range=model_index_range,
         timeout_seconds=args.timeout,
         max_tokens=args.max_tokens,
+        base_url=args.base_url,
         local_mode=args.local_mode
     )
     
@@ -985,6 +1423,9 @@ if __name__ == "__main__":
         print("\nWith model load balancing:")
         print("  python test_r2e_general_agent_on_swe_subprocess.py swe_bench.jsonl \\")
         print("    --max-concurrent 20 --model-name swe-8676-0807 --model-index-range 0,19")
+        print("\nWith custom base URL:")
+        print("  python test_r2e_general_agent_on_swe_subprocess.py swe_bench.jsonl \\")
+        print("    --base-url http://custom-llm-endpoint:8080/v1 --max-concurrent 10")
         sys.exit(1)
     
     asyncio.run(main())

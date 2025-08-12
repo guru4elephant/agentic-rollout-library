@@ -37,6 +37,7 @@ class R2EBashExecutorTool(AgenticBaseTool):
         self.pod_name = config.get("pod_name")
         self.namespace = config.get("namespace", "default")
         self.kubeconfig_path = config.get("kubeconfig_path", None)
+        self.working_dir = config.get("working_dir", "/testbed")  # R2E default working directory
         
         # Validate K8s configuration if needed
         if self.execution_mode == "k8s":
@@ -85,12 +86,12 @@ The bash command (and optional arguments) to execute.
             name="r2e_bash_executor",
             description=f"Execute a bash command in the terminal{execution_context}. R2E-style tool with security restrictions.",
             parameters={
-                "command": {
+                "cmd": {
                     "type": "string",
                     "description": "The bash command to execute. For example: 'python my_script.py'"
                 }
             },
-            required=["command"]
+            required=["cmd"]
         )
     
     async def execute_tool(self, instance_id: str, parameters: Dict[str, Any], **kwargs) -> ToolResult:
@@ -190,10 +191,13 @@ The bash command (and optional arguments) to execute.
     async def _run_local_command(self, command: str) -> Dict[str, Any]:
         """Run bash command locally (R2E-style)."""
         try:
+            # For local execution, prepend cd to working directory
+            full_command = f"cd {self.working_dir} && {command}"
+            
             # Try to use the new parameters (Python 3.7+)
             try:
                 result = subprocess.run(
-                    command,
+                    full_command,
                     shell=True,
                     capture_output=True,
                     text=True,
@@ -202,7 +206,7 @@ The bash command (and optional arguments) to execute.
             except TypeError:
                 # Fallback for Python 3.5 and 3.6
                 result = subprocess.run(
-                    command,
+                    full_command,
                     shell=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -243,10 +247,15 @@ The bash command (and optional arguments) to execute.
         try:
             k8s_mgr = self._get_k8s_manager()
             
-            logger.info(f"Executing command in K8s pod {self.pod_name}: {command}")
+            # Prepend cd to working directory and properly handle timeout
+            # Format: cd {working_dir} && timeout {timeout} {command}
+            # This ensures we're always in the right directory and have timeout protection
+            full_command = f"cd {self.working_dir} && timeout {self.timeout} {command}"
+            
+            logger.info(f"Executing command in K8s pod {self.pod_name}: {full_command}")
             
             # Execute command in pod using kodo API
-            output, exit_code = k8s_mgr.execute_command(self.pod_name, command)
+            output, exit_code = k8s_mgr.execute_command(self.pod_name, full_command)
             
             # Log raw output for debugging
             logger.debug(f"Raw K8s output: {output}")

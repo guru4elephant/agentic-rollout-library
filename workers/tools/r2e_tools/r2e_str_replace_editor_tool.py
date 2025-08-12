@@ -9,14 +9,15 @@ from typing import Any, Dict, Optional
 
 from ...core.base_tool import AgenticBaseTool
 from ...core.tool_schemas import OpenAIFunctionToolSchema, ToolResult, create_openai_tool_schema
-from .r2e_file_editor_tool import R2EFileEditorTool
 
 import logging
 logger = logging.getLogger(__name__)
 
-
 # Control what commands are visible to agents (from R2E)
 ALLOWED_STR_REPLACE_EDITOR_COMMANDS = ["view", "create", "str_replace", "insert"]
+
+# Import at the end to avoid circular import
+from .r2e_file_editor_tool import R2EFileEditorTool
 
 
 class R2EStrReplaceEditorTool(R2EFileEditorTool):
