@@ -97,7 +97,16 @@ The bash command (and optional arguments) to execute.
     async def execute_tool(self, instance_id: str, parameters: Dict[str, Any], **kwargs) -> ToolResult:
         """Execute bash command."""
         try:
-            command = parameters["cmd"].strip()
+            # Support both 'command' and 'cmd' parameter names for backward compatibility
+            if "command" in parameters:
+                command = parameters["command"].strip()
+            elif "cmd" in parameters:
+                command = parameters["cmd"].strip()
+            else:
+                return ToolResult(
+                    success=False,
+                    error="Missing required parameter. Please provide either 'command' or 'cmd' parameter."
+                )
             
             # Security check (R2E-style)
             first_token = command.split()[0] if command.strip() else ""
@@ -172,7 +181,7 @@ The bash command (and optional arguments) to execute.
             logger.error(f"R2E bash execution failed: {e}", exc_info=True)
             return ToolResult(
                 success=False, 
-                error=f"Tool execution error: {str(e)}\nCommand: {parameters.get('command', 'N/A')}",
+                error=f"Tool execution error: {str(e)}\nCommand: {parameters.get('command', parameters.get('cmd', 'N/A'))}",
                 result={
                     "error_type": type(e).__name__,
                     "error_details": str(e)
