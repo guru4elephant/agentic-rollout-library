@@ -4,7 +4,7 @@ R2E File Editor tool converted to official tool implementation.
 Supports both local file editing and remote K8s pod file editing.
 Based on the original R2E file_editor.py with full functionality.
 """
-
+ 
 import os
 import json
 import logging
@@ -15,7 +15,7 @@ import base64
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
-
+ 
 # Optional K8s support
 try:
     from kodo import KubernetesManager
@@ -23,13 +23,13 @@ try:
 except ImportError:
     KubernetesManager = None
     K8S_AVAILABLE = False
-
+ 
 from ...core.base_tool import AgenticBaseTool
 from ...core.tool_schemas import OpenAIFunctionToolSchema, ToolResult, create_openai_tool_schema
-
+ 
 logger = logging.getLogger(__name__)
-
-
+ 
+ 
 # R2E constants
 SNIPPET_LINES = 4
 MAX_RESPONSE_LEN = 10000
@@ -38,8 +38,8 @@ TRUNCATED_MESSAGE = (
     "shown to you. You should retry this tool after you have searched inside the file "
     "with `grep -n` in order to find the line numbers of what you are looking for.</NOTE>"
 )
-
-
+ 
+ 
 class R2EFileEditorTool(AgenticBaseTool):
     """R2E-style file editor tool supporting view, create, str_replace, insert, and undo_edit."""
     
@@ -85,12 +85,12 @@ Custom editing tool for viewing, creating and editing files
   •    The create command cannot be used if the specified path already exists as a file
   •    If a command generates a long output, it will be truncated and marked with <response clipped>
   •    The undo_edit command will revert the last edit made to the file at path
-
+ 
 Notes for using the str_replace command:
   •    The old_str parameter should match EXACTLY one or more consecutive lines from the original file. Be mindful of whitespaces!
   •    If the old_str parameter is not unique in the file, the replacement will not be performed. Make sure to include enough context in old_str to make it unique
   •    The new_str parameter should contain the edited lines that should replace the old_str
-
+ 
 Parameters:
   1.    command (string, required)
 Allowed values: [view, create, str_replace, insert, undo_edit]
@@ -113,7 +113,7 @@ Required for the insert command. The new_str will be inserted after the line num
   8.    concise (boolean, optional)
   •    Optional for the view command.
   •    Defaults to True; displays a concise skeletal view of the file. If set to False, displays the full content in the specified view_range.
-
+ 
 –– END FUNCTION #1 ––"""
         
         # Default: return JSON schema
@@ -601,7 +601,7 @@ Required for the insert command. The new_str will be inserted after the line num
                 if self.python_only and not path_str.endswith(".py"):
                     return ToolResult(
                         success=False,
-                        error=f"Viewing non-Python files is disallowed. File '{path_str}' is not a .py file."
+                        error=f"ERROR: Viewing non-Python files is disallowed for saving context. File '{path_str}' is not a .py file."
                     )
                 
                 # Read file content
@@ -612,8 +612,72 @@ Required for the insert command. The new_str will be inserted after the line num
                 file_content = cat_result["stdout"]
                 lines = file_content.splitlines()
                 
-                # Apply view range and format output with correct line numbers
-                output = f"Here's the result of running `cat -n` on the file: {path_str}:\n"
+                # Auto-enable concise mode for large Python files (>110 lines)
+                # Note: In K8s mode, we can't use tree-sitter for proper concise view,
+                # but we can provide a simple implementation
+                should_use_concise = False
+                if path_str.endswith(".py") and not view_range and not concise:
+                    if len(lines) > 110:
+                        should_use_concise = True
+                        concise = True  # Enable concise mode
+                        logger.debug(f"File {path_str} has {len(lines)} lines, auto-enabling concise mode")
+                
+                # For concise mode in K8s, provide a simple implementation
+                if concise and path_str.endswith(".py"):
+                    # Simple concise implementation: show imports, class/function definitions
+                    concise_lines = []
+                    in_function = False
+                    function_indent = 0
+                    
+                    for i, line in enumerate(lines):
+                        stripped = line.lstrip()
+                        indent = len(line) - len(stripped)
+                        
+                        # Always show imports, class definitions, and function definitions
+                        if (stripped.startswith('import ') or 
+                            stripped.startswith('from ') or
+                            stripped.startswith('class ') or
+                            stripped.startswith('def ') or
+                            stripped.startswith('async def ') or
+                            stripped.startswith('@')):  # decorators
+                            concise_lines.append((i, line))
+                            if stripped.startswith('def ') or stripped.startswith('async def '):
+                                in_function = True
+                                function_indent = indent
+                        # Show first line of docstrings
+                        elif stripped.startswith('"""') or stripped.startswith("'''"):
+                            concise_lines.append((i, line))
+                        # Show function body ellipsis
+                        elif in_function and indent > function_indent:
+                            if len(concise_lines) == 0 or concise_lines[-1][0] != i - 1:
+                                # Add ellipsis for elided function body
+                                concise_lines.append((i-1, " " * (function_indent + 4) + "..."))
+                            in_function = False
+                        else:
+                            in_function = False
+                    
+                    # Format concise output
+                    output = f"Here is a condensed view for file: {path_str}; [Note: Useful for understanding file structure in a concise manner. Use specific view_range to explore relevant parts.]\n"
+                    for i, line in concise_lines:
+                        output += f"{i+1:6d} {line}\n"
+                    
+                    output = self._maybe_truncate(output)
+                    return ToolResult(
+                        success=True,
+                        result={
+                            "output": output,
+                            "type": "file",
+                            "total_lines": len(concise_lines),
+                            "file_total_lines": len(lines),
+                            "concise": True
+                        }
+                    )
+                
+                # Regular view mode
+                if concise:
+                    output = f"Here is a condensed view for file: {path_str}; [Note: Useful for understanding file structure in a concise manner. Use specific view_range to explore relevant parts.]\n"
+                else:
+                    output = f"Here's the result of running `cat -n` on the file: {path_str}:\n"
                 
                 if view_range and len(view_range) == 2:
                     # view_range uses 1-based line numbers (user-facing)

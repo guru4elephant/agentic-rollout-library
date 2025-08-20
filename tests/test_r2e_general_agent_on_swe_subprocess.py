@@ -60,7 +60,7 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
     
     from workers.agents.general_agent import GeneralAgent, dump_trajectory
     from workers.core import create_tool
-    from workers.utils import create_llm_client
+    from workers.utils.llm_helper import call_llm
     from workers.core.trajectory import TrajectoryStep, StepType
     from workers.core.safe_profiler import SafeProfiler
     from workers.core.profiler_visualizer import ProfilerVisualizer
@@ -82,7 +82,7 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
     
     # Configure logging
     handlers = []
-    log_format = '%(asctime)s - [%(process)d] - %(levelname)s - %(message)s'
+    log_format = '%(asctime)s - [%(process)d] - %(levelname)s - %(name)s - %(message)s'
     
     # Console handler
     console_handler = logging.StreamHandler()
@@ -95,11 +95,34 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
         file_handler.setFormatter(logging.Formatter(log_format))
         handlers.append(file_handler)
     
+    # Configure root logger to capture all logs
     logging.basicConfig(level=logging.INFO, handlers=handlers, force=True)
+    
+    # Ensure R2E tools loggers propagate to root logger
+    # Allow debug level to be controlled via environment variable
+    r2e_log_level = os.environ.get('R2E_LOG_LEVEL', 'DEBUG')
+    if r2e_log_level.upper() == 'DEBUG':
+        logging.getLogger('workers.tools.r2e_tools').setLevel(logging.DEBUG)
+    else:
+        logging.getLogger('workers.tools.r2e_tools').setLevel(logging.INFO)
+    
+    # Also ensure kodo and other libraries log properly
+    logging.getLogger('kodo').setLevel(logging.INFO)
+    logging.getLogger('workers').setLevel(logging.INFO)
+    
     logger = logging.getLogger(__name__)
     
     if log_file:
         logger.info(f"Logging to file: {log_file}")
+        # Log active logger configuration
+        logger.info(f"Logger configuration:")
+        logger.info(f"  Root logger level: {logging.getLogger().level}")
+        logger.info(f"  R2E tools logger level: {logging.getLogger('workers.tools.r2e_tools').level}")
+        logger.info(f"  Workers logger level: {logging.getLogger('workers').level}")
+        logger.info(f"  R2E_LOG_LEVEL env var: {r2e_log_level}")
+        # Test that R2E tools logging is working
+        test_logger = logging.getLogger('workers.tools.r2e_tools.test')
+        test_logger.info("R2E tools logging test - this should appear in the log file")
     
     # Load instance data
     with open(instance_data_file, 'rb') as f:
@@ -123,7 +146,7 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
     # Use provided base_url or environment variable or default
     actual_base_url = base_url or provided_base_url or BASE_URL
     
-    logger.info(f"Process {os.getpid()}: Processing instance {instance_id} with model {actual_model_name}")
+    logger.info(f"Process {os.getpid()}: Processing instance {instance_id} with model {actual_model_name} and {actual_base_url}")
     
     # Global variables for cleanup
     global_kodo_runner = None
@@ -198,12 +221,20 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
                         environment={
                             "PYTHONPATH": "/testbed",
                             "SWE_INSTANCE_ID": instance_id,
+                            # UTF-8 encoding settings for LLM-generated code
+                            # This prevents UnicodeEncodeError when LLM generates Unicode characters
+                            # like checkmarks (âœ“), crosses (âœ—), or other special symbols
+                            "PYTHONIOENCODING": "utf-8",
+                            "LANG": "C.UTF-8",
+                            "LC_ALL": "C.UTF-8",
+                            # Proxy settings
                             "http_proxy": "http://agent.baidu.com:8891",
                             "https_proxy": "http://agent.baidu.com:8891",
                             "PIP_INDEX_URL": "http://pip.baidu.com/pypi/simple",
                             "PIP_TRUSTED_HOST": "pip.baidu.com"
                         }
                     )
+
                     logger.info(f"Pod {pod_name} started successfully on attempt {attempt + 1}")
                     break
                 except Exception as pod_error:
@@ -358,7 +389,7 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
             
             # Create agent
             agent = GeneralAgent(
-                max_rounds=50,
+                max_rounds=100,
                 debug=True,
                 termination_tool_names=["r2e_submit"],
                 action_parser=parse_xml_action_custom,
@@ -371,29 +402,32 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
             logger.info("Running agent to solve the issue...")
             logger.info(f"LLM Configuration: model={actual_model_name}, base_url={actual_base_url}, max_tokens={max_tokens}")
             
-            try:
-                llm_client = create_llm_client(
-                    api_key=API_KEY,
-                    base_url=actual_base_url,
-                    model=actual_model_name,
-                    debug=True
-                )
-            except Exception as e:
-                logger.error(f"Failed to create LLM client: {e}")
-                logger.error(f"API_KEY present: {bool(API_KEY)}")
-                logger.error(f"BASE_URL: {actual_base_url}")
-                logger.error(f"Model: {actual_model_name}")
-                raise
+            # 设置环境变量以供 llm_helper 使用
+            os.environ['LLM_API_KEY'] = API_KEY
+            os.environ['LLM_BASE_URL'] = actual_base_url
+            os.environ['LLM_MODEL_NAME'] = actual_model_name
             
-            # Override the generate method to use custom max_tokens and log LLM calls
-            original_generate = llm_client.generate
+            # 保存代理设置（重要：这些值在函数创建时就固定了）
+            saved_http_proxy = os.environ.get('http_proxy')
+            saved_https_proxy = os.environ.get('https_proxy')
+            if saved_http_proxy or saved_https_proxy:
+                logger.info(f"Proxy configured: http={saved_http_proxy}, https={saved_https_proxy}")
+            
+            # 创建一个包装函数，将同步的 call_llm 转换为异步接口
             llm_call_count = 0
             
-            async def generate_with_logging(messages, **kwargs):
+            async def llm_generate_func(messages, **kwargs):
                 nonlocal llm_call_count
                 llm_call_count += 1
                 
-                # Use our custom max_tokens if not already specified
+                # 重要：对于内网 LLM 服务，需要清除代理设置
+                # 因为内网服务不需要通过代理访问
+                if 'http_proxy' in os.environ:
+                    del os.environ['http_proxy']
+                if 'https_proxy' in os.environ:
+                    del os.environ['https_proxy']
+                
+                # 使用我们的默认 max_tokens
                 if 'max_tokens' not in kwargs:
                     kwargs['max_tokens'] = max_tokens
                 
@@ -402,8 +436,8 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
                 logger.info(f"LLM CALL #{llm_call_count}")
                 logger.info(f"{'~'*60}")
                 logger.info(f"Model: {actual_model_name}")
-                logger.info(f"Max Tokens: {kwargs.get('max_tokens', 'default')}")
-                logger.info(f"Temperature: {kwargs.get('temperature', 'default')}")
+                logger.info(f"Max Tokens: {kwargs.get('max_tokens', max_tokens)}")
+                logger.info(f"Temperature: {kwargs.get('temperature', 0.7)}")
                 logger.info(f"Messages: {len(messages)} messages")
                 
                 # Log all messages for better debugging
@@ -443,7 +477,23 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
                 start_time = time.time()
                 
                 try:
-                    response = await original_generate(messages, **kwargs)
+                    # 调试：检查调用前的代理状态
+                    current_http_proxy = os.environ.get('http_proxy', 'NOT SET')
+                    current_https_proxy = os.environ.get('https_proxy', 'NOT SET')
+                    logger.debug(f"Before call_llm - http_proxy: {current_http_proxy}, https_proxy: {current_https_proxy}")
+                    
+                    # 重要：使用 asyncio.to_thread 在线程中运行同步函数
+                    # 这样不会阻塞事件循环，避免与其他异步操作冲突
+                    import asyncio
+                    response = await asyncio.to_thread(
+                        call_llm,
+                        messages=messages,
+                        model=actual_model_name,
+                        temperature=kwargs.get('temperature', 0.7),
+                        top_p=kwargs.get('top_p', 0.95),
+                        max_tokens=kwargs.get('max_tokens', max_tokens),
+                        timeout=60
+                    )
                     execution_time = time.time() - start_time
                     
                     # Log response with full content
@@ -488,7 +538,7 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
                     logger.error(f"{'~'*60}\n")
                     raise
             
-            llm_client.generate = generate_with_logging
+            # 使用我们的包装函数
             
             prompt = f"""
 Consider the following github issue:
@@ -547,7 +597,7 @@ Follow these steps to resolve the issue:
                 
                 result = await agent.run_trajectory(
                     prompt=prompt,
-                    llm_generate_func=llm_client.generate,
+                    llm_generate_func=llm_generate_func,
                     request_id=f"swe_{instance_id}"
                 )
             except Exception as traj_error:
@@ -576,7 +626,7 @@ Follow these steps to resolve the issue:
             logger.info(f"Total trajectory steps: {len(result.steps)}")
             
             # Check if agent reached max rounds without calling termination tool
-            reached_max_rounds = len(result.steps) >= 50 * 2  # Rough estimate: 50 rounds * 2 steps per round
+            reached_max_rounds = len(result.steps) >= 100 * 2  # Rough estimate: 50 rounds * 2 steps per round
             called_submit = any(
                 step.tool_name == "r2e_submit" 
                 for step in result.steps 
@@ -584,10 +634,10 @@ Follow these steps to resolve the issue:
             )
             
             if not called_submit and reached_max_rounds:
-                logger.warning(f"⚠️ Agent reached max rounds (50) without calling r2e_submit")
-                logger.warning(f"⚠️ Patch will still be generated from current changes")
+                logger.warning(f"âš ï¸ Agent reached max rounds (100) without calling r2e_submit")
+                logger.warning(f"âš ï¸ Patch will still be generated from current changes")
             elif called_submit:
-                logger.info(f"✓ Agent called r2e_submit - normal termination")
+                logger.info(f"âœ“ Agent called r2e_submit - normal termination")
             else:
                 logger.info(f"Agent stopped after {len(result.steps)} steps")
             
@@ -854,6 +904,7 @@ class SubprocessSWEBenchRunner:
                  timeout_seconds: int = 600,  # Default 10 minutes timeout
                  max_tokens: int = 16000,  # Maximum tokens for model output
                  base_url: str = None,  # LLM base URL
+                 api_key: str = "",
                  local_mode: bool = False):  # Local mode for debugging
         """Initialize the runner.
         
@@ -873,6 +924,7 @@ class SubprocessSWEBenchRunner:
         self.timeout_seconds = timeout_seconds
         self.max_tokens = max_tokens
         self.base_url = base_url
+        self.api_key = api_key
         self.local_mode = local_mode
         self.patches = {}
         
@@ -914,7 +966,8 @@ class SubprocessSWEBenchRunner:
                 'output_dir': self.output_dir,
                 'enable_profiling': self.enable_profiling,
                 'max_tokens': self.max_tokens,  # Add max_tokens to instance data
-                'base_url': self.base_url  # Add base_url to instance data
+                'base_url': self.base_url,  # Add base_url to instance data
+                'api_key': self.api_key
             }
             
             # Save instance data to temp file
@@ -1072,7 +1125,7 @@ class SubprocessSWEBenchRunner:
         logger.info(f"{'='*80}")
         
         # Basic metrics
-        logger.info(f"\n📊 Basic Metrics:")
+        logger.info(f"\nðŸ“Š Basic Metrics:")
         logger.info(f"  Total instances: {len(instances)}")
         logger.info(f"  Successful: {successful} ({successful/len(instances)*100:.1f}%)")
         logger.info(f"  Failed: {failed} ({failed/len(instances)*100:.1f}%)")
@@ -1081,14 +1134,14 @@ class SubprocessSWEBenchRunner:
         logger.info(f"  Average time per instance: {elapsed_time/len(instances):.2f} seconds")
         
         # Throughput metrics
-        logger.info(f"\n⚡ Throughput:")
+        logger.info(f"\nâš¡ Throughput:")
         logger.info(f"  Overall: {overall_throughput:.3f} rollouts/sec")
         logger.info(f"  Completed rollouts: {global_stats['throughput']['completed']}")
         if self.max_concurrent > 1:
             logger.info(f"  Concurrency: {self.max_concurrent}x parallel")
         
         # Tool usage statistics
-        logger.info(f"\n🔧 Tool Usage:")
+        logger.info(f"\nðŸ”§ Tool Usage:")
         logger.info(f"  Total tool calls: {global_stats['total_tool_calls']}")
         if global_stats['total_tool_calls'] > 0:
             logger.info(f"  Average tool execution time: {avg_tool_time:.3f} seconds")
@@ -1098,14 +1151,14 @@ class SubprocessSWEBenchRunner:
                 logger.info(f"    - {tool_name}: {tool_stats['count']} calls, avg {avg_time:.3f}s")
         
         # LLM usage statistics
-        logger.info(f"\n🤖 LLM Usage:")
+        logger.info(f"\nðŸ¤– LLM Usage:")
         logger.info(f"  Total LLM calls: {global_stats['total_llm_calls']}")
         if global_stats['total_llm_calls'] > 0:
             logger.info(f"  Average LLM call time: {avg_llm_time:.3f} seconds")
             logger.info(f"  Average LLM calls per instance: {global_stats['total_llm_calls']/len(instances):.1f}")
         
         # Trajectory statistics
-        logger.info(f"\n📈 Trajectory Statistics:")
+        logger.info(f"\nðŸ“ˆ Trajectory Statistics:")
         if global_stats['rounds']['count'] > 0:
             logger.info(f"  Rounds: min={global_stats['rounds']['min']}, "
                       f"max={global_stats['rounds']['max']}, avg={avg_rounds:.1f}")
@@ -1114,7 +1167,7 @@ class SubprocessSWEBenchRunner:
                       f"max={global_stats['trajectory_lengths']['max']}, avg={avg_trajectory_length:.1f}")
         
         # Termination reasons
-        logger.info(f"\n🏁 Termination Reasons:")
+        logger.info(f"\nðŸ Termination Reasons:")
         term_stats = global_stats['termination_stats']
         total_terminations = sum(term_stats.values())
         if total_terminations > 0:
@@ -1123,8 +1176,8 @@ class SubprocessSWEBenchRunner:
             logger.info(f"  Other: {term_stats['other']} ({term_stats['other']/total_terminations*100:.1f}%)")
             
             if term_stats['max_rounds_reached'] > 0:
-                logger.warning(f"  ⚠️ {term_stats['max_rounds_reached']} instances reached max rounds without calling r2e_submit")
-                logger.warning(f"  ⚠️ These patches were generated from partial work")
+                logger.warning(f"  âš ï¸ {term_stats['max_rounds_reached']} instances reached max rounds without calling r2e_submit")
+                logger.warning(f"  âš ï¸ These patches were generated from partial work")
         
         logger.info(f"{'='*80}")
         
@@ -1147,7 +1200,6 @@ class SubprocessSWEBenchRunner:
             "max_concurrent": self.max_concurrent,
             "model_name": self.model_name,
             "model_index_range": self.model_index_range,
-            "base_url": self.base_url,
             "profiling_enabled": self.enable_profiling,
             "statistics": {
                 "throughput": {
@@ -1369,6 +1421,8 @@ async def main():
                        help="Maximum tokens for model output (default: 16000)")
     parser.add_argument("--base-url", type=str, default=None,
                        help="LLM base URL (overrides environment variable)")
+    parser.add_argument("--api-key", type=str, default=None,
+                       help="LLM API key (overrides environment variable)")
     parser.add_argument("--local-mode", action="store_true",
                        help="Run in local mode without subprocess for debugging")
     
@@ -1408,6 +1462,7 @@ async def main():
         timeout_seconds=args.timeout,
         max_tokens=args.max_tokens,
         base_url=args.base_url,
+        api_key=args.api_key,
         local_mode=args.local_mode
     )
     
