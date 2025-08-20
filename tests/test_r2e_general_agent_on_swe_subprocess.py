@@ -927,6 +927,36 @@ class SubprocessSWEBenchRunner:
         self.api_key = api_key
         self.local_mode = local_mode
         self.patches = {}
+    
+    def _has_existing_trajectory(self, instance_id: str) -> bool:
+        """Check if a trajectory file already exists for the given instance.
+        
+        Args:
+            instance_id: The instance ID to check
+            
+        Returns:
+            True if a trajectory file exists, False otherwise
+        """
+        trajectory_dir = os.path.join(self.output_dir, "trajectories")
+        if not os.path.exists(trajectory_dir):
+            return False
+        
+        # Replace / with __ for filesystem compatibility (same as in process_single_instance)
+        file_safe_instance_id = instance_id.replace('/', '__')
+        
+        # Check if any trajectory file exists for this instance
+        # Pattern: {instance_id}_{timestamp}.jsonl
+        import glob
+        pattern = os.path.join(trajectory_dir, f"{file_safe_instance_id}_*.jsonl")
+        existing_files = glob.glob(pattern)
+        
+        if existing_files:
+            # Return the most recent trajectory file for logging
+            existing_files.sort()
+            logger.info(f"Found existing trajectory for {instance_id}: {os.path.basename(existing_files[-1])}")
+            return True
+        
+        return False
         
     async def process_instances(self, instances: List[Dict[str, Any]]):
         """Process multiple instances concurrently using subprocess or locally."""
@@ -939,6 +969,38 @@ class SubprocessSWEBenchRunner:
             logger.info(f"Subprocess logs will be saved to: {logs_dir}")
         
         temp_dir = tempfile.mkdtemp(prefix="swe_bench_")
+        
+        # Filter out instances with existing trajectories
+        instances_to_process = []
+        skipped_instances = []
+        
+        for instance in instances:
+            instance_id = instance.get('instance_id', 'unknown')
+            if self._has_existing_trajectory(instance_id):
+                skipped_instances.append(instance_id)
+                logger.info(f"Skipping {instance_id} - trajectory already exists")
+            else:
+                instances_to_process.append(instance)
+        
+        # Log summary of skipped instances
+        if skipped_instances:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"SKIPPED INSTANCES WITH EXISTING TRAJECTORIES")
+            logger.info(f"{'='*60}")
+            logger.info(f"Total skipped: {len(skipped_instances)}")
+            logger.info(f"Instances to process: {len(instances_to_process)}")
+            for instance_id in skipped_instances[:10]:  # Show first 10
+                logger.info(f"  - {instance_id}")
+            if len(skipped_instances) > 10:
+                logger.info(f"  ... and {len(skipped_instances) - 10} more")
+            logger.info(f"{'='*60}\n")
+        
+        # Update instances to only include those without existing trajectories
+        instances = instances_to_process
+        
+        if not instances:
+            logger.info("All instances have existing trajectories. Nothing to process.")
+            return
         
         logger.info(f"Processing {len(instances)} instances with max concurrency: {self.max_concurrent}")
         if self.model_index_range:
@@ -1125,8 +1187,10 @@ class SubprocessSWEBenchRunner:
         logger.info(f"{'='*80}")
         
         # Basic metrics
-        logger.info(f"\nðŸ“Š Basic Metrics:")
+        logger.info(f"\nðŸ"Š Basic Metrics:")
         logger.info(f"  Total instances: {len(instances)}")
+        if skipped_instances:
+            logger.info(f"  Skipped (existing): {len(skipped_instances)}")
         logger.info(f"  Successful: {successful} ({successful/len(instances)*100:.1f}%)")
         logger.info(f"  Failed: {failed} ({failed/len(instances)*100:.1f}%)")
         logger.info(f"  Timeout: {timeout_count} ({timeout_count/len(instances)*100:.1f}%)")
@@ -1185,6 +1249,7 @@ class SubprocessSWEBenchRunner:
         summary_file = os.path.join(self.output_dir, "summary.json")
         summary = {
             "total_instances": len(instances),
+            "skipped_instances": len(skipped_instances) if 'skipped_instances' in locals() else 0,
             "successful_patches": successful,
             "failed_instances": failed,
             "timeout_instances": timeout_count,
@@ -1195,6 +1260,7 @@ class SubprocessSWEBenchRunner:
             "successful_instance_ids": successful_instances,
             "failed_instance_ids": failed_instances,
             "timeout_instance_ids": timeout_instances,
+            "skipped_instance_ids": skipped_instances if 'skipped_instances' in locals() else [],
             "timestamp": datetime.now().isoformat(),
             "elapsed_time": elapsed_time,
             "max_concurrent": self.max_concurrent,
