@@ -223,7 +223,7 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
                             "SWE_INSTANCE_ID": instance_id,
                             # UTF-8 encoding settings for LLM-generated code
                             # This prevents UnicodeEncodeError when LLM generates Unicode characters
-                            # like checkmarks (âœ“), crosses (âœ—), or other special symbols
+                            # like checkmarks (✓), crosses (✗), or other special symbols
                             "PYTHONIOENCODING": "utf-8",
                             "LANG": "C.UTF-8",
                             "LC_ALL": "C.UTF-8",
@@ -1187,7 +1187,7 @@ class SubprocessSWEBenchRunner:
         logger.info(f"{'='*80}")
         
         # Basic metrics
-        logger.info(f"\nðŸ"Š Basic Metrics:")
+        logger.info(f"Basic Metrics:")
         logger.info(f"  Total instances: {len(instances)}")
         if skipped_instances:
             logger.info(f"  Skipped (existing): {len(skipped_instances)}")
@@ -1198,14 +1198,14 @@ class SubprocessSWEBenchRunner:
         logger.info(f"  Average time per instance: {elapsed_time/len(instances):.2f} seconds")
         
         # Throughput metrics
-        logger.info(f"\nâš¡ Throughput:")
+        logger.info(f"Throughput:")
         logger.info(f"  Overall: {overall_throughput:.3f} rollouts/sec")
         logger.info(f"  Completed rollouts: {global_stats['throughput']['completed']}")
         if self.max_concurrent > 1:
             logger.info(f"  Concurrency: {self.max_concurrent}x parallel")
         
         # Tool usage statistics
-        logger.info(f"\nðŸ”§ Tool Usage:")
+        logger.info(f"Tool Usage:")
         logger.info(f"  Total tool calls: {global_stats['total_tool_calls']}")
         if global_stats['total_tool_calls'] > 0:
             logger.info(f"  Average tool execution time: {avg_tool_time:.3f} seconds")
@@ -1215,14 +1215,14 @@ class SubprocessSWEBenchRunner:
                 logger.info(f"    - {tool_name}: {tool_stats['count']} calls, avg {avg_time:.3f}s")
         
         # LLM usage statistics
-        logger.info(f"\nðŸ¤– LLM Usage:")
+        logger.info(f"LLM Usage:")
         logger.info(f"  Total LLM calls: {global_stats['total_llm_calls']}")
         if global_stats['total_llm_calls'] > 0:
             logger.info(f"  Average LLM call time: {avg_llm_time:.3f} seconds")
             logger.info(f"  Average LLM calls per instance: {global_stats['total_llm_calls']/len(instances):.1f}")
         
         # Trajectory statistics
-        logger.info(f"\nðŸ“ˆ Trajectory Statistics:")
+        logger.info(f"Trajectory Statistics:")
         if global_stats['rounds']['count'] > 0:
             logger.info(f"  Rounds: min={global_stats['rounds']['min']}, "
                       f"max={global_stats['rounds']['max']}, avg={avg_rounds:.1f}")
@@ -1231,7 +1231,7 @@ class SubprocessSWEBenchRunner:
                       f"max={global_stats['trajectory_lengths']['max']}, avg={avg_trajectory_length:.1f}")
         
         # Termination reasons
-        logger.info(f"\nðŸ Termination Reasons:")
+        logger.info(f"Termination Reasons:")
         term_stats = global_stats['termination_stats']
         total_terminations = sum(term_stats.values())
         if total_terminations > 0:
