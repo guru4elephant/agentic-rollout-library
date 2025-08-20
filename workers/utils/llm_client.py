@@ -7,7 +7,8 @@ Provides a unified interface for calling various LLM APIs using OpenAI SDK compa
 
 import asyncio
 import logging
-from typing import List, Dict, Any, Optional
+import os
+from typing import List, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,8 @@ logger = logging.getLogger(__name__)
 class LLMAPIClient:
     """LLM API客户端 - 使用OpenAI SDK接口兼容多种LLM提供商"""
     
-    def __init__(self, api_key: str, base_url: str, model: str, debug: bool = False, max_retries: int = 3):
+    def __init__(self, api_key: str, base_url: str, model: str, debug: bool = False, max_retries: int = 3,
+                 proxy_url: Optional[str] = None):
         """
         Initialize LLM API client.
         
@@ -25,6 +27,7 @@ class LLMAPIClient:
             model: Model name to use for generation
             debug: Enable debug mode to log all API inputs and outputs
             max_retries: Maximum number of retry attempts on failure (default: 3)
+            proxy_url: Optional proxy URL to use for requests (overrides environment variables)
         """
         self.api_key = api_key
         self.base_url = base_url.rstrip('/')
@@ -34,13 +37,55 @@ class LLMAPIClient:
         
         try:
             import openai
-            self.client = openai.AsyncOpenAI(
-                api_key=api_key,
-                base_url=f"{base_url}/v1",
-                timeout=60.0
-            )
-        except ImportError:
-            logger.error("需要安装openai库: pip install openai")
+            import httpx
+            
+            # 优先使用显式传入的代理配置，否则检测环境变量
+            if proxy_url:
+                http_proxy = proxy_url
+                https_proxy = proxy_url
+            else:
+                # 检测代理环境变量
+                http_proxy = os.environ.get('http_proxy') or os.environ.get('HTTP_PROXY')
+                https_proxy = os.environ.get('https_proxy') or os.environ.get('HTTPS_PROXY')
+            
+            # 如果有代理配置，创建自定义的 httpx 客户端
+            if http_proxy or https_proxy:
+                # httpx 使用统一的代理配置，优先使用 https_proxy
+                proxy_url = https_proxy or http_proxy
+                logger.info(f"使用代理: {proxy_url}")
+                
+                # 创建配置了代理的 httpx 客户端
+                # 重要：trust_env=False 确保不会受环境变量变化影响
+                http_client = httpx.AsyncClient(
+                    proxy=proxy_url,  # 使用 proxy 参数，而不是 proxies
+                    timeout=httpx.Timeout(120.0, connect=30.0),  # 增加超时时间
+                    verify=True,  # 验证 SSL 证书
+                    follow_redirects=True,
+                    trust_env=False  # 禁用自动读取环境变量，避免被 kodo 等工具干扰
+                )
+                
+                # 使用自定义 http 客户端创建 OpenAI 客户端
+                self.client = openai.AsyncOpenAI(
+                    api_key=api_key,
+                    base_url=f"{base_url}",
+                    timeout=60.0,
+                    http_client=http_client
+                )
+                logger.info(f"OpenAI 客户端已配置代理访问")
+            else:
+                # 没有代理配置，使用默认设置
+                self.client = openai.AsyncOpenAI(
+                    api_key=api_key,
+                    base_url=f"{base_url}",
+                    timeout=120.0  # 增加超时时间到 120 秒
+                )
+                logger.debug("OpenAI 客户端使用直连模式（无代理）")
+                
+        except ImportError as e:
+            if "openai" in str(e):
+                logger.error("需要安装openai库: pip install openai")
+            elif "httpx" in str(e):
+                logger.error("需要安装httpx库: pip install httpx")
             raise
     
     async def generate(self, messages: List[Dict[str, str]], max_tokens: int = 16000, temperature: float = 0.7) -> str:
@@ -214,7 +259,8 @@ class LLMAPIClient:
             logger.warning(f"Error closing client: {e}")
 
 
-def create_llm_client(api_key: str, base_url: str, model: str, debug: bool = False, max_retries: int = 3) -> LLMAPIClient:
+def create_llm_client(api_key: str, base_url: str, model: str, debug: bool = False, max_retries: int = 3,
+                     proxy_url: Optional[str] = None) -> LLMAPIClient:
     """
     Factory function to create LLM API client.
     
@@ -224,11 +270,12 @@ def create_llm_client(api_key: str, base_url: str, model: str, debug: bool = Fal
         model: Model name to use for generation
         debug: Enable debug mode to log all API inputs and outputs
         max_retries: Maximum number of retry attempts on failure (default: 3)
+        proxy_url: Optional proxy URL to use for requests (overrides environment variables)
         
     Returns:
         Configured LLMAPIClient instance
     """
-    return LLMAPIClient(api_key, base_url, model, debug, max_retries)
+    return LLMAPIClient(api_key, base_url, model, debug, max_retries, proxy_url)
 
 
 async def test_llm_connection(client: LLMAPIClient) -> bool:
@@ -259,3 +306,4 @@ async def test_llm_connection(client: LLMAPIClient) -> bool:
     except Exception as e:
         logger.error(f"❌ API连接测试失败: {e}")
         return False
+
