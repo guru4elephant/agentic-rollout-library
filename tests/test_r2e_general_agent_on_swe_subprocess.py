@@ -223,7 +223,7 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
                             "SWE_INSTANCE_ID": instance_id,
                             # UTF-8 encoding settings for LLM-generated code
                             # This prevents UnicodeEncodeError when LLM generates Unicode characters
-                            # like checkmarks (âœ“), crosses (âœ—), or other special symbols
+                            # like checkmarks (✓), crosses (✗), or other special symbols
                             "PYTHONIOENCODING": "utf-8",
                             "LANG": "C.UTF-8",
                             "LC_ALL": "C.UTF-8",
@@ -927,6 +927,36 @@ class SubprocessSWEBenchRunner:
         self.api_key = api_key
         self.local_mode = local_mode
         self.patches = {}
+    
+    def _has_existing_trajectory(self, instance_id: str) -> bool:
+        """Check if a trajectory file already exists for the given instance.
+        
+        Args:
+            instance_id: The instance ID to check
+            
+        Returns:
+            True if a trajectory file exists, False otherwise
+        """
+        trajectory_dir = os.path.join(self.output_dir, "trajectories")
+        if not os.path.exists(trajectory_dir):
+            return False
+        
+        # Replace / with __ for filesystem compatibility (same as in process_single_instance)
+        file_safe_instance_id = instance_id.replace('/', '__')
+        
+        # Check if any trajectory file exists for this instance
+        # Pattern: {instance_id}_{timestamp}.jsonl
+        import glob
+        pattern = os.path.join(trajectory_dir, f"{file_safe_instance_id}_*.jsonl")
+        existing_files = glob.glob(pattern)
+        
+        if existing_files:
+            # Return the most recent trajectory file for logging
+            existing_files.sort()
+            logger.info(f"Found existing trajectory for {instance_id}: {os.path.basename(existing_files[-1])}")
+            return True
+        
+        return False
         
     async def process_instances(self, instances: List[Dict[str, Any]]):
         """Process multiple instances concurrently using subprocess or locally."""
@@ -939,6 +969,38 @@ class SubprocessSWEBenchRunner:
             logger.info(f"Subprocess logs will be saved to: {logs_dir}")
         
         temp_dir = tempfile.mkdtemp(prefix="swe_bench_")
+        
+        # Filter out instances with existing trajectories
+        instances_to_process = []
+        skipped_instances = []
+        
+        for instance in instances:
+            instance_id = instance.get('instance_id', 'unknown')
+            if self._has_existing_trajectory(instance_id):
+                skipped_instances.append(instance_id)
+                logger.info(f"Skipping {instance_id} - trajectory already exists")
+            else:
+                instances_to_process.append(instance)
+        
+        # Log summary of skipped instances
+        if skipped_instances:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"SKIPPED INSTANCES WITH EXISTING TRAJECTORIES")
+            logger.info(f"{'='*60}")
+            logger.info(f"Total skipped: {len(skipped_instances)}")
+            logger.info(f"Instances to process: {len(instances_to_process)}")
+            for instance_id in skipped_instances[:10]:  # Show first 10
+                logger.info(f"  - {instance_id}")
+            if len(skipped_instances) > 10:
+                logger.info(f"  ... and {len(skipped_instances) - 10} more")
+            logger.info(f"{'='*60}\n")
+        
+        # Update instances to only include those without existing trajectories
+        instances = instances_to_process
+        
+        if not instances:
+            logger.info("All instances have existing trajectories. Nothing to process.")
+            return
         
         logger.info(f"Processing {len(instances)} instances with max concurrency: {self.max_concurrent}")
         if self.model_index_range:
@@ -1125,8 +1187,10 @@ class SubprocessSWEBenchRunner:
         logger.info(f"{'='*80}")
         
         # Basic metrics
-        logger.info(f"\nðŸ“Š Basic Metrics:")
+        logger.info(f"Basic Metrics:")
         logger.info(f"  Total instances: {len(instances)}")
+        if skipped_instances:
+            logger.info(f"  Skipped (existing): {len(skipped_instances)}")
         logger.info(f"  Successful: {successful} ({successful/len(instances)*100:.1f}%)")
         logger.info(f"  Failed: {failed} ({failed/len(instances)*100:.1f}%)")
         logger.info(f"  Timeout: {timeout_count} ({timeout_count/len(instances)*100:.1f}%)")
@@ -1134,14 +1198,14 @@ class SubprocessSWEBenchRunner:
         logger.info(f"  Average time per instance: {elapsed_time/len(instances):.2f} seconds")
         
         # Throughput metrics
-        logger.info(f"\nâš¡ Throughput:")
+        logger.info(f"Throughput:")
         logger.info(f"  Overall: {overall_throughput:.3f} rollouts/sec")
         logger.info(f"  Completed rollouts: {global_stats['throughput']['completed']}")
         if self.max_concurrent > 1:
             logger.info(f"  Concurrency: {self.max_concurrent}x parallel")
         
         # Tool usage statistics
-        logger.info(f"\nðŸ”§ Tool Usage:")
+        logger.info(f"Tool Usage:")
         logger.info(f"  Total tool calls: {global_stats['total_tool_calls']}")
         if global_stats['total_tool_calls'] > 0:
             logger.info(f"  Average tool execution time: {avg_tool_time:.3f} seconds")
@@ -1151,14 +1215,14 @@ class SubprocessSWEBenchRunner:
                 logger.info(f"    - {tool_name}: {tool_stats['count']} calls, avg {avg_time:.3f}s")
         
         # LLM usage statistics
-        logger.info(f"\nðŸ¤– LLM Usage:")
+        logger.info(f"LLM Usage:")
         logger.info(f"  Total LLM calls: {global_stats['total_llm_calls']}")
         if global_stats['total_llm_calls'] > 0:
             logger.info(f"  Average LLM call time: {avg_llm_time:.3f} seconds")
             logger.info(f"  Average LLM calls per instance: {global_stats['total_llm_calls']/len(instances):.1f}")
         
         # Trajectory statistics
-        logger.info(f"\nðŸ“ˆ Trajectory Statistics:")
+        logger.info(f"Trajectory Statistics:")
         if global_stats['rounds']['count'] > 0:
             logger.info(f"  Rounds: min={global_stats['rounds']['min']}, "
                       f"max={global_stats['rounds']['max']}, avg={avg_rounds:.1f}")
@@ -1167,7 +1231,7 @@ class SubprocessSWEBenchRunner:
                       f"max={global_stats['trajectory_lengths']['max']}, avg={avg_trajectory_length:.1f}")
         
         # Termination reasons
-        logger.info(f"\nðŸ Termination Reasons:")
+        logger.info(f"Termination Reasons:")
         term_stats = global_stats['termination_stats']
         total_terminations = sum(term_stats.values())
         if total_terminations > 0:
@@ -1185,6 +1249,7 @@ class SubprocessSWEBenchRunner:
         summary_file = os.path.join(self.output_dir, "summary.json")
         summary = {
             "total_instances": len(instances),
+            "skipped_instances": len(skipped_instances) if 'skipped_instances' in locals() else 0,
             "successful_patches": successful,
             "failed_instances": failed,
             "timeout_instances": timeout_count,
@@ -1195,6 +1260,7 @@ class SubprocessSWEBenchRunner:
             "successful_instance_ids": successful_instances,
             "failed_instance_ids": failed_instances,
             "timeout_instance_ids": timeout_instances,
+            "skipped_instance_ids": skipped_instances if 'skipped_instances' in locals() else [],
             "timestamp": datetime.now().isoformat(),
             "elapsed_time": elapsed_time,
             "max_concurrent": self.max_concurrent,
