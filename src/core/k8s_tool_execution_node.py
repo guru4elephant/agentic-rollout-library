@@ -310,11 +310,17 @@ class K8SToolExecutionNode(ToolExecutionNode):
 
             parsed_result = tool.parse_result(raw_result)
 
+            # Determine status: use parser's status if provided, otherwise default
+            if isinstance(parsed_result, dict) and "status" in parsed_result:
+                status = parsed_result.get("status")
+            else:
+                status = "success" if exit_code == 0 else "error"
+
             # Format response - always include stdout/stderr/exit_code
             result = {
                 "tool": tool_name,
                 "result": parsed_result,
-                "status": "success" if exit_code == 0 else "error",
+                "status": status,
                 "execution_mode": "k8s",
                 "pod": self.pod_name,
                 "stdout": stdout,        # Always provide subprocess stdout

@@ -58,7 +58,7 @@ if __name__ == "__main__":
 
     result = finish_func(command=args.command, result=args.result)
 
-    if result["error"]:
-        print(f"ERROR: {result['error']}")
+    if result.get("status") == "error":
+        print(f"ERROR: {result.get('error', 'Unknown error')}")
     else:
-        print(result["output"])
+        print(result.get("output", ""))

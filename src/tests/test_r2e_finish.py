@@ -124,9 +124,22 @@ class TestR2EFinishK8S:
             image="python:3.11-slim",
             pod_name="test-finish-pod"
         ) as executor:
+            # Register with result parser to extract stop status
+            def finish_parse_result(result):
+                if isinstance(result, dict) and result.get('stdout'):
+                    # Check if output contains finish marker
+                    if '<<<Finished>>>' in result['stdout']:
+                        return {
+                            "output": result['stdout'],
+                            "status": "stop",
+                            "message": "Task completed"
+                        }
+                return result
+
             executor.register_tool(
                 "r2e_submit",
-                "src/tools/r2e/finish.py"
+                "src/tools/r2e/finish.py",
+                finish_parse_result
             )
 
             tool_call = {
@@ -158,9 +171,22 @@ class TestR2EFinishK8S:
             image="python:3.11-slim",
             pod_name="test-finish-term-pod"
         ) as executor:
+            # Register with result parser to extract stop status
+            def finish_parse_result(result):
+                if isinstance(result, dict) and result.get('stdout'):
+                    # Check if output contains finish marker
+                    if '<<<Finished>>>' in result['stdout']:
+                        return {
+                            "output": result['stdout'],
+                            "status": "stop",
+                            "message": "Task completed"
+                        }
+                return result
+
             executor.register_tool(
                 "r2e_submit",
-                "src/tools/r2e/finish.py"
+                "src/tools/r2e/finish.py",
+                finish_parse_result
             )
 
             # Submit should set status to "stop"
