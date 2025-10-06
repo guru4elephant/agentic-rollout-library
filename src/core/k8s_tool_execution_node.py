@@ -107,9 +107,8 @@ class K8SToolExecutionNode(ToolExecutionNode):
         self._pod_creation_started = True
 
         try:
-            # Run synchronous pod creation in thread pool to avoid blocking
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._create_pod)
+            # Create pod asynchronously
+            await self._create_pod_async()
 
             # Signal that pod is ready
             self._pod_ready.set()
@@ -447,6 +446,43 @@ class K8SToolExecutionNode(ToolExecutionNode):
             self.logger.error(f"kubectl exec failed: {str(e)}")
             raise
 
+    async def _create_pod_async(self) -> None:
+        """
+        Create the persistent pod for tool execution asynchronously.
+
+        This pod will be used throughout the node's lifecycle.
+        First deletes any existing pod with the same name to ensure idempotency.
+        """
+        self.logger.info(f"Creating persistent K8S pod: {self.pod_name}")
+
+        try:
+            # Delete existing pod with same name if it exists (async)
+            await self._cleanup_existing_pod_async()
+
+            # Add PYTHONPATH to environment
+            env = self.environment.copy()
+            env['PYTHONPATH'] = '/workspace:$PYTHONPATH'
+
+            # Run blocking kodo call in thread pool
+            loop = asyncio.get_event_loop()
+            self.pod = await loop.run_in_executor(
+                None,
+                lambda: self.runner.start_container(
+                    self.image,
+                    name=self.pod_name,
+                    environment=env,
+                    node_selector=self.node_selector
+                )
+            )
+            self.logger.info(f"Pod {self.pod_name} created successfully")
+
+            # Copy tools to the pod (async)
+            await self._copy_tools_to_pod_async()
+
+        except Exception as e:
+            self.logger.error(f"Failed to create pod {self.pod_name}: {str(e)}")
+            raise
+
     def _create_pod(self) -> None:
         """
         Create the persistent pod for tool execution.
@@ -478,6 +514,66 @@ class K8SToolExecutionNode(ToolExecutionNode):
         except Exception as e:
             self.logger.error(f"Failed to create pod {self.pod_name}: {str(e)}")
             raise
+
+    async def _cleanup_existing_pod_async(self) -> None:
+        """
+        Clean up any existing pod with the same name asynchronously.
+
+        This ensures idempotency - if a previous run left a pod with the same name,
+        we delete it before creating a new one.
+        """
+        try:
+            # Check if pod exists
+            check_cmd = [
+                "kubectl", "get", "pod", self.pod_name,
+                "-n", self.namespace,
+                "--ignore-not-found"
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *check_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=10
+            )
+
+            # If pod exists (non-empty output), delete it
+            if stdout.strip():
+                self.logger.info(f"Found existing pod {self.pod_name}, deleting...")
+
+                delete_cmd = [
+                    "kubectl", "delete", "pod", self.pod_name,
+                    "-n", self.namespace,
+                    "--force", "--grace-period=0"
+                ]
+
+                delete_process = await asyncio.create_subprocess_exec(
+                    *delete_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+
+                await asyncio.wait_for(
+                    delete_process.communicate(),
+                    timeout=30
+                )
+
+                self.logger.info(f"Deleted existing pod {self.pod_name}")
+
+                # Wait asynchronously for pod to be fully deleted
+                await asyncio.sleep(2)
+            else:
+                self.logger.debug(f"No existing pod {self.pod_name} found")
+
+        except asyncio.TimeoutError:
+            self.logger.warning(f"Timeout while checking/deleting existing pod {self.pod_name}")
+        except Exception as e:
+            self.logger.warning(f"Error checking/deleting existing pod {self.pod_name}: {str(e)}")
+            # Don't raise - we'll try to create the pod anyway
 
     def _cleanup_existing_pod(self) -> None:
         """
@@ -533,6 +629,76 @@ class K8SToolExecutionNode(ToolExecutionNode):
         except Exception as e:
             self.logger.warning(f"Error checking/deleting existing pod {self.pod_name}: {str(e)}")
             # Don't raise - we'll try to create the pod anyway
+
+    async def _copy_tools_to_pod_async(self) -> None:
+        """
+        Copy the tools directory to the pod by copying individual files asynchronously.
+        """
+        import os
+        import glob
+
+        self.logger.info("Copying tools to pod...")
+
+        try:
+            # Get the tools directory path
+            current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            tools_dir = os.path.join(current_dir, "tools")
+
+            if not os.path.exists(tools_dir):
+                self.logger.warning(f"Tools directory not found: {tools_dir}")
+                return
+
+            # Create directory structure (run in thread pool)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: self.runner.execute_command(self.pod, "mkdir -p /workspace/src/tools/r2e")
+            )
+            await loop.run_in_executor(
+                None,
+                lambda: self.runner.execute_command(self.pod, "mkdir -p /workspace/src/tools/mini_swe")
+            )
+
+            # Collect all files to copy
+            copy_tasks = []
+
+            # Copy all Python files from tools/r2e
+            r2e_dir = os.path.join(tools_dir, "r2e")
+            if os.path.exists(r2e_dir):
+                for py_file in glob.glob(os.path.join(r2e_dir, "*.py")):
+                    filename = os.path.basename(py_file)
+                    pod_path = f"/workspace/src/tools/r2e/{filename}"
+                    copy_tasks.append(self._copy_file_to_pod_async(py_file, pod_path))
+
+            # Copy all Python files from tools/mini_swe
+            mini_swe_dir = os.path.join(tools_dir, "mini_swe")
+            if os.path.exists(mini_swe_dir):
+                for py_file in glob.glob(os.path.join(mini_swe_dir, "*.py")):
+                    filename = os.path.basename(py_file)
+                    pod_path = f"/workspace/src/tools/mini_swe/{filename}"
+                    copy_tasks.append(self._copy_file_to_pod_async(py_file, pod_path))
+
+            # Copy base_tool.py if exists
+            base_tool_path = os.path.join(tools_dir, "base_tool.py")
+            if os.path.exists(base_tool_path):
+                copy_tasks.append(self._copy_file_to_pod_async(base_tool_path, "/workspace/src/tools/base_tool.py"))
+
+            # Copy __init__.py files
+            for init_file in ["__init__.py", "r2e/__init__.py", "mini_swe/__init__.py"]:
+                local_init = os.path.join(tools_dir, init_file)
+                if os.path.exists(local_init):
+                    pod_init = f"/workspace/src/tools/{init_file}"
+                    copy_tasks.append(self._copy_file_to_pod_async(local_init, pod_init))
+
+            # Execute all copy operations concurrently
+            await asyncio.gather(*copy_tasks, return_exceptions=True)
+
+            self.logger.info("Tools copied to pod at /workspace/src/tools")
+
+        except Exception as e:
+            self.logger.warning(f"Failed to copy tools to pod: {str(e)}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
 
     def _copy_tools_to_pod(self) -> None:
         """
@@ -593,6 +759,34 @@ class K8SToolExecutionNode(ToolExecutionNode):
             import traceback
             self.logger.debug(traceback.format_exc())
             # Continue anyway - tools might not be needed
+
+    async def _copy_file_to_pod_async(self, local_path: str, pod_path: str) -> None:
+        """
+        Copy a single file to the pod using heredoc asynchronously.
+
+        Args:
+            local_path: Path to local file
+            pod_path: Destination path in pod
+        """
+        try:
+            # Read file content
+            with open(local_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            # Use base64 encoding to avoid shell escaping issues
+            import base64
+            content_b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+
+            # Create file in pod using base64 decoding (run in thread pool)
+            cmd = f"echo '{content_b64}' | base64 -d > {pod_path}"
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: self.runner.execute_command(self.pod, cmd)
+            )
+
+        except Exception as e:
+            self.logger.warning(f"Failed to copy {local_path} to pod: {str(e)}")
 
     def _copy_file_to_pod(self, local_path: str, pod_path: str) -> None:
         """
