@@ -228,8 +228,10 @@ async def process_single_instance(
     progress_tracker.create_task(task_id, instance_id)
 
     # Derive pod name from instance_id for idempotency
-    # Replace "--" with "-" to ensure valid K8S naming
-    pod_name = f"r2e-{instance_id.replace('--', '-')}"
+    # Replace all underscores and double-dashes with single dash for valid K8S naming
+    # K8S pod names must match: [a-z0-9]([-a-z0-9]*[a-z0-9])?
+    safe_instance_id = instance_id.replace('__', '-').replace('_', '-').replace('--', '-')
+    pod_name = f"r2e-{safe_instance_id}".lower()
 
     result = {
         "instance_id": instance_id,
@@ -469,7 +471,8 @@ async def main(
         async with semaphore:
             # Use instance_id to derive pod suffix for idempotency
             instance_id = instance_data.get("instance_id", f"unknown-{index}")
-            pod_suffix = instance_id.replace('--', '-')
+            # Sanitize for K8S naming: replace all underscores and double-dashes
+            pod_suffix = instance_id.replace('__', '-').replace('_', '-').replace('--', '-')
             return await process_single_instance(
                 instance_data,
                 pod_suffix,
