@@ -47,6 +47,8 @@ class TaskProgress:
     llm_success: int = 0
     llm_error: int = 0
     llm_timeout: int = 0
+    tool_parse_fail: int = 0
+    tool_exec_fail: int = 0
     status: str = "running"  # running, success, failed, max_iter
 
     def elapsed_time(self) -> float:
@@ -92,6 +94,18 @@ class ProgressTracker:
             if task_id in self.tasks:
                 self.tasks[task_id].llm_timeout += 1
 
+    def increment_tool_parse_fail(self, task_id: int) -> None:
+        """Increment tool parsing failures."""
+        with self.lock:
+            if task_id in self.tasks:
+                self.tasks[task_id].tool_parse_fail += 1
+
+    def increment_tool_exec_fail(self, task_id: int) -> None:
+        """Increment tool execution failures."""
+        with self.lock:
+            if task_id in self.tasks:
+                self.tasks[task_id].tool_exec_fail += 1
+
     def set_status(self, task_id: int, status: str) -> None:
         """Set task status."""
         with self.lock:
@@ -111,14 +125,14 @@ class ProgressTracker:
 
         # Clear screen and print header
         print("\033[2J\033[H", end="")  # Clear screen, move cursor to top
-        print("=" * 120)
+        print("=" * 135)
         print("CONCURRENT TASK PROGRESS")
-        print("=" * 120)
+        print("=" * 135)
 
         # Table header
-        header = f"{'Task':<6} {'Instance ID':<20} {'Iter':<5} {'Time(s)':<8} {'LLM✓':<6} {'LLM✗':<6} {'LLM⏱':<6} {'Status':<12}"
+        header = f"{'Task':<6} {'Instance ID':<20} {'Iter':<5} {'Time(s)':<8} {'LLM✓':<6} {'LLM✗':<6} {'LLM⏱':<6} {'TPF':<5} {'TEF':<5} {'Status':<12}"
         print(header)
-        print("-" * 120)
+        print("-" * 135)
 
         # Sort by task_id
         snapshot.sort(key=lambda t: t.task_id)
@@ -141,11 +155,13 @@ class ProgressTracker:
                 f"{task.llm_success:<6} "
                 f"{task.llm_error:<6} "
                 f"{task.llm_timeout:<6} "
+                f"{task.tool_parse_fail:<5} "
+                f"{task.tool_exec_fail:<5} "
                 f"{status_emoji} {task.status:<10}"
             )
             print(row)
 
-        print("-" * 120)
+        print("-" * 135)
 
         # Summary stats
         total = len(snapshot)
@@ -154,9 +170,12 @@ class ProgressTracker:
         completed = total - running - initializing
         total_llm_calls = sum(t.llm_success + t.llm_error + t.llm_timeout for t in snapshot)
 
-        print(f"Total: {total} | Initializing: {initializing} | Running: {running} | Completed: {completed} | Total LLM calls: {total_llm_calls}")
-        print("=" * 120)
-        print(f"Last update: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        total_parse_fails = sum(t.tool_parse_fail for t in snapshot)
+        total_exec_fails = sum(t.tool_exec_fail for t in snapshot)
+
+        print(f"Total: {total} | Initializing: {initializing} | Running: {running} | Completed: {completed} | Total LLM calls: {total_llm_calls} | Parse fails: {total_parse_fails} | Exec fails: {total_exec_fails}")
+        print("=" * 135)
+        print(f"Last update: {time.strftime('%Y-%m-%d %H:%M:%S')}\nTPF=Tool Parse Fail | TEF=Tool Exec Fail")
 
     def start_display(self, interval: float = 2.0) -> None:
         """Start background thread to display progress."""
@@ -372,10 +391,23 @@ async def process_single_instance(
                         raise
 
                     # Parse tool calls
-                    if enable_timeline:
-                        tool_calls = await parser.process_with_timing(llm_response, event_type="parse")
-                    else:
-                        tool_calls = await parser.process_async(llm_response)
+                    try:
+                        if enable_timeline:
+                            tool_calls = await parser.process_with_timing(llm_response, event_type="parse")
+                        else:
+                            tool_calls = await parser.process_async(llm_response)
+
+                        if not tool_calls or len(tool_calls) == 0:
+                            progress_tracker.increment_tool_parse_fail(task_id)
+                            print(f"\n⚠️  Task {task_id} ({instance_id}): Tool parsing returned empty list")
+                            print(f"   LLM Response: {llm_response.get('content', '')[:500]}")
+                            raise ValueError("No tool calls parsed from LLM response")
+
+                    except Exception as e:
+                        progress_tracker.increment_tool_parse_fail(task_id)
+                        print(f"\n❌ Task {task_id} ({instance_id}): Tool parse error: {str(e)}")
+                        print(f"   LLM Response: {llm_response.get('content', '')[:500]}")
+                        raise
 
                     context.add_message(
                         message_content=llm_response['content'],
@@ -384,11 +416,26 @@ async def process_single_instance(
                     )
                     tool_call = tool_calls[0]
 
-                    if enable_timeline:
-                        results = await k8s_executor.process_with_timing([tool_call], event_type="tool_execute", tool_name=tool_call.get('tool', 'unknown'))
-                    else:
-                        results = await k8s_executor.process_async([tool_call])
-                    tool_result = results[0] if results else {}
+                    # Execute tool
+                    try:
+                        if enable_timeline:
+                            results = await k8s_executor.process_with_timing([tool_call], event_type="tool_execute", tool_name=tool_call.get('tool', 'unknown'))
+                        else:
+                            results = await k8s_executor.process_async([tool_call])
+                        tool_result = results[0] if results else {}
+
+                        # Check if tool execution had errors
+                        if isinstance(tool_result, dict) and tool_result.get("status") == "error":
+                            progress_tracker.increment_tool_exec_fail(task_id)
+                            print(f"\n⚠️  Task {task_id} ({instance_id}): Tool execution error")
+                            print(f"   Tool: {tool_call.get('tool', 'unknown')}")
+                            print(f"   Error: {tool_result.get('error', 'Unknown error')[:200]}")
+
+                    except Exception as e:
+                        progress_tracker.increment_tool_exec_fail(task_id)
+                        print(f"\n❌ Task {task_id} ({instance_id}): Tool execution exception: {str(e)}")
+                        print(f"   Tool: {tool_call.get('tool', 'unknown')}")
+                        raise
 
                     # Check for stop signal
                     if isinstance(tool_result, dict) and tool_result.get("status") == "stop":
