@@ -36,6 +36,8 @@ class LLMNode(BaseNode):
             "max_tokens": 2000,
             "top_p": 0.95
         }
+        # Shared aiohttp session for connection pooling (created lazily)
+        self._shared_session = None
         self.retry_config = {
             "max_retries": 3,
             "initial_delay": 1,
@@ -304,15 +306,19 @@ class LLMNode(BaseNode):
 
         async def _make_api_call():
             import aiohttp
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    headers=headers,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=self.model_config.get('timeout', 60))
-                ) as response:
-                    response.raise_for_status()
-                    return await response.json()
+            # Create shared session if not exists (lazy initialization with connection pooling)
+            if self._shared_session is None or self._shared_session.closed:
+                connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
+                self._shared_session = aiohttp.ClientSession(connector=connector)
+
+            async with self._shared_session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=self.model_config.get('timeout', 60))
+            ) as response:
+                response.raise_for_status()
+                return await response.json()
 
         try:
             data = await self._retry_with_backoff_async(_make_api_call)
@@ -487,8 +493,28 @@ class LLMNode(BaseNode):
         """
         return self.last_response
 
+    async def close_async(self) -> None:
+        """Close the shared aiohttp session asynchronously."""
+        if self._shared_session and not self._shared_session.closed:
+            await self._shared_session.close()
+            self._shared_session = None
+
     def reset(self) -> None:
         """Reset the node to initial state."""
         super().reset()
         self.last_response = None
+
+    def __del__(self):
+        """Cleanup on deletion - close session if exists."""
+        if self._shared_session and not self._shared_session.closed:
+            # Can't use await in __del__, so just close synchronously
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self.close_async())
+                else:
+                    loop.run_until_complete(self.close_async())
+            except:
+                pass  # Best effort cleanup
 
