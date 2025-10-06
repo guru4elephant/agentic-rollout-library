@@ -382,10 +382,14 @@ class K8SToolExecutionNode(ToolExecutionNode):
         Create the persistent pod for tool execution.
 
         This pod will be used throughout the node's lifecycle.
+        First deletes any existing pod with the same name to ensure idempotency.
         """
         self.logger.info(f"Creating persistent K8S pod: {self.pod_name}")
 
         try:
+            # Delete existing pod with same name if it exists
+            self._cleanup_existing_pod()
+
             # Add PYTHONPATH to environment
             env = self.environment.copy()
             env['PYTHONPATH'] = '/workspace:$PYTHONPATH'
@@ -404,6 +408,61 @@ class K8SToolExecutionNode(ToolExecutionNode):
         except Exception as e:
             self.logger.error(f"Failed to create pod {self.pod_name}: {str(e)}")
             raise
+
+    def _cleanup_existing_pod(self) -> None:
+        """
+        Clean up any existing pod with the same name.
+
+        This ensures idempotency - if a previous run left a pod with the same name,
+        we delete it before creating a new one.
+        """
+        try:
+            import subprocess
+
+            # Check if pod exists
+            check_cmd = [
+                "kubectl", "get", "pod", self.pod_name,
+                "-n", self.namespace,
+                "--ignore-not-found"
+            ]
+
+            result = subprocess.run(
+                check_cmd,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            # If pod exists (non-empty output), delete it
+            if result.stdout.strip():
+                self.logger.info(f"Found existing pod {self.pod_name}, deleting...")
+
+                delete_cmd = [
+                    "kubectl", "delete", "pod", self.pod_name,
+                    "-n", self.namespace,
+                    "--force", "--grace-period=0"
+                ]
+
+                subprocess.run(
+                    delete_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+
+                self.logger.info(f"Deleted existing pod {self.pod_name}")
+
+                # Wait a bit for pod to be fully deleted
+                import time
+                time.sleep(2)
+            else:
+                self.logger.debug(f"No existing pod {self.pod_name} found")
+
+        except subprocess.TimeoutExpired:
+            self.logger.warning(f"Timeout while checking/deleting existing pod {self.pod_name}")
+        except Exception as e:
+            self.logger.warning(f"Error checking/deleting existing pod {self.pod_name}: {str(e)}")
+            # Don't raise - we'll try to create the pod anyway
 
     def _copy_tools_to_pod(self) -> None:
         """

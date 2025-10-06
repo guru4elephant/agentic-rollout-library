@@ -216,7 +216,7 @@ async def process_single_instance(
 
     Args:
         instance_data: Data for a single instance from JSONL
-        pod_suffix: Unique suffix for the pod name
+        pod_suffix: Unique suffix for the pod name (derived from instance_id)
         enable_timeline: Enable timeline tracking
 
     Returns:
@@ -226,6 +226,10 @@ async def process_single_instance(
 
     # Register task with progress tracker
     progress_tracker.create_task(task_id, instance_id)
+
+    # Derive pod name from instance_id for idempotency
+    # Replace "--" with "-" to ensure valid K8S naming
+    pod_name = f"r2e-{instance_id.replace('--', '-')}"
 
     result = {
         "instance_id": instance_id,
@@ -270,7 +274,7 @@ async def process_single_instance(
             name=f"R2EK8SExecutor-{pod_suffix}",
             namespace="default",
             image=image,
-            pod_name=f"r2e-agent-{pod_suffix}",
+            pod_name=pod_name,
             environment={
                 "PYTHONUNBUFFERED": "1"
             },
@@ -463,8 +467,9 @@ async def main(
     async def process_with_semaphore(instance_data, index):
         """Process an instance with semaphore control."""
         async with semaphore:
-            # Use index as pod suffix and task_id
-            pod_suffix = f"{index:04d}"
+            # Use instance_id to derive pod suffix for idempotency
+            instance_id = instance_data.get("instance_id", f"unknown-{index}")
+            pod_suffix = instance_id.replace('--', '-')
             return await process_single_instance(
                 instance_data,
                 pod_suffix,
