@@ -232,8 +232,7 @@ async def process_single_instance(
     task_id: int,
     progress_tracker: ProgressTracker,
     enable_timeline: bool = False,
-    debug: bool = False
-) -> Dict:
+    debug: bool = False) -> Dict:
     """Process a single instance from the JSONL file.
 
     Args:
@@ -298,12 +297,16 @@ async def process_single_instance(
         # Use context manager for automatic cleanup
         with K8SToolExecutionNode(
                 name=f"R2EK8SExecutor-{pod_suffix}",
-                namespace="default",
+                namespace="qianfan-train-cpu-ns",
+                node_selector={"nvme": "ok"},
                 kubeconfig_path="./cpu_config2",
                 image=image,
                 pod_name=pod_name,
                 environment={
-                    "PYTHONUNBUFFERED": "1"
+                    "PYTHONPATH": "/testbed",
+                    "PYTHONIOENCODING": "utf-8",
+                    "LANG": "C.UTF-8",
+                    "LC_ALL": "C.UTF-8"
                 },
                 timeline_enabled=enable_timeline
         ) as k8s_executor:
