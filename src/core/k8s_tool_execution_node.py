@@ -175,14 +175,18 @@ class K8SToolExecutionNode(ToolExecutionNode):
                 stderr = result_data.get("stderr", "")
                 exit_code = result_data.get("exit_code", 0)
             except (json.JSONDecodeError, AttributeError) as e:
-                self.logger.warning(f"Failed to parse tool output as JSON: {e}")
-                self.logger.debug(f"Raw output: {output[:200]}")
-                stdout = str(output) if output is not None else ""
-                stderr = ""
+                self.logger.error(f"Tool '{tool_name}' wrapper failed to produce JSON output")
+                self.logger.error(f"JSON parse error: {e}")
+                self.logger.error(f"Raw output (first 500 chars): {output[:500] if output else 'EMPTY'}")
+                self.logger.error(f"kubectl status code: {kodo_status}")
+
+                # Treat this as a critical tool execution error
+                stdout = ""
+                stderr = f"Tool wrapper script failed. Raw output: {output[:200] if output else 'EMPTY'}"
                 try:
-                    exit_code = int(kodo_status) if kodo_status and kodo_status != "0" else 0
+                    exit_code = int(kodo_status) if kodo_status and kodo_status != "0" else 1
                 except (ValueError, TypeError):
-                    exit_code = 0 if str(kodo_status) == "0" else 1
+                    exit_code = 1  # Always mark as error if JSON parsing failed
 
             raw_result = {
                 "output": stdout,
@@ -311,16 +315,18 @@ class K8SToolExecutionNode(ToolExecutionNode):
                 stderr = result_data.get("stderr", "")
                 exit_code = result_data.get("exit_code", 0)
             except (json.JSONDecodeError, AttributeError) as e:
-                # Fallback if output is not valid JSON
-                self.logger.warning(f"Failed to parse tool output as JSON: {e}")
-                self.logger.debug(f"Raw output: {output[:200]}")
-                stdout = str(output) if output is not None else ""
-                stderr = ""
-                # Try to extract exit code from kodo_status
+                self.logger.error(f"Tool '{tool_name}' wrapper failed to produce JSON output")
+                self.logger.error(f"JSON parse error: {e}")
+                self.logger.error(f"Raw output (first 500 chars): {output[:500] if output else 'EMPTY'}")
+                self.logger.error(f"kodo status code: {kodo_status}")
+
+                # Treat this as a critical tool execution error
+                stdout = ""
+                stderr = f"Tool wrapper script failed. Raw output: {output[:200] if output else 'EMPTY'}"
                 try:
-                    exit_code = int(kodo_status) if kodo_status and kodo_status != "0" else 0
+                    exit_code = int(kodo_status) if kodo_status and kodo_status != "0" else 1
                 except (ValueError, TypeError):
-                    exit_code = 0 if str(kodo_status) == "0" else 1
+                    exit_code = 1  # Always mark as error if JSON parsing failed
 
             # Build raw_result with both stdout and stderr
             # Provide both formats for compatibility with different result_parsers

@@ -364,7 +364,7 @@ async def process_single_instance(
                 message_type="query"
             )
 
-            max_iterations = 10
+            max_iterations = instance_data.get("max_iterations", 30)
             iteration = 0
 
             # Mark as running after pod is ready
@@ -427,9 +427,11 @@ async def process_single_instance(
                         # Check if tool execution had errors
                         if isinstance(tool_result, dict) and tool_result.get("status") == "error":
                             progress_tracker.increment_tool_exec_fail(task_id)
-                            print(f"\n⚠️  Task {task_id} ({instance_id}): Tool execution error")
+                            error_msg = tool_result.get('error', 'Unknown error')
+                            print(f"\n⚠️  Task {task_id} ({instance_id}) iter {iteration}: Tool execution error")
                             print(f"   Tool: {tool_call.get('tool', 'unknown')}")
-                            print(f"   Error: {tool_result.get('error', 'Unknown error')[:200]}")
+                            print(f"   Error: {error_msg[:300]}")
+                            # Don't continue with more error details to avoid log spam
 
                     except Exception as e:
                         progress_tracker.increment_tool_exec_fail(task_id)
@@ -526,21 +528,35 @@ async def main(
 
     # Create semaphore for concurrency control
     semaphore = asyncio.Semaphore(max_concurrent)
+    active_tasks = {'count': 0}
+    lock = asyncio.Lock()
 
     async def process_with_semaphore(instance_data, index):
         """Process an instance with semaphore control."""
         async with semaphore:
-            # Use instance_id to derive pod suffix for idempotency
-            instance_id = instance_data.get("instance_id", f"unknown-{index}")
-            # Sanitize for K8S naming: replace all underscores and double-dashes
-            pod_suffix = instance_id.replace('__', '-').replace('_', '-').replace('--', '-')
-            return await process_single_instance(
-                instance_data,
-                pod_suffix,
-                task_id=index,
-                progress_tracker=progress_tracker,
-                enable_timeline=enable_timeline
-            )
+            async with lock:
+                active_tasks['count'] += 1
+                current_active = active_tasks['count']
+
+            # Log when we reach peak concurrency
+            if current_active >= max_concurrent * 0.8:
+                print(f"⚡ High concurrency: {current_active}/{max_concurrent} tasks active")
+
+            try:
+                # Use instance_id to derive pod suffix for idempotency
+                instance_id = instance_data.get("instance_id", f"unknown-{index}")
+                # Sanitize for K8S naming: replace all underscores and double-dashes
+                pod_suffix = instance_id.replace('__', '-').replace('_', '-').replace('--', '-')
+                return await process_single_instance(
+                    instance_data,
+                    pod_suffix,
+                    task_id=index,
+                    progress_tracker=progress_tracker,
+                    enable_timeline=enable_timeline
+                )
+            finally:
+                async with lock:
+                    active_tasks['count'] -= 1
 
     # Create tasks for all instances
     tasks = [
