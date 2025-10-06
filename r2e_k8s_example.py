@@ -231,7 +231,8 @@ async def process_single_instance(
     pod_suffix: str,
     task_id: int,
     progress_tracker: ProgressTracker,
-    enable_timeline: bool = False
+    enable_timeline: bool = False,
+    debug: bool = False
 ) -> Dict:
     """Process a single instance from the JSONL file.
 
@@ -239,6 +240,7 @@ async def process_single_instance(
         instance_data: Data for a single instance from JSONL
         pod_suffix: Unique suffix for the pod name (derived from instance_id)
         enable_timeline: Enable timeline tracking
+        debug: Enable debug mode (detailed logging)
 
     Returns:
         Result dictionary with instance_id and execution status
@@ -382,6 +384,13 @@ async def process_single_instance(
                             llm_response = await llm_node.process_with_timing(messages, event_type="llm_call")
                         else:
                             llm_response = await llm_node.process_async(messages)
+
+                        # Print raw LLM response for debugging
+                        if debug:
+                            print(f"\n🤖 Task {task_id} iter {iteration} - LLM Response (FULL):")
+                            print(f"{llm_response.get('content', '')}")
+                            print("-" * 80)
+
                         progress_tracker.increment_llm_success(task_id)
                     except asyncio.TimeoutError:
                         progress_tracker.increment_llm_timeout(task_id)
@@ -396,6 +405,12 @@ async def process_single_instance(
                             tool_calls = await parser.process_with_timing(llm_response, event_type="parse")
                         else:
                             tool_calls = await parser.process_async(llm_response)
+
+                        # Print parsed tool calls for debugging
+                        if debug and tool_calls and len(tool_calls) > 0:
+                            print(f"📝 Parsed tool: {tool_calls[0].get('tool', 'unknown')}")
+                            print(f"📝 Tool params (FULL): {tool_calls[0].get('parameters', {})}")
+                            print("-" * 80)
 
                         if not tool_calls or len(tool_calls) == 0:
                             progress_tracker.increment_tool_parse_fail(task_id)
@@ -424,6 +439,17 @@ async def process_single_instance(
                             results = await k8s_executor.process_async([tool_call])
                         tool_result = results[0] if results else {}
 
+                        # Print raw tool execution result for debugging
+                        if debug:
+                            print(f"🔧 Tool result status: {tool_result.get('status', 'unknown')}")
+                            if 'exit_code' in tool_result:
+                                print(f"🔧 Tool exit_code: {tool_result.get('exit_code')}")
+                            if 'stdout' in tool_result:
+                                print(f"🔧 Tool stdout (FULL):\n{tool_result.get('stdout', '')}")
+                            if 'stderr' in tool_result and tool_result.get('stderr'):
+                                print(f"🔧 Tool stderr (FULL):\n{tool_result.get('stderr', '')}")
+                            print("-" * 80)
+
                         # Check if tool execution had errors
                         if isinstance(tool_result, dict) and tool_result.get("status") == "error":
                             progress_tracker.increment_tool_exec_fail(task_id)
@@ -447,6 +473,11 @@ async def process_single_instance(
 
                     # Get formatted result from parser
                     formatted_result = tool_result.get('result', '')
+
+                    # Print formatted result for debugging
+                    if debug:
+                        print(f"📤 Formatted result (FULL):\n{str(formatted_result)}")
+                        print("=" * 80)
 
                     # Ensure formatted_result is a string
                     if isinstance(formatted_result, dict):
@@ -491,7 +522,8 @@ async def process_single_instance(
 async def main(
     jsonl_file: str,
     max_concurrent: int = 3,
-    enable_timeline: bool = False
+    enable_timeline: bool = False,
+    debug: bool = False
 ):
     """Main function to process JSONL file with concurrent execution.
 
@@ -499,6 +531,7 @@ async def main(
         jsonl_file: Path to the JSONL file containing instances
         max_concurrent: Maximum number of concurrent executions
         enable_timeline: Enable timeline tracking for profiling
+        debug: Enable debug mode (detailed logging, no progress table)
     """
     # Create progress tracker
     progress_tracker = ProgressTracker()
@@ -507,6 +540,7 @@ async def main(
     print(f"📁 JSONL file: {jsonl_file}")
     print(f"🔧 Max concurrent: {max_concurrent}")
     print(f"⏱️ Timeline tracking: {'ENABLED' if enable_timeline else 'DISABLED'}")
+    print(f"🐛 Debug mode: {'ENABLED' if debug else 'DISABLED'}")
     print()
 
     # Load instances from JSONL file
@@ -521,10 +555,13 @@ async def main(
         print(f"❌ Error loading JSONL file: {e}")
         return
 
-    # Start progress display
-    print("\n🔄 Starting progress display...\n")
-    time.sleep(1)
-    progress_tracker.start_display(interval=2.0)
+    # Start progress display (only if not in debug mode)
+    if not debug:
+        print("\n🔄 Starting progress display...\n")
+        time.sleep(1)
+        progress_tracker.start_display(interval=2.0)
+    else:
+        print("\n🐛 Debug mode: Progress table disabled, detailed logging enabled\n")
 
     # Create semaphore for concurrency control
     semaphore = asyncio.Semaphore(max_concurrent)
@@ -552,7 +589,8 @@ async def main(
                     pod_suffix,
                     task_id=index,
                     progress_tracker=progress_tracker,
-                    enable_timeline=enable_timeline
+                    enable_timeline=enable_timeline,
+                    debug=debug
                 )
             finally:
                 async with lock:
@@ -567,8 +605,9 @@ async def main(
     # Execute all tasks
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Stop progress display
-    progress_tracker.stop_display()
+    # Stop progress display (only if it was started)
+    if not debug:
+        progress_tracker.stop_display()
 
     # Print summary
     print("\n\n" + "="*60)
@@ -636,6 +675,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable timeline tracking for profiling"
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode (detailed logging, no progress table)"
+    )
     args = parser.parse_args()
 
     # Set up event loop with proper configuration for high concurrency
@@ -647,7 +691,8 @@ if __name__ == "__main__":
             main(
                 jsonl_file=args.jsonl,
                 max_concurrent=args.concurrent,
-                enable_timeline=args.timeline
+                enable_timeline=args.timeline,
+                debug=args.debug
             )
         )
     finally:
