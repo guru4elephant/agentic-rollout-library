@@ -9,9 +9,13 @@ in Kubernetes pods using the R2E prompt format and tools (bash, file_editor, sea
 import sys
 import json
 import asyncio
+import time
+import threading
 from pathlib import Path
 from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from collections import defaultdict
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
@@ -31,6 +35,146 @@ from r2e_configs import (
     QUERY_PROMPT_TEMPLATE,
     DEFAULT_TEMPLATE_VARIABLES
 )
+
+
+@dataclass
+class TaskProgress:
+    """Track progress for a single task."""
+    task_id: int
+    instance_id: str
+    start_time: float = field(default_factory=time.time)
+    iterations: int = 0
+    llm_success: int = 0
+    llm_error: int = 0
+    llm_timeout: int = 0
+    status: str = "running"  # running, success, failed, max_iter
+
+    def elapsed_time(self) -> float:
+        """Get elapsed time in seconds."""
+        return time.time() - self.start_time
+
+
+class ProgressTracker:
+    """Thread-safe progress tracker for concurrent tasks."""
+
+    def __init__(self):
+        self.tasks: Dict[int, TaskProgress] = {}
+        self.lock = threading.Lock()
+        self.display_running = False
+        self.display_thread = None
+
+    def create_task(self, task_id: int, instance_id: str) -> None:
+        """Create a new task entry."""
+        with self.lock:
+            self.tasks[task_id] = TaskProgress(task_id=task_id, instance_id=instance_id)
+
+    def update_iteration(self, task_id: int, iteration: int) -> None:
+        """Update iteration count."""
+        with self.lock:
+            if task_id in self.tasks:
+                self.tasks[task_id].iterations = iteration
+
+    def increment_llm_success(self, task_id: int) -> None:
+        """Increment successful LLM calls."""
+        with self.lock:
+            if task_id in self.tasks:
+                self.tasks[task_id].llm_success += 1
+
+    def increment_llm_error(self, task_id: int) -> None:
+        """Increment LLM errors."""
+        with self.lock:
+            if task_id in self.tasks:
+                self.tasks[task_id].llm_error += 1
+
+    def increment_llm_timeout(self, task_id: int) -> None:
+        """Increment LLM timeouts."""
+        with self.lock:
+            if task_id in self.tasks:
+                self.tasks[task_id].llm_timeout += 1
+
+    def set_status(self, task_id: int, status: str) -> None:
+        """Set task status."""
+        with self.lock:
+            if task_id in self.tasks:
+                self.tasks[task_id].status = status
+
+    def get_snapshot(self) -> List[TaskProgress]:
+        """Get a thread-safe snapshot of all tasks."""
+        with self.lock:
+            return list(self.tasks.values())
+
+    def print_table(self) -> None:
+        """Print progress table."""
+        snapshot = self.get_snapshot()
+        if not snapshot:
+            return
+
+        # Clear screen and print header
+        print("\033[2J\033[H", end="")  # Clear screen, move cursor to top
+        print("=" * 120)
+        print("CONCURRENT TASK PROGRESS")
+        print("=" * 120)
+
+        # Table header
+        header = f"{'Task':<6} {'Instance ID':<20} {'Iter':<5} {'Time(s)':<8} {'LLM✓':<6} {'LLM✗':<6} {'LLM⏱':<6} {'Status':<12}"
+        print(header)
+        print("-" * 120)
+
+        # Sort by task_id
+        snapshot.sort(key=lambda t: t.task_id)
+
+        # Print each task
+        for task in snapshot:
+            status_emoji = {
+                "running": "🔄",
+                "success": "✅",
+                "failed": "❌",
+                "max_iter": "⚠️"
+            }.get(task.status, "❓")
+
+            row = (
+                f"{task.task_id:<6} "
+                f"{task.instance_id[:20]:<20} "
+                f"{task.iterations:<5} "
+                f"{task.elapsed_time():<8.1f} "
+                f"{task.llm_success:<6} "
+                f"{task.llm_error:<6} "
+                f"{task.llm_timeout:<6} "
+                f"{status_emoji} {task.status:<10}"
+            )
+            print(row)
+
+        print("-" * 120)
+
+        # Summary stats
+        total = len(snapshot)
+        running = sum(1 for t in snapshot if t.status == "running")
+        completed = total - running
+        total_llm_calls = sum(t.llm_success + t.llm_error + t.llm_timeout for t in snapshot)
+
+        print(f"Total: {total} | Running: {running} | Completed: {completed} | Total LLM calls: {total_llm_calls}")
+        print("=" * 120)
+        print(f"Last update: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    def start_display(self, interval: float = 2.0) -> None:
+        """Start background thread to display progress."""
+        self.display_running = True
+
+        def display_loop():
+            while self.display_running:
+                self.print_table()
+                time.sleep(interval)
+
+        self.display_thread = threading.Thread(target=display_loop, daemon=True)
+        self.display_thread.start()
+
+    def stop_display(self) -> None:
+        """Stop background display thread."""
+        self.display_running = False
+        if self.display_thread:
+            self.display_thread.join(timeout=3)
+        # Print final table
+        self.print_table()
 
 def create_r2e_parser():
     """
@@ -64,6 +208,8 @@ def create_r2e_parser():
 async def process_single_instance(
     instance_data: Dict,
     pod_suffix: str,
+    task_id: int,
+    progress_tracker: ProgressTracker,
     enable_timeline: bool = False
 ) -> Dict:
     """Process a single instance from the JSONL file.
@@ -77,7 +223,9 @@ async def process_single_instance(
         Result dictionary with instance_id and execution status
     """
     instance_id = instance_data.get("instance_id", "unknown")
-    print(f"\n🚀 Processing instance: {instance_id} (pod: r2e-agent-{pod_suffix})")
+
+    # Register task with progress tracker
+    progress_tracker.create_task(task_id, instance_id)
 
     result = {
         "instance_id": instance_id,
@@ -193,13 +341,28 @@ async def process_single_instance(
 
             while iteration < max_iterations:
                 iteration += 1
+                progress_tracker.update_iteration(task_id, iteration)
+
                 messages = context.get_llm_context()
                 try:
+                    # Call LLM and track success/error/timeout
+                    try:
+                        if enable_timeline:
+                            llm_response = await llm_node.process_with_timing(messages, event_type="llm_call")
+                        else:
+                            llm_response = await llm_node.process_async(messages)
+                        progress_tracker.increment_llm_success(task_id)
+                    except asyncio.TimeoutError:
+                        progress_tracker.increment_llm_timeout(task_id)
+                        raise
+                    except Exception:
+                        progress_tracker.increment_llm_error(task_id)
+                        raise
+
+                    # Parse tool calls
                     if enable_timeline:
-                        llm_response = await llm_node.process_with_timing(messages, event_type="llm_call")
                         tool_calls = await parser.process_with_timing(llm_response, event_type="parse")
                     else:
-                        llm_response = await llm_node.process_async(messages)
                         tool_calls = await parser.process_async(llm_response)
 
                     context.add_message(
@@ -218,7 +381,7 @@ async def process_single_instance(
                     # Check for stop signal
                     if isinstance(tool_result, dict) and tool_result.get("status") == "stop":
                         result["status"] = "success"
-                        print(f"✅ Instance {instance_id} completed successfully")
+                        progress_tracker.set_status(task_id, "success")
                         return result
 
                     # Get formatted result from parser
@@ -241,17 +404,17 @@ async def process_single_instance(
                     )
 
                 except Exception as e:
-                    print(f"\n❌ Error in agent loop for {instance_id}: {str(e)}")
                     result["error"] = str(e)
+                    progress_tracker.set_status(task_id, "failed")
                     break
 
             if iteration >= max_iterations:
-                print(f"\n⚠️ Instance {instance_id} reached maximum iterations ({max_iterations})")
                 result["status"] = "max_iterations"
+                progress_tracker.set_status(task_id, "max_iter")
 
     except Exception as e:
-        print(f"❌ Error processing instance {instance_id}: {str(e)}")
         result["error"] = str(e)
+        progress_tracker.set_status(task_id, "failed")
 
     return result
 
@@ -268,10 +431,14 @@ async def main(
         max_concurrent: Maximum number of concurrent executions
         enable_timeline: Enable timeline tracking for profiling
     """
-    print("=== R2E Agent K8S Concurrent Executor ===\n")
+    # Create progress tracker
+    progress_tracker = ProgressTracker()
+
+    print("=== R2E Agent K8S Concurrent Executor ===")
     print(f"📁 JSONL file: {jsonl_file}")
     print(f"🔧 Max concurrent: {max_concurrent}")
-    print(f"⏱️ Timeline tracking: {'ENABLED' if enable_timeline else 'DISABLED'}\n")
+    print(f"⏱️ Timeline tracking: {'ENABLED' if enable_timeline else 'DISABLED'}")
+    print()
 
     # Load instances from JSONL file
     instances = []
@@ -280,10 +447,15 @@ async def main(
             for line in f:
                 if line.strip():
                     instances.append(json.loads(line))
-        print(f"📊 Loaded {len(instances)} instances from file\n")
+        print(f"📊 Loaded {len(instances)} instances from file")
     except Exception as e:
         print(f"❌ Error loading JSONL file: {e}")
         return
+
+    # Start progress display
+    print("\n🔄 Starting progress display...\n")
+    time.sleep(1)
+    progress_tracker.start_display(interval=2.0)
 
     # Create semaphore for concurrency control
     semaphore = asyncio.Semaphore(max_concurrent)
@@ -291,12 +463,14 @@ async def main(
     async def process_with_semaphore(instance_data, index):
         """Process an instance with semaphore control."""
         async with semaphore:
-            # Use index as pod suffix to ensure uniqueness
+            # Use index as pod suffix and task_id
             pod_suffix = f"{index:04d}"
             return await process_single_instance(
                 instance_data,
                 pod_suffix,
-                enable_timeline
+                task_id=index,
+                progress_tracker=progress_tracker,
+                enable_timeline=enable_timeline
             )
 
     # Create tasks for all instances
@@ -306,11 +480,13 @@ async def main(
     ]
 
     # Execute all tasks
-    print(f"🚀 Starting concurrent processing...\n")
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
+    # Stop progress display
+    progress_tracker.stop_display()
+
     # Print summary
-    print("\n" + "="*60)
+    print("\n\n" + "="*60)
     print("EXECUTION SUMMARY")
     print("="*60)
 
