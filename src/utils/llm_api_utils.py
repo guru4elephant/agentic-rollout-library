@@ -143,6 +143,9 @@ def create_openai_api_handle_async(
         os.environ.pop('ALL_PROXY', None)
         os.environ.pop('all_proxy', None)
 
+    # Shared session for connection pooling (lazy initialization)
+    session = None
+
     async def openai_api_handle_async(messages: List[Dict], **kwargs) -> Dict:
         """
         Handle OpenAI-compatible API requests asynchronously.
@@ -158,6 +161,13 @@ def create_openai_api_handle_async(
             RuntimeError: If API request fails or response is invalid
         """
         import aiohttp
+
+        nonlocal session
+
+        # Create shared session if not exists
+        if session is None or session.closed:
+            connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
+            session = aiohttp.ClientSession(connector=connector)
 
         url = f"{base_url.rstrip('/')}/chat/completions"
         headers = {
@@ -176,15 +186,14 @@ def create_openai_api_handle_async(
 
         try:
             timeout = aiohttp.ClientTimeout(total=kwargs.get('timeout', 120))
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    headers=headers,
-                    json=payload,
-                    timeout=timeout
-                ) as response:
-                    response.raise_for_status()
-                    data = await response.json()
+            async with session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=timeout
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
 
             choice = data['choices'][0]
             message = choice['message']

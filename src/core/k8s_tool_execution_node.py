@@ -81,13 +81,43 @@ class K8SToolExecutionNode(ToolExecutionNode):
         # Generate pod name if not provided
         self.pod_name = pod_name or self._generate_pod_name()
 
-        # Pod reference (will be created during initialization)
+        # Pod reference (will be created lazily on first use)
         self.pod = None
+        self._pod_ready = asyncio.Event()
+        self._pod_creation_started = False
 
-        # Create the persistent pod
-        self._create_pod()
+        self.logger.info(f"K8S Tool Execution Node initialized (pod will be created on first use): {self.pod_name}")
 
-        self.logger.info(f"K8S Tool Execution Node initialized with pod: {self.pod_name}")
+    async def _ensure_pod_ready(self) -> None:
+        """
+        Ensure pod is created and ready (lazy initialization).
+
+        Uses asyncio.Event to ensure only one coroutine creates the pod.
+        """
+        # If pod already ready, return immediately
+        if self._pod_ready.is_set():
+            return
+
+        # If another coroutine is creating the pod, wait for it
+        if self._pod_creation_started:
+            await self._pod_ready.wait()
+            return
+
+        # This coroutine will create the pod
+        self._pod_creation_started = True
+
+        try:
+            # Run synchronous pod creation in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._create_pod)
+
+            # Signal that pod is ready
+            self._pod_ready.set()
+
+        except Exception as e:
+            self.logger.error(f"Failed to create pod: {str(e)}")
+            self._pod_creation_started = False
+            raise
 
     async def _execute_single_tool_async(self, tool_call: Dict) -> Dict:
         """
@@ -99,6 +129,8 @@ class K8SToolExecutionNode(ToolExecutionNode):
         Returns:
             Execution result dictionary
         """
+        # Ensure pod is ready before executing
+        await self._ensure_pod_ready()
         tool_name = (tool_call.get("tool") or
                     tool_call.get("function") or
                     tool_call.get("name") or
@@ -134,13 +166,8 @@ class K8SToolExecutionNode(ToolExecutionNode):
 
             command = self._build_tool_command(tool_name, arguments)
 
-            loop = asyncio.get_event_loop()
-            output, kodo_status = await loop.run_in_executor(
-                None,
-                self.runner.execute_command,
-                self.pod,
-                command
-            )
+            # Execute kubectl command asynchronously (no GIL blocking)
+            output, kodo_status = await self._execute_kubectl_async(command)
 
             import json
             try:
@@ -376,6 +403,49 @@ class K8SToolExecutionNode(ToolExecutionNode):
                 "execution_mode": "k8s",
                 "pod": self.pod_name
             }
+
+    async def _execute_kubectl_async(self, command: str) -> tuple:
+        """
+        Execute kubectl command asynchronously without GIL blocking.
+
+        Args:
+            command: Command to execute in the pod
+
+        Returns:
+            Tuple of (stdout, exit_code)
+        """
+        # Build kubectl exec command
+        kubectl_cmd = [
+            "kubectl", "exec", self.pod_name,
+            "-n", self.namespace,
+            "--",
+            "sh", "-c", command
+        ]
+
+        try:
+            # Use asyncio subprocess for true concurrency
+            process = await asyncio.create_subprocess_exec(
+                *kubectl_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            stdout, stderr = await process.communicate()
+
+            # Decode output
+            stdout_str = stdout.decode('utf-8', errors='replace')
+            stderr_str = stderr.decode('utf-8', errors='replace')
+
+            # Log errors if present
+            if stderr_str:
+                self.logger.debug(f"kubectl stderr: {stderr_str[:200]}")
+
+            # Return in Kodo-compatible format (output, status)
+            return (stdout_str, str(process.returncode))
+
+        except Exception as e:
+            self.logger.error(f"kubectl exec failed: {str(e)}")
+            raise
 
     def _create_pod(self) -> None:
         """

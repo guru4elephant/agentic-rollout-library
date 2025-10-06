@@ -126,6 +126,7 @@ class ProgressTracker:
         # Print each task
         for task in snapshot:
             status_emoji = {
+                "initializing": "⏳",
                 "running": "🔄",
                 "success": "✅",
                 "failed": "❌",
@@ -148,11 +149,12 @@ class ProgressTracker:
 
         # Summary stats
         total = len(snapshot)
+        initializing = sum(1 for t in snapshot if t.status == "initializing")
         running = sum(1 for t in snapshot if t.status == "running")
-        completed = total - running
+        completed = total - running - initializing
         total_llm_calls = sum(t.llm_success + t.llm_error + t.llm_timeout for t in snapshot)
 
-        print(f"Total: {total} | Running: {running} | Completed: {completed} | Total LLM calls: {total_llm_calls}")
+        print(f"Total: {total} | Initializing: {initializing} | Running: {running} | Completed: {completed} | Total LLM calls: {total_llm_calls}")
         print("=" * 120)
         print(f"Last update: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -226,6 +228,7 @@ async def process_single_instance(
 
     # Register task with progress tracker
     progress_tracker.create_task(task_id, instance_id)
+    progress_tracker.set_status(task_id, "initializing")
 
     # Derive pod name from instance_id for idempotency
     # Replace all underscores and double-dashes with single dash for valid K8S naming
@@ -345,6 +348,9 @@ async def process_single_instance(
             max_iterations = 10
             iteration = 0
 
+            # Mark as running after pod is ready
+            progress_tracker.set_status(task_id, "running")
+
             while iteration < max_iterations:
                 iteration += 1
                 progress_tracker.update_iteration(task_id, iteration)
@@ -410,7 +416,11 @@ async def process_single_instance(
                     )
 
                 except Exception as e:
-                    result["error"] = str(e)
+                    import traceback
+                    error_msg = f"{type(e).__name__}: {str(e)}"
+                    print(f"\n❌ Error in agent loop for task {task_id} ({instance_id}): {error_msg}")
+                    print(f"   Traceback: {traceback.format_exc()[:500]}")
+                    result["error"] = error_msg
                     progress_tracker.set_status(task_id, "failed")
                     break
 
@@ -419,7 +429,11 @@ async def process_single_instance(
                 progress_tracker.set_status(task_id, "max_iter")
 
     except Exception as e:
-        result["error"] = str(e)
+        import traceback
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        print(f"\n❌ Fatal error processing instance {instance_id}: {error_msg}")
+        print(f"   Traceback: {traceback.format_exc()[:500]}")
+        result["error"] = error_msg
         progress_tracker.set_status(task_id, "failed")
 
     return result
