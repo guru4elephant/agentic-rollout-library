@@ -297,14 +297,15 @@ async def process_single_instance(
 
         # Use context manager for automatic cleanup
         with K8SToolExecutionNode(
-            name=f"R2EK8SExecutor-{pod_suffix}",
-            namespace="default",
-            image=image,
-            pod_name=pod_name,
-            environment={
-                "PYTHONUNBUFFERED": "1"
-            },
-            timeline_enabled=enable_timeline
+                name=f"R2EK8SExecutor-{pod_suffix}",
+                namespace="default",
+                kubeconfig_path="./cpu_config2",
+                image=image,
+                pod_name=pod_name,
+                environment={
+                    "PYTHONUNBUFFERED": "1"
+                },
+                timeline_enabled=enable_timeline
         ) as k8s_executor:
 
             # Register R2E tools
