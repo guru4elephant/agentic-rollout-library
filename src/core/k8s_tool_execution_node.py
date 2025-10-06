@@ -482,6 +482,9 @@ class K8SToolExecutionNode(ToolExecutionNode):
             )
             self.logger.info(f"Pod {self.pod_name} created successfully")
 
+            # Run post-creation initialization commands
+            await self._run_pod_init_commands_async()
+
             # Copy tools to the pod (async)
             await self._copy_tools_to_pod_async()
 
@@ -514,12 +517,79 @@ class K8SToolExecutionNode(ToolExecutionNode):
             )
             self.logger.info(f"Pod {self.pod_name} created successfully")
 
+            # Run post-creation initialization commands
+            self._run_pod_init_commands()
+
             # Copy tools to the pod
             self._copy_tools_to_pod()
 
         except Exception as e:
             self.logger.error(f"Failed to create pod {self.pod_name}: {str(e)}")
             raise
+
+    def _run_pod_init_commands(self) -> None:
+        """
+        Run initialization commands in the pod after creation (sync version).
+
+        These commands set up the environment for tool execution:
+        - Install required Python packages
+        - Create necessary symlinks
+        - Set up permissions
+        """
+        init_commands = [
+            # Install common dependencies
+            "python3 -m pip install --quiet --no-warn-script-location chardet 2>/dev/null || true",
+
+            # Create workspace directory if not exists
+            "mkdir -p /workspace",
+
+            # Make conda env symlink if conda exists
+            "if [ -d /opt/miniconda3/envs/testbed ]; then ln -sf /opt/miniconda3/envs/testbed /root/.venv; fi",
+        ]
+
+        self.logger.info("Running pod initialization commands...")
+
+        for cmd in init_commands:
+            try:
+                self.runner.execute_command(self.pod, cmd)
+                self.logger.debug(f"Init command succeeded: {cmd[:50]}...")
+            except Exception as e:
+                # Don't fail pod creation if init commands fail - they're optional
+                self.logger.warning(f"Init command failed (non-fatal): {cmd[:50]}... - {str(e)}")
+
+        self.logger.info("Pod initialization completed")
+
+    async def _run_pod_init_commands_async(self) -> None:
+        """
+        Run initialization commands in the pod after creation (async version).
+
+        These commands set up the environment for tool execution:
+        - Install required Python packages
+        - Create necessary symlinks
+        - Set up permissions
+        """
+        init_commands = [
+            # Install common dependencies
+            "python3 -m pip install --quiet --no-warn-script-location chardet 2>/dev/null || true",
+
+            # Create workspace directory if not exists
+            "mkdir -p /workspace",
+
+            # Make conda env symlink if conda exists
+            "if [ -d /opt/miniconda3/envs/testbed ]; then ln -sf /opt/miniconda3/envs/testbed /root/.venv; fi",
+        ]
+
+        self.logger.info("Running pod initialization commands...")
+
+        for cmd in init_commands:
+            try:
+                output, status = await self._execute_kubectl_async(cmd)
+                self.logger.debug(f"Init command succeeded: {cmd[:50]}...")
+            except Exception as e:
+                # Don't fail pod creation if init commands fail - they're optional
+                self.logger.warning(f"Init command failed (non-fatal): {cmd[:50]}... - {str(e)}")
+
+        self.logger.info("Pod initialization completed")
 
     async def _cleanup_existing_pod_async(self) -> None:
         """
