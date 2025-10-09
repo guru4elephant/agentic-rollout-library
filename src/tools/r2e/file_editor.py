@@ -98,7 +98,8 @@ def _view(path: Path, view_range: Optional[List[int]] = None, concise: bool = Fa
             cmd = ["find", str(path), "-maxdepth", "2", "-not", "-path", "*/.*"]
             proc = subprocess.run(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 check=False
             )

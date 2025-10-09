@@ -166,7 +166,15 @@ def create_openai_api_handle_async(
 
         # Create shared session if not exists
         if session is None or session.closed:
-            connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
+            # Increase connection pool limits for high concurrency
+            # limit: total connection limit across all hosts
+            # limit_per_host: connection limit per single host (critical for 500+ concurrent tasks)
+            connector = aiohttp.TCPConnector(
+                limit=1000,              # Support up to 1000 concurrent connections
+                limit_per_host=600,      # Support 600 connections to same host (for 500+ concurrent)
+                force_close=False,       # Reuse connections (HTTP Keep-Alive)
+                enable_cleanup_closed=True
+            )
             session = aiohttp.ClientSession(connector=connector)
 
         url = f"{base_url.rstrip('/')}/chat/completions"

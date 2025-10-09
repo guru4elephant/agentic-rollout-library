@@ -185,6 +185,10 @@ class LLMNode(BaseNode):
             raise ValueError("Invalid input format for LLM Node")
 
         params = {**self.default_params, **self.model_config}
+        
+        # Add timeout if configured
+        if self.timeout:
+            params['timeout'] = self.timeout
 
         try:
             response = await self._retry_with_backoff_async(
@@ -229,6 +233,10 @@ class LLMNode(BaseNode):
 
         # Merge default params with model config
         params = {**self.default_params, **self.model_config}
+        
+        # Add timeout if configured
+        if self.timeout:
+            params['timeout'] = self.timeout
 
         try:
             # Call the custom LLM function with retry logic
