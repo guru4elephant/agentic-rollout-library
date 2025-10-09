@@ -1,0 +1,211 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..99e61b4e1
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with :type: and :rtype: giving false ambiguous class lookup warnings.
++"""
++
++import tempfile
++import os
++import shutil
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++# Create a temporary directory for our test
++with tempfile.TemporaryDirectory() as tmpdir:
++    srcdir = os.path.join(tmpdir, 'source')
++    outdir = os.path.join(tmpdir, 'build')
++    doctreedir = os.path.join(tmpdir, 'doctrees')
++    os.makedirs(srcdir)
++    
++    # Create the test RST file as described in the issue
++    rst_content = """\
++.. py:class:: mod.A
++.. py:class:: mod.submod.A
++
++.. py:function:: f()
++
++\t- :py:class:`mod.A`
++\t- :py:class:`mod.submod.A`
++
++\t:param mod.A a:
++\t:param mod.submod.A b:
++\t:rtype: mod.A
++\t:rtype: mod.submod.A
++
++.. py:currentmodule:: mod
++
++.. py:function:: f()
++
++\t- :py:class:`A`
++\t- :py:class:`mod.A`
++\t- :py:class:`mod.submod.A`
++
++\t:param A a:
++\t:param mod.A b:
++\t:param mod.submod.A c:
++\t:rtype: A
++\t:rtype: mod.A
++\t:rtype: mod.submod.A
++
++.. py:currentmodule:: mod.submod
++
++.. py:function:: f()
++
++\t- :py:class:`A`
++\t- :py:class:`mod.A`
++\t- :py:class:`mod.submod.A`
++
++\t:param A a: BUG: links to mod.A instead of mod.submod.A
++\t:param mod.A b:
++\t:param mod.submod.A c:
++\t:rtype: A
++\t:rtype: mod.A
++\t:rtype: mod.submod.A
++"""
++    
++    with open(os.path.join(srcdir, 'index.rst'), 'w') as f:
++        f.write(rst_content)
++    
++    # Create a minimal conf.py
++    conf_content = """\
++extensions = []
++master_doc = 'index'
++"""
++    with open(os.path.join(srcdir, 'conf.py'), 'w') as f:
++        f.write(conf_content)
++    
++    # Build with Sphinx and capture warnings
++    with docutils_namespace():
++        import sys
++        from io import StringIO
++        
++        # Capture stderr during build
++        old_stderr = sys.stderr
++        captured_stderr = StringIO()
++        sys.stderr = captured_stderr
++        
++        try:
++            app = Sphinx(srcdir, srcdir, outdir, doctreedir, 'html', warningiserror=False)
++            app.build()
++        finally:
++            sys.stderr = old_stderr
++        
++        # Check if we got the expected warnings
++        warnings = []
++        stderr_output = captured_stderr.getvalue()
++        for line in stderr_output.split('\n'):
++            if 'more than one target found for cross-reference' in line:
++                warnings.append(line)
++        
++        print(f"Found {len(warnings)} ambiguous cross-reference warnings:")
++        for warning in warnings:
++            print(f"  {warning}")
++            
++        # The issue expects 4 warnings for the 4 unqualified type names 'A'
++        expected_warnings = 4
++        if len(warnings) == expected_warnings:
++            print(f"\n✓ Successfully reproduced the issue! Found {expected_warnings} warnings as expected.")
++        else:
++            print(f"\n✗ Unexpected number of warnings. Expected {expected_warnings}, got {len(warnings)}")
+\ No newline at end of file
+diff --git a/setup.py b/setup.py
+index 8d40de1a8..03f325278 100644
+--- a/setup.py
++++ b/setup.py
+@@ -15,22 +15,22 @@ if sys.version_info < (3, 5):
+     sys.exit(1)
+ 
+ install_requires = [
+-    'sphinxcontrib-applehelp',
+-    'sphinxcontrib-devhelp',
++    'sphinxcontrib-applehelp<=1.0.7',
++    'sphinxcontrib-devhelp<=1.0.5',
+     'sphinxcontrib-jsmath',
+-    'sphinxcontrib-htmlhelp',
+-    'sphinxcontrib-serializinghtml',
+-    'sphinxcontrib-qthelp',
+-    'Jinja2>=2.3',
++    'sphinxcontrib-htmlhelp<=2.0.4',
++    'sphinxcontrib-serializinghtml<=1.1.9',
++    'sphinxcontrib-qthelp<=1.0.6',
++    'Jinja2<3.0',
+     'Pygments>=2.0',
+     'docutils>=0.12',
+     'snowballstemmer>=1.1',
+     'babel>=1.3',
+-    'alabaster>=0.7,<0.8',
++    'alabaster>=0.7,<0.7.12',
+     'imagesize',
+     'requests>=2.5.0',
+     'setuptools',
+-    'packaging',
++    'packaging', 'markupsafe<=2.0.1',
+ ]
+ 
+ extras_require = {
+diff --git a/sphinx/domains/python.py b/sphinx/domains/python.py
+index 79d7e4f46..6cb0e5688 100644
+--- a/sphinx/domains/python.py
++++ b/sphinx/domains/python.py
+@@ -1266,11 +1266,38 @@ class PythonDomain(Domain):
+                     elif name in self.objects and self.objects[name].objtype in objtypes:
+                         newname = name
+                     else:
+-                        # "fuzzy" searching mode
+-                        searchname = '.' + name
+-                        matches = [(oname, self.objects[oname]) for oname in self.objects
+-                                   if oname.endswith(searchname) and
+-                                   self.objects[oname].objtype in objtypes]
++                        # "fuzzy" searching mode - respect current module context
++                        # First try to find in current module
++                        if modname:
++                            mod_searchname = modname + '.' + name
++                            mod_matches = [(oname, self.objects[oname]) for oname in self.objects
++                                          if oname == mod_searchname and
++                                          self.objects[oname].objtype in objtypes]
++                            if mod_matches:
++                                matches = mod_matches
++                                continue
++                        
++                        # Then try to find in parent modules
++                        if modname:
++                            # Look for objects in parent modules (e.g., if modname is "mod.submod", 
++                            # also look in "mod")
++                            parent_modname = modname
++                            while '.' in parent_modname:
++                                parent_modname = parent_modname.rsplit('.', 1)[0]
++                                parent_searchname = parent_modname + '.' + name
++                                parent_matches = [(oname, self.objects[oname]) for oname in self.objects
++                                                  if oname == parent_searchname and
++                                                  self.objects[oname].objtype in objtypes]
++                                if parent_matches:
++                                    matches = parent_matches
++                                    break
++                        
++                        # Finally, fall back to global search
++                        if not matches:
++                            searchname = '.' + name
++                            matches = [(oname, self.objects[oname]) for oname in self.objects
++                                       if oname.endswith(searchname) and
++                                       self.objects[oname].objtype in objtypes]
+         else:
+             # NOTE: searching for exact match, object type is not considered
+             if name in self.objects:
+diff --git a/tox.ini b/tox.ini
+index dbb705a3a..9f4fc3a32 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -28,7 +28,7 @@ setenv =
+     PYTHONWARNINGS = all,ignore::ImportWarning:importlib._bootstrap_external,ignore::DeprecationWarning:site,ignore::DeprecationWarning:distutils
+     PYTEST_ADDOPTS = {env:PYTEST_ADDOPTS:} --color yes
+ commands=
+-    python -X dev -m pytest --durations 25 {posargs}
++    python -X dev -m pytest -rA --durations 25 {posargs}
+ 
+ [testenv:flake8]
+ basepython = python3

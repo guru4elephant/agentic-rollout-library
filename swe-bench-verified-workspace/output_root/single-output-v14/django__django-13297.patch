@@ -1,0 +1,360 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..36775aec19
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to simulate the exact issue described in the GitHub issue
++"""
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++from django.conf import settings
++from django.utils.functional import SimpleLazyObject
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def simulate_github_issue():
++    """Simulate the exact issue described in the GitHub issue"""
++    print("Simulating GitHub issue scenario...")
++    
++    # Import the necessary classes
++    from django.views.generic.base import ContextMixin, _wrap_url_kwargs_with_deprecation_warning
++    
++    # Simulate URL kwargs that would come from a URL pattern like:
++    # path("/offers/<slug:offer_slug>/", OfferView.as_view(), name="offer_view")
++    url_kwargs = {"offer_slug": "test-offer"}
++    
++    # This is what happens internally in TemplateView.get()
++    wrapped_kwargs = _wrap_url_kwargs_with_deprecation_warning(url_kwargs)
++    
++    print(f"URL kwargs: {url_kwargs}")
++    print(f"Wrapped kwargs: {wrapped_kwargs}")
++    print(f"Wrapped offer_slug type: {type(wrapped_kwargs['offer_slug'])}")
++    print(f"Wrapped offer_slug value: {wrapped_kwargs['offer_slug']}")
++    
++    # Simulate what happens in get_context_data() method
++    mixin = ContextMixin()
++    context = mixin.get_context_data(**wrapped_kwargs)
++    
++    print(f"\nAfter get_context_data():")
++    print(f"Context: {context}")
++    print(f"offer_slug type in context: {type(context['offer_slug'])}")
++    print(f"offer_slug value in context: {context['offer_slug']}")
++    
++    # Test that the value can be used in a database-like context
++    # (simulating get_object_or_404(Account, slug=offer_slug))
++    try:
++        # This simulates what would happen in a database query filter
++        test_filter = {"slug": context['offer_slug']}
++        print(f"\nTesting database filter simulation:")
++        print(f"Filter dict: {test_filter}")
++        print(f"Filter value type: {type(test_filter['slug'])}")
++        
++        # The value should now be a regular string, not a SimpleLazyObject
++        assert isinstance(test_filter['slug'], str), f"Expected str, got {type(test_filter['slug'])}"
++        assert test_filter['slug'] == "test-offer", f"Expected 'test-offer', got {test_filter['slug']}"
++        
++        print("SUCCESS: SimpleLazyObject was properly resolved to string!")
++        print("The issue described in the GitHub issue should now be fixed.")
++        
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    simulate_github_issue()
+\ No newline at end of file
+diff --git a/django/views/generic/base.py b/django/views/generic/base.py
+index ea5baca08d..235a286e50 100644
+--- a/django/views/generic/base.py
++++ b/django/views/generic/base.py
+@@ -27,7 +27,20 @@ class ContextMixin:
+         kwargs.setdefault('view', self)
+         if self.extra_context is not None:
+             kwargs.update(self.extra_context)
+-        return kwargs
++        
++        # Resolve any SimpleLazyObject instances in kwargs to prevent issues
++        # when they are used in database queries or other contexts that expect
++        # regular Python types
++        resolved_kwargs = {}
++        for key, value in kwargs.items():
++            from django.utils.functional import SimpleLazyObject
++            if isinstance(value, SimpleLazyObject):
++                print(f"DEBUG: Resolving SimpleLazyObject for key '{key}'")
++                resolved_kwargs[key] = str(value)
++            else:
++                resolved_kwargs[key] = value
++        
++        return resolved_kwargs
+ 
+ 
+ class View:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..60303b2d64
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with TemplateView.get_context_data() returning SimpleLazyObjects
++"""
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++from django.conf import settings
++from django.test import TestCase
++from django.urls import path
++from django.http import HttpRequest
++from django.views.generic import TemplateView
++from django.shortcuts import get_object_or_404
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF=__name__,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'test',
++        ],
++        USE_TZ=True,
++    )
++
++# Import Django models
++from django.db import models
++
++# Simple model for testing
++class Account(models.Model):
++    slug = models.SlugField(unique=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# View that reproduces the issue
++class OfferView(TemplateView):
++    template_name = "offers/offer.html"
++    
++    def get_context_data(self, **kwargs):
++        offer_slug = kwargs.get("offer_slug", "")
++        print(f"offer_slug type: {type(offer_slug)}")
++        print(f"offer_slug value: {offer_slug}")
++        
++        # This should fail with SimpleLazyObject in Django 3.1
++        offer = get_object_or_404(Account, slug=offer_slug)
++        return {"offer": offer, "offer_slug": offer_slug}
++
++# URL pattern
++urlpatterns = [
++    path("/offers/<slug:offer_slug>/", OfferView.as_view(), name="offer_view"),
++]
++
++def test_issue():
++    """Test the issue reproduction"""
++    print("Testing TemplateView.get_context_data() issue...")
++    
++    # Setup Django
++    import django
++    django.setup()
++    
++    # Create a mock request
++    request = HttpRequest()
++    request.method = 'GET'
++    
++    # Create view instance - this is where the SimpleLazyObject wrapping happens
++    view = OfferView()
++    view.setup(request, offer_slug="test-offer")
++    
++    # Simulate what happens in TemplateView.get() - manually call the wrapping function
++    from django.views.generic.base import _wrap_url_kwargs_with_deprecation_warning
++    
++    # This is what happens internally in TemplateView.get()
++    url_kwargs = {"offer_slug": "test-offer"}
++    wrapped_kwargs = _wrap_url_kwargs_with_deprecation_warning(url_kwargs)
++    
++    print(f"Original kwargs: {url_kwargs}")
++    print(f"Wrapped kwargs type: {type(wrapped_kwargs['offer_slug'])}")
++    print(f"Wrapped kwargs value: {wrapped_kwargs['offer_slug']}")
++    
++    # Now call get_context_data with the wrapped kwargs (this is what happens internally)
++    try:
++        context = view.get_context_data(**wrapped_kwargs)
++        print("SUCCESS: No error occurred")
++        print(f"Context: {context}")
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_issue()
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..f098a7e8e4
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++"""
++Simple script to reproduce the SimpleLazyObject issue in TemplateView
++"""
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++from django.conf import settings
++from django.utils.functional import SimpleLazyObject
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_simple_lazy_object():
++    """Test the SimpleLazyObject behavior that causes the issue"""
++    print("Testing SimpleLazyObject behavior...")
++    
++    # Create a SimpleLazyObject like the one used in TemplateView
++    def get_value():
++        return "test-offer"
++    
++    lazy_value = SimpleLazyObject(get_value)
++    
++    print(f"Type: {type(lazy_value)}")
++    print(f"String representation: {lazy_value}")
++    print(f"Direct access (should resolve): {lazy_value}")
++    
++    # Test what happens when we try to use it in a context where it needs to be a string
++    try:
++        # This simulates what happens in get_object_or_404 when filtering
++        test_dict = {"slug": lazy_value}
++        print(f"Dict with lazy value: {test_dict}")
++        
++        # This would fail in a database query context
++        print("SUCCESS: No immediate error (but would fail in DB query)")
++        
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++
++def test_template_view_wrapping():
++    """Test the actual wrapping function from TemplateView"""
++    print("\nTesting TemplateView wrapping function...")
++    
++    # Import the function that wraps URL kwargs
++    from django.views.generic.base import _wrap_url_kwargs_with_deprecation_warning
++    
++    # Simulate URL kwargs
++    url_kwargs = {"offer_slug": "test-offer"}
++    wrapped_kwargs = _wrap_url_kwargs_with_deprecation_warning(url_kwargs)
++    
++    print(f"Original kwargs: {url_kwargs}")
++    print(f"Wrapped kwargs: {wrapped_kwargs}")
++    print(f"Wrapped value type: {type(wrapped_kwargs['offer_slug'])}")
++    print(f"Wrapped value: {wrapped_kwargs['offer_slug']}")
++    
++    # Test if we can convert it to string
++    try:
++        str_value = str(wrapped_kwargs['offer_slug'])
++        print(f"String conversion: {str_value} (type: {type(str_value)})")
++        print("SUCCESS: Can be converted to string")
++    except Exception as e:
++        print(f"ERROR converting to string: {type(e).__name__}: {e}")
++
++if __name__ == "__main__":
++    test_simple_lazy_object()
++    test_template_view_wrapping()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..ac958cd677
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for SimpleLazyObject issue in TemplateView
++"""
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++from django.conf import settings
++from django.utils.functional import SimpleLazyObject
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_fix():
++    """Test that the fix resolves SimpleLazyObject instances"""
++    print("Testing the fix for SimpleLazyObject issue...")
++    
++    # Import the ContextMixin class
++    from django.views.generic.base import ContextMixin
++    
++    # Create a SimpleLazyObject like the one used in TemplateView
++    def get_value():
++        return "test-offer"
++    
++    lazy_value = SimpleLazyObject(get_value)
++    
++    # Create test kwargs with SimpleLazyObject
++    test_kwargs = {
++        "offer_slug": lazy_value,
++        "regular_param": "regular_value"
++    }
++    
++    # Create ContextMixin instance and test get_context_data
++    mixin = ContextMixin()
++    context = mixin.get_context_data(**test_kwargs)
++    
++    print(f"Input kwargs: {test_kwargs}")
++    print(f"Output context: {context}")
++    print(f"offer_slug type before: {type(test_kwargs['offer_slug'])}")
++    print(f"offer_slug type after: {type(context['offer_slug'])}")
++    print(f"regular_param type after: {type(context['regular_param'])}")
++    
++    # Verify that SimpleLazyObject was resolved to string
++    assert isinstance(context['offer_slug'], str), f"Expected str, got {type(context['offer_slug'])}"
++    assert context['offer_slug'] == "test-offer", f"Expected 'test-offer', got {context['offer_slug']}"
++    assert isinstance(context['regular_param'], str), f"Expected str, got {type(context['regular_param'])}"
++    assert context['regular_param'] == "regular_value", f"Expected 'regular_value', got {context['regular_param']}"
++    
++    print("SUCCESS: Fix works correctly!")
++
++if __name__ == "__main__":
++    test_fix()
+\ No newline at end of file

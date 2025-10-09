@@ -1,0 +1,199 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..4d7f5f33d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,24 @@
++import numpy as np
++from sklearn.datasets import load_iris
++from sklearn.feature_selection import SelectKBest
++from sklearn.feature_selection import chi2
++
++X, y = load_iris(return_X_y=True, as_frame=True)
++X = X.astype(
++   {
++       "petal width (cm)": np.float16,
++       "petal length (cm)": np.float16,
++   }
++)
++X["cat"] = y.astype("category")
++
++print("Input dtypes:")
++print(X.dtypes)
++print("\n")
++
++selector = SelectKBest(chi2, k=2)
++selector.set_output(transform="pandas", dtype_preservation=True)
++X_out = selector.fit_transform(X, y)
++
++print("Output dtypes:")
++print(X_out.dtypes)
+\ No newline at end of file
+diff --git a/sklearn/utils/_set_output.py b/sklearn/utils/_set_output.py
+index 335773c6a..a0a6fc159 100644
+--- a/sklearn/utils/_set_output.py
++++ b/sklearn/utils/_set_output.py
+@@ -12,6 +12,7 @@ def _wrap_in_pandas_container(
+     *,
+     columns,
+     index=None,
++    dtypes=None,
+ ):
+     """Create a Pandas DataFrame.
+ 
+@@ -36,6 +37,10 @@ def _wrap_in_pandas_container(
+     index : array-like, default=None
+         Index for data.
+ 
++    dtypes : Series, default=None
++        Dtypes to use for the output DataFrame. If provided and the output
++        columns match the original input columns, dtypes will be preserved.
++
+     Returns
+     -------
+     dataframe : DataFrame
+@@ -57,9 +62,35 @@ def _wrap_in_pandas_container(
+             data_to_wrap.columns = columns
+         if index is not None:
+             data_to_wrap.index = index
++        
++        # Preserve dtypes if requested and columns match
++        if dtypes is not None and hasattr(data_to_wrap, 'columns'):
++            # Only preserve dtypes for columns that exist in both input and output
++            for col in data_to_wrap.columns:
++                if col in dtypes.index:
++                    try:
++                        data_to_wrap[col] = data_to_wrap[col].astype(dtypes[col])
++                    except (TypeError, ValueError):
++                        # If dtype conversion fails, keep the original dtype
++                        pass
++        
+         return data_to_wrap
+ 
+-    return pd.DataFrame(data_to_wrap, index=index, columns=columns)
++    # Create new DataFrame
++    df = pd.DataFrame(data_to_wrap, index=index, columns=columns)
++    
++    # Preserve dtypes if requested and columns match
++    if dtypes is not None and hasattr(df, 'columns'):
++        # Only preserve dtypes for columns that exist in both input and output
++        for col in df.columns:
++            if col in dtypes.index:
++                try:
++                    df[col] = df[col].astype(dtypes[col])
++                except (TypeError, ValueError):
++                    # If dtype conversion fails, keep the original dtype
++                    pass
++    
++    return df
+ 
+ 
+ def _get_output_config(method, estimator=None):
+@@ -81,6 +112,8 @@ def _get_output_config(method, estimator=None):
+ 
+         - "dense": specifies the dense container for `method`. This can be
+           `"default"` or `"pandas"`.
++        - "dtype_preservation": bool indicating whether to preserve dtypes
++          when using pandas output.
+     """
+     est_sklearn_output_config = getattr(estimator, "_sklearn_output_config", {})
+     if method in est_sklearn_output_config:
+@@ -93,7 +126,9 @@ def _get_output_config(method, estimator=None):
+             f"output config must be 'default' or 'pandas' got {dense_config}"
+         )
+ 
+-    return {"dense": dense_config}
++    dtype_preservation = est_sklearn_output_config.get("dtype_preservation", False)
++
++    return {"dense": dense_config, "dtype_preservation": dtype_preservation}
+ 
+ 
+ def _wrap_data_with_container(method, data_to_wrap, original_input, estimator):
+@@ -131,6 +166,7 @@ def _wrap_data_with_container(method, data_to_wrap, original_input, estimator):
+         data_to_wrap=data_to_wrap,
+         index=getattr(original_input, "index", None),
+         columns=estimator.get_feature_names_out,
++        dtypes=original_input.dtypes if output_config["dtype_preservation"] else None,
+     )
+ 
+ 
+@@ -208,7 +244,7 @@ class _SetOutputMixin:
+             setattr(cls, method, wrapped_method)
+ 
+     @available_if(_auto_wrap_is_configured)
+-    def set_output(self, *, transform=None):
++    def set_output(self, *, transform=None, dtype_preservation=False):
+         """Set output container.
+ 
+         See :ref:`sphx_glr_auto_examples_miscellaneous_plot_set_output.py`
+@@ -223,18 +259,27 @@ class _SetOutputMixin:
+             - `"pandas"`: DataFrame output
+             - `None`: Transform configuration is unchanged
+ 
++        dtype_preservation : bool, default=False
++            Whether to preserve the dtypes of the original input when using
++            pandas output. Only applicable when transform="pandas".
++
+         Returns
+         -------
+         self : estimator instance
+             Estimator instance.
+         """
+-        if transform is None:
++        if transform is None and dtype_preservation is False:
+             return self
+ 
+         if not hasattr(self, "_sklearn_output_config"):
+             self._sklearn_output_config = {}
+ 
+-        self._sklearn_output_config["transform"] = transform
++        if transform is not None:
++            self._sklearn_output_config["transform"] = transform
++        
++        if dtype_preservation:
++            self._sklearn_output_config["dtype_preservation"] = True
++        
+         return self
+ 
+ 
+diff --git a/test_default_behavior.py b/test_default_behavior.py
+new file mode 100644
+index 000000000..7febb90a6
+--- /dev/null
++++ b/test_default_behavior.py
+@@ -0,0 +1,34 @@
++import numpy as np
++from sklearn.datasets import load_iris
++from sklearn.feature_selection import SelectKBest
++from sklearn.feature_selection import chi2
++
++X, y = load_iris(return_X_y=True, as_frame=True)
++X = X.astype(
++   {
++       "petal width (cm)": np.float16,
++       "petal length (cm)": np.float16,
++   }
++)
++X["cat"] = y.astype("category")
++
++print("Input dtypes:")
++print(X.dtypes)
++print("\n")
++
++# Test default behavior (should convert to float64)
++selector = SelectKBest(chi2, k=2)
++selector.set_output(transform="pandas")
++X_out = selector.fit_transform(X, y)
++
++print("Output dtypes (default behavior):")
++print(X_out.dtypes)
++print("\n")
++
++# Test with dtype_preservation=False explicitly
++selector2 = SelectKBest(chi2, k=2)
++selector2.set_output(transform="pandas", dtype_preservation=False)
++X_out2 = selector2.fit_transform(X, y)
++
++print("Output dtypes (dtype_preservation=False):")
++print(X_out2.dtypes)
+\ No newline at end of file

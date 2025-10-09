@@ -1,0 +1,186 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 59a5d6abbb..6769d76f73 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -1836,7 +1836,29 @@ class SQLUpdateCompiler(SQLCompiler):
+         query.clear_ordering(force=True)
+         query.extra = {}
+         query.select = []
+-        query.add_fields([query.get_meta().pk.name])
++        
++        # When there are related updates, we need to select both the primary key
++        # and the foreign keys that point to related models
++        if self.query.related_updates:
++            # Collect all fields we need to select
++            fields_to_select = [query.get_meta().pk.name]
++            
++            # For each related model, find the foreign key field that points to it
++            for related_model in self.query.related_updates.keys():
++                found = False
++                for field in self.query.model._meta.get_fields():
++                    if (field.is_relation and 
++                        field.related_model == related_model and
++                        (field.many_to_one or field.one_to_one)):
++                        fields_to_select.append(field.name)
++                        found = True
++                        break
++            
++            query.add_fields(fields_to_select)
++        else:
++            # Normal case: select primary key from current model
++            query.add_fields([query.get_meta().pk.name])
++        
+         super().pre_sql_setup()
+ 
+         must_pre_select = (
+@@ -1851,8 +1873,35 @@ class SQLUpdateCompiler(SQLCompiler):
+             # don't want them to change), or the db backend doesn't support
+             # selecting from the updating table (e.g. MySQL).
+             idents = []
+-            for rows in query.get_compiler(self.using).execute_sql(MULTI):
+-                idents.extend(r[0] for r in rows)
++            if self.query.related_updates:
++                # For multiple inheritance, we need to extract foreign key values
++                # for each related model and store them separately
++                self.query._related_foreign_keys = {}
++                
++                # Get the list of foreign key field names in the same order as selected
++                fk_fields = []
++                for related_model in self.query.related_updates.keys():
++                    for field in self.query.model._meta.get_fields():
++                        if (field.is_relation and 
++                            field.related_model == related_model and
++                            (field.many_to_one or field.one_to_one)):
++                            fk_fields.append((related_model, field.name))
++                            break
++                
++                # Process the results to extract foreign key values for each related model
++                for rows in query.get_compiler(self.using).execute_sql(MULTI):
++                    idents.extend(r[0] for r in rows)  # Primary key values
++                    
++                    # Extract foreign key values for each related model
++                    for i, (related_model, fk_field) in enumerate(fk_fields, 1):
++                        if related_model not in self.query._related_foreign_keys:
++                            self.query._related_foreign_keys[related_model] = []
++                        self.query._related_foreign_keys[related_model].extend(r[i] for r in rows)
++            else:
++                # Normal case: just extract primary key values
++                for rows in query.get_compiler(self.using).execute_sql(MULTI):
++                    idents.extend(r[0] for r in rows)
++            
+             self.query.add_filter("pk__in", idents)
+             self.query.related_ids = idents
+         else:
+diff --git a/django/db/models/sql/subqueries.py b/django/db/models/sql/subqueries.py
+index 04063f73bc..99d45a30d1 100644
+--- a/django/db/models/sql/subqueries.py
++++ b/django/db/models/sql/subqueries.py
+@@ -134,7 +134,15 @@ class UpdateQuery(Query):
+             query = UpdateQuery(model)
+             query.values = values
+             if self.related_ids is not None:
+-                query.add_filter("pk__in", self.related_ids)
++                # For multiple inheritance, we need to get the foreign key values
++                # that point to this specific parent model, not the primary keys
++                # of the child model
++                if hasattr(self, '_related_foreign_keys') and model in self._related_foreign_keys:
++                    # Use the precomputed foreign key values for this model
++                    query.add_filter("pk__in", self._related_foreign_keys[model])
++                else:
++                    # Fallback to the original behavior
++                    query.add_filter("pk__in", self.related_ids)
+             result.append(query)
+         return result
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..74cbd695b6
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Define the models from the issue
++class Base(models.Model):
++    base_id = models.AutoField(primary_key=True)
++    field_base = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++class OtherBase(models.Model):
++    otherbase_id = models.AutoField(primary_key=True)
++    field_otherbase = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++class Child(Base, OtherBase):
++    class Meta:
++        app_label = 'test'
++
++# Create database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Base)
++    schema_editor.create_model(OtherBase)
++    schema_editor.create_model(Child)
++
++# Reproduce the issue
++print("=== Creating test data ===")
++
++# Create OtherBase instances
++ob1 = OtherBase.objects.create(field_otherbase=100)
++ob2 = OtherBase.objects.create(field_otherbase=101)
++print(f"Created OtherBase instances: {list(OtherBase.objects.values())}")
++
++# Create Child instances
++c1 = Child.objects.create(field_base=0, field_otherbase=0)
++c2 = Child.objects.create(field_base=1, field_otherbase=1)
++print(f"Created Child instances: {list(Child.objects.values())}")
++
++print("\n=== Testing the issue ===")
++print("Before update:")
++print(f"Child.objects.values('field_otherbase'): {list(Child.objects.values('field_otherbase'))}")
++print(f"OtherBase.objects.filter(otherbase_id__in=[1,2]).values('field_otherbase'): {list(OtherBase.objects.filter(otherbase_id__in=[1,2]).values('field_otherbase'))}")
++
++# This is where the issue occurs
++print("\nExecuting: Child.objects.update(field_otherbase=55)")
++result = Child.objects.update(field_otherbase=55)
++print(f"Update result: {result}")
++
++print("\nAfter update:")
++print(f"Child.objects.values('field_otherbase'): {list(Child.objects.values('field_otherbase'))}")
++print(f"OtherBase.objects.filter(otherbase_id__in=[1,2]).values('field_otherbase'): {list(OtherBase.objects.filter(otherbase_id__in=[1,2]).values('field_otherbase'))}")
++
++# Let's also check what the SQL looks like
++from django.db import connection
++print(f"\nQueries executed:")
++for i, query in enumerate(connection.queries):
++    print(f"{i+1}. {query}")
+\ No newline at end of file

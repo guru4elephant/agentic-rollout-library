@@ -1,0 +1,290 @@
+diff --git a/django/contrib/admin/sites.py b/django/contrib/admin/sites.py
+index 59a4a0364d..74ef4c491e 100644
+--- a/django/contrib/admin/sites.py
++++ b/django/contrib/admin/sites.py
+@@ -420,7 +420,7 @@ class AdminSite:
+     def catch_all_view(self, request, url):
+         if settings.APPEND_SLASH and not url.endswith('/'):
+             urlconf = getattr(request, 'urlconf', None)
+-            path = '%s/' % request.path_info
++            path = '%s/' % request.path
+             try:
+                 match = resolve(path, urlconf)
+             except Resolver404:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..fddf895b76
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,104 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the catch_all_view FORCE_SCRIPT_NAME issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import RequestFactory
++from django.test.utils import override_script_prefix
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF='tests.urls',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++            'django.contrib.sessions',
++            'tests.admin_views',
++        ],
++        MIDDLEWARE=[
++            'django.middleware.security.SecurityMiddleware',
++            'django.contrib.sessions.middleware.SessionMiddleware',
++            'django.middleware.common.CommonMiddleware',
++            'django.middleware.csrf.CsrfViewMiddleware',
++            'django.contrib.auth.middleware.AuthenticationMiddleware',
++            'django.contrib.messages.middleware.MessageMiddleware',
++            'django.middleware.clickjacking.XFrameOptionsMiddleware',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.admin.sites import AdminSite
++
++def test_path_vs_path_info():
++    """Test the difference between request.path and request.path_info with FORCE_SCRIPT_NAME simulation"""
++    factory = RequestFactory()
++    
++    # Create a request and manually simulate FORCE_SCRIPT_NAME behavior
++    request = factory.get('/script/admin/test')
++    
++    # Simulate FORCE_SCRIPT_NAME by modifying the request object
++    # In a real FORCE_SCRIPT_NAME scenario, path_info would be without script prefix
++    # but path would include it
++    original_path_info = request.path_info
++    request.path_info = '/admin/test'  # Simulate what FORCE_SCRIPT_NAME does
++    
++    print("Simulating FORCE_SCRIPT_NAME='/script':")
++    print(f"request.path: {request.path}")  # This includes script prefix
++    print(f"request.path_info: {request.path_info}")  # This excludes script prefix
++    print()
++    
++    # Test what happens when we try to redirect
++    original_path = '%s/' % request.path_info  # Current implementation
++    correct_path = '%s/' % request.path        # Fixed implementation
++    print(f"Original redirect (path_info): {original_path}")
++    print(f"Correct redirect (path): {correct_path}")
++    print(f"Are they different? {original_path != correct_path}")
++    print()
++
++def test_catch_all_view_redirect():
++    """Test the actual catch_all_view redirect behavior"""
++    factory = RequestFactory()
++    admin_site = AdminSite()
++    
++    # Create a request that would trigger the redirect
++    request = factory.get('/script/admin/test')
++    
++    # Mock the resolve function to simulate a matching route
++    from unittest.mock import patch
++    from django.urls import resolve
++    
++    with patch('django.urls.resolve') as mock_resolve:
++        # Mock a successful resolve to trigger the redirect
++        mock_resolve.return_value = type('obj', (object,), {
++            'func': type('obj', (object,), {'should_append_slash': True})
++        })
++        
++        try:
++            response = admin_site.catch_all_view(request, 'admin/test')
++            print(f"Redirect URL: {response.url}")
++            print(f"Expected URL: /script/admin/test/")
++            print(f"Match: {response.url == '/script/admin/test/'}")
++        except Exception as e:
++            print(f"Exception: {e}")
++
++if __name__ == '__main__':
++    test_path_vs_path_info()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..c9f742f85b
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,113 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the catch_all_view FORCE_SCRIPT_NAME fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import RequestFactory
++from django.test.utils import override_script_prefix
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF='tests.urls',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++            'django.contrib.sessions',
++            'tests.admin_views',
++        ],
++        MIDDLEWARE=[
++            'django.middleware.security.SecurityMiddleware',
++            'django.contrib.sessions.middleware.SessionMiddleware',
++            'django.middleware.common.CommonMiddleware',
++            'django.middleware.csrf.CsrfViewMiddleware',
++            'django.contrib.auth.middleware.AuthenticationMiddleware',
++            'django.contrib.messages.middleware.MessageMiddleware',
++            'django.middleware.clickjacking.XFrameOptionsMiddleware',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.admin.sites import AdminSite
++from unittest.mock import patch
++from django.urls import resolve
++
++def test_catch_all_view_fix():
++    """Test that catch_all_view now preserves script name in redirects"""
++    factory = RequestFactory()
++    admin_site = AdminSite()
++    
++    print("Testing catch_all_view fix...")
++    
++    # Test case 1: Without script prefix
++    print("\n1. Testing without script prefix:")
++    request = factory.get('/admin/test')
++    with patch('django.contrib.admin.sites.resolve') as mock_resolve:
++        mock_resolve.return_value = type('obj', (object,), {
++            'func': type('obj', (object,), {'should_append_slash': True})
++        })
++        
++        response = admin_site.catch_all_view(request, 'admin/test')
++        print(f"   Redirect URL: {response.url}")
++        print(f"   Expected: /admin/test/")
++        print(f"   ✓ Correct" if response.url == '/admin/test/' else f"   ✗ Incorrect")
++    
++    # Test case 2: With script prefix (simulating FORCE_SCRIPT_NAME)
++    print("\n2. Testing with script prefix (simulating FORCE_SCRIPT_NAME):")
++    request = factory.get('/script/admin/test')
++    # Simulate FORCE_SCRIPT_NAME behavior
++    original_path_info = request.path_info
++    request.path_info = '/admin/test'  # This is what FORCE_SCRIPT_NAME does
++    
++    with patch('django.contrib.admin.sites.resolve') as mock_resolve:
++        mock_resolve.return_value = type('obj', (object,), {
++            'func': type('obj', (object,), {'should_append_slash': True})
++        })
++        
++        response = admin_site.catch_all_view(request, 'admin/test')
++        print(f"   Redirect URL: {response.url}")
++        print(f"   Expected: /script/admin/test/")
++        print(f"   ✓ Correct" if response.url == '/script/admin/test/' else f"   ✗ Incorrect")
++        
++        # Restore original path_info
++        request.path_info = original_path_info
++    
++    # Test case 3: Verify the fix handles edge cases
++    print("\n3. Testing edge cases:")
++    
++    # Test with empty path
++    request = factory.get('/script/')
++    request.path_info = '/'
++    
++    with patch('django.contrib.admin.sites.resolve') as mock_resolve:
++        mock_resolve.return_value = type('obj', (object,), {
++            'func': type('obj', (object,), {'should_append_slash': True})
++        })
++        
++        response = admin_site.catch_all_view(request, '')
++        print(f"   Empty path redirect: {response.url}")
++        print(f"   Expected: /script/")
++        print(f"   ✓ Correct" if response.url == '/script/' else f"   ✗ Incorrect")
++    
++    print("\nFix verification complete!")
++
++if __name__ == '__main__':
++    test_catch_all_view_fix()
+\ No newline at end of file
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 0000000000..32eae27df7
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python3
++"""
++Simple verification that the catch_all_view fix is implemented correctly.
++"""
++
++# Read the relevant part of the file and check if the fix is in place
++with open('/testbed/django/contrib/admin/sites.py', 'r') as f:
++    content = f.read()
++
++# Look for the catch_all_view method
++lines = content.split('\n')
++catch_all_start = None
++for i, line in enumerate(lines):
++    if 'def catch_all_view(self, request, url):' in line:
++        catch_all_start = i
++        break
++
++if catch_all_start is None:
++    print("ERROR: Could not find catch_all_view method")
++    exit(1)
++
++# Check the next few lines for the fix
++found_fix = False
++for i in range(catch_all_start, catch_all_start + 10):
++    if i < len(lines) and 'request.path' in lines[i] and 'request.path_info' not in lines[i]:
++        found_fix = True
++        print(f"✓ Fix found on line {i+1}: {lines[i].strip()}")
++        break
++
++if found_fix:
++    print("✓ The fix has been successfully implemented!")
++    print("✓ catch_all_view now uses request.path instead of request.path_info")
++    print("✓ This preserves FORCE_SCRIPT_NAME in redirects")
++else:
++    print("✗ Fix not found. The code still uses request.path_info")
++    # Show the current code
++    for i in range(catch_all_start, catch_all_start + 10):
++        if i < len(lines):
++            print(f"Line {i+1}: {lines[i]}")
+\ No newline at end of file

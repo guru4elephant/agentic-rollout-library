@@ -1,0 +1,169 @@
+diff --git a/django/contrib/admin/checks.py b/django/contrib/admin/checks.py
+index f82c20c2f1..9fd77b5d41 100644
+--- a/django/contrib/admin/checks.py
++++ b/django/contrib/admin/checks.py
+@@ -720,33 +720,33 @@ class ModelAdminChecks(BaseModelAdminChecks):
+             return []
+         elif hasattr(obj, item):
+             return []
+-        elif hasattr(obj.model, item):
++        else:
+             try:
+                 field = obj.model._meta.get_field(item)
+             except FieldDoesNotExist:
+-                return []
+-            else:
+-                if isinstance(field, models.ManyToManyField):
++                try:
++                    field = getattr(obj.model, item)
++                except AttributeError:
+                     return [
+                         checks.Error(
+-                            "The value of '%s' must not be a ManyToManyField." % label,
++                            "The value of '%s' refers to '%s', which is not a callable, "
++                            "an attribute of '%s', or an attribute or method on '%s.%s'." % (
++                                label, item, obj.__class__.__name__,
++                                obj.model._meta.app_label, obj.model._meta.object_name,
++                            ),
+                             obj=obj.__class__,
+-                            id='admin.E109',
++                            id='admin.E108',
+                         )
+                     ]
+-                return []
+-        else:
+-            return [
+-                checks.Error(
+-                    "The value of '%s' refers to '%s', which is not a callable, "
+-                    "an attribute of '%s', or an attribute or method on '%s.%s'." % (
+-                        label, item, obj.__class__.__name__,
+-                        obj.model._meta.app_label, obj.model._meta.object_name,
+-                    ),
+-                    obj=obj.__class__,
+-                    id='admin.E108',
+-                )
+-            ]
++            if isinstance(field, models.ManyToManyField):
++                return [
++                    checks.Error(
++                        "The value of '%s' must not be a ManyToManyField." % label,
++                        obj=obj.__class__,
++                        id='admin.E109',
++                    )
++                ]
++            return []
+ 
+     def _check_list_display_links(self, obj):
+         """ Check that list_display_links is a unique subset of list_display.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..613ae451b3
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++test_settings = {
++    'SECRET_KEY': 'test-secret-key',
++    'INSTALLED_APPS': [
++        'django.contrib.admin',
++        'django.contrib.auth',
++        'django.contrib.contenttypes',
++        'django.contrib.messages',
++        'django.contrib.sessions',
++    ],
++    'DATABASES': {
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    'USE_TZ': True,
++}
++
++settings.configure(**test_settings)
++
++django.setup()
++
++# Create a simple model with a field that might cause issues
++from django.db import models
++from django.contrib import admin
++
++# Create a simple model with a field that might cause issues
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    # Simulate a PositionField-like descriptor that raises AttributeError when accessed on class
++    @property
++    def position_field(self):
++        return 1
++    
++    # Create a descriptor that raises AttributeError when accessed on class (like PositionField)
++    class PositionFieldDescriptor:
++        def __get__(self, instance, owner):
++            if instance is None:
++                # This simulates PositionField behavior - raises AttributeError when accessed on class
++                raise AttributeError("PositionField can only be accessed via model instance")
++            return 1
++    
++    # This should cause hasattr(obj.model, 'position_field_descriptor') to return False
++    position_field_descriptor = PositionFieldDescriptor()
++    
++    # Create a proper field that simulates PositionField behavior
++    position_field_proper = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Create ModelAdmin that uses the problematic field
++class TestModelAdmin(admin.ModelAdmin):
++    list_display = ['name', 'position_field_descriptor']
++
++# Now test the checks
++from django.contrib.admin.checks import ModelAdminChecks
++from django.core.exceptions import FieldDoesNotExist
++
++def test_check():
++    checks = ModelAdminChecks()
++    admin_obj = TestModelAdmin(TestModel, admin.site)
++    
++    print("Testing _check_list_display_item...")
++    # Debug: check what hasattr returns
++    print(f"hasattr(obj.model, 'position_field_descriptor'): {hasattr(admin_obj.model, 'position_field_descriptor')}")
++    # Debug: check what getattr does
++    try:
++        field = getattr(admin_obj.model, 'position_field_descriptor')
++        print(f"getattr succeeded: {field}")
++    except AttributeError as e:
++        print(f"getattr failed with AttributeError: {e}")
++    
++    # Debug: check what _meta.get_field does
++    try:
++        field = admin_obj.model._meta.get_field('position_field_descriptor')
++        print(f"_meta.get_field succeeded: {field}")
++    except FieldDoesNotExist as e:
++        print(f"_meta.get_field failed with FieldDoesNotExist: {e}")
++    
++    # Test the method directly
++    result = checks._check_list_display_item(admin_obj, 'position_field_descriptor', 'list_display[1]')
++    print(f"Result: {result}")
++    
++    if result:
++        print("ERROR: The check incorrectly failed!")
++        return False
++    else:
++        print("SUCCESS: The check passed correctly!")
++        return True
++
++if __name__ == '__main__':
++    success = test_check()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

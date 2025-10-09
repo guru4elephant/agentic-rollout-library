@@ -1,0 +1,265 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..549afe9cfa
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count, Value
++from django.db.models.functions import Concat
++
++# Create a test model with Meta.ordering
++class Foo(models.Model):
++    uuid = models.UUIDField(primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        ordering = ['name']
++        app_label = 'test'
++
++# Test both paths: when _fields is None and when it's not None
++print("Testing QuerySet.ordered property with GROUP BY queries...")
++
++# Test 1: Regular queryset (should be ordered)
++qs = Foo.objects.all()
++print("=== Test 1: Regular queryset ===")
++print(f"SQL: {qs.query}")
++print(f"Ordered: {qs.ordered}")
++print(f"Default ordering: {qs.query.default_ordering}")
++print(f"Has ORDER BY in SQL: {'ORDER BY' in str(qs.query)}")
++print()
++
++# Test 2: Annotated queryset with _fields=None (should NOT be ordered)
++qs2 = Foo.objects.annotate(Count("pk")).all()
++print("=== Test 2: Annotated queryset (_fields=None) ===")
++print(f"SQL: {qs2.query}")
++print(f"Ordered: {qs2.ordered}")
++print(f"Default ordering: {qs2.query.default_ordering}")
++print(f"Has ORDER BY in SQL: {'ORDER BY' in str(qs2.query)}")
++print()
++
++# Test 3: Annotated queryset with specific fields (should NOT be ordered)
++qs3 = Foo.objects.values('name').annotate(Count("pk"))
++print("=== Test 3: Annotated queryset with values() (_fields not None) ===")
++print(f"SQL: {qs3.query}")
++print(f"Ordered: {qs3.ordered}")
++print(f"Default ordering: {qs3.query.default_ordering}")
++print(f"Has ORDER BY in SQL: {'ORDER BY' in str(qs3.query)}")
++print()
++
++# Test 4: Explicitly ordered annotated queryset (should be ordered)
++qs4 = Foo.objects.annotate(Count("pk")).order_by('name')
++print("=== Test 4: Explicitly ordered annotated queryset ===")
++print(f"SQL: {qs4.query}")
++print(f"Ordered: {qs4.ordered}")
++print(f"Default ordering: {qs4.query.default_ordering}")
++print(f"Has ORDER BY in SQL: {'ORDER BY' in str(qs4.query)}")
++print()
++
++# Test 5: Non-aggregate annotation (should still be ordered)
++qs5 = Foo.objects.annotate(full_name=Concat('name', Value(' '), 'name'))
++print("=== Test 5: Non-aggregate annotation ===")
++print(f"SQL: {qs5.query}")
++print(f"Ordered: {qs5.ordered}")
++print(f"Default ordering: {qs5.query.default_ordering}")
++print(f"Has ORDER BY in SQL: {'ORDER BY' in str(qs5.query)}")
+\ No newline at end of file
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 85cd8311a7..6db87f6d00 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1122,6 +1122,8 @@ class QuerySet:
+             if alias in annotations and annotation.contains_aggregate:
+                 if clone._fields is None:
+                     clone.query.group_by = True
++                    # Disable default ordering for GROUP BY queries
++                    clone.query.default_ordering = False
+                 else:
+                     clone.query.set_group_by()
+                 break
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 4648daf395..f9f4ab2142 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -2034,6 +2034,8 @@ class Query(BaseExpression):
+                     group_by_cols = annotation.get_group_by_cols(alias=alias)
+                 group_by.extend(group_by_cols)
+         self.group_by = tuple(group_by)
++        # Disable default ordering for GROUP BY queries
++        self.default_ordering = False
+ 
+     def add_select_related(self, fields):
+         """
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..122804fad4
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count
++
++# Create a test model with Meta.ordering
++class Foo(models.Model):
++    uuid = models.UUIDField(primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        ordering = ['name']
++        app_label = 'test'
++
++# Test the issue
++print("Testing QuerySet.ordered property with GROUP BY queries...")
++
++# Create a simple test
++qs = Foo.objects.all()
++print(f"Regular queryset SQL: {qs.query}")
++print(f"Regular queryset ordered: {qs.ordered}")
++print(f"Regular queryset query.default_ordering: {qs.query.default_ordering}")
++print()
++
++qs2 = Foo.objects.annotate(Count("pk")).all()
++print(f"Annotated queryset SQL: {qs2.query}")
++print(f"Annotated queryset ordered: {qs2.ordered}")
++print(f"Annotated queryset query.default_ordering: {qs2.query.default_ordering}")
++print()
++
++# Let's also check if the SQL actually contains ORDER BY
++print("Checking if SQL contains ORDER BY:")
++print(f"Regular queryset SQL has ORDER BY: {'ORDER BY' in str(qs.query)}")
++print(f"Annotated queryset SQL has ORDER BY: {'ORDER BY' in str(qs2.query)}")
+\ No newline at end of file
+diff --git a/test_basic_functionality.py b/test_basic_functionality.py
+new file mode 100644
+index 0000000000..2b726feda5
+--- /dev/null
++++ b/test_basic_functionality.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key'
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count
++
++# Create a test model with Meta.ordering
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++    
++    class Meta:
++        ordering = ['name']
++        app_label = 'test'
++
++# Test basic functionality
++print("Testing basic QuerySet functionality...")
++
++# Test 1: Basic ordering
++qs1 = TestModel.objects.all()
++print(f"Basic queryset ordered: {qs1.ordered}")
++print(f"Basic queryset SQL: {qs1.query}")
++
++# Test 2: Annotated queryset
++qs2 = TestModel.objects.annotate(count=Count('value'))
++print(f"Annotated queryset ordered: {qs2.ordered}")
++print(f"Annotated queryset SQL: {qs2.query}")
++
++# Test 3: Explicit ordering on annotated queryset
++qs3 = TestModel.objects.annotate(count=Count('value')).order_by('name')
++print(f"Explicitly ordered annotated queryset ordered: {qs3.ordered}")
++print(f"Explicitly ordered annotated queryset SQL: {qs3.query}")
++
++print("All tests completed successfully!")
+\ No newline at end of file
+diff --git a/test_settings.py b/test_settings.py
+new file mode 100644
+index 0000000000..0b144875ed
+--- /dev/null
++++ b/test_settings.py
+@@ -0,0 +1,13 @@
++DEBUG = True
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++INSTALLED_APPS = [
++    'django.contrib.contenttypes',
++    'django.contrib.auth',
++]
++USE_TZ = True
++SECRET_KEY = 'test-secret-key'
+\ No newline at end of file

@@ -1,0 +1,280 @@
+diff --git a/debug_ast.py b/debug_ast.py
+new file mode 100644
+index 000000000..73d6c49ad
+--- /dev/null
++++ b/debug_ast.py
+@@ -0,0 +1,34 @@
++#!/usr/bin/env python3
++"""Debug script to understand AST generation for constants"""
++
++import ast
++import sys
++
++def test_ast_generation():
++    """Test how AST should handle constants like False"""
++    print(f"Python version: {sys.version}")
++    
++    # Test what AST should be generated for "False"
++    try:
++        # This is what the current code generates
++        name_node = ast.Name("False", ast.Load())
++        expr = ast.fix_missing_locations(ast.Expression(name_node))
++        code = compile(expr, filename="<test>", mode="eval")
++        print("ast.Name works:", code)
++    except Exception as e:
++        print("ast.Name fails:", e)
++    
++    try:
++        # This is what should be generated for Python 3.8+
++        if sys.version_info >= (3, 8):
++            const_node = ast.Constant(False)
++        else:
++            const_node = ast.NameConstant(False)
++        expr = ast.fix_missing_locations(ast.Expression(const_node))
++        code = compile(expr, filename="<test>", mode="eval")
++        print("ast.Constant/NameConstant works:", code)
++    except Exception as e:
++        print("ast.Constant/NameConstant fails:", e)
++
++if __name__ == "__main__":
++    test_ast_generation()
+\ No newline at end of file
+diff --git a/debug_test_case.py b/debug_test_case.py
+new file mode 100644
+index 000000000..112b4e056
+--- /dev/null
++++ b/debug_test_case.py
+@@ -0,0 +1,25 @@
++#!/usr/bin/env python3
++"""Debug the specific test case that's failing"""
++
++from _pytest.mark.expression import Expression
++
++def test_debug():
++    """Debug the specific test case"""
++    ident = "False"
++    matcher = {ident: True}.__getitem__
++    
++    try:
++        expr = Expression.compile(ident)
++        print(f"Compiled '{ident}' successfully")
++        
++        result = expr.evaluate(matcher)
++        print(f"Evaluation result: {result}")
++        
++        # Check what the matcher returns
++        print(f"Matcher result for '{ident}': {matcher(ident)}")
++        
++    except Exception as e:
++        print(f"Failed: {e}")
++
++if __name__ == "__main__":
++    test_debug()
+\ No newline at end of file
+diff --git a/debug_true_false.py b/debug_true_false.py
+new file mode 100644
+index 000000000..79457c6ee
+--- /dev/null
++++ b/debug_true_false.py
+@@ -0,0 +1,23 @@
++#!/usr/bin/env python3
++"""Debug why True works but False doesn't"""
++
++from _pytest.mark.expression import Expression
++
++def test_true_false():
++    """Test True and False separately"""
++    try:
++        expr_true = Expression.compile("True")
++        result_true = expr_true.evaluate(lambda x: True)
++        print(f"True: {result_true}")
++    except Exception as e:
++        print(f"True failed: {e}")
++    
++    try:
++        expr_false = Expression.compile("False")
++        result_false = expr_false.evaluate(lambda x: True)
++        print(f"False: {result_false}")
++    except Exception as e:
++        print(f"False failed: {e}")
++
++if __name__ == "__main__":
++    test_true_false()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..8e87c7d14
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,19 @@
++#!/usr/bin/env python3
++"""Script to reproduce the issue with Expression.compile("False")"""
++
++from _pytest.mark.expression import Expression
++
++def test_reproduce_issue():
++    """Test that reproduces the crash with Expression.compile("False")"""
++    try:
++        # This should crash the interpreter according to the issue
++        expr = Expression.compile("False")
++        print(f"Successfully compiled expression: {expr}")
++        return True
++    except Exception as e:
++        print(f"Exception occurred: {e}")
++        return False
++
++if __name__ == "__main__":
++    success = test_reproduce_issue()
++    print(f"Test passed: {success}")
+\ No newline at end of file
+diff --git a/src/_pytest/mark/expression.py b/src/_pytest/mark/expression.py
+index 04c73411a..908c00153 100644
+--- a/src/_pytest/mark/expression.py
++++ b/src/_pytest/mark/expression.py
+@@ -18,6 +18,7 @@ The semantics are:
+ import ast
+ import enum
+ import re
++import sys
+ import types
+ from typing import Callable
+ from typing import Iterator
+@@ -46,6 +47,7 @@ class TokenType(enum.Enum):
+     AND = "and"
+     NOT = "not"
+     IDENT = "identifier"
++    CONSTANT = "constant"
+     EOF = "end of input"
+ 
+ 
+@@ -99,6 +101,8 @@ class Scanner:
+                         yield Token(TokenType.AND, value, pos)
+                     elif value == "not":
+                         yield Token(TokenType.NOT, value, pos)
++                    elif value in ("True", "False", "None"):
++                        yield Token(TokenType.CONSTANT, value, pos)
+                     else:
+                         yield Token(TokenType.IDENT, value, pos)
+                     pos += len(value)
+@@ -129,7 +133,11 @@ class Scanner:
+ 
+ def expression(s: Scanner) -> ast.Expression:
+     if s.accept(TokenType.EOF):
+-        ret = ast.NameConstant(False)  # type: ast.expr
++        # Handle AST changes in Python 3.8+
++        if sys.version_info >= (3, 8):
++            ret = ast.Constant(False)  # type: ast.expr
++        else:
++            ret = ast.NameConstant(False)  # type: ast.expr
+     else:
+         ret = expr(s)
+         s.accept(TokenType.EOF, reject=True)
+@@ -162,6 +170,23 @@ def not_expr(s: Scanner) -> ast.expr:
+     ident = s.accept(TokenType.IDENT)
+     if ident:
+         return ast.Name(ident.value, ast.Load())
++    constant = s.accept(TokenType.CONSTANT)
++    if constant:
++        # Handle AST changes in Python 3.8+
++        if sys.version_info >= (3, 8):
++            if constant.value == "True":
++                return ast.Constant(True)
++            elif constant.value == "False":
++                return ast.Constant(False)
++            else:  # "None"
++                return ast.Constant(None)
++        else:
++            if constant.value == "True":
++                return ast.NameConstant(True)
++            elif constant.value == "False":
++                return ast.NameConstant(False)
++            else:  # "None"
++                return ast.NameConstant(None)
+     s.reject((TokenType.NOT, TokenType.LPAREN, TokenType.IDENT))
+ 
+ 
+diff --git a/test_constants.py b/test_constants.py
+new file mode 100644
+index 000000000..ea56abc5b
+--- /dev/null
++++ b/test_constants.py
+@@ -0,0 +1,27 @@
++#!/usr/bin/env python3
++"""Test script to verify all constants work properly"""
++
++from _pytest.mark.expression import Expression
++
++def test_all_constants():
++    """Test that True, False, and None all work correctly"""
++    constants = ["True", "False", "None"]
++    
++    for const in constants:
++        try:
++            expr = Expression.compile(const)
++            print(f"Successfully compiled '{const}': {expr}")
++            
++            # Test evaluation
++            result = expr.evaluate(lambda x: True)
++            print(f"Evaluation result for '{const}': {result}")
++            
++        except Exception as e:
++            print(f"Failed to compile/evaluate '{const}': {e}")
++            return False
++    
++    return True
++
++if __name__ == "__main__":
++    success = test_all_constants()
++    print(f"All tests passed: {success}")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..5a7dd9bdb
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++"""Test edge cases to ensure the fix doesn't break existing functionality"""
++
++from _pytest.mark.expression import Expression
++
++def test_edge_cases():
++    """Test various edge cases"""
++    test_cases = [
++        # Basic expressions
++        "test",
++        "test and other",
++        "test or other",
++        "not test",
++        "(test)",
++        
++        # Expressions with constants
++        "test and True",
++        "False or test", 
++        "not None",
++        "(True and test)",
++        
++        # Complex expressions
++        "test and (True or False)",
++        "not (test and None)",
++    ]
++    
++    for expr_str in test_cases:
++        try:
++            expr = Expression.compile(expr_str)
++            print(f"Successfully compiled '{expr_str}'")
++            
++            # Test evaluation with a simple matcher
++            result = expr.evaluate(lambda x: True)
++            print(f"Evaluation result for '{expr_str}': {result}")
++            
++        except Exception as e:
++            print(f"Failed to compile/evaluate '{expr_str}': {e}")
++            return False
++    
++    return True
++
++if __name__ == "__main__":
++    success = test_edge_cases()
++    print(f"All edge case tests passed: {success}")
+\ No newline at end of file

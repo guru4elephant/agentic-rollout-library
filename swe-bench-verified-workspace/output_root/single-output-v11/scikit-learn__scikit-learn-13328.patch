@@ -1,0 +1,196 @@
+diff --git a/performance_test.py b/performance_test.py
+new file mode 100644
+index 000000000..f2277c834
+--- /dev/null
++++ b/performance_test.py
+@@ -0,0 +1,33 @@
++import numpy as np
++from sklearn.linear_model import HuberRegressor
++from sklearn.datasets import make_regression
++import time
++
++# Performance test to ensure our fix doesn't introduce significant overhead
++
++print("Performance test:")
++
++# Create a larger dataset
++X, y, coef = make_regression(n_samples=1000, n_features=10, noise=3.0, coef=True, random_state=42)
++
++# Test with float64 (baseline)
++start_time = time.time()
++huber = HuberRegressor().fit(X, y)
++float_time = time.time() - start_time
++print(f"Float64 time: {float_time:.4f}s")
++
++# Test with boolean
++X_bool = (X > 0).astype(bool)
++start_time = time.time()
++huber = HuberRegressor().fit(X_bool, y)
++bool_time = time.time() - start_time
++print(f"Boolean time: {bool_time:.4f}s")
++
++# Check if there's significant performance difference
++ratio = bool_time / float_time
++print(f"Boolean/Float ratio: {ratio:.2f}x")
++
++if ratio < 2.0:  # Reasonable threshold
++    print("✓ Performance impact is acceptable")
++else:
++    print("⚠ Performance impact might be significant")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..ec59186a8
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,29 @@
++import numpy as np
++from sklearn.datasets import make_regression
++from sklearn.linear_model import HuberRegressor
++
++# Random data
++X, y, coef = make_regression(n_samples=200, n_features=2, noise=4.0, coef=True, random_state=0)
++X_bool = X > 0
++X_bool_as_float = np.asarray(X_bool, dtype=float)
++
++print("Testing with regular float X:")
++try:
++    huber = HuberRegressor().fit(X, y)
++    print("✓ Works")
++except Exception as e:
++    print(f"✗ Fails: {e}")
++
++print("\nTesting with boolean X (should fail):")
++try:
++    huber = HuberRegressor().fit(X_bool, y)
++    print("✓ Works")
++except Exception as e:
++    print(f"✗ Fails: {e}")
++
++print("\nTesting with boolean converted to float X:")
++try:
++    huber = HuberRegressor().fit(X_bool_as_float, y)
++    print("✓ Works")
++except Exception as e:
++    print(f"✗ Fails: {e}")
+\ No newline at end of file
+diff --git a/sklearn/linear_model/huber.py b/sklearn/linear_model/huber.py
+index 65c686400..a9667f4b2 100644
+--- a/sklearn/linear_model/huber.py
++++ b/sklearn/linear_model/huber.py
+@@ -90,7 +90,7 @@ def _huber_loss_and_gradient(w, X, y, epsilon, alpha, sample_weight=None):
+         grad = np.zeros(n_features + 1)
+ 
+     # Gradient due to the squared loss.
+-    X_non_outliers = -axis0_safe_slice(X, ~outliers_mask, n_non_outliers)
++    X_non_outliers = -axis0_safe_slice(X, ~outliers_mask, n_non_outliers).astype(float)
+     grad[:n_features] = (
+         2. / sigma * safe_sparse_dot(weighted_non_outliers, X_non_outliers))
+ 
+@@ -98,7 +98,7 @@ def _huber_loss_and_gradient(w, X, y, epsilon, alpha, sample_weight=None):
+     signed_outliers = np.ones_like(outliers)
+     signed_outliers_mask = linear_loss[outliers_mask] < 0
+     signed_outliers[signed_outliers_mask] = -1.0
+-    X_outliers = axis0_safe_slice(X, outliers_mask, num_outliers)
++    X_outliers = axis0_safe_slice(X, outliers_mask, num_outliers).astype(float)
+     sw_outliers = sample_weight[outliers_mask] * signed_outliers
+     grad[:n_features] -= 2. * epsilon * (
+         safe_sparse_dot(sw_outliers, X_outliers))
+diff --git a/test_dtype_compatibility.py b/test_dtype_compatibility.py
+new file mode 100644
+index 000000000..5223432f7
+--- /dev/null
++++ b/test_dtype_compatibility.py
+@@ -0,0 +1,36 @@
++import numpy as np
++from sklearn.linear_model import HuberRegressor
++from sklearn.datasets import make_regression
++
++# Test that our fix doesn't break normal float operations and works with various dtypes
++
++print("Testing dtype compatibility:")
++
++X, y, coef = make_regression(n_samples=100, n_features=3, noise=2.0, coef=True, random_state=42)
++
++# Test different numeric dtypes
++dtypes_to_test = [
++    ('float32', np.float32),
++    ('float64', np.float64), 
++    ('int32', np.int32),
++    ('int64', np.int64),
++    ('bool', bool)
++]
++
++for dtype_name, dtype in dtypes_to_test:
++    print(f"\nTesting {dtype_name}:")
++    
++    if dtype == bool:
++        X_converted = (X > 0).astype(dtype)
++    else:
++        X_converted = X.astype(dtype)
++        
++    try:
++        huber = HuberRegressor().fit(X_converted, y)
++        print("✓ Works")
++        # Check that coefficients are reasonable
++        print(f"  Coef shape: {huber.coef_.shape}, Intercept: {huber.intercept_:.3f}")
++    except Exception as e:
++        print(f"✗ Fails: {e}")
++
++print("\nAll dtype compatibility tests completed!")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..bca58ee4a
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,48 @@
++import numpy as np
++from sklearn.linear_model import HuberRegressor
++
++# Test various edge cases with boolean arrays
++
++print("Testing edge cases with boolean arrays:")
++
++# Test 1: All True
++print("\n1. All True values:")
++X_all_true = np.ones((50, 3), dtype=bool)
++y_all_true = np.random.randn(50)
++try:
++    huber = HuberRegressor().fit(X_all_true, y_all_true)
++    print("✓ Works")
++except Exception as e:
++    print(f"✗ Fails: {e}")
++
++# Test 2: All False  
++print("\n2. All False values:")
++X_all_false = np.zeros((50, 3), dtype=bool)
++y_all_false = np.random.randn(50)
++try:
++    huber = HuberRegressor().fit(X_all_false, y_all_false)
++    print("✓ Works")
++except Exception as e:
++    print(f"✗ Fails: {e}")
++
++# Test 3: Mixed boolean values
++print("\n3. Mixed boolean values:")
++X_mixed = np.array([[True, False], [False, True], [True, True], [False, False]], dtype=bool)
++y_mixed = np.random.randn(4)
++try:
++    huber = HuberRegressor().fit(X_mixed, y_mixed)
++    print("✓ Works")
++except Exception as e:
++    print(f"✗ Fails: {e}")
++
++# Test 4: Single feature boolean
++print("\n4. Single feature boolean:")
++X_single = np.array([True, False, True, False], dtype=bool).reshape(-1, 1)
++y_single = np.random.randn(4)
++try:
++    huber = HuberRegressor().fit(X_single, y_single)
++    print("✓ Works")
++except Exception as e:
++    print(f"✗ Fails: {e}")
++
++print("\nAll edge case tests completed!")
+\ No newline at end of file

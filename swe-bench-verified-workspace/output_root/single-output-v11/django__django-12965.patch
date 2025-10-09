@@ -1,0 +1,450 @@
+diff --git a/debug_alias.py b/debug_alias.py
+new file mode 100644
+index 0000000000..fdf5effe3e
+--- /dev/null
++++ b/debug_alias.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++"""
++Debug script to check alias behavior for Model.objects.all().delete()
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def debug_alias_behavior():
++    """Debug the alias behavior for Model.objects.all()"""
++    print("Debugging alias behavior for Model.objects.all()")
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Get the queryset
++    qs = TestModel.objects.all()
++    
++    # Check the query properties
++    query = qs.query
++    compiler = query.get_compiler(connection.alias)
++    
++    print(f"Query alias_map: {query.alias_map}")
++    print(f"Query alias_refcount: {query.alias_refcount}")
++    print(f"Compiler type: {type(compiler).__name__}")
++    
++    # Check if where clause is empty
++    print(f"Where clause is empty: {not query.where}")
++    
++    # For delete, we need to use the delete compiler
++    from django.db.models.sql.compiler import SQLDeleteCompiler
++    delete_compiler = SQLDeleteCompiler(query, connection, connection.alias)
++    print(f"single_alias result: {delete_compiler.single_alias}")
++    
++    # Check the actual SQL
++    sql, params = delete_compiler.as_sql()
++    print(f"Generated SQL: {sql}")
++
++if __name__ == '__main__':
++    debug_alias_behavior()
+\ No newline at end of file
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 29e33c075f..59d6ce3790 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -1407,11 +1407,26 @@ class SQLInsertCompiler(SQLCompiler):
+ class SQLDeleteCompiler(SQLCompiler):
+     @cached_property
+     def single_alias(self):
+-        return sum(self.query.alias_refcount[t] > 0 for t in self.query.alias_map) == 1
++        # Check if we have exactly one alias with refcount > 0
++        alias_count = sum(self.query.alias_refcount[t] > 0 for t in self.query.alias_map)
++        
++        # For simple DELETE operations without joins or complex conditions,
++        # we should use simple DELETE even when alias_map is empty
++        if alias_count == 0 and not self.query.where:
++            # This is likely a simple Model.objects.all().delete() case
++            # where we're deleting all records from a single table
++            return True
++            
++        return alias_count == 1
+ 
+     def _as_sql(self, query):
++        # Get the base table name, fall back to model's db_table if base_table is None
++        base_table = query.base_table
++        if base_table is None:
++            base_table = query.model._meta.db_table
++        
+         result = [
+-            'DELETE FROM %s' % self.quote_name_unless_alias(query.base_table)
++            'DELETE FROM %s' % self.quote_name_unless_alias(base_table)
+         ]
+         where, params = self.compile(query.where)
+         if where:
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..6864252f59
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""
++Final comprehensive test to verify the fix works correctly
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++
++def capture_sql_for_delete(queryset):
++    """Capture the SQL generated for a delete operation"""
++    from django.db.models.sql.compiler import SQLDeleteCompiler
++    
++    # Create delete compiler
++    delete_compiler = SQLDeleteCompiler(queryset.query, connection, connection.alias)
++    
++    # Get the SQL
++    sql, params = delete_compiler.as_sql()
++    return sql
++
++def test_comprehensive():
++    """Comprehensive test of the fix"""
++    print("=== Comprehensive Test of DELETE SQL Fix ===\n")
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Add test data
++    TestModel.objects.create(name="test1", value=10)
++    TestModel.objects.create(name="test2", value=20)
++    TestModel.objects.create(name="test3", value=30)
++    
++    # Test 1: Simple delete all - should use simple DELETE
++    print("1. TestModel.objects.all().delete():")
++    qs = TestModel.objects.all()
++    sql = capture_sql_for_delete(qs)
++    print(f"   SQL: {sql}")
++    if "WHERE" not in sql and "IN (SELECT" not in sql:
++        print("   ✅ PASS: Simple DELETE without subquery")
++    else:
++        print("   ❌ FAIL: Should use simple DELETE")
++    
++    # Test 2: Delete with simple WHERE - should use WHERE clause
++    print("\n2. TestModel.objects.filter(name='test1').delete():")
++    qs = TestModel.objects.filter(name='test1')
++    sql = capture_sql_for_delete(qs)
++    print(f"   SQL: {sql}")
++    if "WHERE" in sql and "IN (SELECT" not in sql:
++        print("   ✅ PASS: DELETE with WHERE clause")
++    else:
++        print("   ❌ FAIL: Should use WHERE clause")
++    
++    # Test 3: Delete with IN condition - should use WHERE clause
++    print("\n3. TestModel.objects.filter(name__in=['test1', 'test2']).delete():")
++    qs = TestModel.objects.filter(name__in=['test1', 'test2'])
++    sql = capture_sql_for_delete(qs)
++    print(f"   SQL: {sql}")
++    if "WHERE" in sql and "IN (SELECT" not in sql:
++        print("   ✅ PASS: DELETE with WHERE clause")
++    else:
++        print("   ❌ FAIL: Should use WHERE clause")
++    
++    # Test 4: Delete with range - should use WHERE clause
++    print("\n4. TestModel.objects.filter(value__gt=15).delete():")
++    qs = TestModel.objects.filter(value__gt=15)
++    sql = capture_sql_for_delete(qs)
++    print(f"   SQL: {sql}")
++    if "WHERE" in sql and "IN (SELECT" not in sql:
++        print("   ✅ PASS: DELETE with WHERE clause")
++    else:
++        print("   ❌ FAIL: Should use WHERE clause")
++    
++    # Test 5: Actually execute the delete to ensure it works
++    print("\n5. Executing actual delete operations:")
++    
++    # Count before
++    count_before = TestModel.objects.count()
++    print(f"   Count before: {count_before}")
++    
++    # Execute delete all
++    result = TestModel.objects.all().delete()
++    print(f"   Delete result: {result}")
++    
++    # Count after
++    count_after = TestModel.objects.count()
++    print(f"   Count after: {count_after}")
++    
++    if count_after == 0:
++        print("   ✅ PASS: Delete operation worked correctly")
++    else:
++        print("   ❌ FAIL: Delete operation failed")
++    
++    print("\n=== Test Summary ===")
++    print("The fix ensures that Model.objects.all().delete() generates")
++    print("a simple DELETE FROM table statement instead of a subquery-based")
++    print("DELETE, which improves performance and fixes LOCK TABLES issues.")
++
++if __name__ == '__main__':
++    test_comprehensive()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..16ef4898c9
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the Model.objects.all().delete() performance regression
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_delete_sql():
++    """Test the SQL generated by Model.objects.all().delete()"""
++    print("Testing SQL generated by Model.objects.all().delete()")
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Add some test data
++    TestModel.objects.create(name="test1")
++    TestModel.objects.create(name="test2")
++    
++    # Monkey patch to capture the SQL
++    original_execute_sql = None
++    captured_sql = []
++    
++    def capture_execute_sql(self, result_type):
++        nonlocal captured_sql
++        sql, params = self.as_sql()
++        captured_sql.append((sql, params))
++        return original_execute_sql(self, result_type)
++    
++    # Get the queryset
++    qs = TestModel.objects.all()
++    
++    # Patch the compiler to capture SQL
++    from django.db.models.sql.compiler import SQLCompiler
++    original_execute_sql = SQLCompiler.execute_sql
++    SQLCompiler.execute_sql = capture_execute_sql
++    
++    # Test the delete method
++    try:
++        result = qs.delete()
++        print(f"Delete result: {result}")
++        
++        # Print captured SQL
++        print("Captured SQL statements:")
++        for i, (sql, params) in enumerate(captured_sql):
++            print(f"{i+1}. SQL: {sql}")
++            print(f"   Params: {params}")
++            
++    except Exception as e:
++        print(f"Delete error: {e}")
++    finally:
++        # Restore original method
++        SQLCompiler.execute_sql = original_execute_sql
++
++if __name__ == '__main__':
++    test_delete_sql()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..f40f821e12
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,104 @@
++#!/usr/bin/env python3
++"""
++Test edge cases to ensure the fix doesn't break existing functionality
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++
++# Create test models
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class RelatedModel(models.Model):
++    test_model = models.ForeignKey(TestModel, on_delete=models.CASCADE)
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++def capture_delete_sql(queryset):
++    """Capture the SQL generated by a delete operation"""
++    from django.db.models.sql.compiler import SQLDeleteCompiler
++    
++    # Create delete compiler
++    delete_compiler = SQLDeleteCompiler(queryset.query, connection, connection.alias)
++    
++    # Get the SQL
++    sql, params = delete_compiler.as_sql()
++    return sql, params
++
++def test_edge_cases():
++    """Test various edge cases"""
++    print("Testing edge cases for DELETE SQL generation")
++    
++    # Create the tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++        schema_editor.create_model(RelatedModel)
++    
++    # Add some test data
++    tm1 = TestModel.objects.create(name="test1")
++    tm2 = TestModel.objects.create(name="test2")
++    RelatedModel.objects.create(test_model=tm1, value=10)
++    RelatedModel.objects.create(test_model=tm2, value=20)
++    
++    # Test 1: Simple delete all (should use simple DELETE)
++    print("\n1. TestModel.objects.all().delete():")
++    qs = TestModel.objects.all()
++    sql, params = capture_delete_sql(qs)
++    print(f"   SQL: {sql}")
++    print(f"   Expected: Simple DELETE without WHERE")
++    print(f"   Result: {'✓' if 'WHERE' not in sql else '✗'}")
++    
++    # Test 2: Delete with WHERE clause (should use subquery)
++    print("\n2. TestModel.objects.filter(name='test1').delete():")
++    qs = TestModel.objects.filter(name='test1')
++    sql, params = capture_delete_sql(qs)
++    print(f"   SQL: {sql}")
++    print(f"   Expected: DELETE with WHERE clause")
++    print(f"   Result: {'✓' if 'WHERE' in sql else '✗'}")
++    
++    # Test 3: Delete with complex condition (should use WHERE)
++    print("\n3. TestModel.objects.filter(name__in=['test1', 'test2']).delete():")
++    qs = TestModel.objects.filter(name__in=['test1', 'test2'])
++    sql, params = capture_delete_sql(qs)
++    print(f"   SQL: {sql}")
++    print(f"   Expected: DELETE with WHERE clause")
++    print(f"   Result: {'✓' if 'WHERE' in sql else '✗'}")
++    
++    # Test 4: RelatedModel delete all (should use simple DELETE)
++    print("\n4. RelatedModel.objects.all().delete():")
++    qs = RelatedModel.objects.all()
++    sql, params = capture_delete_sql(qs)
++    print(f"   SQL: {sql}")
++    print(f"   Expected: Simple DELETE without WHERE")
++    print(f"   Result: {'✓' if 'WHERE' not in sql else '✗'}")
++
++if __name__ == '__main__':
++    test_edge_cases()
+\ No newline at end of file

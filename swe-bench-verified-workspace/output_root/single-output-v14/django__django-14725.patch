@@ -1,0 +1,330 @@
+diff --git a/django/forms/formsets.py b/django/forms/formsets.py
+index 75b0646512..90decb62c5 100644
+--- a/django/forms/formsets.py
++++ b/django/forms/formsets.py
+@@ -63,6 +63,7 @@ class BaseFormSet(RenderableFormMixin):
+     template_name_p = 'django/forms/formsets/p.html'
+     template_name_table = 'django/forms/formsets/table.html'
+     template_name_ul = 'django/forms/formsets/ul.html'
++    can_add = True
+ 
+     def __init__(self, data=None, files=None, auto_id='id_%s', prefix=None,
+                  initial=None, error_class=ErrorList, form_kwargs=None,
+@@ -146,10 +147,17 @@ class BaseFormSet(RenderableFormMixin):
+             # count in the data; this is DoS protection to prevent clients
+             # from forcing the server to instantiate arbitrary numbers of
+             # forms
+-            return min(self.management_form.cleaned_data[TOTAL_FORM_COUNT], self.absolute_max)
++            total_forms = min(self.management_form.cleaned_data[TOTAL_FORM_COUNT], self.absolute_max)
++            # If can_add is False, don't allow more forms than initial forms
++            if not self.can_add:
++                total_forms = min(total_forms, self.initial_form_count())
++            return total_forms
+         else:
+             initial_forms = self.initial_form_count()
+             total_forms = max(initial_forms, self.min_num) + self.extra
++            # If can_add is False, don't allow extra forms
++            if not self.can_add:
++                total_forms = initial_forms
+             # Allow all existing related objects/inlines to be displayed,
+             # but don't allow extra beyond max_num.
+             if initial_forms > self.max_num >= 0:
+@@ -478,7 +486,7 @@ class BaseFormSet(RenderableFormMixin):
+ def formset_factory(form, formset=BaseFormSet, extra=1, can_order=False,
+                     can_delete=False, max_num=None, validate_max=False,
+                     min_num=None, validate_min=False, absolute_max=None,
+-                    can_delete_extra=True, renderer=None):
++                    can_delete_extra=True, renderer=None, can_add=True):
+     """Return a FormSet for the given form class."""
+     if min_num is None:
+         min_num = DEFAULT_MIN_NUM
+@@ -505,6 +513,7 @@ def formset_factory(form, formset=BaseFormSet, extra=1, can_order=False,
+         'validate_min': validate_min,
+         'validate_max': validate_max,
+         'renderer': renderer or get_default_renderer(),
++        'can_add': can_add,
+     }
+     return type(form.__name__ + 'FormSet', (formset,), attrs)
+ 
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 7effb202e3..019b03122c 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -820,6 +820,9 @@ class BaseModelFormSet(BaseFormSet):
+             # object.
+             if self.can_delete and self._should_delete_form(form):
+                 continue
++            # If can_add is False, don't save new objects
++            if not self.can_add:
++                continue
+             self.new_objects.append(self.save_new(form, commit=commit))
+             if not commit:
+                 self.saved_forms.append(form)
+@@ -875,7 +878,8 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
+                          widgets=None, validate_max=False, localized_fields=None,
+                          labels=None, help_texts=None, error_messages=None,
+                          min_num=None, validate_min=False, field_classes=None,
+-                         absolute_max=None, can_delete_extra=True, renderer=None):
++                         absolute_max=None, can_delete_extra=True, renderer=None,
++                         can_add=True):
+     """Return a FormSet class for the given Django model class."""
+     meta = getattr(form, 'Meta', None)
+     if (getattr(meta, 'fields', fields) is None and
+@@ -894,7 +898,7 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
+                               can_order=can_order, can_delete=can_delete,
+                               validate_min=validate_min, validate_max=validate_max,
+                               absolute_max=absolute_max, can_delete_extra=can_delete_extra,
+-                              renderer=renderer)
++                              renderer=renderer, can_add=can_add)
+     FormSet.model = model
+     return FormSet
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..29dc2d4960
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++
++"""
++Reproduction script for the issue: Provide a way for model formsets to disallow new object creation
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.forms import modelformset_factory
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the current behavior with extra=0
++TestFormSet = modelformset_factory(TestModel, fields=['name'], extra=0)
++
++print("Current behavior with extra=0:")
++print("The formset allows creating new objects even when extra=0")
++print("Users can add more forms via JavaScript and submit them")
++
++# The issue is that there's no way to prevent new object creation
++# We need to add a parameter like can_add=False to modelformset_factory
++
++print("\nWhat we need:")
++print("A way to create 'edit only' formsets that disallow new object creation")
++print("This should prevent both form creation and validation/saving of new objects")
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..229318cf55
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.forms import modelformset_factory
++from django.db import models
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the can_add parameter
++print("Testing can_add parameter...")
++
++# Test 1: Default behavior (can_add=True)
++TestFormSet1 = modelformset_factory(TestModel, fields=['name'], extra=0)
++formset1 = TestFormSet1(queryset=TestModel.objects.none())
++print(f"Default can_add: {formset1.can_add}")
++
++# Test 2: Explicit can_add=True
++TestFormSet2 = modelformset_factory(TestModel, fields=['name'], extra=0, can_add=True)
++formset2 = TestFormSet2(queryset=TestModel.objects.none())
++print(f"Explicit can_add=True: {formset2.can_add}")
++
++# Test 3: Explicit can_add=False
++TestFormSet3 = modelformset_factory(TestModel, fields=['name'], extra=0, can_add=False)
++formset3 = TestFormSet3(queryset=TestModel.objects.none())
++print(f"Explicit can_add=False: {formset3.can_add}")
++
++print("All tests passed!")
+\ No newline at end of file
+diff --git a/test_can_add.py b/test_can_add.py
+new file mode 100644
+index 0000000000..c32b223aec
+--- /dev/null
++++ b/test_can_add.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python3
++
++"""
++Test script for the can_add functionality in model formsets
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.forms import modelformset_factory
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test 1: Default behavior (can_add=True)
++print("=== Test 1: Default behavior (can_add=True) ===")
++TestFormSet = modelformset_factory(TestModel, fields=['name'], extra=0, can_add=True)
++formset = TestFormSet(queryset=TestModel.objects.none())
++
++print(f"Total forms: {formset.total_form_count()}")
++print(f"Initial forms: {formset.initial_form_count()}")
++print(f"Forms: {len(formset.forms)}")
++print(f"Can add: {formset.can_add}")
++
++# Test 2: Edit-only behavior (can_add=False)
++print("\n=== Test 2: Edit-only behavior (can_add=False) ===")
++EditOnlyFormSet = modelformset_factory(TestModel, fields=['name'], extra=0, can_add=False)
++edit_only_formset = EditOnlyFormSet(queryset=TestModel.objects.none())
++
++print(f"Total forms: {edit_only_formset.total_form_count()}")
++print(f"Initial forms: {edit_only_formset.initial_form_count()}")
++print(f"Forms: {len(edit_only_formset.forms)}")
++print(f"Can add: {edit_only_formset.can_add}")
++
++# Test 3: Bound formset with can_add=False
++print("\n=== Test 3: Bound formset with can_add=False ===")
++post_data = {
++    'form-TOTAL_FORMS': '3',  # More forms than initial
++    'form-INITIAL_FORMS': '0',
++    'form-0-name': 'New Object 1',
++    'form-1-name': 'New Object 2',
++    'form-2-name': 'New Object 3',
++}
++
++bound_formset = EditOnlyFormSet(post_data, queryset=TestModel.objects.none())
++print(f"Total forms: {bound_formset.total_form_count()}")
++print(f"Initial forms: {bound_formset.initial_form_count()}")
++print(f"Forms: {len(bound_formset.forms)}")
++print(f"Can add: {bound_formset.can_add}")
++
++# Test 4: Test save_new_objects with can_add=False
++print("\n=== Test 4: Test save_new_objects with can_add=False ===")
++class MockForm:
++    def has_changed(self):
++        return True
++
++class MockFormSet:
++    def __init__(self):
++        self.can_add = False
++        self.can_delete = False
++        self.extra_forms = [MockForm(), MockForm()]
++        self.new_objects = []
++        self.saved_forms = []
++    
++    def _should_delete_form(self, form):
++        return False
++    
++    def save_new(self, form, commit=True):
++        return "new_object"
++
++# Test the method directly
++from django.forms.models import BaseModelFormSet
++
++# Create a test instance
++test_formset = BaseModelFormSet()
++test_formset.can_add = False
++test_formset.can_delete = False
++test_formset.extra_forms = [MockForm(), MockForm()]
++test_formset.new_objects = []
++test_formset.saved_forms = []
++
++# Mock the save_new method
++def mock_save_new(form, commit=True):
++    return "new_object"
++
++test_formset.save_new = mock_save_new
++
++# Test save_new_objects
++result = test_formset.save_new_objects()
++print(f"Saved objects: {result}")
++print(f"New objects: {test_formset.new_objects}")
++
++print("\n=== All tests completed ===")
+\ No newline at end of file

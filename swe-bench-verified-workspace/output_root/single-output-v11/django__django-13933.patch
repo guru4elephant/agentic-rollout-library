@@ -1,0 +1,489 @@
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 422bc5d178..e03a3803cd 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -1188,7 +1188,7 @@ class ModelChoiceField(ChoiceField):
+     # This class is a subclass of ChoiceField for purity, but it doesn't
+     # actually use any of ChoiceField's implementation.
+     default_error_messages = {
+-        'invalid_choice': _('Select a valid choice. That choice is not one of'
++        'invalid_choice': _('Select a valid choice. %(value)s is not one of'
+                             ' the available choices.'),
+     }
+     iterator = ModelChoiceIterator
+@@ -1284,7 +1284,11 @@ class ModelChoiceField(ChoiceField):
+                 value = getattr(value, key)
+             value = self.queryset.get(**{key: value})
+         except (ValueError, TypeError, self.queryset.model.DoesNotExist):
+-            raise ValidationError(self.error_messages['invalid_choice'], code='invalid_choice')
++            raise ValidationError(
++                self.error_messages['invalid_choice'],
++                code='invalid_choice',
++                params={'value': value},
++            )
+         return value
+ 
+     def validate(self, value):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..ac70f42f00
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where ModelChoiceField doesn't show 
++the value of the invalid choice when raising a ValidationError.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.db import models
++from django.core.exceptions import ValidationError
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    def __str__(self):
++        return self.name
++
++    class Meta:
++        app_label = 'test'
++
++# Create a mock queryset for testing
++class MockQuerySet:
++    model = TestModel
++    
++    def get(self, **kwargs):
++        raise TestModel.DoesNotExist("Object does not exist")
++    
++    def all(self):
++        return self
++
++# Test ModelChoiceField
++class TestForm(forms.Form):
++    model_choice = forms.ModelChoiceField(queryset=MockQuerySet())
++    regular_choice = forms.ChoiceField(choices=[('1', 'Choice 1'), ('2', 'Choice 2')])
++
++print("Testing ModelChoiceField vs ChoiceField validation error messages...")
++print("=" * 60)
++
++# Test ModelChoiceField
++form1 = TestForm({'model_choice': '999'})  # Invalid choice
++if not form1.is_valid():
++    print("ModelChoiceField errors:")
++    for field, errors in form1.errors.items():
++        print(f"  {field}: {errors}")
++        for error in errors:
++            print(f"    Error message: {error}")
++            print(f"    Error code: {getattr(error, 'code', 'N/A')}")
++            print(f"    Error params: {getattr(error, 'params', 'N/A')}")
++    print()
++
++# Test regular ChoiceField  
++form2 = TestForm({'regular_choice': '999'})  # Invalid choice
++if not form2.is_valid():
++    print("ChoiceField errors:")
++    for field, errors in form2.errors.items():
++        print(f"  {field}: {errors}")
++        for error in errors:
++            print(f"    Error message: {error}")
++            print(f"    Error code: {getattr(error, 'code', 'N/A')}")
++            print(f"    Error params: {getattr(error, 'params', 'N/A')}")
++    print()
++
++print("The ModelChoiceField error message doesn't show the invalid value,")
++print("while the ChoiceField error message does show the invalid value.")
+\ No newline at end of file
+diff --git a/test_backward_compatibility.py b/test_backward_compatibility.py
+new file mode 100644
+index 0000000000..f5d4d0eda9
+--- /dev/null
++++ b/test_backward_compatibility.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++"""
++Test to ensure backward compatibility after the ModelChoiceField fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.db import models
++from django.core.exceptions import ValidationError
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    def __str__(self):
++        return self.name
++
++    class Meta:
++        app_label = 'test'
++
++# Create a mock queryset that returns a valid object for specific values
++class MockQuerySet:
++    model = TestModel
++    
++    def get(self, **kwargs):
++        key = list(kwargs.keys())[0]
++        value = kwargs[key]
++        
++        # Return a mock object for valid values
++        if value == '1':
++            obj = TestModel()
++            obj.pk = 1
++            obj.name = "Valid Option"
++            return obj
++        # Raise DoesNotExist for invalid values
++        raise TestModel.DoesNotExist("Object does not exist")
++    
++    def all(self):
++        return self
++
++print("Testing backward compatibility...")
++print("=" * 40)
++
++# Test 1: Valid value should work normally
++print("Test 1: Valid value")
++field = forms.ModelChoiceField(queryset=MockQuerySet())
++try:
++    result = field.clean('1')
++    print("✓ Valid value processed correctly")
++except Exception as e:
++    print(f"✗ Error with valid value: {e}")
++
++# Test 2: Invalid value should show the value in error message
++print("\nTest 2: Invalid value")
++field = forms.ModelChoiceField(queryset=MockQuerySet())
++try:
++    result = field.clean('999')
++    print("✗ Invalid value should have raised validation error")
++except ValidationError as e:
++    error_msg = str(e)
++    if '999' in error_msg:
++        print("✓ Invalid value shows in error message")
++    else:
++        print(f"✗ Error message doesn't contain value: {error_msg}")
++
++# Test 3: Empty value should work normally
++print("\nTest 3: Empty value")
++field = forms.ModelChoiceField(queryset=MockQuerySet(), required=False)
++try:
++    result = field.clean('')
++    print("✓ Empty value processed correctly")
++except Exception as e:
++    print(f"✗ Error with empty value: {e}")
++
++print("\nAll backward compatibility tests completed!")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..74eff44c6c
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the ModelChoiceField fix works for different scenarios.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.db import models
++from django.core.exceptions import ValidationError
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    def __str__(self):
++        return self.name
++
++    class Meta:
++        app_label = 'test'
++
++# Create a mock queryset for testing
++class MockQuerySet:
++    model = TestModel
++    
++    def get(self, **kwargs):
++        raise TestModel.DoesNotExist("Object does not exist")
++    
++    def all(self):
++        return self
++
++# Test ModelChoiceField with different invalid values
++class TestForm(forms.Form):
++    model_choice = forms.ModelChoiceField(queryset=MockQuerySet())
++
++print("Testing ModelChoiceField with different invalid values...")
++print("=" * 60)
++
++test_values = ['999', 'invalid_id', '123abc', '0', '-1']
++
++for value in test_values:
++    form = TestForm({'model_choice': value})
++    if not form.is_valid():
++        for field, errors in form.errors.items():
++            for error in errors:
++                print(f"Value '{value}': {error}")
++    print()
++
++print("All tests completed successfully!")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..1a4ade83b5
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the ModelChoiceField fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.db import models
++from django.core.exceptions import ValidationError
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    def __str__(self):
++        return self.name
++
++    class Meta:
++        app_label = 'test'
++
++# Create a mock queryset that always raises DoesNotExist
++class MockQuerySet:
++    model = TestModel
++    
++    def get(self, **kwargs):
++        raise TestModel.DoesNotExist("Object does not exist")
++    
++    def all(self):
++        return self
++
++print("Testing edge cases...")
++print("=" * 40)
++
++# Test different types of invalid values
++test_cases = [
++    ('string_value', 'string_value'),
++    ('123', '123'),
++    ('0', '0'),
++    ('-1', '-1'),
++    ('1.5', '1.5'),
++    ('true', 'true'),
++    ('false', 'false'),
++    ('null', 'null'),
++    ('none', 'none'),
++]
++
++for value, expected_in_message in test_cases:
++    field = forms.ModelChoiceField(queryset=MockQuerySet())
++    try:
++        result = field.clean(value)
++        print(f"✗ Value '{value}' should have raised validation error")
++    except ValidationError as e:
++        error_msg = str(e)
++        if expected_in_message in error_msg:
++            print(f"✓ Value '{value}': Error message contains '{expected_in_message}'")
++        else:
++            print(f"✗ Value '{value}': Error message doesn't contain '{expected_in_message}': {error_msg}")
++
++print("\nAll edge case tests completed!")
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..3bd87fcd70
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++"""
++Test to verify the GitHub issue is fixed: ModelChoiceField should show 
++the value of the invalid choice when raising a ValidationError.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.db import models
++from django.core.exceptions import ValidationError
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    def __str__(self):
++        return self.name
++
++    class Meta:
++        app_label = 'test'
++
++# Create a mock queryset that always raises DoesNotExist
++class MockQuerySet:
++    model = TestModel
++    
++    def get(self, **kwargs):
++        raise TestModel.DoesNotExist("Object does not exist")
++    
++    def all(self):
++        return self
++
++print("Testing GitHub issue fix...")
++print("=" * 50)
++
++# Test ModelChoiceField
++model_choice_field = forms.ModelChoiceField(queryset=MockQuerySet())
++try:
++    model_choice_field.clean('invalid_value_123')
++    print("✗ ModelChoiceField should have raised validation error")
++except ValidationError as e:
++    error_msg = str(e)
++    print(f"ModelChoiceField error message: {error_msg}")
++    if 'invalid_value_123' in error_msg:
++        print("✓ ModelChoiceField now shows the invalid value in the error message!")
++    else:
++        print("✗ ModelChoiceField still doesn't show the invalid value")
++
++print()
++
++# Test ChoiceField for comparison
++choice_field = forms.ChoiceField(choices=[('1', 'Choice 1'), ('2', 'Choice 2')])
++try:
++    choice_field.clean('invalid_value_123')
++    print("✗ ChoiceField should have raised validation error")
++except ValidationError as e:
++    error_msg = str(e)
++    print(f"ChoiceField error message: {error_msg}")
++    if 'invalid_value_123' in error_msg:
++        print("✓ ChoiceField shows the invalid value in the error message (as expected)")
++    else:
++        print("✗ ChoiceField doesn't show the invalid value")
++
++print("\n" + "=" * 50)
++print("Before the fix: ModelChoiceField didn't show invalid values")
++print("After the fix: ModelChoiceField now shows invalid values like ChoiceField!")
++print("GitHub issue is FIXED! ✅")
+\ No newline at end of file

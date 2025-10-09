@@ -1,0 +1,291 @@
+diff --git a/final_comprehensive_test.py b/final_comprehensive_test.py
+new file mode 100644
+index 00000000..921a2980
+--- /dev/null
++++ b/final_comprehensive_test.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++
++import requests
++
++def test_comprehensive():
++    print("=== Comprehensive Test ===")
++    
++    # Test the exact scenario from the GitHub issue
++    session = requests.Session()
++    session.headers['Accept-Encoding'] = None
++    
++    # Prepare a request
++    prepared_request = session.prepare_request(requests.Request('GET', 'http://httpbin.org/get'))
++    
++    # Check that the bug is fixed
++    if 'Accept-Encoding' in prepared_request.headers:
++        actual_value = prepared_request.headers['Accept-Encoding']
++        if actual_value == 'None':
++            print("❌ BUG STILL EXISTS: Header value is string 'None'")
++            return False
++        else:
++            print(f"❌ UNEXPECTED: Header exists with value: {actual_value}")
++            return False
++    else:
++        print("✅ BUG FIXED: Accept-Encoding header correctly removed")
++    
++    # Test that other functionality still works
++    if 'User-Agent' in prepared_request.headers and 'Accept' in prepared_request.headers:
++        print("✅ Other headers preserved correctly")
++    else:
++        print("❌ Other headers missing")
++        return False
++    
++    # Test that the workaround (del) still works
++    session2 = requests.Session()
++    del session2.headers['Accept-Encoding']
++    prepared_request2 = session2.prepare_request(requests.Request('GET', 'http://httpbin.org/get'))
++    if 'Accept-Encoding' not in prepared_request2.headers:
++        print("✅ del workaround still works")
++    else:
++        print("❌ del workaround broken")
++        return False
++    
++    # Test request-level None headers (should already work)
++    request = requests.Request('GET', 'http://httpbin.org/get', headers={'Test-Header': None})
++    prepared_request3 = session.prepare_request(request)
++    if 'Test-Header' not in prepared_request3.headers:
++        print("✅ Request-level None headers work correctly")
++    else:
++        print("❌ Request-level None headers broken")
++        return False
++    
++    # Test regular headers still work
++    request2 = requests.Request('GET', 'http://httpbin.org/get', headers={'Test-Header': 'test-value'})
++    prepared_request4 = session.prepare_request(request2)
++    if 'Test-Header' in prepared_request4.headers and prepared_request4.headers['Test-Header'] == 'test-value':
++        print("✅ Regular headers work correctly")
++    else:
++        print("❌ Regular headers broken")
++        return False
++    
++    print("✅ ALL TESTS PASSED - The fix is working correctly!")
++    return True
++
++if __name__ == "__main__":
++    success = test_comprehensive()
++    exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..02cad0c6
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,23 @@
++#!/usr/bin/env python3
++
++import requests
++
++# Create a session
++session = requests.Session()
++
++# Set a header to None (this should remove it, but currently sends "None")
++session.headers['Accept-Encoding'] = None
++
++print("Session headers:", session.headers)
++
++# Make a request to see what headers are actually sent
++# We'll use a mock server or inspect the prepared request
++prepared_request = session.prepare_request(requests.Request('GET', 'http://httpbin.org/get'))
++print("Prepared request headers:", prepared_request.headers)
++
++# Check if None values are being converted to string "None"
++for key, value in prepared_request.headers.items():
++    if value == 'None':
++        print(f"BUG: Header '{key}' has value 'None' (string) instead of being removed")
++    elif value is None:
++        print(f"OK: Header '{key}' has value None (should be removed)")
+\ No newline at end of file
+diff --git a/requests/models.py b/requests/models.py
+index cd232e68..d67672a6 100644
+--- a/requests/models.py
++++ b/requests/models.py
+@@ -391,7 +391,9 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+         """Prepares the given HTTP headers."""
+ 
+         if headers:
+-            self.headers = CaseInsensitiveDict((to_native_string(name), value) for name, value in headers.items())
++            # Filter out headers with None values
++            filtered_headers = {to_native_string(name): value for name, value in headers.items() if value is not None}
++            self.headers = CaseInsensitiveDict(filtered_headers)
+         else:
+             self.headers = CaseInsensitiveDict()
+ 
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 00000000..456bc503
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++
++import requests
++
++def test_case(description, headers_to_set, expected_headers):
++    print(f"\n=== {description} ===")
++    session = requests.Session()
++    
++    # Set headers as specified
++    for key, value in headers_to_set.items():
++        session.headers[key] = value
++    
++    print("Session headers:", session.headers)
++    
++    # Prepare a request
++    prepared_request = session.prepare_request(requests.Request('GET', 'http://httpbin.org/get'))
++    print("Prepared request headers:", prepared_request.headers)
++    
++    # Check if the result matches expected headers
++    actual_headers = dict(prepared_request.headers)
++    success = actual_headers == expected_headers
++    print(f"Expected: {expected_headers}")
++    print(f"Match: {success}")
++    
++    return success
++
++# Test cases
++test_cases = [
++    # Test 1: Single None header should be removed
++    (
++        "Single None header",
++        {'Accept-Encoding': None},
++        {'User-Agent': 'python-requests/2.3.0 CPython/3.9.21 Linux/5.10.0-1.0.0.28', 'Accept': '*/*'}
++    ),
++    
++    # Test 2: Multiple None headers should all be removed
++    (
++        "Multiple None headers", 
++        {'Accept-Encoding': None, 'Custom-Header': None},
++        {'User-Agent': 'python-requests/2.3.0 CPython/3.9.21 Linux/5.10.0-1.0.0.28', 'Accept': '*/*'}
++    ),
++    
++    # Test 3: Mix of None and valid headers
++    (
++        "Mix of None and valid headers",
++        {'Accept-Encoding': None, 'Custom-Header': 'valid-value'},
++        {'User-Agent': 'python-requests/2.3.0 CPython/3.9.21 Linux/5.10.0-1.0.0.28', 'Accept': '*/*', 'Custom-Header': 'valid-value'}
++    ),
++    
++    # Test 4: Empty string should be preserved (not None)
++    (
++        "Empty string value",
++        {'Custom-Header': ''},
++        {'User-Agent': 'python-requests/2.3.0 CPython/3.9.21 Linux/5.10.0-1.0.0.28', 'Accept-Encoding': 'gzip, deflate, compress', 'Accept': '*/*', 'Custom-Header': ''}
++    ),
++    
++    # Test 5: Zero should be preserved (not None)
++    (
++        "Zero value",
++        {'Custom-Header': 0},
++        {'User-Agent': 'python-requests/2.3.0 CPython/3.9.21 Linux/5.10.0-1.0.0.28', 'Accept-Encoding': 'gzip, deflate, compress', 'Accept': '*/*', 'Custom-Header': 0}
++    ),
++]
++
++all_passed = True
++for description, headers_to_set, expected_headers in test_cases:
++    if not test_case(description, headers_to_set, expected_headers):
++        all_passed = False
++
++print(f"\n=== Overall Result ===")
++print(f"All tests passed: {all_passed}")
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 00000000..96a9b6bf
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,43 @@
++#!/usr/bin/env python3
++
++import requests
++
++# Test the exact scenario from the GitHub issue
++print("Testing GitHub issue scenario...")
++
++# Create session as described in the issue
++session = requests.Session()
++
++# Set Accept-Encoding to None (this should remove it, not send "None")
++session.headers['Accept-Encoding'] = None
++
++print("Session headers:", session.headers)
++
++# Prepare a request to see what headers are actually sent
++prepared_request = session.prepare_request(requests.Request('GET', 'http://httpbin.org/get'))
++print("Prepared request headers:", prepared_request.headers)
++
++# Check that Accept-Encoding is NOT in the headers (should be removed)
++if 'Accept-Encoding' in prepared_request.headers:
++    print("❌ FAIL: Accept-Encoding header is still present")
++    print(f"Value: {prepared_request.headers['Accept-Encoding']}")
++else:
++    print("✅ PASS: Accept-Encoding header was correctly removed")
++
++# Also test that other headers are still present
++expected_headers = ['User-Agent', 'Accept']
++for header in expected_headers:
++    if header in prepared_request.headers:
++        print(f"✅ {header} header is present as expected")
++    else:
++        print(f"❌ {header} header is missing")
++
++# Test the workaround mentioned in the issue (using del) still works
++print("\nTesting del workaround...")
++session2 = requests.Session()
++del session2.headers['Accept-Encoding']
++prepared_request2 = session2.prepare_request(requests.Request('GET', 'http://httpbin.org/get'))
++if 'Accept-Encoding' in prepared_request2.headers:
++    print("❌ FAIL: del workaround didn't remove Accept-Encoding")
++else:
++    print("✅ PASS: del workaround still works correctly")
+\ No newline at end of file
+diff --git a/test_request_headers.py b/test_request_headers.py
+new file mode 100644
+index 00000000..d55f5829
+--- /dev/null
++++ b/test_request_headers.py
+@@ -0,0 +1,37 @@
++#!/usr/bin/env python3
++
++import requests
++
++print("Testing request-level headers with None values...")
++
++# Test 1: Request-level None headers should also be removed
++session = requests.Session()
++request = requests.Request('GET', 'http://httpbin.org/get', headers={'Custom-Header': None})
++prepared_request = session.prepare_request(request)
++
++print("Request with None header prepared headers:", dict(prepared_request.headers))
++if 'Custom-Header' in prepared_request.headers:
++    print("❌ FAIL: Request-level None header was not removed")
++else:
++    print("✅ PASS: Request-level None header was correctly removed")
++
++# Test 2: Mix of session and request None headers
++session.headers['Session-None-Header'] = None
++request2 = requests.Request('GET', 'http://httpbin.org/get', headers={'Request-None-Header': None})
++prepared_request2 = session.prepare_request(request2)
++
++print("Mixed None headers prepared headers:", dict(prepared_request2.headers))
++for header in ['Session-None-Header', 'Request-None-Header']:
++    if header in prepared_request2.headers:
++        print(f"❌ FAIL: {header} was not removed")
++    else:
++        print(f"✅ PASS: {header} was correctly removed")
++
++# Test 3: Regular headers should still work
++request3 = requests.Request('GET', 'http://httpbin.org/get', headers={'Valid-Header': 'valid-value'})
++prepared_request3 = session.prepare_request(request3)
++
++if 'Valid-Header' in prepared_request3.headers and prepared_request3.headers['Valid-Header'] == 'valid-value':
++    print("✅ PASS: Regular headers still work correctly")
++else:
++    print("❌ FAIL: Regular headers are broken")
+\ No newline at end of file

@@ -1,0 +1,464 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..a582e2385
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,28 @@
++#!/usr/bin/env python3
++
++from sphinx.pycode import ModuleAnalyzer
++import tempfile
++import os
++
++# Create a temporary file with the example content
++content = '''_foo = None  #: :meta public:
++'''
++
++with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++    f.write(content)
++    f.flush()
++    
++    # Analyze the file
++    analyzer = ModuleAnalyzer.for_file(f.name, 'test_module')
++    attr_docs = analyzer.find_attr_docs()
++    print('attr_docs:', attr_docs)
++    
++    # Test metadata extraction
++    from sphinx.util.docstrings import extract_metadata
++    for key, docstrings in attr_docs.items():
++        combined_doc = '\n'.join(docstrings)
++        metadata = extract_metadata(combined_doc)
++        print(f'Key: {key}, Metadata: {metadata}')
++    
++    # Clean up
++    os.unlink(f.name)
+\ No newline at end of file
+diff --git a/setup.py b/setup.py
+index 8d40de1a8..03f325278 100644
+--- a/setup.py
++++ b/setup.py
+@@ -15,22 +15,22 @@ if sys.version_info < (3, 5):
+     sys.exit(1)
+ 
+ install_requires = [
+-    'sphinxcontrib-applehelp',
+-    'sphinxcontrib-devhelp',
++    'sphinxcontrib-applehelp<=1.0.7',
++    'sphinxcontrib-devhelp<=1.0.5',
+     'sphinxcontrib-jsmath',
+-    'sphinxcontrib-htmlhelp',
+-    'sphinxcontrib-serializinghtml',
+-    'sphinxcontrib-qthelp',
+-    'Jinja2>=2.3',
++    'sphinxcontrib-htmlhelp<=2.0.4',
++    'sphinxcontrib-serializinghtml<=1.1.9',
++    'sphinxcontrib-qthelp<=1.0.6',
++    'Jinja2<3.0',
+     'Pygments>=2.0',
+     'docutils>=0.12',
+     'snowballstemmer>=1.1',
+     'babel>=1.3',
+-    'alabaster>=0.7,<0.8',
++    'alabaster>=0.7,<0.7.12',
+     'imagesize',
+     'requests>=2.5.0',
+     'setuptools',
+-    'packaging',
++    'packaging', 'markupsafe<=2.0.1',
+ ]
+ 
+ extras_require = {
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 000000000..8e44c4011
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python3
++
++from sphinx.pycode import ModuleAnalyzer
++from sphinx.util.docstrings import extract_metadata
++import tempfile
++import os
++
++# Create test module content
++module_content = '''_foo = None  #: :meta public:
++bar = "public variable"
++_baz = "private variable"  #: :meta private:
++'''
++
++# Create temporary module file
++with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++    f.write(module_content)
++    f.flush()
++    
++    # Analyze the file
++    analyzer = ModuleAnalyzer.for_file(f.name, 'test_module')
++    attr_docs = analyzer.find_attr_docs()
++    
++    print("Attribute documentation found:")
++    for key, docstrings in attr_docs.items():
++        combined_doc = '\n'.join(docstrings)
++        metadata = extract_metadata(combined_doc)
++        print(f"  {key}: {docstrings} -> Metadata: {metadata}")
++        
++        # Test the logic from our fix
++        isprivate = key[1].startswith('_')  # Default logic
++        if 'private' in metadata:
++            isprivate = True
++        elif 'public' in metadata:
++            isprivate = False
++        
++        print(f"    Should be public: {not isprivate}")
++    
++    # Clean up
++    os.unlink(f.name)
+\ No newline at end of file
+diff --git a/sphinx/ext/autodoc/__init__.py b/sphinx/ext/autodoc/__init__.py
+index 76265f5be..2546bc7fb 100644
+--- a/sphinx/ext/autodoc/__init__.py
++++ b/sphinx/ext/autodoc/__init__.py
+@@ -757,6 +757,18 @@ class Documenter:
+                 else:
+                     keep = False
+             elif (namespace, membername) in attr_docs:
++                # Extract metadata from attribute documentation
++                attr_docstrings = attr_docs[(namespace, membername)]
++                combined_attr_doc = '\n'.join(attr_docstrings)
++                attr_metadata = extract_metadata(combined_attr_doc)
++                
++                # Update isprivate based on attribute metadata
++                if 'private' in attr_metadata:
++                    isprivate = True
++                elif 'public' in attr_metadata:
++                    isprivate = False
++                # If no metadata, keep the original isprivate value
++                
+                 if want_all and isprivate:
+                     if self.options.private_members is None:
+                         keep = False
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..1f46aba98
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++
++from sphinx.pycode import ModuleAnalyzer
++from sphinx.util.docstrings import extract_metadata
++import tempfile
++import os
++
++# Test various edge cases
++test_cases = [
++    # Case 1: Multiple metadata directives
++    '''var1 = None  #: :meta public: :meta private:''',
++    
++    # Case 2: Public metadata on public variable
++    '''var2 = None  #: :meta public:''',
++    
++    # Case 3: Private metadata on public variable  
++    '''var3 = None  #: :meta private:''',
++    
++    # Case 4: Public metadata on private variable
++    '''_var4 = None  #: :meta public:''',
++    
++    # Case 5: Private metadata on private variable
++    '''_var5 = None  #: :meta private:''',
++    
++    # Case 6: No metadata on private variable
++    '''_var6 = None''',
++    
++    # Case 7: No metadata on public variable
++    '''var7 = None''',
++    
++    # Case 8: Multiple lines of documentation
++    '''_var8 = None  #: First line
++#: Second line :meta public:''',
++]
++
++for i, content in enumerate(test_cases, 1):
++    print(f"\n=== Test Case {i} ===")
++    print(f"Content: {content}")
++    
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write(content)
++        f.flush()
++        
++        analyzer = ModuleAnalyzer.for_file(f.name, f'test_case_{i}')
++        attr_docs = analyzer.find_attr_docs()
++        
++        print("Attribute documentation found:")
++        for key, docstrings in attr_docs.items():
++            combined_doc = '\n'.join(docstrings)
++            metadata = extract_metadata(combined_doc)
++            print(f"  {key}: {docstrings} -> Metadata: {metadata}")
++            
++            # Test the logic from our fix
++            isprivate = key[1].startswith('_')  # Default logic
++            if 'private' in metadata:
++                isprivate = True
++            elif 'public' in metadata:
++                isprivate = False
++            
++            print(f"    Should be public: {not isprivate}")
++        
++        os.unlink(f.name)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 000000000..ac5f05127
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++
++import tempfile
++import os
++from sphinx.ext.autodoc import ModuleDocumenter
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++from sphinx.util import logging
++from io import StringIO
++import sys
++
++# Create test module content
++module_content = '''_foo = None  #: :meta public:
++bar = "public variable"
++_baz = "private variable"  #: :meta private:
++'''
++
++# Create temporary module file
++with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++    f.write(module_content)
++    f.flush()
++    module_file = f.name
++    module_name = 'test_module'
++
++# Add the directory to Python path
++sys.path.insert(0, os.path.dirname(module_file))
++
++try:
++    # Import the test module
++    import importlib.util
++    spec = importlib.util.spec_from_file_location(module_name, module_file)
++    test_module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(test_module)
++    
++    # Create a minimal Sphinx app for testing
++    confdir = srcdir = outdir = doctreedir = tempfile.mkdtemp()
++    
++    with docutils_namespace():
++        app = Sphinx(srcdir, confdir, outdir, doctreedir, 'html')
++        
++        # Create a ModuleDocumenter for the test module
++        documenter = ModuleDocumenter(app.env.get_and_resolve_doctree, test_module.__name__)
++        documenter.objpath = [test_module.__name__]
++        documenter.object = test_module
++        documenter.parent = None
++        documenter.modname = test_module.__name__
++        
++        # Get the members and filter them
++        members = documenter.get_object_members(False)
++        filtered_members = documenter.filter_members(members, True)
++        
++        print("Filtered members:")
++        for member_name, member_obj, is_attr in filtered_members:
++            print(f"  - {member_name} (is_attr: {is_attr})")
++            
++        # Check if _foo is included (should be included due to :meta public:)
++        member_names = [name for name, obj, is_attr in filtered_members]
++        print(f"\n_foo included: {'_foo' in member_names}")
++        print(f"bar included: {'bar' in member_names}")
++        print(f"_baz included: {'_baz' in member_names}")
++        
++finally:
++    # Clean up
++    sys.path.remove(os.path.dirname(module_file))
++    os.unlink(module_file)
++    import shutil
++    shutil.rmtree(confdir, ignore_errors=True)
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 000000000..13a3865c1
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++
++import tempfile
++import os
++import sys
++from pathlib import Path
++
++# Reproduce the exact issue from GitHub
++module_content = '''_foo = None  #: :meta public:
++'''
++
++# Create a temporary directory structure
++test_dir = tempfile.mkdtemp()
++sys.path.insert(0, test_dir)
++
++# Create the test module (example.py as mentioned in the issue)
++module_file = Path(test_dir) / 'example.py'
++module_file.write_text(module_content)
++
++# Create conf.py
++conf_content = '''
++extensions = ['sphinx.ext.autodoc']
++'''
++conf_file = Path(test_dir) / 'conf.py'
++conf_file.write_text(conf_content)
++
++# Create index.rst (exactly as mentioned in the issue)
++index_content = '''
++.. automodule:: example
++   :members:
++'''
++index_file = Path(test_dir) / 'index.rst'
++index_file.write_text(index_content)
++
++# Build the documentation
++from sphinx.cmd.build import main as sphinx_build
++
++try:
++    # Build HTML documentation
++    build_dir = Path(test_dir) / '_build'
++    result = sphinx_build(['-b', 'html', test_dir, str(build_dir)])
++    
++    # Check if _foo is included in the documentation
++    html_file = build_dir / 'index.html'
++    if html_file.exists():
++        content = html_file.read_text()
++        
++        # The GitHub issue states that _foo should be shown on the built document
++        if '_foo' in content:
++            print("✓ SUCCESS: The GitHub issue is FIXED!")
++            print("  _foo is now documented with :meta public:")
++        else:
++            print("✗ FAILURE: The GitHub issue is NOT fixed")
++            print("  _foo is still not documented despite :meta public:")
++            
++        print("\nGenerated documentation snippet:")
++        if '_foo' in content:
++            # Extract the relevant part showing _foo
++            lines = content.split('\n')
++            for i, line in enumerate(lines):
++                if '_foo' in line:
++                    start = max(0, i-2)
++                    end = min(len(lines), i+3)
++                    for j in range(start, end):
++                        print(f"  {lines[j]}")
++                    break
++    else:
++        print("HTML file not generated")
++        
++finally:
++    # Clean up
++    sys.path.remove(test_dir)
++    import shutil
++    shutil.rmtree(test_dir, ignore_errors=True)
+\ No newline at end of file
+diff --git a/test_meta_public.py b/test_meta_public.py
+new file mode 100644
+index 000000000..fcbd9b141
+--- /dev/null
++++ b/test_meta_public.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++
++import tempfile
++import os
++import sys
++from pathlib import Path
++
++# Create a test module with the issue
++test_module_content = '''_foo = None  #: :meta public:
++bar = "public variable"
++_baz = "private variable"  #: :meta private:
++'''
++
++# Create a temporary directory structure
++test_dir = tempfile.mkdtemp()
++sys.path.insert(0, test_dir)
++
++# Create the test module
++module_file = Path(test_dir) / 'test_module.py'
++module_file.write_text(test_module_content)
++
++# Create conf.py
++conf_content = '''
++extensions = ['sphinx.ext.autodoc']
++'''
++conf_file = Path(test_dir) / 'conf.py'
++conf_file.write_text(conf_content)
++
++# Create index.rst
++index_content = '''
++Test Module
++===========
++
++.. automodule:: test_module
++   :members:
++'''
++index_file = Path(test_dir) / 'index.rst'
++index_file.write_text(index_content)
++
++# Build the documentation
++from sphinx.cmd.build import main as sphinx_build
++
++try:
++    # Build HTML documentation
++    build_dir = Path(test_dir) / '_build'
++    result = sphinx_build(['-b', 'html', test_dir, str(build_dir)])
++    
++    # Check if _foo is included in the documentation
++    html_file = build_dir / 'index.html'
++    if html_file.exists():
++        content = html_file.read_text()
++        print("Generated HTML content:")
++        print("=" * 50)
++        print(content)
++        print("=" * 50)
++        
++        # Check if _foo is documented
++        if '_foo' in content:
++            print("✓ SUCCESS: _foo is documented (meta public worked)")
++        else:
++            print("✗ FAILURE: _foo is not documented (meta public failed)")
++            
++        # Check if bar is documented  
++        if 'bar' in content:
++            print("✓ SUCCESS: bar is documented")
++        else:
++            print("✗ FAILURE: bar is not documented")
++            
++        # Check if _baz is documented (should not be)
++        if '_baz' in content:
++            print("✗ FAILURE: _baz is documented (should be private)")
++        else:
++            print("✓ SUCCESS: _baz is not documented (meta private worked)")
++    else:
++        print("HTML file not generated")
++        
++finally:
++    # Clean up
++    sys.path.remove(test_dir)
++    import shutil
++    shutil.rmtree(test_dir, ignore_errors=True)
+\ No newline at end of file
+diff --git a/tox.ini b/tox.ini
+index dbb705a3a..9f4fc3a32 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -28,7 +28,7 @@ setenv =
+     PYTHONWARNINGS = all,ignore::ImportWarning:importlib._bootstrap_external,ignore::DeprecationWarning:site,ignore::DeprecationWarning:distutils
+     PYTEST_ADDOPTS = {env:PYTEST_ADDOPTS:} --color yes
+ commands=
+-    python -X dev -m pytest --durations 25 {posargs}
++    python -X dev -m pytest -rA --durations 25 {posargs}
+ 
+ [testenv:flake8]
+ basepython = python3

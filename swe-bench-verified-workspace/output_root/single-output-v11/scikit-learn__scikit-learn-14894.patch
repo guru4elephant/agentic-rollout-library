@@ -1,0 +1,269 @@
+diff --git a/debug_issue.py b/debug_issue.py
+new file mode 100644
+index 000000000..0a102acb8
+--- /dev/null
++++ b/debug_issue.py
+@@ -0,0 +1,34 @@
++import numpy as np
++import scipy
++import sklearn
++from sklearn.svm import SVR
++
++# Reproduce the issue with debug info
++x_train = np.array([[0, 1, 0, 0],
++                    [0, 0, 0, 1],
++                    [0, 0, 1, 0],
++                    [0, 0, 0, 1]])
++y_train = np.array([0.04, 0.04, 0.10, 0.16])
++
++model = SVR(C=316.227766017, cache_size=200, coef0=0.0, degree=3, epsilon=0.1,
++            gamma=1.0, kernel='linear', max_iter=15000,
++            shrinking=True, tol=0.001, verbose=False)
++
++# Convert to sparse
++xtrain = scipy.sparse.csr_matrix(x_train)
++
++# Let's manually check what happens inside _sparse_fit
++print("Fitting model...")
++try:
++    model.fit(xtrain, y_train)
++except Exception as e:
++    print(f"Error: {e}")
++    print("Let's inspect the internal state...")
++    print(f"support_vectors_ shape: {model.support_vectors_.shape}")
++    print(f"hasattr classes_: {hasattr(model, 'classes_')}")
++    if hasattr(model, 'classes_'):
++        print(f"classes_: {model.classes_}")
++        print(f"n_class would be: {len(model.classes_) - 1}")
++    else:
++        print("n_class would be: 1 (regression)")
++    print(f"n_SV: {model.support_vectors_.shape[0]}")
+\ No newline at end of file
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 000000000..9e271dde6
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,32 @@
++import numpy as np
++import scipy
++import sklearn
++from sklearn.svm import SVR
++
++# Exact reproduction from the issue
++x_train = np.array([[0, 1, 0, 0],
++[0, 0, 0, 1],
++[0, 0, 1, 0],
++[0, 0, 0, 1]])
++y_train = np.array([0.04, 0.04, 0.10, 0.16])
++model = SVR(C=316.227766017, cache_size=200, coef0=0.0, degree=3, epsilon=0.1,
++  	    gamma=1.0, kernel='linear', max_iter=15000,
++  	    shrinking=True, tol=0.001, verbose=False)
++
++# dense x_train has no error
++model.fit(x_train, y_train)
++
++# convert to sparse
++xtrain= scipy.sparse.csr_matrix(x_train)
++model.fit(xtrain, y_train)
++
++# Check that the expected result is achieved
++print("SUCCESS: No error thrown!")
++print(f"self.dual_coef_ = {model.dual_coef_}")
++print(f"self.dual_coef_.shape = {model.dual_coef_.shape}")
++print(f"self.dual_coef_.data = {model.dual_coef_.data}")
++
++# Verify it's essentially an empty matrix as expected
++assert model.dual_coef_.shape == (1, 0), f"Expected shape (1, 0), got {model.dual_coef_.shape}"
++assert len(model.dual_coef_.data) == 0, f"Expected empty data, got {model.dual_coef_.data}"
++print("All assertions passed!")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..3155d61a0
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,31 @@
++import numpy as np
++import scipy
++import sklearn
++from sklearn.svm import SVR
++
++# Reproduce the issue
++x_train = np.array([[0, 1, 0, 0],
++                    [0, 0, 0, 1],
++                    [0, 0, 1, 0],
++                    [0, 0, 0, 1]])
++y_train = np.array([0.04, 0.04, 0.10, 0.16])
++
++model = SVR(C=316.227766017, cache_size=200, coef0=0.0, degree=3, epsilon=0.1,
++            gamma=1.0, kernel='linear', max_iter=15000,
++            shrinking=True, tol=0.001, verbose=False)
++
++# dense x_train has no error
++print("Testing with dense data...")
++model.fit(x_train, y_train)
++print("Dense data fit successful")
++
++# convert to sparse
++print("Testing with sparse data...")
++xtrain = scipy.sparse.csr_matrix(x_train)
++try:
++    model.fit(xtrain, y_train)
++    print("Sparse data fit successful")
++except ZeroDivisionError as e:
++    print(f"ZeroDivisionError: {e}")
++except Exception as e:
++    print(f"Other error: {e}")
+\ No newline at end of file
+diff --git a/sklearn/svm/base.py b/sklearn/svm/base.py
+index 64cebe837..ce162c3e5 100644
+--- a/sklearn/svm/base.py
++++ b/sklearn/svm/base.py
+@@ -286,12 +286,16 @@ class BaseLibSVM(BaseEstimator, metaclass=ABCMeta):
+             n_class = 1
+         n_SV = self.support_vectors_.shape[0]
+ 
+-        dual_coef_indices = np.tile(np.arange(n_SV), n_class)
+-        dual_coef_indptr = np.arange(0, dual_coef_indices.size + 1,
+-                                     dual_coef_indices.size / n_class)
+-        self.dual_coef_ = sp.csr_matrix(
+-            (dual_coef_data, dual_coef_indices, dual_coef_indptr),
+-            (n_class, n_SV))
++        # Handle the case where there are no support vectors
++        if n_SV == 0:
++            self.dual_coef_ = sp.csr_matrix([])
++        else:
++            dual_coef_indices = np.tile(np.arange(n_SV), n_class)
++            dual_coef_indptr = np.arange(0, dual_coef_indices.size + 1,
++                                         dual_coef_indices.size / n_class)
++            self.dual_coef_ = sp.csr_matrix(
++                (dual_coef_data, dual_coef_indices, dual_coef_indptr),
++                (n_class, n_SV))
+ 
+     def predict(self, X):
+         """Perform regression on samples in X.
+diff --git a/test_classification_edge_case.py b/test_classification_edge_case.py
+new file mode 100644
+index 000000000..188df1b15
+--- /dev/null
++++ b/test_classification_edge_case.py
+@@ -0,0 +1,30 @@
++import numpy as np
++import scipy
++from sklearn.svm import SVC
++
++# Test edge case for classification where n_class could be 0
++# Create a case where all samples belong to the same class
++x_train = np.array([[0, 1, 0, 0],
++                    [0, 0, 0, 1],
++                    [0, 0, 1, 0],
++                    [0, 0, 0, 1]])
++y_train = np.array([0, 0, 0, 0])  # All samples belong to class 0
++
++model = SVC(C=316.227766017, cache_size=200, coef0=0.0, degree=3,
++            gamma=1.0, kernel='linear', max_iter=15000,
++            shrinking=True, tol=0.001, verbose=False)
++
++# Convert to sparse
++xtrain = scipy.sparse.csr_matrix(x_train)
++
++# Fit the model
++try:
++    model.fit(xtrain, y_train)
++    print("Classification model fitted successfully!")
++    print(f"support_vectors_.shape: {model.support_vectors_.shape}")
++    print(f"classes_: {model.classes_}")
++    print(f"n_class would be: {len(model.classes_) - 1}")
++    print(f"dual_coef_.shape: {model.dual_coef_.shape}")
++    print(f"dual_coef_: {model.dual_coef_}")
++except Exception as e:
++    print(f"Error: {e}")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 000000000..4cb81fb63
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,35 @@
++import numpy as np
++import scipy
++from sklearn.svm import SVR
++
++# Test the fix comprehensively
++x_train = np.array([[0, 1, 0, 0],
++                    [0, 0, 0, 1],
++                    [0, 0, 1, 0],
++                    [0, 0, 0, 1]])
++y_train = np.array([0.04, 0.04, 0.10, 0.16])
++
++model = SVR(C=316.227766017, cache_size=200, coef0=0.0, degree=3, epsilon=0.1,
++            gamma=1.0, kernel='linear', max_iter=15000,
++            shrinking=True, tol=0.001, verbose=False)
++
++# Convert to sparse
++xtrain = scipy.sparse.csr_matrix(x_train)
++
++# Fit the model
++model.fit(xtrain, y_train)
++
++# Check the results
++print("Model fitted successfully!")
++print(f"support_vectors_.shape: {model.support_vectors_.shape}")
++print(f"dual_coef_.shape: {model.dual_coef_.shape}")
++print(f"dual_coef_: {model.dual_coef_}")
++print(f"dual_coef_.data: {model.dual_coef_.data}")
++
++# Test that we can also predict without errors
++try:
++    predictions = model.predict(xtrain)
++    print(f"Predictions: {predictions}")
++    print("Prediction successful!")
++except Exception as e:
++    print(f"Prediction error: {e}")
+\ No newline at end of file
+diff --git a/test_other_svm_types.py b/test_other_svm_types.py
+new file mode 100644
+index 000000000..610b344ca
+--- /dev/null
++++ b/test_other_svm_types.py
+@@ -0,0 +1,38 @@
++import numpy as np
++import scipy
++from sklearn.svm import SVC, SVR
++
++# Test SVC with sparse data that might result in no support vectors
++x_train = np.array([[0, 1, 0, 0],
++                    [0, 0, 0, 1],
++                    [0, 0, 1, 0],
++                    [0, 0, 0, 1]])
++y_train = np.array([0, 1, 0, 1])  # Binary classification
++
++model = SVC(C=316.227766017, cache_size=200, coef0=0.0, degree=3,
++            gamma=1.0, kernel='linear', max_iter=15000,
++            shrinking=True, tol=0.001, verbose=False)
++
++# Convert to sparse
++xtrain = scipy.sparse.csr_matrix(x_train)
++
++try:
++    model.fit(xtrain, y_train)
++    print("SVC fitted successfully!")
++    print(f"support_vectors_.shape: {model.support_vectors_.shape}")
++    print(f"dual_coef_.shape: {model.dual_coef_.shape}")
++except Exception as e:
++    print(f"SVC Error: {e}")
++
++# Test SVR again to confirm
++model_svr = SVR(C=316.227766017, cache_size=200, coef0=0.0, degree=3, epsilon=0.1,
++                gamma=1.0, kernel='linear', max_iter=15000,
++                shrinking=True, tol=0.001, verbose=False)
++
++try:
++    model_svr.fit(xtrain, y_train)
++    print("SVR fitted successfully!")
++    print(f"support_vectors_.shape: {model_svr.support_vectors_.shape}")
++    print(f"dual_coef_.shape: {model_svr.dual_coef_.shape}")
++except Exception as e:
++    print(f"SVR Error: {e}")
+\ No newline at end of file

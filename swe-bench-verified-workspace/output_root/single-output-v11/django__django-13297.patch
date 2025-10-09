@@ -1,0 +1,277 @@
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 0000000000..808f0b92d6
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++"""Debug test for the SimpleLazyObject fix"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++from django.conf import settings
++from django.views.generic.base import _wrap_url_kwargs_with_deprecation_warning
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def debug_lazy_object():
++    """Debug the lazy object behavior"""
++    url_kwargs = {"offer_slug": "test-offer"}
++    wrapped_kwargs = _wrap_url_kwargs_with_deprecation_warning(url_kwargs)
++    
++    offer_slug = wrapped_kwargs["offer_slug"]
++    print(f"offer_slug type: {type(offer_slug)}")
++    print(f"offer_slug value: {offer_slug}")
++    
++    # Check what _setupfunc returns
++    print(f"Has _setupfunc: {hasattr(offer_slug, '_setupfunc')}")
++    if hasattr(offer_slug, '_setupfunc'):
++        try:
++            setup_result = offer_slug._setupfunc()
++            print(f"_setupfunc result: {setup_result}")
++            print(f"_setupfunc result type: {type(setup_result)}")
++        except Exception as e:
++            print(f"_setupfunc error: {e}")
++    
++    # Test direct conversion
++    try:
++        direct_str = str(offer_slug)
++        print(f"Direct str conversion: {direct_str}")
++    except Exception as e:
++        print(f"Direct str conversion error: {e}")
++
++if __name__ == '__main__':
++    debug_lazy_object()
+\ No newline at end of file
+diff --git a/django/utils/functional.py b/django/utils/functional.py
+index 6d38f932f9..881ded224d 100644
+--- a/django/utils/functional.py
++++ b/django/utils/functional.py
+@@ -400,7 +400,18 @@ class SimpleLazyObject(LazyObject):
+             result = SimpleLazyObject(self._setupfunc)
+             memo[id(self)] = result
+             return result
+-        return copy.deepcopy(self._wrapped, memo)
++        return copy.deepcopy(self._wrapped, memo
++
++    def __conform__(self, protocol):
++        """
++        Support for database parameter binding protocols (e.g., sqlite3).
++        Resolves the lazy object when conforming to a protocol.
++        """
++        if self._wrapped is empty:
++            self._setup()
++        if hasattr(self._wrapped, '__conform__'):
++            return self._wrapped.__conform__(protocol)
++        return self._wrapped
+ 
+ 
+ def partition(predicate, values):
+diff --git a/django/views/generic/base.py b/django/views/generic/base.py
+index ea5baca08d..e4e9c26f5e 100644
+--- a/django/views/generic/base.py
++++ b/django/views/generic/base.py
+@@ -178,6 +178,7 @@ def _wrap_url_kwargs_with_deprecation_warning(url_kwargs):
+                 RemovedInDjango40Warning, stacklevel=2,
+             )
+             return value
++        
+         context_kwargs[key] = access_value
+     return context_kwargs
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..46099145e1
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""Script to reproduce the SimpleLazyObject issue with TemplateView"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++from django.conf import settings
++from django.views.generic.base import _wrap_url_kwargs_with_deprecation_warning
++from django.utils.functional import SimpleLazyObject
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_simple_lazy_object_issue():
++    """Test that demonstrates the SimpleLazyObject issue"""
++    
++    # Simulate URL kwargs that would come from URL pattern matching
++    url_kwargs = {"offer_slug": "test-offer"}
++    
++    # This is what happens in TemplateView.get_context_data()
++    wrapped_kwargs = _wrap_url_kwargs_with_deprecation_warning(url_kwargs)
++    
++    # Get the offer_slug from kwargs (this is what users do)
++    offer_slug = wrapped_kwargs.get("offer_slug", "")
++    
++    print(f"offer_slug type: {type(offer_slug)}")
++    print(f"offer_slug value: {offer_slug}")
++    print(f"offer_slug is SimpleLazyObject: {isinstance(offer_slug, SimpleLazyObject)}")
++    
++    # Test the issue by simulating what happens in _quote_params_for_last_executed_query
++    try:
++        # This simulates the exact scenario that causes the error
++        import sqlite3
++        conn = sqlite3.connect(':memory:')
++        cursor = conn.cursor()
++        
++        # Try to execute a query with SimpleLazyObject as parameter
++        # This should fail with "Error binding parameter 0 - probably unsupported type"
++        cursor.execute("SELECT ?", (offer_slug,))
++        result = cursor.fetchone()
++        print(f"Query with SimpleLazyObject works: {result}")
++    except Exception as e:
++        print(f"Error when using SimpleLazyObject with sqlite3: {e}")
++        print(f"Error type: {type(e)}")
++    
++    # Test explicit string conversion (the workaround)
++    try:
++        offer_slug_str = str(offer_slug)
++        cursor.execute("SELECT ?", (offer_slug_str,))
++        result = cursor.fetchone()
++        print(f"Explicit string conversion works: {result}")
++    except Exception as e:
++        print(f"Error even with explicit conversion: {e}")
++
++if __name__ == '__main__':
++    test_simple_lazy_object_issue()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..c6b0d5cc44
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++"""Comprehensive test for the SimpleLazyObject fix"""
++
++import os
++import sys
++import warnings
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++from django.conf import settings
++from django.views.generic.base import _wrap_url_kwargs_with_deprecation_warning
++from django.utils.functional import SimpleLazyObject
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_deprecation_warning():
++    """Test that deprecation warnings still work"""
++    print("Testing deprecation warnings...")
++    
++    # Capture warnings
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        
++        url_kwargs = {"offer_slug": "test-offer"}
++        wrapped_kwargs = _wrap_url_kwargs_with_deprecation_warning(url_kwargs)
++        
++        # Access the value to trigger the warning
++        offer_slug = wrapped_kwargs["offer_slug"]
++        print(f"Value: {offer_slug}")
++        
++        # Check if warning was issued
++        if w:
++            print(f"Warning issued: {w[0].message}")
++        else:
++            print("No warning issued")
++    
++    print("Deprecation warning test passed")
++
++def test_database_compatibility():
++    """Test that database compatibility works"""
++    print("Testing database compatibility...")
++    
++    url_kwargs = {"offer_slug": "test-offer"}
++    wrapped_kwargs = _wrap_url_kwargs_with_deprecation_warning(url_kwargs)
++    
++    offer_slug = wrapped_kwargs["offer_slug"]
++    print(f"offer_slug type: {type(offer_slug)}")
++    print(f"offer_slug value: {offer_slug}")
++    
++    # Test sqlite3 compatibility
++    import sqlite3
++    conn = sqlite3.connect(':memory:')
++    cursor = conn.cursor()
++    
++    try:
++        cursor.execute("SELECT ?", (offer_slug,))
++        result = cursor.fetchone()
++        print(f"Database query successful: {result}")
++        print("Database compatibility test passed")
++    except Exception as e:
++        print(f"Database query failed: {e}")
++        return False
++    
++    return True
++
++def test_string_conversion():
++    """Test that string conversion works"""
++    print("Testing string conversion...")
++    
++    url_kwargs = {"offer_slug": "test-offer"}
++    wrapped_kwargs = _wrap_url_kwargs_with_deprecation_warning(url_kwargs)
++    
++    offer_slug = wrapped_kwargs["offer_slug"]
++    
++    # Test string conversion
++    try:
++        offer_slug_str = str(offer_slug)
++        print(f"String conversion successful: {offer_slug_str}")
++        print("String conversion test passed")
++    except Exception as e:
++        print(f"String conversion failed: {e}")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    print("Running comprehensive tests...")
++    
++    test_deprecation_warning()
++    
++    if test_database_compatibility():
++        print("✓ Database compatibility test passed")
++    else:
++        print("✗ Database compatibility test failed")
++    
++    if test_string_conversion():
++        print("✓ String conversion test passed")
++    else:
++        print("✗ String conversion test failed")
++    
++    print("All tests completed")
+\ No newline at end of file

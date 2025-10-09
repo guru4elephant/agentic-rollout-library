@@ -1,0 +1,312 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..0e6386ad78
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,74 @@
++import os
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=['test'],
++        USE_TZ=True,
++    )
++    django.setup()
++
++import pickle
++from django.db.models import Sum
++from django.db import models
++
++# Create a simple model
++class Toy(models.Model):
++    name = models.CharField(max_length=16)
++    material = models.CharField(max_length=16)
++    price = models.PositiveIntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Toy)
++
++# Create some test data
++Toy.objects.create(name='foo', price=10, material='wood')
++Toy.objects.create(name='bar', price=20, material='plastic')
++Toy.objects.create(name='baz', price=100, material='wood')
++
++print("=== Testing values() with annotate() ===")
++prices = Toy.objects.values('material').annotate(total_price=Sum('price'))
++print("Original:", list(prices))
++prices2 = Toy.objects.all()
++prices2.query = pickle.loads(pickle.dumps(prices.query))
++print("Unpickled:", list(prices2))
++print("Success: No crash!")
++
++print("\n=== Testing values() ===")
++materials = Toy.objects.values('material')
++print("Original:", list(materials))
++materials2 = Toy.objects.all()
++materials2.query = pickle.loads(pickle.dumps(materials.query))
++print("Unpickled:", list(materials2))
++print("Success: No crash!")
++
++print("\n=== Testing values_list() ===")
++names = Toy.objects.values_list('name')
++print("Original:", list(names))
++names2 = Toy.objects.all()
++names2.query = pickle.loads(pickle.dumps(names.query))
++print("Unpickled:", list(names2))
++print("Success: No crash!")
++
++print("\n=== Testing normal queryset (should still work) ===")
++normal = Toy.objects.all()
++print("Original:", list(normal))
++normal2 = Toy.objects.all()
++normal2.query = pickle.loads(pickle.dumps(normal.query))
++print("Unpickled:", list(normal2))
++print("Success: Normal querysets still work!")
++
++print("\n=== All tests passed! ===")
+\ No newline at end of file
+diff --git a/debug_pickle.py b/debug_pickle.py
+new file mode 100644
+index 0000000000..475762efa6
+--- /dev/null
++++ b/debug_pickle.py
+@@ -0,0 +1,79 @@
++import os
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=['test'],
++        USE_TZ=True,
++    )
++    django.setup()
++
++import pickle
++from django.db.models import Sum
++from django.db import models
++
++# Create a simple model
++class Toy(models.Model):
++    name = models.CharField(max_length=16)
++    material = models.CharField(max_length=16)
++    price = models.PositiveIntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Toy)
++
++# Create some test data
++Toy.objects.create(name='foo', price=10, material='wood')
++Toy.objects.create(name='bar', price=20, material='plastic')
++Toy.objects.create(name='baz', price=100, material='wood')
++
++# Original query with values() and annotate()
++prices = Toy.objects.values('material').annotate(total_price=Sum('price'))
++print("Original prices:")
++print(f"Type: {type(prices)}")
++print(f"_iterable_class: {prices._iterable_class}")
++print(f"Query: {prices.query}")
++print()
++
++# Pickle the query
++pickled_query = pickle.dumps(prices.query)
++print("Pickled query:")
++print(f"Length: {len(pickled_query)} bytes")
++print()
++
++# Unpickle the query
++unpickled_query = pickle.loads(pickled_query)
++print("Unpickled query:")
++print(f"Type: {type(unpickled_query)}")
++print(f"Query: {unpickled_query}")
++print()
++
++# Create new queryset and assign the unpickled query
++prices2 = Toy.objects.all()
++print("Before assignment:")
++print(f"prices2._iterable_class: {prices2._iterable_class}")
++print(f"prices2.query: {prices2.query}")
++
++prices2.query = unpickled_query
++print("After assignment:")
++print(f"prices2._iterable_class: {prices2._iterable_class}")
++print(f"prices2.query: {prices2.query}")
++print()
++
++# Check if _iterable_class is preserved
++print("Checking _iterable_class preservation:")
++print(f"Original _iterable_class: {prices._iterable_class}")
++print(f"New _iterable_class: {prices2._iterable_class}")
++print(f"Are they the same? {prices._iterable_class == prices2._iterable_class}")
+\ No newline at end of file
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index b48d0df9c0..9d110ef6c2 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -211,6 +211,13 @@ class QuerySet:
+     @query.setter
+     def query(self, value):
+         self._query = value
++        # Update _iterable_class based on the query type
++        if hasattr(value, 'values_select') and value.values_select:
++            # This is a values() or values_list() query
++            self._iterable_class = ValuesIterable
++        else:
++            # This is a normal model query
++            self._iterable_class = ModelIterable
+ 
+     def as_manager(cls):
+         # Address the circular dependency between `Queryset` and `Manager`.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..930dd13033
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,59 @@
++import os
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=['test'],
++        USE_TZ=True,
++    )
++    django.setup()
++
++import pickle
++from django.db.models import Sum
++from django.db import models
++
++# Create a simple model
++class Toy(models.Model):
++    name = models.CharField(max_length=16)
++    material = models.CharField(max_length=16)
++    price = models.PositiveIntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Toy)
++
++# Create some test data
++Toy.objects.create(name='foo', price=10, material='wood')
++Toy.objects.create(name='bar', price=20, material='plastic')
++Toy.objects.create(name='baz', price=100, material='wood')
++
++# Original query with values() and annotate()
++prices = Toy.objects.values('material').annotate(total_price=Sum('price'))
++print("Original prices:")
++print(prices)
++print(f"Type of prices[0]: {type(prices[0])}")
++
++# Pickle and unpickle the query
++prices2 = Toy.objects.all()
++prices2.query = pickle.loads(pickle.dumps(prices.query))
++
++print(f"Type of prices2[0]: {type(prices2[0])}")
++print("prices2 result:")
++try:
++    print(prices2)
++except Exception as e:
++    print(f"Error: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_values_list.py b/test_values_list.py
+new file mode 100644
+index 0000000000..45eeb4fa0d
+--- /dev/null
++++ b/test_values_list.py
+@@ -0,0 +1,54 @@
++import os
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=['test'],
++        USE_TZ=True,
++    )
++    django.setup()
++
++import pickle
++from django.db.models import Sum
++from django.db import models
++
++# Create a simple model
++class Toy(models.Model):
++    name = models.CharField(max_length=16)
++    material = models.CharField(max_length=16)
++    price = models.PositiveIntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Toy)
++
++# Create some test data
++Toy.objects.create(name='foo', price=10, material='wood')
++Toy.objects.create(name='bar', price=20, material='plastic')
++Toy.objects.create(name='baz', price=100, material='wood')
++
++# Test values_list()
++materials = Toy.objects.values_list('material', flat=True)
++print("Original materials:")
++print(materials)
++print(f"Type of materials[0]: {type(materials[0])}")
++
++# Pickle and unpickle the query
++materials2 = Toy.objects.all()
++materials2.query = pickle.loads(pickle.dumps(materials.query))
++
++print(f"Type of materials2[0]: {type(materials2[0])}")
++print("materials2 result:")
++print(materials2)
+\ No newline at end of file

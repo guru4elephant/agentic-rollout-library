@@ -1,0 +1,259 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..f6942ea90
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,23 @@
++import numpy as np
++from sklearn.datasets import load_iris
++from sklearn.feature_selection import SelectKBest
++from sklearn.feature_selection import chi2
++
++X, y = load_iris(return_X_y=True, as_frame=True)
++X = X.astype(
++   {
++       "petal width (cm)": np.float16,
++       "petal length (cm)": np.float16,
++   }
++)
++X["cat"] = y.astype("category")
++
++print("Input dtypes:")
++print(X.dtypes)
++print()
++
++selector = SelectKBest(chi2, k=2)
++selector.set_output(transform="pandas")
++X_out = selector.fit_transform(X, y)
++print("Output dtypes:")
++print(X_out.dtypes)
+\ No newline at end of file
+diff --git a/sklearn/utils/_set_output.py b/sklearn/utils/_set_output.py
+index 335773c6a..bb458718d 100644
+--- a/sklearn/utils/_set_output.py
++++ b/sklearn/utils/_set_output.py
+@@ -12,6 +12,7 @@ def _wrap_in_pandas_container(
+     *,
+     columns,
+     index=None,
++    dtypes=None,
+ ):
+     """Create a Pandas DataFrame.
+ 
+@@ -36,6 +37,10 @@ def _wrap_in_pandas_container(
+     index : array-like, default=None
+         Index for data.
+ 
++    dtypes : dict, default=None
++        Dictionary mapping column names to dtypes. If not None, the output
++        DataFrame will use these dtypes.
++
+     Returns
+     -------
+     dataframe : DataFrame
+@@ -57,9 +62,14 @@ def _wrap_in_pandas_container(
+             data_to_wrap.columns = columns
+         if index is not None:
+             data_to_wrap.index = index
++        if dtypes is not None:
++            data_to_wrap = data_to_wrap.astype(dtypes)
+         return data_to_wrap
+ 
+-    return pd.DataFrame(data_to_wrap, index=index, columns=columns)
++    df = pd.DataFrame(data_to_wrap, index=index, columns=columns)
++    if dtypes is not None:
++        df = df.astype(dtypes)
++    return df
+ 
+ 
+ def _get_output_config(method, estimator=None):
+@@ -127,10 +137,25 @@ def _wrap_data_with_container(method, data_to_wrap, original_input, estimator):
+         return data_to_wrap
+ 
+     # dense_config == "pandas"
++    # Get dtypes from original input if it's a DataFrame
++    dtypes = None
++    pd = check_pandas_support("Setting output container to 'pandas'")
++    if isinstance(original_input, pd.DataFrame):
++        # Get the feature names that will be in the output
++        feature_names_out = estimator.get_feature_names_out()
++        # Map output feature names to original dtypes
++        dtypes = {}
++        for feature_name in feature_names_out:
++            if feature_name in original_input.columns:
++                dtypes[feature_name] = original_input[feature_name].dtype
++            # Handle the case where feature names might be different
++            # but we still want to preserve dtype if possible
++    
+     return _wrap_in_pandas_container(
+         data_to_wrap=data_to_wrap,
+         index=getattr(original_input, "index", None),
+         columns=estimator.get_feature_names_out,
++        dtypes=dtypes,
+     )
+ 
+ 
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 000000000..f0dc77167
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,55 @@
++import numpy as np
++import pandas as pd
++from sklearn.feature_selection import SelectKBest, chi2
++from sklearn.preprocessing import StandardScaler, MinMaxScaler
++from sklearn.decomposition import PCA
++from sklearn.datasets import load_iris
++
++def test_transformer(transformer, name, X, y=None):
++    print(f"=== Testing {name} ===")
++    print("Input dtypes:")
++    print(X.dtypes)
++    print()
++    
++    transformer.set_output(transform="pandas")
++    if y is not None:
++        X_out = transformer.fit_transform(X, y)
++    else:
++        X_out = transformer.fit_transform(X)
++        
++    print("Output dtypes:")
++    print(X_out.dtypes)
++    print()
++    return X_out
++
++# Create test data with various dtypes
++X = pd.DataFrame({
++    'float16_col': np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float16),
++    'float32_col': np.array([1.1, 2.2, 3.3, 4.4, 5.5], dtype=np.float32),
++    'int32_col': np.array([1, 2, 3, 4, 5], dtype=np.int32),
++    'int64_col': np.array([10, 20, 30, 40, 50], dtype=np.int64),
++})
++
++# Create dummy target variable
++y = np.array([0, 1, 0, 1, 0])
++
++# Test with various transformers
++test_transformer(SelectKBest(chi2, k=2), "SelectKBest", X, y)
++test_transformer(StandardScaler(), "StandardScaler", X)
++test_transformer(MinMaxScaler(), "MinMaxScaler", X)
++test_transformer(PCA(n_components=2), "PCA", X)
++
++# Test with iris dataset (original issue)
++print("=== Testing with Iris dataset (original issue) ===")
++X_iris, y_iris = load_iris(return_X_y=True, as_frame=True)
++X_iris = X_iris.astype({
++    "petal width (cm)": np.float16,
++    "petal length (cm)": np.float16,
++})
++X_iris["cat"] = y_iris.astype("category")
++
++selector = SelectKBest(chi2, k=2)
++selector.set_output(transform="pandas")
++X_out = selector.fit_transform(X_iris, y_iris)
++print("Output dtypes:")
++print(X_out.dtypes)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..5f510d50d
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,56 @@
++import numpy as np
++from sklearn.datasets import load_iris
++from sklearn.feature_selection import SelectKBest
++from sklearn.feature_selection import chi2
++
++# Test 1: Original reproduction case
++print("=== Test 1: Original reproduction case ===")
++X, y = load_iris(return_X_y=True, as_frame=True)
++X = X.astype(
++   {
++       "petal width (cm)": np.float16,
++       "petal length (cm)": np.float16,
++   }
++)
++X["cat"] = y.astype("category")
++
++print("Input dtypes:")
++print(X.dtypes)
++print()
++
++selector = SelectKBest(chi2, k=2)
++selector.set_output(transform="pandas")
++X_out = selector.fit_transform(X, y)
++print("Output dtypes:")
++print(X_out.dtypes)
++print()
++
++# Test 2: All columns selected (no feature selection)
++print("=== Test 2: All columns selected ===")
++selector2 = SelectKBest(chi2, k=5)  # Select all 5 features
++selector2.set_output(transform="pandas")
++X_out2 = selector2.fit_transform(X, y)
++print("Output dtypes:")
++print(X_out2.dtypes)
++print()
++
++# Test 3: Non-DataFrame input (should work normally)
++print("=== Test 3: Non-DataFrame input ===")
++X_array, y_array = load_iris(return_X_y=True, as_frame=False)
++selector3 = SelectKBest(chi2, k=2)
++selector3.set_output(transform="pandas")
++X_out3 = selector3.fit_transform(X_array, y_array)
++print("Output dtypes:")
++print(X_out3.dtypes)
++print()
++
++# Test 4: Different feature names (should handle gracefully)
++print("=== Test 4: Different feature names ===")
++X_renamed = X.copy()
++X_renamed.columns = ["a", "b", "c", "d", "e"]
++selector4 = SelectKBest(chi2, k=2)
++selector4.set_output(transform="pandas")
++X_out4 = selector4.fit_transform(X_renamed, y)
++print("Output dtypes:")
++print(X_out4.dtypes)
++print()
+\ No newline at end of file
+diff --git a/test_other_transformer.py b/test_other_transformer.py
+new file mode 100644
+index 000000000..9af0a7efc
+--- /dev/null
++++ b/test_other_transformer.py
+@@ -0,0 +1,32 @@
++import numpy as np
++import pandas as pd
++from sklearn.preprocessing import StandardScaler
++from sklearn.decomposition import PCA
++
++# Test with StandardScaler
++print("=== Test with StandardScaler ===")
++X = pd.DataFrame({
++    'a': np.array([1, 2, 3, 4, 5], dtype=np.float16),
++    'b': np.array([10, 20, 30, 40, 50], dtype=np.int32),
++    'c': np.array([0.1, 0.2, 0.3, 0.4, 0.5], dtype=np.float32)
++})
++
++print("Input dtypes:")
++print(X.dtypes)
++print()
++
++scaler = StandardScaler()
++scaler.set_output(transform="pandas")
++X_scaled = scaler.fit_transform(X)
++print("Scaled output dtypes:")
++print(X_scaled.dtypes)
++print()
++
++# Test with PCA
++print("=== Test with PCA ===")
++pca = PCA(n_components=2)
++pca.set_output(transform="pandas")
++X_pca = pca.fit_transform(X)
++print("PCA output dtypes:")
++print(X_pca.dtypes)
++print()
+\ No newline at end of file

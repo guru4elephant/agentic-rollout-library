@@ -1,0 +1,289 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 64be087bf1..6d4f2865ab 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -269,7 +269,7 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
+                         "class": get_ul_class(self.radio_fields[db_field.name]),
+                     }
+                 )
+-                kwargs["empty_label"] = _("None") if db_field.blank else None
++                kwargs["empty_label"] = (kwargs.get("empty_label") or _("None")) if db_field.blank else None
+ 
+         if "queryset" not in kwargs:
+             queryset = self.get_field_queryset(db, db_field, request)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..a23885b015
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib import admin
++from django.db import models
++from django.contrib.admin.options import ModelAdmin
++from django.utils.translation import gettext_lazy as _
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    related = models.ForeignKey('self', on_delete=models.CASCADE, blank=True, null=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create a custom ModelAdmin that tries to set a custom empty_label
++class MyModelAdmin(ModelAdmin):
++    radio_fields = {'related': admin.HORIZONTAL}
++    
++    def formfield_for_foreignkey(self, db_field, request, **kwargs):
++        if db_field.name == 'related':
++            kwargs['empty_label'] = "I WANT TO SET MY OWN EMPTY LABEL"
++        return super().formfield_for_foreignkey(db_field, request, **kwargs)
++
++# Test the issue
++def test_empty_label_override():
++    admin_instance = MyModelAdmin(TestModel, admin.site)
++    
++    # Get the formfield for the foreign key
++    field = admin_instance.formfield_for_foreignkey(TestModel._meta.get_field('related'), None)
++    
++    print("Empty label from formfield:", field.empty_label)
++    
++    # Check if our custom empty_label was preserved
++    if field.empty_label == "I WANT TO SET MY OWN EMPTY LABEL":
++        print("SUCCESS: Custom empty_label was preserved!")
++        return True
++    else:
++        print("FAILURE: Custom empty_label was overridden!")
++        print(f"Expected: 'I WANT TO SET MY OWN EMPTY LABEL'")
++        print(f"Got: {field.empty_label}")
++        return False
++
++if __name__ == '__main__':
++    success = test_empty_label_override()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_basic_functionality.py b/test_basic_functionality.py
+new file mode 100644
+index 0000000000..2075e8d3dc
+--- /dev/null
++++ b/test_basic_functionality.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib import admin
++from django.db import models
++from django.contrib.admin.options import ModelAdmin
++from django.utils.translation import gettext_lazy as _
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    related = models.ForeignKey('self', on_delete=models.CASCADE, blank=True, null=True)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_basic_radio_fields_functionality():
++    """Test that basic radio_fields functionality still works after our fix"""
++    
++    # Test 1: Default behavior without custom empty_label
++    class DefaultModelAdmin(ModelAdmin):
++        radio_fields = {'related': admin.HORIZONTAL}
++    
++    admin_instance = DefaultModelAdmin(TestModel, admin.site)
++    field = admin_instance.formfield_for_foreignkey(TestModel._meta.get_field('related'), None)
++    
++    print("Test 1 - Default radio fields behavior:")
++    print(f"Widget type: {type(field.widget).__name__}")
++    print(f"Empty label: {field.empty_label}")
++    
++    # Should use AdminRadioSelect widget and default empty_label
++    assert hasattr(field.widget, '__class__') and 'AdminRadioSelect' in str(type(field.widget))
++    assert str(field.empty_label) == "None"  # Default translation
++    
++    print("✓ PASS\n")
++    
++    # Test 2: With custom empty_label (our fix)
++    class CustomModelAdmin(ModelAdmin):
++        radio_fields = {'related': admin.HORIZONTAL}
++        
++        def formfield_for_foreignkey(self, db_field, request, **kwargs):
++            if db_field.name == 'related':
++                kwargs['empty_label'] = "CUSTOM LABEL"
++            return super().formfield_for_foreignkey(db_field, request, **kwargs)
++    
++    custom_admin = CustomModelAdmin(TestModel, admin.site)
++    custom_field = custom_admin.formfield_for_foreignkey(TestModel._meta.get_field('related'), None)
++    
++    print("Test 2 - Custom empty_label with radio fields:")
++    print(f"Widget type: {type(custom_field.widget).__name__}")
++    print(f"Empty label: {custom_field.empty_label}")
++    
++    # Should still use AdminRadioSelect widget but with custom empty_label
++    assert hasattr(custom_field.widget, '__class__') and 'AdminRadioSelect' in str(type(custom_field.widget))
++    assert custom_field.empty_label == "CUSTOM LABEL"  # Our custom label
++    
++    print("✓ PASS\n")
++    
++    print("All basic functionality tests passed!")
++    return True
++
++if __name__ == '__main__':
++    success = test_basic_radio_fields_functionality()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..e394494bed
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib import admin
++from django.db import models
++from django.contrib.admin.options import ModelAdmin
++from django.utils.translation import gettext_lazy as _
++
++# Create test models
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    related_blank = models.ForeignKey('self', on_delete=models.CASCADE, blank=True, null=True)
++    related_not_blank = models.ForeignKey('self', on_delete=models.CASCADE, blank=False, null=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create a custom ModelAdmin that sets custom empty_labels
++class MyModelAdmin(ModelAdmin):
++    radio_fields = {'related_blank': admin.HORIZONTAL, 'related_not_blank': admin.HORIZONTAL}
++    
++    def formfield_for_foreignkey(self, db_field, request, **kwargs):
++        if db_field.name == 'related_blank':
++            kwargs['empty_label'] = "CUSTOM EMPTY LABEL"
++        return super().formfield_for_foreignkey(db_field, request, **kwargs)
++
++# Test edge cases
++def test_edge_cases():
++    admin_instance = MyModelAdmin(TestModel, admin.site)
++    
++    # Test 1: Blank field with custom empty_label
++    field_blank = admin_instance.formfield_for_foreignkey(TestModel._meta.get_field('related_blank'), None)
++    print("Test 1 - Blank field with custom empty_label:")
++    print(f"Empty label: {field_blank.empty_label}")
++    assert field_blank.empty_label == "CUSTOM EMPTY LABEL", f"Expected 'CUSTOM EMPTY LABEL', got {field_blank.empty_label}"
++    print("✓ PASS\n")
++    
++    # Test 2: Not blank field (should not have empty_label set by radio_fields logic)
++    field_not_blank = admin_instance.formfield_for_foreignkey(TestModel._meta.get_field('related_not_blank'), None)
++    print("Test 2 - Not blank field:")
++    print(f"Empty label: {field_not_blank.empty_label}")
++    # For non-blank fields, the radio_fields logic should set empty_label to None
++    assert field_not_blank.empty_label is None, f"Expected None, got {field_not_blank.empty_label}"
++    print("✓ PASS\n")
++    
++    # Test 3: Create another admin that doesn't set custom empty_label (should use default)
++    class DefaultModelAdmin(ModelAdmin):
++        radio_fields = {'related_blank': admin.HORIZONTAL}
++    
++    default_admin = DefaultModelAdmin(TestModel, admin.site)
++    field_default = default_admin.formfield_for_foreignkey(TestModel._meta.get_field('related_blank'), None)
++    print("Test 3 - Default behavior (no custom empty_label):")
++    print(f"Empty label: {field_default.empty_label}")
++    # Should use the default translation for "None"
++    assert str(field_default.empty_label) == "None", f"Expected 'None', got {field_default.empty_label}"
++    print("✓ PASS\n")
++    
++    print("All edge case tests passed!")
++    return True
++
++if __name__ == '__main__':
++    success = test_edge_cases()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

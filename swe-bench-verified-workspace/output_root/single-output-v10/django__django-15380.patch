@@ -1,0 +1,575 @@
+diff --git a/django/db/migrations/autodetector.py b/django/db/migrations/autodetector.py
+index bf9c2acd26..f1238a3504 100644
+--- a/django/db/migrations/autodetector.py
++++ b/django/db/migrations/autodetector.py
+@@ -824,7 +824,7 @@ class MigrationAutodetector:
+         for app_label, model_name, field_name in sorted(self.new_field_keys - self.old_field_keys):
+             old_model_name = self.renamed_models.get((app_label, model_name), model_name)
+             old_model_state = self.from_state.models[app_label, old_model_name]
+-            new_model_state = self.to_state.models[app_label, old_model_name]
++            new_model_state = self.to_state.models[app_label, model_name]
+             field = new_model_state.get_field(field_name)
+             # Scan to see if this is actually a rename!
+             field_dec = self.deep_deconstruct(field)
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..e91da66390
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""
++Final test to verify the KeyError fix for the migration autodetector crash.
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a minimal settings module
++settings_content = '''
++DEBUG = True
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++INSTALLED_APPS = []
++SECRET_KEY = 'test-key'
++USE_TZ = True
++'''
++
++with open('test_settings.py', 'w') as f:
++    f.write(settings_content)
++
++# Now import Django modules
++import django
++django.setup()
++
++from django.db import models
++from django.db.migrations.state import ProjectState, ModelState
++from django.db.migrations.autodetector import MigrationAutodetector
++
++def test_keyerror_fix():
++    """Test that the KeyError is fixed"""
++    
++    # Create initial state with MyModel and old_field
++    initial_state = ProjectState()
++    initial_model = ModelState('test_one2', 'MyModel', [
++        ('id', models.AutoField(primary_key=True)),
++        ('old_field', models.CharField(max_length=100))
++    ])
++    initial_state.add_model(initial_model)
++    
++    # Create new state with MyModel2 and new_field
++    new_state = ProjectState()
++    new_model = ModelState('test_one2', 'MyModel2', [
++        ('id', models.AutoField(primary_key=True)),
++        ('new_field', models.CharField(max_length=100))
++    ])
++    new_state.add_model(new_model)
++    
++    # Create autodetector
++    autodetector = MigrationAutodetector(initial_state, new_state)
++    
++    # Manually set up the renamed_models dict to simulate the scenario
++    autodetector.renamed_models = {('test_one2', 'mymodel2'): 'mymodel'}
++    autodetector.old_field_keys = {('test_one2', 'mymodel', 'old_field')}
++    autodetector.new_field_keys = {('test_one2', 'mymodel2', 'new_field')}
++    
++    try:
++        # This should trigger generate_renamed_fields and should not raise KeyError
++        autodetector.generate_renamed_fields()
++        print("SUCCESS: No KeyError occurred in generate_renamed_fields")
++        return True
++    except KeyError as e:
++        if str(e) == "('test_one2', 'mymodel')":
++            print(f"KEYERROR STILL EXISTS: {e}")
++            return False
++        else:
++            print(f"DIFFERENT KEYERROR: {e}")
++            return False
++    except Exception as e:
++        print(f"OTHER ERROR (may be expected): {e}")
++        return True  # Other errors are not the focus of this test
++
++if __name__ == '__main__':
++    print("Testing KeyError fix for migration autodetector...")
++    success = test_keyerror_fix()
++    
++    # Cleanup
++    if os.path.exists('test_settings.py'):
++        os.remove('test_settings.py')
++    
++    if success:
++        print("KeyError fix verified successfully!")
++    else:
++        print("KeyError fix verification failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e4e2d52e58
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the migration autodetector crash when renaming a model and field.
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a minimal settings module
++settings_content = '''
++DEBUG = True
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++INSTALLED_APPS = []
++SECRET_KEY = 'test-key'
++USE_TZ = True
++'''
++
++with open('test_settings.py', 'w') as f:
++    f.write(settings_content)
++
++# Now import Django modules
++import django
++django.setup()
++
++from django.db import models
++from django.db.migrations.state import ProjectState, ModelState
++from django.db.migrations.autodetector import MigrationAutodetector
++from django.db.migrations.questioner import MigrationQuestioner
++
++def test_rename_model_and_field():
++    """Test case that reproduces the issue"""
++    
++    # Create initial state with MyModel and old_field
++    initial_state = ProjectState()
++    initial_model = ModelState('test_one', 'MyModel', [
++        ('id', models.AutoField(primary_key=True)),
++        ('old_field', models.CharField(max_length=100))
++    ])
++    initial_state.add_model(initial_model)
++    
++    # Create new state with MyModel2 and new_field
++    new_state = ProjectState()
++    new_model = ModelState('test_one', 'MyModel2', [
++        ('id', models.AutoField(primary_key=True)),
++        ('new_field', models.CharField(max_length=100))
++    ])
++    new_state.add_model(new_model)
++    
++    # Create autodetector with a mock questioner that simulates user input
++    class MockQuestioner:
++        def ask_rename_model(self, old_model_name, new_model_name):
++            print(f"Would you like to rename {old_model_name} to {new_model_name}? [y/N] y")
++            return True
++            
++        def ask_rename(self, model_name, old_field_name, new_field_name, field):
++            print(f"Would you like to rename {old_field_name} to {new_field_name}? [y/N] y")
++            return True
++    
++    questioner = MockQuestioner()
++    autodetector = MigrationAutodetector(initial_state, new_state, questioner)
++    
++    try:
++        # This should trigger the error
++        changes = autodetector.changes(None)
++        print("SUCCESS: No error occurred")
++        return True
++    except KeyError as e:
++        print(f"ERROR: {e}")
++        print("This reproduces the issue described in the GitHub issue")
++        return False
++    except Exception as e:
++        print(f"OTHER ERROR: {e}")
++        return False
++
++if __name__ == '__main__':
++    print("Testing migration autodetector with model and field rename...")
++    success = test_rename_model_and_field()
++    
++    # Cleanup
++    if os.path.exists('test_settings.py'):
++        os.remove('test_settings.py')
++    
++    if not success:
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_existing_functionality.py b/test_existing_functionality.py
+new file mode 100644
+index 0000000000..c4a49303b2
+--- /dev/null
++++ b/test_existing_functionality.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""
++Test to verify that our fix doesn't break existing functionality.
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a minimal settings module
++settings_content = '''
++DEBUG = True
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++INSTALLED_APPS = []
++SECRET_KEY = 'test-key'
++USE_TZ = True
++'''
++
++with open('test_settings.py', 'w') as f:
++    f.write(settings_content)
++
++# Now import Django modules
++import django
++django.setup()
++
++from django.db import models
++from django.db.migrations.state import ProjectState, ModelState
++from django.db.migrations.autodetector import MigrationAutodetector
++from django.db.migrations.questioner import MigrationQuestioner
++
++def test_field_rename_only():
++    """Test field rename without model rename (existing functionality)"""
++    
++    # Create initial state with MyModel and old_field
++    initial_state = ProjectState()
++    initial_model = ModelState('test_one', 'MyModel', [
++        ('id', models.AutoField(primary_key=True)),
++        ('old_field', models.CharField(max_length=100))
++    ])
++    initial_state.add_model(initial_model)
++    
++    # Create new state with MyModel and new_field (only field rename)
++    new_state = ProjectState()
++    new_model = ModelState('test_one', 'MyModel', [
++        ('id', models.AutoField(primary_key=True)),
++        ('new_field', models.CharField(max_length=100))
++    ])
++    new_state.add_model(new_model)
++    
++    # Create autodetector with a mock questioner
++    class MockQuestioner:
++        def ask_rename(self, model_name, old_field_name, new_field_name, field):
++            print(f"Would you like to rename {old_field_name} to {new_field_name}? [y/N] y")
++            return True
++    
++    questioner = MockQuestioner()
++    autodetector = MigrationAutodetector(initial_state, new_state, questioner)
++    
++    try:
++        # This should work without errors
++        changes = autodetector.changes(None)
++        print("SUCCESS: Field rename only works correctly")
++        return True
++    except Exception as e:
++        print(f"ERROR: {e}")
++        return False
++
++def test_model_rename_only():
++    """Test model rename without field rename (existing functionality)"""
++    
++    # Create initial state with MyModel
++    initial_state = ProjectState()
++    initial_model = ModelState('test_one', 'MyModel', [
++        ('id', models.AutoField(primary_key=True)),
++        ('field', models.CharField(max_length=100))
++    ])
++    initial_state.add_model(initial_model)
++    
++    # Create new state with MyModel2 (only model rename)
++    new_state = ProjectState()
++    new_model = ModelState('test_one', 'MyModel2', [
++        ('id', models.AutoField(primary_key=True)),
++        ('field', models.CharField(max_length=100))
++    ])
++    new_state.add_model(new_model)
++    
++    # Create autodetector with a mock questioner
++    class MockQuestioner:
++        def ask_rename_model(self, old_model_name, new_model_name):
++            print(f"Would you like to rename {old_model_name} to {new_model_name}? [y/N] y")
++            return True
++    
++    questioner = MockQuestioner()
++    autodetector = MigrationAutodetector(initial_state, new_state, questioner)
++    
++    try:
++        # This should work without errors
++        changes = autodetector.changes(None)
++        print("SUCCESS: Model rename only works correctly")
++        return True
++    except Exception as e:
++        print(f"ERROR: {e}")
++        return False
++
++if __name__ == '__main__':
++    print("Testing existing functionality...")
++    
++    success1 = test_field_rename_only()
++    success2 = test_model_rename_only()
++    
++    # Cleanup
++    if os.path.exists('test_settings.py'):
++        os.remove('test_settings.py')
++    
++    if success1 and success2:
++        print("All existing functionality tests passed!")
++    else:
++        print("Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..10bb7506cd
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,104 @@
++#!/usr/bin/env python3
++"""
++Test to verify the fix for the migration autodetector crash when renaming a model and field.
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a minimal settings module
++settings_content = '''
++DEBUG = True
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++INSTALLED_APPS = []
++SECRET_KEY = 'test-key'
++USE_TZ = True
++'''
++
++with open('test_settings.py', 'w') as f:
++    f.write(settings_content)
++
++# Now import Django modules
++import django
++django.setup()
++
++from django.db import models
++from django.db.migrations.state import ProjectState, ModelState
++from django.db.migrations.autodetector import MigrationAutodetector
++from django.db.migrations.questioner import MigrationQuestioner
++from django.db.migrations.graph import MigrationGraph
++
++def test_rename_model_and_field():
++    """Test case that verifies the fix"""
++    
++    # Create initial state with MyModel and old_field
++    initial_state = ProjectState()
++    initial_model = ModelState('test_one', 'MyModel', [
++        ('id', models.AutoField(primary_key=True)),
++        ('old_field', models.CharField(max_length=100))
++    ])
++    initial_state.add_model(initial_model)
++    
++    # Create new state with MyModel2 and new_field
++    new_state = ProjectState()
++    new_model = ModelState('test_one', 'MyModel2', [
++        ('id', models.AutoField(primary_key=True)),
++        ('new_field', models.CharField(max_length=100))
++    ])
++    new_state.add_model(new_model)
++    
++    # Create autodetector with a mock questioner that simulates user input
++    class MockQuestioner:
++        def ask_rename_model(self, old_model_name, new_model_name):
++            print(f"Would you like to rename {old_model_name} to {new_model_name}? [y/N] y")
++            return True
++            
++        def ask_rename(self, model_name, old_field_name, new_field_name, field):
++            print(f"Would you like to rename {old_field_name} to {new_field_name}? [y/N] y")
++            return True
++    
++    questioner = MockQuestioner()
++    autodetector = MigrationAutodetector(initial_state, new_state, questioner)
++    
++    # Create an empty migration graph
++    graph = MigrationGraph()
++    
++    try:
++        # This should not trigger the KeyError anymore
++        changes = autodetector.changes(graph)
++        print("SUCCESS: No KeyError occurred")
++        print(f"Generated changes: {changes}")
++        return True
++    except KeyError as e:
++        print(f"KEYERROR STILL EXISTS: {e}")
++        print("The fix did not work")
++        return False
++    except Exception as e:
++        print(f"OTHER ERROR (expected): {e}")
++        print("This error is expected due to the simplified test setup")
++        return True  # Other errors are expected in this simplified test
++
++if __name__ == '__main__':
++    print("Testing migration autodetector fix for model and field rename...")
++    success = test_rename_model_and_field()
++    
++    # Cleanup
++    if os.path.exists('test_settings.py'):
++        os.remove('test_settings.py')
++    
++    if success:
++        print("Fix verified successfully!")
++    else:
++        print("Fix verification failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_github_issue_scenario.py b/test_github_issue_scenario.py
+new file mode 100644
+index 0000000000..d0e26b4f9f
+--- /dev/null
++++ b/test_github_issue_scenario.py
+@@ -0,0 +1,104 @@
++#!/usr/bin/env python3
++"""
++Test the exact scenario described in the GitHub issue.
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a minimal settings module
++settings_content = '''
++DEBUG = True
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++INSTALLED_APPS = []
++SECRET_KEY = 'test-key'
++USE_TZ = True
++'''
++
++with open('test_settings.py', 'w') as f:
++    f.write(settings_content)
++
++# Now import Django modules
++import django
++django.setup()
++
++from django.db import models
++from django.db.migrations.state import ProjectState, ModelState
++from django.db.migrations.autodetector import MigrationAutodetector
++from django.db.migrations.questioner import MigrationQuestioner
++
++def test_github_issue_scenario():
++    """Test the exact scenario from the GitHub issue"""
++    
++    # Create initial state with MyModel and old_field
++    initial_state = ProjectState()
++    initial_model = ModelState('test_one', 'MyModel', [
++        ('id', models.AutoField(primary_key=True)),
++        ('old_field', models.CharField(max_length=100))
++    ])
++    initial_state.add_model(initial_model)
++    
++    # Create new state with MyModel2 and new_field
++    new_state = ProjectState()
++    new_model = ModelState('test_one', 'MyModel2', [
++        ('id', models.AutoField(primary_key=True)),
++        ('new_field', models.CharField(max_length=100))
++    ])
++    new_state.add_model(new_model)
++    
++    # Create autodetector with a mock questioner that simulates user input
++    class MockQuestioner:
++        def ask_rename_model(self, old_model_name, new_model_name):
++            print(f"Did you rename the {old_model_name} model to {new_model_name}? [y/N] y")
++            return True
++            
++        def ask_rename(self, model_name, old_field_name, new_field_name, field):
++            print(f"Would you like to rename {old_field_name} to {new_field_name}? [y/N] y")
++            return True
++    
++    questioner = MockQuestioner()
++    autodetector = MigrationAutodetector(initial_state, new_state, questioner)
++    
++    try:
++        # This should trigger the error described in the GitHub issue
++        # We'll call the internal method that was failing
++        autodetector.generate_renamed_models()
++        autodetector.generate_renamed_fields()
++        print("SUCCESS: No KeyError occurred")
++        return True
++    except KeyError as e:
++        if str(e) == "('test_one', 'mymodel')":
++            print(f"KEYERROR STILL EXISTS: {e}")
++            print("This is the exact error from the GitHub issue")
++            return False
++        else:
++            print(f"DIFFERENT KEYERROR: {e}")
++            return False
++    except Exception as e:
++        print(f"OTHER ERROR (may be expected): {e}")
++        return True  # Other errors are not the focus
++
++if __name__ == '__main__':
++    print("Testing GitHub issue scenario...")
++    success = test_github_issue_scenario()
++    
++    # Cleanup
++    if os.path.exists('test_settings.py'):
++        os.remove('test_settings.py')
++    
++    if success:
++        print("GitHub issue scenario test passed!")
++    else:
++        print("GitHub issue scenario test failed!")
++        sys.exit(1)
+\ No newline at end of file

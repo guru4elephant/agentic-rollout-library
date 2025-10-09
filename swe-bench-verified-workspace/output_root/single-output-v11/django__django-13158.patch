@@ -1,0 +1,962 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 07d6ffd4ca..c6f1397315 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -920,6 +920,11 @@ class QuerySet:
+         """Return an empty QuerySet."""
+         clone = self._chain()
+         clone.query.set_empty()
++        # If this is a combined query (union, intersection, difference),
++        # also mark all combined queries as empty
++        if hasattr(clone.query, 'combined_queries'):
++            for combined_query in clone.query.combined_queries:
++                combined_query.set_empty()
+         return clone
+ 
+     ##################################################################
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..53694be426
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++from django.contrib import admin
++
++# Create the models from the issue without app dependency
++Publication = type('Publication', (models.Model,), {
++    '__module__': '__main__',
++    'Meta': type('Meta', (), {'app_label': 'test_app'})
++})
++
++Article = type('Article', (models.Model,), {
++    '__module__': '__main__',
++    'publications': models.ManyToManyField(to=Publication, blank=True, null=True),
++    'Meta': type('Meta', (), {'app_label': 'test_app'})
++})
++
++# Test case 1: Using OR operator (works correctly)
++class ArticleFormOR(forms.ModelForm):
++    publications = forms.ModelMultipleChoiceField(
++        Publication.objects.filter(id__lt=2) | Publication.objects.filter(id__gt=5),
++        required=False,
++    )
++    
++    class Meta:
++        model = Article
++        fields = ["publications"]
++
++# Test case 2: Using union() (has the bug)
++class ArticleFormUnion(forms.ModelForm):
++    publications = forms.ModelMultipleChoiceField(
++        Publication.objects.filter(id__lt=2).union(
++            Publication.objects.filter(id__gt=5)
++        ),
++        required=False,
++    )
++    
++    class Meta:
++        model = Article
++        fields = ["publications"]
++
++def test_forms():
++    print("Testing ModelMultipleChoiceField behavior...")
++    
++    # Create some test publications
++    publications = []
++    for i in range(1, 10):
++        pub = Publication.objects.create()
++        publications.append(pub)
++    
++    print(f"Created {len(publications)} publications with IDs 1-9")
++    
++    # Test OR form
++    print("\n1. Testing OR form:")
++    or_form = ArticleFormOR(data={'publications': []})
++    if or_form.is_valid():
++        article = or_form.save()
++        print(f"   OR form - Selected publications count: {article.publications.count()}")
++        print(f"   OR form - Expected: 0, Got: {article.publications.count()}")
++    else:
++        print(f"   OR form validation errors: {or_form.errors}")
++    
++    # Test Union form
++    print("\n2. Testing Union form:")
++    union_form = ArticleFormUnion(data={'publications': []})
++    if union_form.is_valid():
++        article = union_form.save()
++        print(f"   Union form - Selected publications count: {article.publications.count()}")
++        print(f"   Union form - Expected: 0, Got: {article.publications.count()}")
++        
++        # Check if ALL publications were added (the bug)
++        if article.publications.count() == Publication.objects.count():
++            print("   BUG CONFIRMED: Union form added ALL publications when empty!")
++        else:
++            print("   Union form behaved correctly")
++    else:
++        print(f"   Union form validation errors: {union_form.errors}")
++
++if __name__ == '__main__':
++    test_forms()
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..09222508d0
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++# Let's test the core issue: QuerySet behavior with union() vs OR
++def test_queryset_behavior():
++    print("Testing QuerySet behavior with empty selections...")
++    
++    # Create a simple queryset for testing
++    from django.contrib.auth.models import User
++    
++    # Test OR queryset
++    or_queryset = User.objects.filter(id__lt=2) | User.objects.filter(id__gt=5)
++    print(f"OR queryset when empty: {list(or_queryset.none())}")
++    print(f"OR queryset count when empty: {or_queryset.none().count()}")
++    
++    # Test UNION queryset
++    union_queryset = User.objects.filter(id__lt=2).union(User.objects.filter(id__gt=5))
++    print(f"UNION queryset when empty: {list(union_queryset.none())}")
++    print(f"UNION queryset count when empty: {union_queryset.none().count()}")
++    
++    # The issue: union().none() should return empty queryset, but might return all
++    
++    # Test if union().none() behaves differently
++    print(f"\nTesting .none() behavior:")
++    print(f"OR .none() SQL: {str(or_queryset.none().query)}")
++    print(f"UNION .none() SQL: {str(union_queryset.none().query)}")
++
++if __name__ == '__main__':
++    test_queryset_behavior()
+\ No newline at end of file
+diff --git a/simple_test_fix.py b/simple_test_fix.py
+new file mode 100644
+index 0000000000..71b625b4da
+--- /dev/null
++++ b/simple_test_fix.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.query import QuerySet
++from django.db.models.sql.query import Query
++
++def test_simple_fix():
++    print("Testing the fix for union().none()...")
++    
++    # Create simple queries manually
++    query1 = Query(model=None)
++    query2 = Query(model=None)
++    
++    # Create a union-like query manually
++    union_query = Query(model=None)
++    union_query.combined_queries = [query1, query2]
++    union_query.combinator = 'union'
++    
++    # Create a queryset with our union query
++    union_qs = QuerySet(model=None)
++    union_qs.query = union_query
++    
++    print(f"Union query has combined_queries: {hasattr(union_qs.query, 'combined_queries')}")
++    
++    if hasattr(union_qs.query, 'combined_queries'):
++        print(f"Number of combined queries: {len(union_qs.query.combined_queries)}")
++        
++        # Check if combined queries are empty before .none()
++        for i, combined_query in enumerate(union_qs.query.combined_queries):
++            print(f"Combined query {i} is_empty() before .none(): {combined_query.is_empty()}")
++    
++    # Apply .none() to the union query
++    union_none = union_qs.none()
++    
++    print(f"Union.none() is_empty(): {union_none.query.is_empty()}")
++    
++    if hasattr(union_none.query, 'combined_queries'):
++        print(f"Number of combined queries after .none(): {len(union_none.query.combined_queries)}")
++        
++        # Check if combined queries are empty after .none()
++        for i, combined_query in enumerate(union_none.query.combined_queries):
++            print(f"Combined query {i} is_empty() after .none(): {combined_query.is_empty()}")
++    
++    # The fix should ensure that all combined queries are also marked as empty
++    if (hasattr(union_none.query, 'combined_queries') and 
++        all(combined_query.is_empty() for combined_query in union_none.query.combined_queries)):
++        print("SUCCESS: All combined queries are properly marked as empty!")
++    else:
++        print("FAILURE: Combined queries are not properly marked as empty.")
++
++if __name__ == '__main__':
++    test_simple_fix()
+\ No newline at end of file
+diff --git a/test_combined_empty.py b/test_combined_empty.py
+new file mode 100644
+index 0000000000..313518438e
+--- /dev/null
++++ b/test_combined_empty.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++
++def test_combined_empty():
++    print("Testing combined query emptiness...")
++    
++    # Create a simple query
++    query = Query(model=None)
++    
++    # Create combined queries scenario
++    query.combined_queries = [Query(model=None), Query(model=None)]
++    query.combinator = 'union'
++    
++    # Test is_empty() before setting empty
++    print(f"Query is_empty() before: {query.is_empty()}")
++    
++    # Set empty on main query
++    query.set_empty()
++    print(f"Query is_empty() after set_empty(): {query.is_empty()}")
++    
++    # Check if combined queries are also empty
++    for i, combined_query in enumerate(query.combined_queries):
++        print(f"Combined query {i} is_empty(): {combined_query.is_empty()}")
++    
++    # The issue: combined queries might not be marked as empty
++
++if __name__ == '__main__':
++    test_combined_empty()
+\ No newline at end of file
+diff --git a/test_comprehensive_fix.py b/test_comprehensive_fix.py
+new file mode 100644
+index 0000000000..fe56f81211
+--- /dev/null
++++ b/test_comprehensive_fix.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++# Create the exact models from the GitHub issue
++class Publication(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Article(models.Model):
++    publications = models.ManyToManyField(to=Publication, blank=True, null=True)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_original_issue():
++    print("Testing the original GitHub issue...")
++    print("=" * 50)
++    
++    # Test case 1: OR operator (should work correctly)
++    print("1. Testing OR operator:")
++    class ArticleFormOR(forms.ModelForm):
++        publications = forms.ModelMultipleChoiceField(
++            Publication.objects.filter(id__lt=2) | Publication.objects.filter(id__gt=5),
++            required=False,
++        )
++        
++        class Meta:
++            model = Article
++            fields = ["publications"]
++    
++    or_form = ArticleFormOR(data={'publications': []})
++    if or_form.is_valid():
++        article = or_form.save()
++        count = article.publications.count()
++        print(f"   OR form - Selected publications count: {count}")
++        if count == 0:
++            print("   ✓ OR form works correctly (0 publications added)")
++        else:
++            print(f"   ✗ OR form failed ({count} publications added)")
++    else:
++        print(f"   OR form validation errors: {or_form.errors}")
++    
++    print()
++    
++    # Test case 2: UNION operator (the buggy case)
++    print("2. Testing UNION operator (the original bug):")
++    class ArticleFormUnion(forms.ModelForm):
++        publications = forms.ModelMultipleChoiceField(
++            Publication.objects.filter(id__lt=2).union(
++                Publication.objects.filter(id__gt=5)
++            ),
++            required=False,
++        )
++        
++        class Meta:
++            model = Article
++            fields = ["publications"]
++    
++    union_form = ArticleFormUnion(data={'publications': []})
++    if union_form.is_valid():
++        article = union_form.save()
++        count = article.publications.count()
++        print(f"   UNION form - Selected publications count: {count}")
++        
++        if count == 0:
++            print("   ✓ UNION form now works correctly (0 publications added)")
++            print("   ✓ BUG FIXED: No publications added when form is empty")
++        else:
++            print(f"   ✗ UNION form still broken ({count} publications added)")
++            print("   ✗ BUG PERSISTS: Publications were incorrectly added")
++    else:
++        print(f"   UNION form validation errors: {union_form.errors}")
++    
++    print()
++    print("=" * 50)
++    
++    # Additional test: Direct queryset behavior
++    print("3. Testing direct queryset behavior:")
++    q1 = Publication.objects.filter(id__lt=2)
++    q2 = Publication.objects.filter(id__gt=5)
++    
++    union_qs = q1.union(q2)
++    union_none = union_qs.none()
++    
++    print(f"   Union query type: {type(union_qs)}")
++    print(f"   Union.none() type: {type(union_none)}")
++    print(f"   Union.none() is properly empty: {not union_none.exists()}")
++    
++    if not union_none.exists():
++        print("   ✓ Direct queryset .none() works correctly")
++    else:
++        print("   ✗ Direct queryset .none() is broken")
++
++if __name__ == '__main__':
++    test_original_issue()
+\ No newline at end of file
+diff --git a/test_core_issue.py b/test_core_issue.py
+new file mode 100644
+index 0000000000..4a102414bf
+--- /dev/null
++++ b/test_core_issue.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++def test_core_issue():
++    print("Testing the core issue: union().none() behavior in ModelMultipleChoiceField")
++    print("=" * 60)
++    
++    # Create a simple model for testing
++    class TestModel(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test_app'
++    
++    # Test the specific scenario from the GitHub issue
++    print("1. Testing ModelMultipleChoiceField with union query:")
++    
++    # Create union query like in the issue
++    union_queryset = TestModel.objects.filter(id__lt=2).union(
++        TestModel.objects.filter(id__gt=5)
++    )
++    
++    # Create the field
++    field = forms.ModelMultipleChoiceField(union_queryset, required=False)
++    
++    # Test with empty data (simulating empty form submission)
++    empty_data = []
++    
++    # This is where the bug was: clean() should return an empty queryset
++    # but was returning the original union queryset
++    result = field.clean(empty_data)
++    
++    print(f"   Result type: {type(result)}")
++    print(f"   Result exists(): {result.exists()}")
++    print(f"   Result count(): {result.count()}")
++    
++    # The key test: should be empty
++    if not result.exists() and result.count() == 0:
++        print("   ✓ SUCCESS: Field correctly returns empty queryset")
++        print("   ✓ BUG FIXED: union().none() now works properly")
++    else:
++        print(f"   ✗ FAILURE: Field returned non-empty queryset (count: {result.count()})")
++        print("   ✗ BUG PERSISTS: union().none() is still broken")
++    
++    print()
++    
++    # Compare with OR query (which should work correctly)
++    print("2. Testing ModelMultipleChoiceField with OR query (for comparison):")
++    
++    or_queryset = TestModel.objects.filter(id__lt=2) | TestModel.objects.filter(id__gt=5)
++    or_field = forms.ModelMultipleChoiceField(or_queryset, required=False)
++    or_result = or_field.clean(empty_data)
++    
++    print(f"   OR Result exists(): {or_result.exists()}")
++    print(f"   OR Result count(): {or_result.count()}")
++    
++    if not or_result.exists() and or_result.count() == 0:
++        print("   ✓ OR query works correctly")
++    else:
++        print(f"   ✗ OR query is broken (count: {or_result.count()})")
++    
++    print()
++    
++    # Test direct queryset behavior
++    print("3. Testing direct queryset .none() behavior:")
++    
++    q1 = TestModel.objects.filter(id__lt=2)
++    q2 = TestModel.objects.filter(id__gt=5)
++    
++    union_qs = q1.union(q2)
++    union_none = union_qs.none()
++    
++    print(f"   Union.none() exists(): {union_none.exists()}")
++    print(f"   Union.none() count(): {union_none.count()}")
++    
++    if not union_none.exists() and union_none.count() == 0:
++        print("   ✓ Direct union().none() works correctly")
++    else:
++        print(f"   ✗ Direct union().none() is broken (count: {union_none.count()})")
++
++if __name__ == '__main__':
++    test_core_issue()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..2e5403e615
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.query import QuerySet
++from django.db.models.sql.query import Query
++
++def test_fix():
++    print("Testing the fix for union().none()...")
++    
++    # Create a simple queryset
++    queryset = QuerySet(model=None)
++    
++    # Create filter queries
++    q1 = queryset.filter(id__lt=2)
++    q2 = queryset.filter(id__gt=5)
++    
++    # Create union query
++    union_qs = q1.union(q2)
++    
++    print(f"Union query type: {type(union_qs)}")
++    print(f"Union query has combined_queries: {hasattr(union_qs.query, 'combined_queries')}")
++    
++    if hasattr(union_qs.query, 'combined_queries'):
++        print(f"Number of combined queries: {len(union_qs.query.combined_queries)}")
++        
++        # Check if combined queries are empty before .none()
++        for i, combined_query in enumerate(union_qs.query.combined_queries):
++            print(f"Combined query {i} is_empty() before .none(): {combined_query.is_empty()}")
++    
++    # Apply .none() to the union query
++    union_none = union_qs.none()
++    
++    print(f"Union.none() is_empty(): {union_none.is_empty()}")
++    
++    if hasattr(union_none.query, 'combined_queries'):
++        print(f"Number of combined queries after .none(): {len(union_none.query.combined_queries)}")
++        
++        # Check if combined queries are empty after .none()
++        for i, combined_query in enumerate(union_none.query.combined_queries):
++            print(f"Combined query {i} is_empty() after .none(): {combined_query.is_empty()}")
++    
++    # The fix should ensure that all combined queries are also marked as empty
++    if (hasattr(union_none.query, 'combined_queries') and 
++        all(combined_query.is_empty() for combined_query in union_none.query.combined_queries)):
++        print("SUCCESS: All combined queries are properly marked as empty!")
++    else:
++        print("FAILURE: Combined queries are not properly marked as empty.")
++
++if __name__ == '__main__':
++    test_fix()
+\ No newline at end of file
+diff --git a/test_forms_issue.py b/test_forms_issue.py
+new file mode 100644
+index 0000000000..d5d30db385
+--- /dev/null
++++ b/test_forms_issue.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++# Create a simple test model
++class Publication(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Test the forms issue described in the GitHub issue
++def test_forms_issue():
++    print("Testing the forms issue with union().none()...")
++    
++    # Create a union query like in the issue
++    union_queryset = Publication.objects.filter(id__lt=2).union(
++        Publication.objects.filter(id__gt=5)
++    )
++    
++    # Create a ModelMultipleChoiceField with the union query
++    field = forms.ModelMultipleChoiceField(union_queryset, required=False)
++    
++    # Test with empty data (simulating form submission with no selection)
++    empty_data = []
++    
++    # This should return an empty queryset, not all objects
++    result = field.clean(empty_data)
++    
++    print(f"Result type: {type(result)}")
++    print(f"Result is empty: {not result.exists()}")
++    print(f"Result count: {result.count()}")
++    
++    # The key test: result should be empty, not contain all objects
++    if not result.exists():
++        print("SUCCESS: Field correctly returned empty queryset!")
++    else:
++        print(f"FAILURE: Field returned non-empty queryset with {result.count()} objects")
++
++if __name__ == '__main__':
++    test_forms_issue()
+\ No newline at end of file
+diff --git a/test_query_structure.py b/test_query_structure.py
+new file mode 100644
+index 0000000000..027732e789
+--- /dev/null
++++ b/test_query_structure.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.query import QuerySet
++
++def test_query_structure():
++    print("Testing query structure for union vs OR queries...")
++    
++    # Create a simple queryset without hitting database
++    queryset = QuerySet(model=None)
++    
++    # Create filter queries
++    q1 = queryset.filter(id__lt=2)
++    q2 = queryset.filter(id__gt=5)
++    
++    # Create union and OR queries
++    union_qs = q1.union(q2)
++    or_qs = q1 | q2
++    
++    print(f"OR query type: {type(or_qs)}")
++    print(f"UNION query type: {type(union_qs)}")
++    
++    # Test .none() behavior
++    or_none = or_qs.none()
++    union_none = union_qs.none()
++    
++    print(f"OR .none() type: {type(or_none)}")
++    print(f"UNION .none() type: {type(union_none)}")
++    
++    # Check if they are empty
++    print(f"OR .none() is_empty(): {or_none.is_empty()}")
++    print(f"UNION .none() is_empty(): {union_none.is_empty()}")
++    
++    # Check query structure
++    print(f"OR query has where clause: {hasattr(or_qs.query, 'where')}")
++    print(f"UNION query has where clause: {hasattr(union_qs.query, 'where')}")
++    print(f"OR .none() query has where clause: {hasattr(or_none.query, 'where')}")
++    print(f"UNION .none() query has where clause: {hasattr(union_none.query, 'where')}")
++    
++    # Check if union query has combined_queries
++    print(f"UNION query has combined_queries: {hasattr(union_qs.query, 'combined_queries')}")
++    print(f"UNION .none() query has combined_queries: {hasattr(union_none.query, 'combined_queries')}")
++    
++    if hasattr(union_qs.query, 'combined_queries'):
++        print(f"UNION query combined_queries: {union_qs.query.combined_queries}")
++    if hasattr(union_none.query, 'combined_queries'):
++        print(f"UNION .none() query combined_queries: {union_none.query.combined_queries}")
++
++if __name__ == '__main__':
++    test_query_structure()
+\ No newline at end of file
+diff --git a/test_union_bug.py b/test_union_bug.py
+new file mode 100644
+index 0000000000..4633e50d51
+--- /dev/null
++++ b/test_union_bug.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_union_none_bug():
++    print("Testing the union().none() bug...")
++    
++    # Create a union query
++    q1 = TestModel.objects.filter(id__lt=2)
++    q2 = TestModel.objects.filter(id__gt=5)
++    union_qs = q1.union(q2)
++    
++    print(f"Union query: {union_qs}")
++    print(f"Union query type: {type(union_qs)}")
++    
++    # Test .none() on union query
++    union_none = union_qs.none()
++    print(f"Union.none() query: {union_none}")
++    print(f"Union.none() type: {type(union_none)}")
++    
++    # Test if the .none() actually returns an empty queryset
++    print(f"Union.none() is empty: {union_none.is_empty()}")
++    
++    # Compare with regular OR query
++    or_qs = q1 | q2
++    or_none = or_qs.none()
++    print(f"OR.none() is empty: {or_none.is_empty()}")
++    
++    # The issue: union_none might not be properly empty
++    print(f"Union.none() equals original union: {union_none is union_qs}")
++
++if __name__ == '__main__':
++    test_union_none_bug()
+\ No newline at end of file
+diff --git a/test_union_none.py b/test_union_none.py
+new file mode 100644
+index 0000000000..95a157fd56
+--- /dev/null
++++ b/test_union_none.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.query import QuerySet
++
++def test_union_none_behavior():
++    print("Testing QuerySet.union().none() behavior...")
++    
++    # Create a simple queryset without hitting the database
++    queryset = QuerySet(model=None)
++    
++    # Test OR queryset
++    q1 = queryset.filter(id__lt=2)
++    q2 = queryset.filter(id__gt=5)
++    
++    or_queryset = q1 | q2
++    union_queryset = q1.union(q2)
++    
++    print(f"OR queryset type: {type(or_queryset)}")
++    print(f"UNION queryset type: {type(union_queryset)}")
++    
++    # Test .none() behavior
++    or_none = or_queryset.none()
++    union_none = union_queryset.none()
++    
++    print(f"OR .none() type: {type(or_none)}")
++    print(f"UNION .none() type: {type(union_none)}")
++    
++    # Check if they have the same behavior
++    print(f"OR .none() is empty: {or_none.is_empty()}")
++    print(f"UNION .none() is empty: {union_none.is_empty()}")
++    
++    # The key test: check if union().none() returns the original union queryset
++    print(f"UNION .none() equals original: {union_none is union_queryset}")
++
++if __name__ == '__main__':
++    test_union_none_behavior()
+\ No newline at end of file

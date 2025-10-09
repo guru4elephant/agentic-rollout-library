@@ -1,0 +1,474 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..8fa8758dd3
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,209 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.test import TestCase
++from django.db.models import Prefetch
++from django.db import connection
++from django.test.utils import CaptureQueriesContext
++
++# Define the models from the issue
++class User(models.Model):
++    email = models.EmailField()
++    kind = models.CharField(
++        max_length=10, choices=[("ADMIN", "Admin"), ("REGULAR", "Regular")]
++    )
++    
++    class Meta:
++        app_label = 'tests'
++
++class Profile(models.Model):
++    full_name = models.CharField(max_length=255)
++    user = models.OneToOneField(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'tests'
++
++class Post(models.Model):
++    title = models.CharField(max_length=255)
++    author = models.ForeignKey(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'tests'
++
++def test_original_issue():
++    """Test the original issue from the GitHub issue"""
++    print("=== Testing Original Issue ===")
++    # Create test data
++    user = User.objects.create(
++        email="test@example.com",
++        kind="ADMIN",
++    )
++    Profile.objects.create(user=user, full_name="Test Tester")
++    
++    # Create the queryset from the issue
++    queryset = User.objects.only("email").prefetch_related(
++        Prefetch(
++            "profile",
++            queryset=Profile.objects.prefetch_related(
++                Prefetch("user", queryset=User.objects.only("kind"))
++            ),
++        )
++    )
++    
++    # Execute the queries
++    user = queryset.first()
++    
++    # Check deferred fields
++    print("Deferred fields on user.profile.user:", user.profile.user.get_deferred_fields())
++    
++    # This should not execute any queries
++    with CaptureQueriesContext(connection) as context:
++        result = user.profile.user.kind
++        print(f"Result: {result}")
++        print(f"Queries executed: {len(context.captured_queries)}")
++        
++        if len(context.captured_queries) == 0:
++            print("SUCCESS: No queries executed when accessing user.profile.user.kind")
++            return True
++        else:
++            print("FAILURE: Queries were executed when accessing user.profile.user.kind")
++            for i, query in enumerate(context.captured_queries, 1):
++                print(f"{i}. {query['sql']}")
++            return False
++
++def test_foreign_key_instead_of_one_to_one():
++    """Test with ForeignKey instead of OneToOneField"""
++    print("\n=== Testing ForeignKey Instead of OneToOne ===")
++    # Create test data
++    user = User.objects.create(
++        email="test2@example.com",
++        kind="REGULAR",
++    )
++    Post.objects.create(title="Test Post", author=user)
++    
++    # Create similar queryset but with ForeignKey
++    queryset = User.objects.only("email").prefetch_related(
++        Prefetch(
++            "post_set",
++            queryset=Post.objects.prefetch_related(
++                Prefetch("author", queryset=User.objects.only("kind"))
++            ),
++        )
++    )
++    
++    # Execute the queries
++    user = queryset.first()
++    
++    # Check if there are any posts - use the prefetched objects
++    if hasattr(user, '_prefetched_objects_cache') and 'post_set' in user._prefetched_objects_cache:
++        posts = user._prefetched_objects_cache['post_set']
++        if not posts:
++            print("No posts found for user (prefetched)")
++            return False
++        
++        # Check deferred fields
++        print("Deferred fields on first post's author:", posts[0].author.get_deferred_fields())
++        
++        # This should not execute any queries
++        with CaptureQueriesContext(connection) as context:
++            result = posts[0].author.kind
++            print(f"Result: {result}")
++            print(f"Queries executed: {len(context.captured_queries)}")
++            
++            if len(context.captured_queries) == 0:
++                print("SUCCESS: No queries executed when accessing post.author.kind")
++                return True
++            else:
++                print("FAILURE: Queries were executed when accessing post.author.kind")
++                for i, query in enumerate(context.captured_queries, 1):
++                    print(f"{i}. {query['sql']}")
++                return False
++    else:
++        print("No prefetched posts found for user")
++        return False
++
++def test_normal_prefetch_without_deferred():
++    """Test that normal prefetch still works without deferred fields"""
++    print("\n=== Testing Normal Prefetch Without Deferred Fields ===")
++    # Create test data
++    user = User.objects.create(
++        email="test3@example.com",
++        kind="ADMIN",
++    )
++    Profile.objects.create(user=user, full_name="Test Tester 2")
++    
++    # Create normal prefetch without deferred fields
++    queryset = User.objects.prefetch_related(
++        Prefetch(
++            "profile",
++            queryset=Profile.objects.prefetch_related(
++                Prefetch("user", queryset=User.objects.all())
++            ),
++        )
++    )
++    
++    # Execute the queries
++    user = queryset.first()
++    
++    # Check deferred fields
++    print("Deferred fields on user.profile.user:", user.profile.user.get_deferred_fields())
++    
++    # This should not execute any queries
++    with CaptureQueriesContext(connection) as context:
++        result = user.profile.user.kind
++        print(f"Result: {result}")
++        print(f"Queries executed: {len(context.captured_queries)}")
++        
++        if len(context.captured_queries) == 0:
++            print("SUCCESS: No queries executed when accessing user.profile.user.kind")
++            return True
++        else:
++            print("FAILURE: Queries were executed when accessing user.profile.user.kind")
++            for i, query in enumerate(context.captured_queries, 1):
++                print(f"{i}. {query['sql']}")
++            return False
++
++if __name__ == "__main__":
++    # Create tables using Django's schema editor
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(User)
++        schema_editor.create_model(Profile)
++        schema_editor.create_model(Post)
++    
++    # Run the tests
++    success1 = test_original_issue()
++    success2 = test_foreign_key_instead_of_one_to_one()
++    success3 = test_normal_prefetch_without_deferred()
++    
++    if success1 and success2 and success3:
++        print("\n=== ALL TESTS PASSED ===")
++        sys.exit(0)
++    else:
++        print("\n=== SOME TESTS FAILED ===")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index fb6639793a..3dbdd987d8 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1907,6 +1907,10 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
+         # for performance reasons.
+         rel_qs._prefetch_related_lookups = ()
+ 
++    # Clear any deferred loading state from the prefetch queryset
++    # to prevent prefetched objects from inheriting deferred fields context
++    rel_qs = rel_qs._chain()
++    rel_qs.query.clear_deferred_loading()
+     all_related_objects = list(rel_qs)
+ 
+     rel_obj_cache = {}
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..94cb65e7ab
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.test import TestCase
++from django.db.models import Prefetch
++
++# Define the models from the issue
++class User(models.Model):
++    email = models.EmailField()
++    kind = models.CharField(
++        max_length=10, choices=[("ADMIN", "Admin"), ("REGULAR", "Regular")]
++    )
++    
++    class Meta:
++        app_label = 'tests'
++
++class Profile(models.Model):
++    full_name = models.CharField(max_length=255)
++    user = models.OneToOneField(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'tests'
++
++# Create the test
++def test_only_related_queryset():
++    # Create test data
++    user = User.objects.create(
++        email="test@example.com",
++        kind="ADMIN",
++    )
++    Profile.objects.create(user=user, full_name="Test Tester")
++    
++    # Create the queryset from the issue
++    queryset = User.objects.only("email").prefetch_related(
++        Prefetch(
++            "profile",
++            queryset=Profile.objects.prefetch_related(
++                Prefetch("user", queryset=User.objects.only("kind"))
++            ),
++        )
++    )
++    
++    # Execute the queries
++    user = queryset.first()
++    
++    # Check deferred fields
++    print("Deferred fields on user.profile.user:", user.profile.user.get_deferred_fields())
++    
++    # This should not execute any queries
++    try:
++        from django.db import connection
++        from django.test.utils import CaptureQueriesContext
++        
++        with CaptureQueriesContext(connection) as context:
++            result = user.profile.user.kind
++            print(f"Result: {result}")
++            print(f"Queries executed: {len(context.captured_queries)}")
++            if context.captured_queries:
++                print("Queries:")
++                for i, query in enumerate(context.captured_queries, 1):
++                    print(f"{i}. {query['sql']}")
++            
++        if len(context.captured_queries) == 0:
++            print("SUCCESS: No queries executed when accessing user.profile.user.kind")
++            return True
++        else:
++            print("FAILURE: Queries were executed when accessing user.profile.user.kind")
++            return False
++            
++    except Exception as e:
++        print(f"Error: {e}")
++        return False
++
++if __name__ == "__main__":
++    # Create tables using Django's schema editor
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(User)
++        schema_editor.create_model(Profile)
++    
++    # Run the test
++    success = test_only_related_queryset()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_prefetch_fix.py b/test_prefetch_fix.py
+new file mode 100644
+index 0000000000..edf0a2b213
+--- /dev/null
++++ b/test_prefetch_fix.py
+@@ -0,0 +1,121 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Prefetch
++from django.db import connection
++from django.test.utils import CaptureQueriesContext
++
++# Define test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    email = models.EmailField()
++    
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_basic_prefetch():
++    """Test that basic prefetch still works"""
++    print("=== Testing Basic Prefetch ===")
++    
++    # Create test data
++    author = Author.objects.create(name="Test Author", email="author@example.com")
++    Book.objects.create(title="Test Book", author=author)
++    
++    # Basic prefetch without deferred fields
++    authors = Author.objects.prefetch_related('book_set').all()
++    
++    author = authors[0]
++    
++    # Check if books are prefetched
++    if hasattr(author, '_prefetched_objects_cache') and 'book_set' in author._prefetched_objects_cache:
++        prefetched_books = author._prefetched_objects_cache['book_set']
++        print(f"Number of prefetched books: {len(prefetched_books)}")
++        print("SUCCESS: Books were prefetched correctly")
++        return True
++    else:
++        print("FAILURE: Books were not prefetched")
++        return False
++
++def test_prefetch_with_deferred():
++    """Test prefetch with deferred fields (the original issue)"""
++    print("\n=== Testing Prefetch with Deferred Fields ===")
++    
++    # Create test data
++    author = Author.objects.create(name="Test Author", email="author@example.com")
++    Book.objects.create(title="Test Book", author=author)
++    
++    # Prefetch with deferred fields
++    authors = Author.objects.only("name").prefetch_related(
++        Prefetch(
++            "book_set",
++            queryset=Book.objects.prefetch_related(
++                Prefetch("author", queryset=Author.objects.only("email"))
++            ),
++        )
++    )
++    
++    author = authors[0]
++    
++    # Check deferred fields
++    print("Deferred fields on book.author:", author.book_set.all()[0].author.get_deferred_fields())
++    
++    with CaptureQueriesContext(connection) as context:
++        email = author.book_set.all()[0].author.email
++        print(f"Author email: {email}")
++        print(f"Queries executed: {len(context.captured_queries)}")
++        
++        if len(context.captured_queries) == 0:
++            print("SUCCESS: No queries executed when accessing prefetched author email")
++            return True
++        else:
++            print("FAILURE: Queries were executed when accessing prefetched author email")
++            return False
++
++if __name__ == "__main__":
++    # Create tables using Django's schema editor
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Author)
++        schema_editor.create_model(Book)
++    
++    # Run the tests
++    success1 = test_basic_prefetch()
++    success2 = test_prefetch_with_deferred()
++    
++    if success1 and success2:
++        print("\n=== ALL TESTS PASSED ===")
++        sys.exit(0)
++    else:
++        print("\n=== SOME TESTS FAILED ===")
++        sys.exit(1)
+\ No newline at end of file

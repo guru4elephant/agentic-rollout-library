@@ -1,0 +1,524 @@
+diff --git a/debug_connection.py b/debug_connection.py
+new file mode 100644
+index 00000000..5f0bb81b
+--- /dev/null
++++ b/debug_connection.py
+@@ -0,0 +1,38 @@
++import requests
++from requests.adapters import HTTPAdapter
++from urllib3.exceptions import LocationParseError
++
++# Create a custom adapter to debug where the exception is coming from
++class DebugAdapter(HTTPAdapter):
++    def get_connection(self, url, proxies=None):
++        try:
++            print(f"get_connection called with: {url}")
++            return super().get_connection(url, proxies)
++        except LocationParseError as e:
++            print(f"LocationParseError in get_connection: {e}")
++            raise
++        except Exception as e:
++            print(f"Other exception in get_connection: {type(e).__name__}: {e}")
++            raise
++    
++    def send(self, request, **kwargs):
++        try:
++            print(f"send called with URL: {request.url}")
++            return super().send(request, **kwargs)
++        except LocationParseError as e:
++            print(f"LocationParseError in send: {e}")
++            raise
++        except Exception as e:
++            print(f"Other exception in send: {type(e).__name__}: {e}")
++            raise
++
++# Test with the debug adapter
++session = requests.Session()
++session.mount('http://', DebugAdapter())
++session.mount('https://', DebugAdapter())
++
++try:
++    response = session.get("http://.example.com", timeout=1)
++    print(f"Request succeeded: {response.status_code}")
++except Exception as e:
++    print(f"Final exception: {type(e).__name__}: {e}")
+\ No newline at end of file
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 00000000..ff050636
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,41 @@
++import requests
++from requests.exceptions import InvalidURL
++
++# Test the current behavior with the problematic URLs from the issue
++test_urls = [
++    "http://.example.com",  # The original issue case
++    "http://example..com",  # Another invalid case
++    "http://.café.com",     # Non-ASCII with empty label
++]
++
++for url in test_urls:
++    try:
++        print(f"Testing: {url}")
++        response = requests.get(url)
++        print("Request successful (unexpected)")
++    except InvalidURL as e:
++        print(f"✓ Correctly raised InvalidURL: {e}")
++    except Exception as e:
++        print(f"✗ Unexpected exception: {type(e).__name__}: {e}")
++    print("-" * 50)
++
++# Test that the specific error message from the issue is handled
++print("\nTesting specific error message handling:")
++try:
++    # This should trigger the UnicodeError path if we can bypass urllib3's preprocessing
++    from requests.models import PreparedRequest
++    from requests._internal_utils import unicode_is_ascii
++    
++    # Create a host that would trigger IDNAError -> UnicodeError
++    test_host = "café..com"
++    if not unicode_is_ascii(test_host):
++        req = PreparedRequest()
++        # This should raise UnicodeError which gets converted to InvalidURL in prepare_url
++        req._get_idna_encoded_host(test_host)
++        
++except InvalidURL as e:
++    print(f"✓ InvalidURL caught: {e}")
++except UnicodeError as e:
++    print(f"✗ UnicodeError not converted: {e}")
++except Exception as e:
++    print(f"Other exception: {type(e).__name__}: {e}")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..59b7190c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,22 @@
++import requests
++
++# Test different problematic URL formats
++test_urls = [
++    "http://.example.com",
++    "http://example..com", 
++    "http://example.com.",
++    "http://.com",
++    "http://xn--.com",  # IDNA with empty label
++    "http://café.example.com",  # Non-ASCII characters
++    "http://.café.com",  # Non-ASCII with empty label
++]
++
++for url in test_urls:
++    try:
++        print(f"Testing: {url}")
++        response = requests.get(url)
++        print("Request successful")
++    except Exception as e:
++        print(f"Exception type: {type(e).__name__}")
++        print(f"Exception message: {str(e)}")
++    print("-" * 50)
+\ No newline at end of file
+diff --git a/requests/adapters.py b/requests/adapters.py
+index fe22ff45..27fb5c01 100644
+--- a/requests/adapters.py
++++ b/requests/adapters.py
+@@ -27,7 +27,7 @@ from urllib3.exceptions import ProtocolError
+ from urllib3.exceptions import ReadTimeoutError
+ from urllib3.exceptions import SSLError as _SSLError
+ from urllib3.exceptions import ResponseError
+-from urllib3.exceptions import LocationValueError
++from urllib3.exceptions import LocationValueError, LocationParseError
+ 
+ from .models import Response
+ from .compat import urlparse, basestring
+@@ -411,7 +411,7 @@ class HTTPAdapter(BaseAdapter):
+ 
+         try:
+             conn = self.get_connection(request.url, proxies)
+-        except LocationValueError as e:
++        except (LocationValueError, LocationParseError) as e:
+             raise InvalidURL(e, request=request)
+ 
+         self.cert_verify(conn, request.url, verify, cert)
+@@ -500,6 +500,9 @@ class HTTPAdapter(BaseAdapter):
+         except (ProtocolError, socket.error) as err:
+             raise ConnectionError(err, request=request)
+ 
++        except (LocationValueError, LocationParseError) as e:
++            raise InvalidURL(e, request=request)
++
+         except MaxRetryError as e:
+             if isinstance(e.reason, ConnectTimeoutError):
+                 # TODO: Remove this in 3.0.0: see #2811
+diff --git a/test_bypass_parse_url.py b/test_bypass_parse_url.py
+new file mode 100644
+index 00000000..6269813c
+--- /dev/null
++++ b/test_bypass_parse_url.py
+@@ -0,0 +1,32 @@
++import requests
++from requests.models import Request
++from urllib3.util import parse_url
++
++# Test directly calling the prepare_url method which contains the IDNA logic
++test_urls = [
++    "http://.café.com",  # This should have non-ASCII but parse_url catches it first
++    "http://café..com",   # Double dot with non-ASCII
++    "http://café.example.com",  # Valid non-ASCII
++]
++
++for url in test_urls:
++    try:
++        print(f"Testing: {url}")
++        
++        # First, let's see what parse_url does
++        try:
++            parsed = parse_url(url)
++            print(f"parse_url result: {parsed}")
++        except Exception as e:
++            print(f"parse_url exception: {type(e).__name__}: {e}")
++            continue
++            
++        # Now test the prepare_url method directly
++        req = Request()
++        prepared = req.prepare_url(url, params=None)
++        print(f"prepare_url result: {prepared}")
++        
++    except Exception as e:
++        print(f"Exception type: {type(e).__name__}")
++        print(f"Exception message: {str(e)}")
++    print("-" * 50)
+\ No newline at end of file
+diff --git a/test_exception_conversion.py b/test_exception_conversion.py
+new file mode 100644
+index 00000000..2604abeb
+--- /dev/null
++++ b/test_exception_conversion.py
+@@ -0,0 +1,26 @@
++from urllib3.util import parse_url
++from urllib3.exceptions import LocationParseError
++from requests.exceptions import InvalidURL
++
++# Test the exception conversion directly
++test_urls = [
++    "http://.example.com",
++    "http://example..com", 
++    "http://.café.com",
++]
++
++for url in test_urls:
++    try:
++        print(f"Testing: {url}")
++        parsed = parse_url(url)
++        print(f"parse_url succeeded: {parsed}")
++    except LocationParseError as e:
++        print(f"LocationParseError caught: {e}")
++        # Test the conversion that should happen in requests
++        try:
++            raise InvalidURL(*e.args)
++        except InvalidURL as converted:
++            print(f"Converted to InvalidURL: {converted}")
++    except Exception as e:
++        print(f"Unexpected exception: {type(e).__name__}: {e}")
++    print("-" * 50)
+\ No newline at end of file
+diff --git a/test_full_flow.py b/test_full_flow.py
+new file mode 100644
+index 00000000..2169a51b
+--- /dev/null
++++ b/test_full_flow.py
+@@ -0,0 +1,28 @@
++import requests
++from requests.models import PreparedRequest
++from urllib3.util import parse_url
++
++# Test the full flow with URLs that should trigger the UnicodeError path
++test_urls = [
++    "http://café..com",     # Empty label with non-ASCII - should trigger UnicodeError
++    "http://café.example.com",  # Valid non-ASCII - should work
++]
++
++for url in test_urls:
++    try:
++        print(f"Testing URL: {url}")
++        
++        # First check what parse_url returns
++        parsed = parse_url(url)
++        print(f"parse_url result: {parsed}")
++        print(f"Host: {parsed.host}")
++        
++        # Create a prepared request and call prepare_url
++        req = PreparedRequest()
++        prepared_url = req.prepare_url(url, params=None)
++        print(f"Prepared URL: {prepared_url}")
++        
++    except Exception as e:
++        print(f"Exception type: {type(e).__name__}")
++        print(f"Exception message: {str(e)}")
++    print("-" * 50)
+\ No newline at end of file
+diff --git a/test_idna.py b/test_idna.py
+new file mode 100644
+index 00000000..a50bedeb
+--- /dev/null
++++ b/test_idna.py
+@@ -0,0 +1,20 @@
++import idna
++
++# Test IDNA encoding directly
++test_hosts = [
++    ".example.com",
++    "example..com", 
++    ".com",
++    ".café.com",
++    "café.example.com",
++]
++
++for host in test_hosts:
++    try:
++        print(f"Testing IDNA encoding for: {host}")
++        encoded = idna.encode(host, uts46=True)
++        print(f"Encoded: {encoded.decode('utf-8')}")
++    except Exception as e:
++        print(f"Exception type: {type(e).__name__}")
++        print(f"Exception message: {str(e)}")
++    print("-" * 50)
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 00000000..bcb829cb
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,16 @@
++import requests
++from requests.exceptions import InvalidURL
++
++# Test the exact reproduction case from the GitHub issue
++try:
++    response = requests.get("http://.example.com")
++    print("Request successful (unexpected)")
++except InvalidURL as e:
++    print(f"✓ Correctly raised InvalidURL: {e}")
++    # Test that the error message is appropriate
++    if "URL has an invalid label" in str(e) or "Failed to parse" in str(e):
++        print("✓ Error message is appropriate")
++    else:
++        print("✗ Error message is not appropriate")
++except Exception as e:
++    print(f"✗ Unexpected exception: {type(e).__name__}: {e}")
+\ No newline at end of file
+diff --git a/test_prepare_url_flow.py b/test_prepare_url_flow.py
+new file mode 100644
+index 00000000..6060368e
+--- /dev/null
++++ b/test_prepare_url_flow.py
+@@ -0,0 +1,40 @@
++import requests
++from requests.models import PreparedRequest
++from requests.exceptions import InvalidURL
++
++# Test the actual prepare_url flow with a URL that should trigger UnicodeError
++def test_prepare_url_unicode_error():
++    """Test that prepare_url properly converts UnicodeError to InvalidURL"""
++    
++    # Create a prepared request
++    req = PreparedRequest()
++    
++    # Test with a URL that has non-ASCII characters and invalid labels
++    # We need to bypass urllib3's automatic IDNA encoding
++    test_url = "http://café..com"
++    
++    try:
++        # This should trigger the UnicodeError path in prepare_url
++        prepared_url = req.prepare_url(test_url, params=None)
++        print(f"Prepared URL: {prepared_url}")
++        
++    except InvalidURL as e:
++        if "URL has an invalid label" in str(e):
++            print(f"✓ Correctly caught and converted to InvalidURL: {e}")
++            return True
++        else:
++            print(f"✗ InvalidURL with wrong message: {e}")
++            return False
++    except UnicodeError as e:
++        print(f"✗ UnicodeError was not caught: {e}")
++        return False
++    except Exception as e:
++        print(f"✗ Unexpected exception: {type(e).__name__}: {e}")
++        return False
++    
++    print("✗ No exception was raised")
++    return False
++
++if __name__ == "__main__":
++    success = test_prepare_url_unicode_error()
++    print(f"Test {'PASSED' if success else 'FAILED'}")
+\ No newline at end of file
+diff --git a/test_requests_flow.py b/test_requests_flow.py
+new file mode 100644
+index 00000000..b30d568a
+--- /dev/null
++++ b/test_requests_flow.py
+@@ -0,0 +1,33 @@
++import requests
++from requests.models import PreparedRequest
++from urllib3.util import parse_url
++
++# Test the full requests flow with problematic URLs
++test_urls = [
++    "http://.example.com",
++    "http://example..com", 
++    "http://.café.com",
++]
++
++for url in test_urls:
++    try:
++        print(f"Testing: {url}")
++        
++        # First, check what parse_url returns
++        parsed = parse_url(url)
++        print(f"parse_url result: {parsed}")
++        print(f"Host: {parsed.host}")
++        
++        # Now test the prepare_url method
++        req = PreparedRequest()
++        prepared_url = req.prepare_url(url, params=None)
++        print(f"prepare_url result: {prepared_url}")
++        
++        # Finally, test the actual request
++        response = requests.get(url, timeout=1)
++        print(f"Request status: {response.status_code}")
++        
++    except Exception as e:
++        print(f"Exception type: {type(e).__name__}")
++        print(f"Exception message: {str(e)}")
++    print("-" * 50)
+\ No newline at end of file
+diff --git a/test_unicode_error_fix.py b/test_unicode_error_fix.py
+new file mode 100644
+index 00000000..b8452862
+--- /dev/null
++++ b/test_unicode_error_fix.py
+@@ -0,0 +1,42 @@
++import requests
++from requests.models import PreparedRequest
++from requests.exceptions import InvalidURL
++
++# Test that the UnicodeError to InvalidURL conversion is working
++def test_unicode_error_handling():
++    """Test that UnicodeError is properly converted to InvalidURL"""
++    
++    # Create a prepared request
++    req = PreparedRequest()
++    
++    # Test with a host that would cause IDNAError (empty label)
++    # We'll manually call the method that would trigger the error
++    test_host = "café..com"  # This should cause IDNAError -> UnicodeError
++    
++    try:
++        # Check if it contains non-ASCII (should return True)
++        from requests._internal_utils import unicode_is_ascii
++        has_non_ascii = not unicode_is_ascii(test_host)
++        print(f"Host '{test_host}' has non-ASCII: {has_non_ascii}")
++        
++        if has_non_ascii:
++            # This should trigger the UnicodeError path and convert to InvalidURL
++            encoded = req._get_idna_encoded_host(test_host)
++            print(f"IDNA encoded: {encoded}")
++            
++    except InvalidURL as e:
++        print(f"✓ Correctly caught and converted to InvalidURL: {e}")
++        return True
++    except UnicodeError as e:
++        print(f"✗ UnicodeError was not caught: {e}")
++        return False
++    except Exception as e:
++        print(f"✗ Unexpected exception: {type(e).__name__}: {e}")
++        return False
++    
++    print("✗ No exception was raised")
++    return False
++
++if __name__ == "__main__":
++    success = test_unicode_error_handling()
++    print(f"Test {'PASSED' if success else 'FAILED'}")
+\ No newline at end of file
+diff --git a/test_unicode_error_path.py b/test_unicode_error_path.py
+new file mode 100644
+index 00000000..9de75503
+--- /dev/null
++++ b/test_unicode_error_path.py
+@@ -0,0 +1,30 @@
++import requests
++from requests.models import PreparedRequest
++from requests._internal_utils import unicode_is_ascii
++
++# Test if we can trigger the UnicodeError path by manually calling the IDNA method
++test_hosts = [
++    ".example.com",  # Empty label
++    "example..com",  # Empty label  
++    "café..com",     # Empty label with non-ASCII
++    "café.example.com",  # Valid non-ASCII
++]
++
++for host in test_hosts:
++    try:
++        print(f"Testing host: {host}")
++        print(f"Contains non-ASCII: {not unicode_is_ascii(host)}")
++        
++        # Create a prepared request and manually test the IDNA path
++        req = PreparedRequest()
++        if not unicode_is_ascii(host):
++            print("Would trigger IDNA encoding path")
++            encoded = req._get_idna_encoded_host(host)
++            print(f"IDNA encoded: {encoded}")
++        else:
++            print("ASCII-only, would not trigger IDNA path")
++            
++    except Exception as e:
++        print(f"Exception type: {type(e).__name__}")
++        print(f"Exception message: {str(e)}")
++    print("-" * 50)
+\ No newline at end of file
+diff --git a/trace_execution.py b/trace_execution.py
+new file mode 100644
+index 00000000..7b5dab55
+--- /dev/null
++++ b/trace_execution.py
+@@ -0,0 +1,33 @@
++import requests
++from requests.models import PreparedRequest
++from requests.exceptions import InvalidURL
++
++# Test the execution flow step by step
++test_url = "http://.example.com"
++
++try:
++    print(f"Testing: {test_url}")
++    
++    # Step 1: Create a request object
++    session = requests.Session()
++    request = requests.Request('GET', test_url)
++    
++    # Step 2: Prepare the request (this should call prepare_url)
++    prepared = session.prepare_request(request)
++    print(f"Request prepared successfully: {prepared.url}")
++    
++    # Step 3: Send the request
++    response = session.send(prepared, timeout=1)
++    print(f"Request succeeded: {response.status_code}")
++    
++except InvalidURL as e:
++    print(f"✓ InvalidURL caught: {e}")
++except Exception as e:
++    print(f"Exception type: {type(e).__name__}")
++    print(f"Exception message: {str(e)}")
++    
++    # Check if this is a LocationParseError from urllib3
++    if "LocationParseError" in str(type(e)):
++        print("This is a LocationParseError from urllib3")
++    elif "Failed to parse" in str(e):
++        print("This appears to be a parsing error from urllib3")
+\ No newline at end of file

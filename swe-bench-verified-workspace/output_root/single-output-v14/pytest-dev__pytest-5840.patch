@@ -1,0 +1,269 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..929e38858
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the Windows path casing issue in pytest 5.1.2
++This script simulates the issue where paths are converted to lowercase
++causing ImportError when loading conftest.py files.
++"""
++
++import os
++import sys
++import tempfile
++import shutil
++from pathlib import Path
++
++# Add the pytest source to the path
++sys.path.insert(0, '/testbed/src')
++
++import py
++from _pytest.pathlib import unique_path
++from _pytest.config import findpaths
++
++def test_unique_path_casing():
++    """Test that unique_path converts paths to lowercase on Windows"""
++    print("Testing unique_path function...")
++    
++    # Create a temporary directory with mixed case
++    with tempfile.TemporaryDirectory() as temp_dir:
++        test_dir = py.path.local(temp_dir).join("TestDir", "SubDir")
++        test_dir.ensure(dir=True)
++        
++        # Create a conftest.py file
++        conftest_path = test_dir.join("conftest.py")
++        conftest_path.write("# Test conftest file")
++        
++        print(f"Original path: {test_dir}")
++        
++        # Test unique_path
++        unique_result = unique_path(test_dir)
++        print(f"After unique_path: {unique_result}")
++        
++        # Check if the path was converted to lowercase
++        if str(unique_result).lower() == str(unique_result):
++            print("WARNING: Path was converted to lowercase!")
++            return False
++        else:
++            print("Path case was preserved correctly")
++            return True
++
++def test_findpaths_casing():
++    """Test findpaths module for path casing issues"""
++    print("\nTesting findpaths module...")
++    
++    with tempfile.TemporaryDirectory() as temp_dir:
++        test_dir = Path(temp_dir) / "Azure" / "KMS" / "ComponentTest" / "Python"
++        test_dir.mkdir(parents=True, exist_ok=True)
++        
++        # Create conftest.py files along the path
++        for parent in test_dir.parents:
++            if parent.name:  # Skip root
++                conftest_path = parent / "conftest.py"
++                conftest_path.write_text("# Test conftest")
++        
++        # Test determine_setup function
++        try:
++            result = findpaths.determine_setup([str(test_dir)])
++            print(f"determine_setup result: {result}")
++        except Exception as e:
++            print(f"Error in determine_setup: {e}")
++            return False
++            
++    return True
++
++if __name__ == "__main__":
++    print("Reproducing Windows path casing issue...")
++    print("=" * 50)
++    
++    success1 = test_unique_path_casing()
++    success2 = test_findpaths_casing()
++    
++    print("\n" + "=" * 50)
++    if not success1 or not success2:
++        print("ISSUE REPRODUCED: Path casing problems detected!")
++        sys.exit(1)
++    else:
++        print("No issues detected")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/src/_pytest/config/__init__.py b/src/_pytest/config/__init__.py
+index 3a0eca546..a44a516cb 100644
+--- a/src/_pytest/config/__init__.py
++++ b/src/_pytest/config/__init__.py
+@@ -435,9 +435,9 @@ class PytestPluginManager(PluginManager):
+         # Use realpath to avoid loading the same conftest twice
+         # with build systems that create build directories containing
+         # symlinks to actual files.
+-        conftestpath = unique_path(conftestpath)
++        conftestpath_normalized = unique_path(conftestpath)
+         try:
+-            return self._conftestpath2mod[conftestpath]
++            return self._conftestpath2mod[conftestpath_normalized]
+         except KeyError:
+             pkgpath = conftestpath.pypkgpath()
+             if pkgpath is None:
+@@ -454,7 +454,7 @@ class PytestPluginManager(PluginManager):
+                 raise ConftestImportFailure(conftestpath, sys.exc_info())
+ 
+             self._conftest_plugins.add(mod)
+-            self._conftestpath2mod[conftestpath] = mod
++            self._conftestpath2mod[conftestpath_normalized] = mod
+             dirpath = conftestpath.dirpath()
+             if dirpath in self._dirpath2confmods:
+                 for path, mods in self._dirpath2confmods.items():
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 000000000..6b3646ad7
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python3
++"""
++Test to verify the fix for Windows path casing issue
++"""
++
++import os
++import sys
++import tempfile
++import shutil
++
++# Add the pytest source to the path
++sys.path.insert(0, '/testbed/src')
++
++import py
++from _pytest.config import Config
++
++def test_conftest_import_with_mixed_case():
++    """Test that conftest files with mixed case paths can be imported correctly"""
++    print("Testing conftest import with mixed case paths...")
++    
++    # Create a temporary directory structure with mixed case
++    with tempfile.TemporaryDirectory() as temp_dir:
++        # Create a path with mixed case like the issue example
++        test_dir = py.path.local(temp_dir).join("Azure", "KMS", "ComponentTest", "Python", "PIsys")
++        test_dir.ensure(dir=True)
++        
++        # Create a conftest.py file
++        conftest_path = test_dir.join("conftest.py")
++        conftest_content = '''
++import pytest
++
++def pytest_configure(config):
++    print("Conftest loaded successfully!")
++'''
++        conftest_path.write(conftest_content)
++        
++        print(f"Created conftest at: {conftest_path}")
++        
++        # Test the core functionality: ensure the original path is used for import
++        # while normalized path is used for caching
++        try:
++            # Test that unique_path normalizes but original path is preserved
++            from _pytest.pathlib import unique_path
++            normalized = unique_path(conftest_path)
++            print(f"Original path: {conftest_path}")
++            print(f"Normalized path: {normalized}")
++            
++            # The key insight: the import should use the original path, not normalized
++            # Let's test that pyimport works with the original path
++            try:
++                mod = conftest_path.pyimport()
++                print(f"Successfully imported conftest using original path")
++                return True
++            except Exception as import_error:
++                print(f"Failed to import with original path: {import_error}")
++                return False
++                
++        except Exception as e:
++            print(f"Error: {e}")
++            import traceback
++            traceback.print_exc()
++            return False
++
++def test_unique_path_behavior():
++    """Test that unique_path still works for comparison but doesn't break imports"""
++    print("\nTesting unique_path behavior...")
++    
++    with tempfile.TemporaryDirectory() as temp_dir:
++        test_path = py.path.local(temp_dir).join("Test", "Mixed", "Case")
++        test_path.ensure(dir=True)
++        
++        original_path = test_path
++        normalized_path = original_path.__class__(os.path.normcase(str(original_path.realpath())))
++        
++        print(f"Original path: {original_path}")
++        print(f"Normalized path: {normalized_path}")
++        
++        # They should be different if normcase changes case
++        if str(original_path) != str(normalized_path):
++            print("Paths are different after normcase (simulating Windows behavior)")
++        else:
++            print("Paths are the same (Linux behavior)")
++            
++        return True
++
++if __name__ == "__main__":
++    print("Testing the fix for Windows path casing issue...")
++    print("=" * 60)
++    
++    success1 = test_conftest_import_with_mixed_case()
++    success2 = test_unique_path_behavior()
++    
++    print("\n" + "=" * 60)
++    if success1 and success2:
++        print("SUCCESS: Fix appears to be working correctly!")
++        sys.exit(0)
++    else:
++        print("ISSUE: Tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_windows_casing.py b/test_windows_casing.py
+new file mode 100644
+index 000000000..b8d1a0bf4
+--- /dev/null
++++ b/test_windows_casing.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python3
++"""
++Test to simulate Windows path casing behavior
++"""
++
++import os
++from os.path import normcase
++
++def test_normcase_behavior():
++    """Test how normcase behaves on different platforms"""
++    test_paths = [
++        "/Azure/KMS/ComponentTest/Python",
++        "C:\\Azure\\KMS\\ComponentTest\\Python",
++        "/test/path/With/Mixed/Case",
++        "C:\\Test\\Path\\With\\Mixed\\Case"
++    ]
++    
++    for path in test_paths:
++        normalized = normcase(path)
++        print(f"Original: {path}")
++        print(f"Normcase: {normalized}")
++        print(f"Lowercase: {path.lower()}")
++        print(f"Match: {normalized == path.lower()}")
++        print("-" * 50)
++
++def simulate_windows_normcase(path):
++    """Simulate Windows normcase behavior on any platform"""
++    # On Windows, normcase converts to lowercase
++    return path.lower()
++
++if __name__ == "__main__":
++    print("Testing normcase behavior (simulating Windows)")
++    print("=" * 60)
++    test_normcase_behavior()
++    
++    # Test the specific issue path
++    issue_path = "c:\\azure\\kms\\componenttest\\python\\pisys\\conftest.py"
++    print(f"\nIssue path: {issue_path}")
++    print(f"Simulated Windows normcase: {simulate_windows_normcase(issue_path)}")
+\ No newline at end of file

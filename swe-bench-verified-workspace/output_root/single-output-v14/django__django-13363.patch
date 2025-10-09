@@ -1,0 +1,279 @@
+diff --git a/django/db/models/functions/datetime.py b/django/db/models/functions/datetime.py
+index b6594b043b..6828980733 100644
+--- a/django/db/models/functions/datetime.py
++++ b/django/db/models/functions/datetime.py
+@@ -292,7 +292,7 @@ class TruncDate(TruncBase):
+     def as_sql(self, compiler, connection):
+         # Cast to date rather than truncate to date.
+         lhs, lhs_params = compiler.compile(self.lhs)
+-        tzname = timezone.get_current_timezone_name() if settings.USE_TZ else None
++        tzname = self.get_tzname()
+         sql = connection.ops.datetime_cast_date_sql(lhs, tzname)
+         return sql, lhs_params
+ 
+@@ -305,7 +305,7 @@ class TruncTime(TruncBase):
+     def as_sql(self, compiler, connection):
+         # Cast to time rather than truncate to time.
+         lhs, lhs_params = compiler.compile(self.lhs)
+-        tzname = timezone.get_current_timezone_name() if settings.USE_TZ else None
++        tzname = self.get_tzname()
+         sql = connection.ops.datetime_cast_time_sql(lhs, tzname)
+         return sql, lhs_params
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..fc5d2139bb
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the TruncDate/TruncTime tzinfo issue
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.functions import TruncDate, TruncTime
++from django.utils import timezone
++import pytz
++
++# Create a simple model
++class TimeSlots(models.Model):
++    start_at = models.DateTimeField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the issue
++def test_trunc_date_tzinfo():
++    """Test that TruncDate properly handles tzinfo parameter"""
++    print("Testing TruncDate with tzinfo parameter...")
++    
++    # Create a timezone object for testing
++    tz = pytz.timezone("America/New_York")
++    
++    # Test that TruncDate accepts tzinfo parameter
++    try:
++        trunc_date = TruncDate("start_at", tzinfo=tz)
++        print("✓ TruncDate accepts tzinfo parameter")
++        
++        # Check if the tzinfo is properly stored
++        if trunc_date.tzinfo == tz:
++            print("✓ TruncDate properly stores tzinfo parameter")
++        else:
++            print("✗ TruncDate does not properly store tzinfo parameter")
++            
++    except Exception as e:
++        print(f"✗ TruncDate does not accept tzinfo parameter: {e}")
++
++def test_trunc_time_tzinfo():
++    """Test that TruncTime properly handles tzinfo parameter"""
++    print("\nTesting TruncTime with tzinfo parameter...")
++    
++    # Create a timezone object for testing
++    tz = pytz.timezone("America/New_York")
++    
++    # Test that TruncTime accepts tzinfo parameter
++    try:
++        trunc_time = TruncTime("start_at", tzinfo=tz)
++        print("✓ TruncTime accepts tzinfo parameter")
++        
++        # Check if the tzinfo is properly stored
++        if trunc_time.tzinfo == tz:
++            print("✓ TruncTime properly stores tzinfo parameter")
++        else:
++            print("✗ TruncTime does not properly store tzinfo parameter")
++            
++    except Exception as e:
++        print(f"✗ TruncTime does not accept tzinfo parameter: {e}")
++
++def test_get_tzname_method():
++    """Test that get_tzname method works correctly"""
++    print("\nTesting get_tzname method...")
++    
++    # Create a timezone object for testing
++    tz = pytz.timezone("America/New_York")
++    
++    # Test TruncDate
++    trunc_date = TruncDate("start_at", tzinfo=tz)
++    tzname_date = trunc_date.get_tzname()
++    expected_tzname = "America/New_York"
++    
++    if tzname_date == expected_tzname:
++        print("✓ TruncDate.get_tzname() returns correct timezone name")
++    else:
++        print(f"✗ TruncDate.get_tzname() returns '{tzname_date}', expected '{expected_tzname}'")
++    
++    # Test TruncTime
++    trunc_time = TruncTime("start_at", tzinfo=tz)
++    tzname_time = trunc_time.get_tzname()
++    
++    if tzname_time == expected_tzname:
++        print("✓ TruncTime.get_tzname() returns correct timezone name")
++    else:
++        print(f"✗ TruncTime.get_tzname() returns '{tzname_time}', expected '{expected_tzname}'")
++
++if __name__ == "__main__":
++    test_trunc_date_tzinfo()
++    test_trunc_time_tzinfo()
++    test_get_tzname_method()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..1fbb5917f3
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the TruncDate/TruncTime tzinfo fix
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models.functions import TruncDate, TruncTime
++from django.utils import timezone
++import pytz
++
++# Create a simple model
++class TimeSlots(models.Model):
++    start_at = models.DateTimeField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_sql_generation():
++    """Test that SQL generation uses the correct timezone"""
++    print("Testing SQL generation with tzinfo parameter...")
++    
++    # Create different timezone objects for testing
++    ny_tz = pytz.timezone("America/New_York")
++    utc_tz = pytz.timezone("UTC")
++    
++    # Test TruncDate with different timezones
++    trunc_date_ny = TruncDate("start_at", tzinfo=ny_tz)
++    trunc_date_utc = TruncDate("start_at", tzinfo=utc_tz)
++    trunc_date_default = TruncDate("start_at")  # Should use current timezone
++    
++    # Test TruncTime with different timezones
++    trunc_time_ny = TruncTime("start_at", tzinfo=ny_tz)
++    trunc_time_utc = TruncTime("start_at", tzinfo=utc_tz)
++    trunc_time_default = TruncTime("start_at")  # Should use current timezone
++    
++    # Compile the SQL
++    from django.db.models.sql.compiler import SQLCompiler
++    compiler = SQLCompiler(None, connection, using='default')
++    
++    try:
++        # Test TruncDate SQL generation
++        sql_ny, params_ny = trunc_date_ny.as_sql(compiler, connection)
++        sql_utc, params_utc = trunc_date_utc.as_sql(compiler, connection)
++        sql_default, params_default = trunc_date_default.as_sql(compiler, connection)
++        
++        print("✓ TruncDate SQL generation works with different timezones")
++        print(f"  NY timezone SQL: {sql_ny}")
++        print(f"  UTC timezone SQL: {sql_utc}")
++        print(f"  Default timezone SQL: {sql_default}")
++        
++        # Test TruncTime SQL generation
++        sql_ny_time, params_ny_time = trunc_time_ny.as_sql(compiler, connection)
++        sql_utc_time, params_utc_time = trunc_time_utc.as_sql(compiler, connection)
++        sql_default_time, params_default_time = trunc_time_default.as_sql(compiler, connection)
++        
++        print("✓ TruncTime SQL generation works with different timezones")
++        print(f"  NY timezone SQL: {sql_ny_time}")
++        print(f"  UTC timezone SQL: {sql_utc_time}")
++        print(f"  Default timezone SQL: {sql_default_time}")
++        
++        # The SQL should be different for different timezones
++        if sql_ny != sql_utc:
++            print("✓ Different timezones generate different SQL for TruncDate")
++        else:
++            print("✗ Different timezones generate the same SQL for TruncDate")
++            
++        if sql_ny_time != sql_utc_time:
++            print("✓ Different timezones generate different SQL for TruncTime")
++        else:
++            print("✗ Different timezones generate the same SQL for TruncTime")
++            
++    except Exception as e:
++        print(f"✗ SQL generation failed: {e}")
++        import traceback
++        traceback.print_exc()
++
++def test_timezone_handling():
++    """Test that the timezone handling works correctly"""
++    print("\nTesting timezone handling...")
++    
++    # Test with USE_TZ = True
++    ny_tz = pytz.timezone("America/New_York")
++    trunc_date = TruncDate("start_at", tzinfo=ny_tz)
++    
++    tzname = trunc_date.get_tzname()
++    expected_tzname = "America/New_York"
++    
++    if tzname == expected_tzname:
++        print("✓ get_tzname() returns correct timezone name")
++    else:
++        print(f"✗ get_tzname() returns '{tzname}', expected '{expected_tzname}'")
++    
++    # Test with no tzinfo (should use current timezone)
++    trunc_date_default = TruncDate("start_at")
++    tzname_default = trunc_date_default.get_tzname()
++    current_tzname = timezone.get_current_timezone_name()
++    
++    if tzname_default == current_tzname:
++        print("✓ Default timezone handling works correctly")
++    else:
++        print(f"✗ Default timezone returns '{tzname_default}', expected '{current_tzname}'")
++
++if __name__ == "__main__":
++    test_sql_generation()
++    test_timezone_handling()
+\ No newline at end of file

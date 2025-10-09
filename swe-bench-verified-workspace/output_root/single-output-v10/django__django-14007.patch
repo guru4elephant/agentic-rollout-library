@@ -1,0 +1,599 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 55b1691166..9806f395e2 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -871,7 +871,12 @@ class Model(metaclass=ModelBase):
+             returning_fields = meta.db_returning_fields
+             results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
+             if results:
++                # Apply field converters to the returned values
+                 for value, field in zip(results[0], returning_fields):
++                    # Get field converters and apply them
++                    converters = field.get_db_converters(connections[using])
++                    for converter in converters:
++                        value = converter(value, field, connections[using])
+                     setattr(self, field.attname, value)
+         return updated
+ 
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..a9bfcb76c3
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create the custom field as described in the GitHub issue
++class MyIntWrapper:
++    def __init__(self, value):
++        self.value = value
++    
++    def __repr__(self):
++        return f'<MyIntWrapper: {self.value}>'
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return self.value == other
++
++class MyAutoField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        return int(value)
++
++# Create the model
++class AutoModel(models.Model):
++    id = MyAutoField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_github_issue_fix():
++    """Test that the GitHub issue is fixed"""
++    from django.db import connection
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(AutoModel)
++    
++    print("Testing GitHub issue fix...")
++    
++    # Test the exact scenario from the GitHub issue
++    print("\n1. Testing query of existing instances:")
++    am = AutoModel.objects.create()
++    print(f"   Created instance: {am}")
++    print(f"   Instance ID: {am.id} (type: {type(am.id)})")
++    
++    # Query it back
++    queried = AutoModel.objects.first()
++    print(f"   Queried instance ID: {queried.id} (type: {type(queried.id)})")
++    assert isinstance(queried.id, MyIntWrapper), "Queried instance should have MyIntWrapper"
++    
++    print("\n2. Testing create operation (the main issue):")
++    am2 = AutoModel.objects.create()
++    print(f"   Created instance: {am2}")
++    print(f"   Instance ID: {am2.id} (type: {type(am2.id)})")
++    assert isinstance(am2.id, MyIntWrapper), "Newly created instance should have MyIntWrapper"
++    
++    print("\n3. Verifying the fix works:")
++    print(f"   ✅ Before fix: create() would return plain int (e.g., 2)")
++    print(f"   ✅ After fix: create() returns MyIntWrapper (e.g., <MyIntWrapper: 3>)")
++    print(f"   ✅ Query operations continue to work correctly")
++    
++    print("\n🎉 GitHub issue is FIXED! from_db_value is now called for returning_fields on insert")
++
++if __name__ == '__main__':
++    test_github_issue_fix()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..a3d7e1b15f
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create the custom field as described in the issue
++class MyIntWrapper:
++    def __init__(self, value):
++        self.value = value
++    
++    def __repr__(self):
++        return f'<MyIntWrapper: {self.value}>'
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return self.value == other
++
++class MyAutoField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        return int(value)
++
++# Create the model
++class AutoModel(models.Model):
++    id = MyAutoField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the issue
++def test_issue():
++    from django.db import connection
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(AutoModel)
++    
++    # Test 1: Query existing instances (should work)
++    print("Testing query of existing instances...")
++    instance = AutoModel.objects.create()
++    print(f"Created instance: {instance}")
++    print(f"Instance ID type: {type(instance.id)}, value: {instance.id}")
++    
++    # Query it back
++    queried = AutoModel.objects.first()
++    print(f"Queried instance ID type: {type(queried.id)}, value: {queried.id}")
++    
++    # Test 2: Create new instance (should show the issue)
++    print("\nTesting create operation...")
++    new_instance = AutoModel.objects.create()
++    print(f"New instance ID type: {type(new_instance.id)}, value: {new_instance.id}")
++    
++    # Test 3: Bulk create
++    print("\nTesting bulk create...")
++    instances = [AutoModel()]
++    created = AutoModel.objects.bulk_create(instances)
++    print(f"Bulk created instances: {created}")
++    print(f"First bulk instance ID type: {type(instances[0].id)}, value: {instances[0].id}")
++
++if __name__ == '__main__':
++    test_issue()
+\ No newline at end of file
+diff --git a/test_bulk_create.py b/test_bulk_create.py
+new file mode 100644
+index 0000000000..23112420b9
+--- /dev/null
++++ b/test_bulk_create.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connections
++
++# Create the custom field as described in the issue
++class MyIntWrapper:
++    def __init__(self, value):
++        self.value = value
++    
++    def __repr__(self):
++        return f'<MyIntWrapper: {self.value}>'
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return self.value == other
++
++class MyAutoField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        return int(value)
++
++# Create the model
++class AutoModel(models.Model):
++    id = MyAutoField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_bulk_create_features():
++    from django.db import connection
++    
++    # Check database features
++    print("Database features:")
++    print(f"can_return_columns_from_insert: {connection.features.can_return_columns_from_insert}")
++    print(f"can_return_rows_from_bulk_insert: {connection.features.can_return_rows_from_bulk_insert}")
++
++if __name__ == '__main__':
++    test_bulk_create_features()
+\ No newline at end of file
+diff --git a/test_existing_functionality.py b/test_existing_functionality.py
+new file mode 100644
+index 0000000000..60d0b1f204
+--- /dev/null
++++ b/test_existing_functionality.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++def test_existing_functionality():
++    """Test that existing functionality still works after our changes"""
++    
++    # Test 1: Regular model with AutoField
++    class RegularModel(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test1'
++    
++    # Create table
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(RegularModel)
++    
++    # Test create operation
++    obj = RegularModel.objects.create(name='test')
++    print(f"✅ Regular create works: id={obj.id}, name={obj.name}")
++    
++    # Test query operation
++    queried = RegularModel.objects.first()
++    print(f"✅ Regular query works: id={queried.id}, name={queried.name}")
++    
++    # Test 2: Model with BigAutoField
++    class BigModel(models.Model):
++        id = models.BigAutoField(primary_key=True)
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test2'
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(BigModel)
++    
++    # Test create operation
++    big_obj = BigModel.objects.create(name='big_test')
++    print(f"✅ BigAutoField create works: id={big_obj.id}, name={big_obj.name}")
++    
++    # Test query operation
++    big_queried = BigModel.objects.first()
++    print(f"✅ BigAutoField query works: id={big_queried.id}, name={big_queried.name}")
++    
++    # Test 3: Model with custom field that doesn't override from_db_value
++    class SimpleCustomField(models.BigAutoField):
++        pass
++    
++    class SimpleModel(models.Model):
++        id = SimpleCustomField(primary_key=True)
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test3'
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SimpleModel)
++    
++    # Test create operation
++    simple_obj = SimpleModel.objects.create(name='simple_test')
++    print(f"✅ Simple custom field create works: id={simple_obj.id}, name={simple_obj.name}")
++    
++    # Test query operation
++    simple_queried = SimpleModel.objects.first()
++    print(f"✅ Simple custom field query works: id={simple_queried.id}, name={simple_queried.name}")
++    
++    print("\n🎉 All existing functionality tests passed!")
++
++if __name__ == '__main__':
++    test_existing_functionality()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..81ed604af4
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,116 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create the custom field as described in the issue
++class MyIntWrapper:
++    def __init__(self, value):
++        self.value = value
++    
++    def __repr__(self):
++        return f'<MyIntWrapper: {self.value}>'
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return self.value == other
++
++class MyAutoField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        return int(value)
++
++# Create the model
++class AutoModel(models.Model):
++    id = MyAutoField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_fix():
++    from django.db import connection
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(AutoModel)
++    
++    print("Testing the main issue fix...")
++    
++    # Test 1: Create new instance (should now work with from_db_value)
++    print("\n1. Testing create operation...")
++    new_instance = AutoModel.objects.create()
++    print(f"New instance ID type: {type(new_instance.id)}, value: {new_instance.id}")
++    
++    # Verify it's actually a MyIntWrapper
++    assert isinstance(new_instance.id, MyIntWrapper), f"Expected MyIntWrapper, got {type(new_instance.id)}"
++    print("✅ Create operation correctly applies from_db_value")
++    
++    # Test 2: Query existing instances (should still work)
++    print("\n2. Testing query operation...")
++    queried = AutoModel.objects.first()
++    print(f"Queried instance ID type: {type(queried.id)}, value: {queried.id}")
++    
++    # Verify it's actually a MyIntWrapper
++    assert isinstance(queried.id, MyIntWrapper), f"Expected MyIntWrapper, got {type(queried.id)}"
++    print("✅ Query operation correctly applies from_db_value")
++    
++    # Test 3: Edge case - None values
++    print("\n3. Testing edge cases...")
++    
++    # Test with a field that might return None
++    class NullableField(models.IntegerField):
++        def from_db_value(self, value, expression, connection):
++            if value is None:
++                return "NULL_CONVERTED"
++            return value
++    
++    class TestModel(models.Model):
++        id = models.AutoField(primary_key=True)
++        nullable_field = NullableField(null=True)
++        
++        class Meta:
++            app_label = 'test2'
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Create instance with None value
++    test_instance = TestModel.objects.create(nullable_field=None)
++    print(f"Nullable field value: {test_instance.nullable_field}")
++    assert test_instance.nullable_field == "NULL_CONVERTED", f"Expected 'NULL_CONVERTED', got {test_instance.nullable_field}"
++    print("✅ None values are correctly handled by from_db_value")
++    
++    print("\n🎉 All tests passed! The fix is working correctly.")
++
++if __name__ == '__main__':
++    test_fix()
+\ No newline at end of file
+diff --git a/test_postgresql.py b/test_postgresql.py
+new file mode 100644
+index 0000000000..ee74362607
+--- /dev/null
++++ b/test_postgresql.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings for PostgreSQL
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.postgresql',
++                'NAME': 'testdb',
++                'USER': 'testuser',
++                'PASSWORD': 'testpass',
++                'HOST': 'localhost',
++                'PORT': '5432',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connections
++
++# Create the custom field as described in the issue
++class MyIntWrapper:
++    def __init__(self, value):
++        self.value = value
++    
++    def __repr__(self):
++        return f'<MyIntWrapper: {self.value}>'
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return self.value == other
++
++class MyAutoField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        return int(value)
++
++# Create the model
++class AutoModel(models.Model):
++    id = MyAutoField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_postgresql_features():
++    from django.db import connection
++    
++    # Check database features
++    print("PostgreSQL database features:")
++    print(f"can_return_columns_from_insert: {connection.features.can_return_columns_from_insert}")
++    print(f"can_return_rows_from_bulk_insert: {connection.features.can_return_rows_from_bulk_insert}")
++
++if __name__ == '__main__':
++    test_postgresql_features()
+\ No newline at end of file

@@ -1,0 +1,902 @@
+diff --git a/direct_test.py b/direct_test.py
+new file mode 100644
+index 0000000000..2e0049ec32
+--- /dev/null
++++ b/direct_test.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python
++"""
++Direct test of the field_choices method logic without full Django setup
++"""
++
++def test_related_field_list_filter_ordering():
++    """Test the logic for RelatedFieldListFilter ordering fallback"""
++    print("Testing RelatedFieldListFilter ordering fallback logic...")
++    
++    # Mock the components
++    class MockModel:
++        class _meta:
++            ordering = ('name',)
++    
++    class MockField:
++        def __init__(self):
++            self.remote_field = MockRemoteField(MockModel)
++    
++    class MockRemoteField:
++        def __init__(self, model):
++            self.model = model
++    
++    # Simulate the field_choices method logic
++    def simulate_field_choices(field, model_admin_ordering=None):
++        ordering = ()
++        # Simulate getting ordering from related admin
++        if model_admin_ordering is not None:
++            ordering = model_admin_ordering
++        # Simulate fallback to model's Meta.ordering
++        if not ordering:
++            ordering = field.remote_field.model._meta.ordering or ()
++        return ordering
++    
++    # Test case 1: No ModelAdmin ordering (should use model Meta.ordering)
++    mock_field = MockField()
++    ordering = simulate_field_choices(mock_field, model_admin_ordering=None)
++    print(f"Test 1 - No ModelAdmin ordering: {ordering}")
++    assert ordering == ('name',), f"Expected ('name',), got {ordering}"
++    
++    # Test case 2: With ModelAdmin ordering (should use admin ordering)
++    mock_field = MockField()
++    ordering = simulate_field_choices(mock_field, model_admin_ordering=('id',))
++    print(f"Test 2 - With ModelAdmin ordering: {ordering}")
++    assert ordering == ('id',), f"Expected ('id',), got {ordering}"
++    
++    # Test case 3: Empty ModelAdmin ordering (should use model Meta.ordering)
++    mock_field = MockField()
++    ordering = simulate_field_choices(mock_field, model_admin_ordering=())
++    print(f"Test 3 - Empty ModelAdmin ordering: {ordering}")
++    assert ordering == ('name',), f"Expected ('name',), got {ordering}"
++    
++    print("RelatedFieldListFilter logic test passed!")
++
++def test_related_only_field_list_filter_ordering():
++    """Test the logic for RelatedOnlyFieldListFilter ordering"""
++    print("\nTesting RelatedOnlyFieldListFilter ordering logic...")
++    
++    # Mock the components
++    class MockModel:
++        class _meta:
++            ordering = ('description',)
++    
++    class MockField:
++        def __init__(self):
++            self.remote_field = MockRemoteField(MockModel)
++    
++    class MockRemoteField:
++        def __init__(self, model):
++            self.model = model
++    
++    # Simulate the field_choices method logic
++    def simulate_field_choices(field, model_admin_ordering=None):
++        # Simulate getting ordering from related admin
++        ordering = ()
++        if model_admin_ordering is not None:
++            ordering = model_admin_ordering
++        # Simulate fallback to model's Meta.ordering
++        if not ordering:
++            ordering = field.remote_field.model._meta.ordering or ()
++        return ordering
++    
++    # Test case 1: No ModelAdmin ordering (should use model Meta.ordering)
++    mock_field = MockField()
++    ordering = simulate_field_choices(mock_field, model_admin_ordering=None)
++    print(f"Test 1 - No ModelAdmin ordering: {ordering}")
++    assert ordering == ('description',), f"Expected ('description',), got {ordering}"
++    
++    # Test case 2: With ModelAdmin ordering (should use admin ordering)
++    mock_field = MockField()
++    ordering = simulate_field_choices(mock_field, model_admin_ordering=('name',))
++    print(f"Test 2 - With ModelAdmin ordering: {ordering}")
++    assert ordering == ('name',), f"Expected ('name',), got {ordering}"
++    
++    print("RelatedOnlyFieldListFilter logic test passed!")
++
++if __name__ == '__main__':
++    test_related_field_list_filter_ordering()
++    test_related_only_field_list_filter_ordering()
++    print("\nAll logic tests passed! The fix should work correctly.")
+\ No newline at end of file
+diff --git a/django/contrib/admin/filters.py b/django/contrib/admin/filters.py
+index d65e01d5e2..6b172cb059 100644
+--- a/django/contrib/admin/filters.py
++++ b/django/contrib/admin/filters.py
+@@ -198,6 +198,9 @@ class RelatedFieldListFilter(FieldListFilter):
+         related_admin = model_admin.admin_site._registry.get(field.remote_field.model)
+         if related_admin is not None:
+             ordering = related_admin.get_ordering(request)
++        if not ordering:
++            # Fall back to the model's Meta.ordering if no admin ordering is specified
++            ordering = field.remote_field.model._meta.ordering or ()
+         return field.get_choices(include_blank=False, ordering=ordering)
+ 
+     def choices(self, changelist):
+@@ -419,4 +422,11 @@ FieldListFilter.register(lambda f: True, AllValuesFieldListFilter)
+ class RelatedOnlyFieldListFilter(RelatedFieldListFilter):
+     def field_choices(self, field, request, model_admin):
+         pk_qs = model_admin.get_queryset(request).distinct().values_list('%s__pk' % self.field_path, flat=True)
+-        return field.get_choices(include_blank=False, limit_choices_to={'pk__in': pk_qs})
++        # Get ordering from related admin or fall back to model's Meta.ordering
++        ordering = ()
++        related_admin = model_admin.admin_site._registry.get(field.remote_field.model)
++        if related_admin is not None:
++            ordering = related_admin.get_ordering(request)
++        if not ordering:
++            ordering = field.remote_field.model._meta.ordering or ()
++        return field.get_choices(include_blank=False, limit_choices_to={'pk__in': pk_qs}, ordering=ordering)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..0c4feff715
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,154 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import RequestFactory
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++            'tests.admin_filters',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.admin import site, ModelAdmin
++from django.contrib.admin.filters import RelatedFieldListFilter, RelatedOnlyFieldListFilter
++from tests.admin_filters.models import Book, Employee, Department
++from django.contrib.auth.models import User
++
++# Create test data
++def create_test_data():
++    # Create departments with specific ordering
++    dept1 = Department.objects.create(code='B', description='Beta Department')
++    dept2 = Department.objects.create(code='A', description='Alpha Department')
++    dept3 = Department.objects.create(code='C', description='Gamma Department')
++    
++    # Create employees
++    emp1 = Employee.objects.create(department=dept1, name='John Doe')
++    emp2 = Employee.objects.create(department=dept2, name='Jane Smith')
++    emp3 = Employee.objects.create(department=dept3, name='Bob Johnson')
++    
++    # Create users
++    user1 = User.objects.create_user('user1', 'user1@example.com', 'password')
++    user2 = User.objects.create_user('user2', 'user2@example.com', 'password')
++    user3 = User.objects.create_user('user3', 'user3@example.com', 'password')
++    
++    # Create books
++    Book.objects.create(title='Book 1', author=user1, employee=emp1)
++    Book.objects.create(title='Book 2', author=user2, employee=emp2)
++    Book.objects.create(title='Book 3', author=user3, employee=emp3)
++
++def test_related_field_list_filter():
++    print("=== Testing RelatedFieldListFilter ===")
++    
++    # Test with ModelAdmin ordering
++    class EmployeeAdminWithOrdering(ModelAdmin):
++        ordering = ('name',)  # Order by name
++    
++    site.register(Employee, EmployeeAdminWithOrdering)
++    
++    class BookAdmin(ModelAdmin):
++        list_filter = ('employee',)
++    
++    modeladmin = BookAdmin(Book, site)
++    request = RequestFactory().get('/')
++    request.user = User.objects.first()
++    
++    # Create filter instance
++    field = Book._meta.get_field('employee')
++    filter_instance = RelatedFieldListFilter(field, request, {}, Book, modeladmin, 'employee')
++    
++    print("Lookup choices (should be ordered by name):")
++    for pk, name in filter_instance.lookup_choices:
++        print(f"  {pk}: {name}")
++    
++    # Test fallback to model Meta.ordering
++    site.unregister(Employee)
++    
++    # Add Meta.ordering to Department model
++    Department._meta.ordering = ('description',)  # Order by description
++    
++    class BookAdmin2(ModelAdmin):
++        list_filter = ('employee__department',)
++    
++    modeladmin2 = BookAdmin2(Book, site)
++    filter_instance2 = RelatedFieldListFilter(
++        Book._meta.get_field('employee__department'), request, {}, Book, modeladmin2, 'employee__department'
++    )
++    
++    print("\nLookup choices with Meta.ordering (should be ordered by description):")
++    for pk, name in filter_instance2.lookup_choices:
++        print(f"  {pk}: {name}")
++    
++    # Clean up
++    del Department._meta.ordering
++
++def test_related_only_field_list_filter():
++    print("\n=== Testing RelatedOnlyFieldListFilter ===")
++    
++    # Test with ModelAdmin ordering
++    class EmployeeAdminWithOrdering(ModelAdmin):
++        ordering = ('name',)  # Order by name
++    
++    site.register(Employee, EmployeeAdminWithOrdering)
++    
++    class BookAdmin(ModelAdmin):
++        list_filter = (('employee', RelatedOnlyFieldListFilter),)
++    
++    modeladmin = BookAdmin(Book, site)
++    request = RequestFactory().get('/')
++    request.user = User.objects.first()
++    
++    # Create filter instance
++    field = Book._meta.get_field('employee')
++    filter_instance = RelatedOnlyFieldListFilter(field, request, {}, Book, modeladmin, 'employee')
++    
++    print("Lookup choices (should be ordered by name):")
++    for pk, name in filter_instance.lookup_choices:
++        print(f"  {pk}: {name}")
++    
++    # Test fallback to model Meta.ordering
++    site.unregister(Employee)
++    
++    # Add Meta.ordering to Department model
++    Department._meta.ordering = ('description',)  # Order by description
++    
++    class BookAdmin2(ModelAdmin):
++        list_filter = (('employee__department', RelatedOnlyFieldListFilter),)
++    
++    modeladmin2 = BookAdmin2(Book, site)
++    filter_instance2 = RelatedOnlyFieldListFilter(
++        Book._meta.get_field('employee__department'), request, {}, Book, modeladmin2, 'employee__department'
++    )
++    
++    print("\nLookup choices with Meta.ordering (should be ordered by description):")
++    for pk, name in filter_instance2.lookup_choices:
++        print(f"  {pk}: {name}")
++    
++    # Clean up
++    del Department._meta.ordering
++
++if __name__ == '__main__':
++    from django.core.management import execute_from_command_line
++    # Create database tables
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    create_test_data()
++    test_related_field_list_filter()
++    test_related_only_field_list_filter()
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..f4d81c6545
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import RequestFactory, TestCase
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.admin import site, ModelAdmin
++from django.contrib.admin.filters import RelatedFieldListFilter, RelatedOnlyFieldListFilter
++from django.db import models
++from django.contrib.auth.models import User
++
++# Create simple test models
++class Department(models.Model):
++    code = models.CharField(max_length=4, unique=True)
++    description = models.CharField(max_length=50, blank=True, null=True)
++    
++    class Meta:
++        ordering = ('description',)  # Default ordering
++    
++    def __str__(self):
++        return self.description
++
++class Employee(models.Model):
++    department = models.ForeignKey(Department, models.CASCADE, to_field="code")
++    name = models.CharField(max_length=100)
++    
++    def __str__(self):
++        return self.name
++
++class Book(models.Model):
++    title = models.CharField(max_length=50)
++    employee = models.ForeignKey(Employee, models.SET_NULL, blank=True, null=True)
++    
++    def __str__(self):
++        return self.title
++
++def test_related_field_list_filter_ordering():
++    print("=== Testing RelatedFieldListFilter ordering ===")
++    
++    # Test 1: With ModelAdmin ordering
++    class EmployeeAdminWithOrdering(ModelAdmin):
++        ordering = ('name',)  # Order by name
++    
++    site.register(Employee, EmployeeAdminWithOrdering)
++    
++    class BookAdmin(ModelAdmin):
++        list_filter = ('employee',)
++    
++    modeladmin = BookAdmin(Book, site)
++    request = RequestFactory().get('/')
++    request.user = User.objects.create_user('test', 'test@example.com', 'password')
++    
++    # Create filter instance
++    field = Book._meta.get_field('employee')
++    filter_instance = RelatedFieldListFilter(field, request, {}, Book, modeladmin, 'employee')
++    
++    print("Test 1 - Should use ModelAdmin ordering (name):")
++    print("  Lookup choices:", filter_instance.lookup_choices)
++    
++    # Test 2: Without ModelAdmin ordering (should fallback to model Meta.ordering)
++    site.unregister(Employee)
++    
++    class EmployeeAdminWithoutOrdering(ModelAdmin):
++        pass  # No ordering specified
++    
++    site.register(Employee, EmployeeAdminWithoutOrdering)
++    
++    filter_instance2 = RelatedFieldListFilter(field, request, {}, Book, modeladmin, 'employee')
++    
++    print("\nTest 2 - Should fallback to model Meta.ordering (description):")
++    print("  Lookup choices:", filter_instance2.lookup_choices)
++    
++    # Clean up
++    site.unregister(Employee)
++
++def test_related_only_field_list_filter_ordering():
++    print("\n=== Testing RelatedOnlyFieldListFilter ordering ===")
++    
++    # Test 1: With ModelAdmin ordering
++    class EmployeeAdminWithOrdering(ModelAdmin):
++        ordering = ('name',)  # Order by name
++    
++    site.register(Employee, EmployeeAdminWithOrdering)
++    
++    class BookAdmin(ModelAdmin):
++        list_filter = (('employee', RelatedOnlyFieldListFilter),)
++    
++    modeladmin = BookAdmin(Book, site)
++    request = RequestFactory().get('/')
++    request.user = User.objects.create_user('test', 'test@example.com', 'password')
++    
++    # Create filter instance
++    field = Book._meta.get_field('employee')
++    filter_instance = RelatedOnlyFieldListFilter(field, request, {}, Book, modeladmin, 'employee')
++    
++    print("Test 1 - Should use ModelAdmin ordering (name):")
++    print("  Lookup choices:", filter_instance.lookup_choices)
++    
++    # Test 2: Without ModelAdmin ordering (should fallback to model Meta.ordering)
++    site.unregister(Employee)
++    
++    class EmployeeAdminWithoutOrdering(ModelAdmin):
++        pass  # No ordering specified
++    
++    site.register(Employee, EmployeeAdminWithoutOrdering)
++    
++    filter_instance2 = RelatedOnlyFieldListFilter(field, request, {}, Book, modeladmin, 'employee')
++    
++    print("\nTest 2 - Should fallback to model Meta.ordering (description):")
++    print("  Lookup choices:", filter_instance2.lookup_choices)
++    
++    # Clean up
++    site.unregister(Employee)
++
++if __name__ == '__main__':
++    # Create test data without database
++    print("Note: This script tests the filter logic without database operations")
++    test_related_field_list_filter_ordering()
++    test_related_only_field_list_filter_ordering()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..229ead790d
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,164 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings properly
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++        ],
++        MIDDLEWARE=[
++            'django.contrib.sessions.middleware.SessionMiddleware',
++            'django.contrib.auth.middleware.AuthenticationMiddleware',
++            'django.contrib.messages.middleware.MessageMiddleware',
++        ],
++        TEMPLATES=[
++            {
++                'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                'APP_DIRS': True,
++                'OPTIONS': {
++                    'context_processors': [
++                        'django.contrib.auth.context_processors.auth',
++                        'django.contrib.messages.context_processors.messages',
++                    ],
++                },
++            },
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.admin import site, ModelAdmin
++from django.contrib.admin.filters import RelatedFieldListFilter, RelatedOnlyFieldListFilter
++from django.test import RequestFactory
++from django.contrib.auth.models import User
++
++# Create simple test models
++class Department(models.Model):
++    code = models.CharField(max_length=4, unique=True)
++    description = models.CharField(max_length=50, blank=True, null=True)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ('description',)  # Default ordering
++    
++    def __str__(self):
++        return self.description
++
++class Employee(models.Model):
++    department = models.ForeignKey(Department, models.CASCADE, to_field="code")
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ('name',)  # Default ordering
++    
++    def __str__(self):
++        return self.name
++
++class Book(models.Model):
++    title = models.CharField(max_length=50)
++    employee = models.ForeignKey(Employee, models.SET_NULL, blank=True, null=True)
++    
++    class Meta:
++        app_label = 'test_app'
++    
++    def __str__(self):
++        return self.title
++
++def test_related_field_list_filter_ordering():
++    """Test that RelatedFieldListFilter falls back to model Meta.ordering"""
++    print("Testing RelatedFieldListFilter ordering fallback...")
++    
++    # Create a request
++    request = RequestFactory().get('/')
++    request.user = User.objects.create_user('test', 'test@example.com', 'password')
++    
++    # Test without ModelAdmin ordering (should use model Meta.ordering)
++    class EmployeeAdminWithoutOrdering(ModelAdmin):
++        pass  # No ordering specified
++    
++    site.register(Employee, EmployeeAdminWithoutOrdering)
++    
++    class BookAdmin(ModelAdmin):
++        list_filter = ('employee',)
++    
++    modeladmin = BookAdmin(Book, site)
++    
++    # Create filter instance
++    field = Book._meta.get_field('employee')
++    filter_instance = RelatedFieldListFilter(field, request, {}, Book, modeladmin, 'employee')
++    
++    # The field_choices method should use the model's Meta.ordering
++    choices = filter_instance.field_choices(field, request, modeladmin)
++    print("Choices from field_choices:", list(choices))
++    
++    # Clean up
++    site.unregister(Employee)
++    print("RelatedFieldListFilter test completed")
++
++def test_related_only_field_list_filter_ordering():
++    """Test that RelatedOnlyFieldListFilter respects ordering"""
++    print("\nTesting RelatedOnlyFieldListFilter ordering...")
++    
++    # Create a request
++    request = RequestFactory().get('/')
++    request.user = User.objects.create_user('test', 'test@example.com', 'password')
++    
++    # Test with ModelAdmin ordering
++    class EmployeeAdminWithOrdering(ModelAdmin):
++        ordering = ('name',)  # Order by name
++    
++    site.register(Employee, EmployeeAdminWithOrdering)
++    
++    class BookAdmin(ModelAdmin):
++        list_filter = (('employee', RelatedOnlyFieldListFilter),)
++    
++    modeladmin = BookAdmin(Book, site)
++    
++    # Create filter instance
++    field = Book._meta.get_field('employee')
++    filter_instance = RelatedOnlyFieldListFilter(field, request, {}, Book, modeladmin, 'employee')
++    
++    # The field_choices method should use the admin's ordering
++    choices = filter_instance.field_choices(field, request, modeladmin)
++    print("Choices from field_choices:", list(choices))
++    
++    # Clean up
++    site.unregister(Employee)
++    print("RelatedOnlyFieldListFilter test completed")
++
++if __name__ == '__main__':
++    # Create database tables
++    from django.core.management.color import no_style
++    from django.db import connection
++    
++    style = no_style()
++    sql = connection.ops.sql_table_creation_suffix()
++    tables = connection.introspection.django_table_names()
++    
++    # Create tables for our test models
++    with connection.cursor() as cursor:
++        for model in [Department, Employee, Book]:
++            sql = connection.ops.sql_create_table(model._meta, style)
++            cursor.execute(sql)
++    
++    test_related_field_list_filter_ordering()
++    test_related_only_field_list_filter_ordering()
+\ No newline at end of file
+diff --git a/test_logic.py b/test_logic.py
+new file mode 100644
+index 0000000000..6bee16b9f3
+--- /dev/null
++++ b/test_logic.py
+@@ -0,0 +1,165 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings properly
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++        ],
++        MIDDLEWARE=[
++            'django.contrib.sessions.middleware.SessionMiddleware',
++            'django.contrib.auth.middleware.AuthenticationMiddleware',
++            'django.contrib.messages.middleware.MessageMiddleware',
++        ],
++        TEMPLATES=[
++            {
++                'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                'APP_DIRS': True,
++                'OPTIONS': {
++                    'context_processors': [
++                        'django.contrib.auth.context_processors.auth',
++                        'django.contrib.messages.context_processors.messages',
++                    ],
++                },
++            },
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.admin import site, ModelAdmin
++from django.contrib.admin.filters import RelatedFieldListFilter, RelatedOnlyFieldListFilter
++from django.test import RequestFactory
++from django.contrib.auth.models import User
++
++def test_related_field_list_filter_ordering():
++    """Test that RelatedFieldListFilter falls back to model Meta.ordering"""
++    print("Testing RelatedFieldListFilter ordering fallback...")
++    
++    # Create a simple model with Meta.ordering
++    class TestModel(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test'
++            ordering = ('name',)
++        
++        def __str__(self):
++            return self.name
++    
++    # Create a request
++    request = RequestFactory().get('/')
++    request.user = User.objects.create_user('test', 'test@example.com', 'password')
++    
++    # Test without ModelAdmin ordering (should use model Meta.ordering)
++    class TestModelAdminWithoutOrdering(ModelAdmin):
++        pass  # No ordering specified
++    
++    site.register(TestModel, TestModelAdminWithoutOrdering)
++    
++    class BookAdmin(ModelAdmin):
++        list_filter = ('test_field',)
++    
++    # Create a mock field for testing
++    class MockField:
++        def __init__(self, remote_model):
++            self.remote_field = MockRemoteField(remote_model)
++        
++        def get_choices(self, include_blank=False, ordering=()):
++            print(f"get_choices called with ordering: {ordering}")
++            return [(1, 'Test 1'), (2, 'Test 2')]
++    
++    class MockRemoteField:
++        def __init__(self, model):
++            self.model = model
++    
++    # Create filter instance
++    mock_field = MockField(TestModel)
++    modeladmin = BookAdmin(None, site)
++    
++    # Test the field_choices method directly
++    filter_instance = RelatedFieldListFilter(mock_field, request, {}, None, modeladmin, 'test_field')
++    choices = filter_instance.field_choices(mock_field, request, modeladmin)
++    
++    print("Choices from field_choices:", list(choices))
++    
++    # Clean up
++    site.unregister(TestModel)
++    print("RelatedFieldListFilter test completed")
++
++def test_related_only_field_list_filter_ordering():
++    """Test that RelatedOnlyFieldListFilter respects ordering"""
++    print("\nTesting RelatedOnlyFieldListFilter ordering...")
++    
++    # Create a simple model
++    class TestModel(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test'
++            ordering = ('name',)
++        
++        def __str__(self):
++            return self.name
++    
++    # Create a request
++    request = RequestFactory().get('/')
++    request.user = User.objects.create_user('test', 'test@example.com', 'password')
++    
++    # Test with ModelAdmin ordering
++    class TestModelAdminWithOrdering(ModelAdmin):
++        ordering = ('name',)  # Order by name
++    
++    site.register(TestModel, TestModelAdminWithOrdering)
++    
++    class BookAdmin(ModelAdmin):
++        list_filter = (('test_field', RelatedOnlyFieldListFilter),)
++    
++    # Create a mock field for testing
++    class MockField:
++        def __init__(self, remote_model):
++            self.remote_field = MockRemoteField(remote_model)
++        
++        def get_choices(self, include_blank=False, limit_choices_to=None, ordering=()):
++            print(f"get_choices called with ordering: {ordering}, limit_choices_to: {limit_choices_to}")
++            return [(1, 'Test 1'), (2, 'Test 2')]
++    
++    class MockRemoteField:
++        def __init__(self, model):
++            self.model = model
++    
++    # Create filter instance
++    mock_field = MockField(TestModel)
++    modeladmin = BookAdmin(None, site)
++    
++    # Test the field_choices method directly
++    filter_instance = RelatedOnlyFieldListFilter(mock_field, request, {}, None, modeladmin, 'test_field')
++    choices = filter_instance.field_choices(mock_field, request, modeladmin)
++    
++    print("Choices from field_choices:", list(choices))
++    
++    # Clean up
++    site.unregister(TestModel)
++    print("RelatedOnlyFieldListFilter test completed")
++
++if __name__ == '__main__':
++    test_related_field_list_filter_ordering()
++    test_related_only_field_list_filter_ordering()
+\ No newline at end of file
+diff --git a/test_no_db.py b/test_no_db.py
+new file mode 100644
+index 0000000000..380c68532e
+--- /dev/null
++++ b/test_no_db.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Minimal Django configuration
++if not settings.configured:
++    settings.configure(
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.admin import site, ModelAdmin
++from django.contrib.admin.filters import RelatedFieldListFilter, RelatedOnlyFieldListFilter
++from django.test import RequestFactory
++
++def test_related_field_list_filter_ordering():
++    """Test that RelatedFieldListFilter falls back to model Meta.ordering"""
++    print("Testing RelatedFieldListFilter ordering fallback...")
++    
++    # Create a mock model class with Meta.ordering
++    class MockModel:
++        class _meta:
++            ordering = ('name',)
++        
++        def __str__(self):
++            return "MockModel"
++    
++    # Create a mock field
++    class MockField:
++        def __init__(self):
++            self.remote_field = MockRemoteField(MockModel)
++        
++        def get_choices(self, include_blank=False, ordering=()):
++            print(f"get_choices called with ordering: {ordering}")
++            return [(1, 'Test 1'), (2, 'Test 2')]
++    
++    class MockRemoteField:
++        def __init__(self, model):
++            self.model = model
++    
++    # Create mock objects
++    request = RequestFactory().get('/')
++    mock_field = MockField()
++    
++    # Create a mock model admin with no ordering
++    class MockModelAdmin(ModelAdmin):
++        pass
++    
++    # Create a mock site registry
++    site._registry = {}
++    
++    # Test the field_choices method directly
++    filter_instance = RelatedFieldListFilter(mock_field, request, {}, None, MockModelAdmin(), 'test_field')
++    choices = filter_instance.field_choices(mock_field, request, MockModelAdmin())
++    
++    print("Choices from field_choices:", list(choices))
++    print("RelatedFieldListFilter test completed")
++
++def test_related_only_field_list_filter_ordering():
++    """Test that RelatedOnlyFieldListFilter respects ordering"""
++    print("\nTesting RelatedOnlyFieldListFilter ordering...")
++    
++    # Create a mock model class with Meta.ordering
++    class MockModel:
++        class _meta:
++            ordering = ('name',)
++        
++        def __str__(self):
++            return "MockModel"
++    
++    # Create a mock field
++    class MockField:
++        def __init__(self):
++            self.remote_field = MockRemoteField(MockModel)
++        
++        def get_choices(self, include_blank=False, limit_choices_to=None, ordering=()):
++            print(f"get_choices called with ordering: {ordering}, limit_choices_to: {limit_choices_to}")
++            return [(1, 'Test 1'), (2, 'Test 2')]
++    
++    class MockRemoteField:
++        def __init__(self, model):
++            self.model = model
++    
++    # Create mock objects
++    request = RequestFactory().get('/')
++    mock_field = MockField()
++    
++    # Create a mock model admin with ordering
++    class MockModelAdmin(ModelAdmin):
++        def get_ordering(self, request):
++            return ('name',)
++    
++    # Create a mock site registry
++    site._registry = {MockModel: MockModelAdmin()}
++    
++    # Test the field_choices method directly
++    filter_instance = RelatedOnlyFieldListFilter(mock_field, request, {}, None, MockModelAdmin(), 'test_field')
++    choices = filter_instance.field_choices(mock_field, request, MockModelAdmin())
++    
++    print("Choices from field_choices:", list(choices))
++    print("RelatedOnlyFieldListFilter test completed")
++
++if __name__ == '__main__':
++    test_related_field_list_filter_ordering()
++    test_related_only_field_list_filter_ordering()
+\ No newline at end of file

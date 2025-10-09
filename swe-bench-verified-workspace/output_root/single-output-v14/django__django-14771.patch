@@ -1,0 +1,364 @@
+diff --git a/django/utils/autoreload.py b/django/utils/autoreload.py
+index cc65c043ab..b4a2a6dd39 100644
+--- a/django/utils/autoreload.py
++++ b/django/utils/autoreload.py
+@@ -220,6 +220,8 @@ def get_child_arguments():
+     py_script = Path(sys.argv[0])
+ 
+     args = [sys.executable] + ['-W%s' % o for o in sys.warnoptions]
++    # Add -X options from sys._xoptions
++    args += ['-X%s' % key for key in sys._xoptions]
+     # __spec__ is set when the server was started with the `-m` option,
+     # see https://docs.python.org/3/reference/import.html#main-spec
+     # __spec__ may not exist, e.g. when running in a Conda env.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..4ebede61c7
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,28 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with -X options not being passed in auto-reloader.
++"""
++import sys
++import subprocess
++import os
++
++def test_xoptions():
++    print("Testing -X options handling...")
++    print(f"sys._xoptions: {sys._xoptions}")
++    
++    # Test if -X utf8 option is present
++    if 'utf8' in sys._xoptions:
++        print("✓ -X utf8 option is present in sys._xoptions")
++    else:
++        print("✗ -X utf8 option is NOT present in sys._xoptions")
++    
++    # Test file encoding behavior that depends on -X utf8
++    with open("test_file.txt", "w", encoding="utf-8") as f:
++        f.write("Test content")
++    
++    with open("test_file.txt", "r") as f:
++        print(f"File encoding: {f.encoding}")
++        print(f"File content: {f.read()}")
++
++if __name__ == "__main__":
++    test_xoptions()
+\ No newline at end of file
+diff --git a/test_autoreload_fix.py b/test_autoreload_fix.py
+new file mode 100644
+index 0000000000..869178bf3d
+--- /dev/null
++++ b/test_autoreload_fix.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++"""
++Test script to verify that -X options are properly passed in auto-reloader.
++"""
++import sys
++import subprocess
++import os
++from pathlib import Path
++
++def test_get_child_arguments():
++    """Test the modified get_child_arguments function"""
++    # Mock the necessary imports and variables
++    import __main__
++    
++    # Save original values
++    original_argv = sys.argv.copy()
++    original_warnoptions = sys.warnoptions.copy()
++    original_xoptions = sys._xoptions.copy()
++    
++    try:
++        # Create a temporary script file for testing
++        test_script = Path("test_manage.py")
++        test_script.write_text("print('test script')")
++        
++        # Test case 1: No -X options
++        sys.argv = ['test_manage.py', 'runserver']
++        sys.warnoptions = []
++        sys._xoptions = {}
++        
++        # Import and test the function
++        from django.utils.autoreload import get_child_arguments
++        args = get_child_arguments()
++        print(f"Test 1 - No -X options: {args}")
++        assert '-X' not in ' '.join(args), "Should not have -X options when none are set"
++        
++        # Test case 2: With -X utf8 option
++        sys.argv = ['test_manage.py', 'runserver']
++        sys.warnoptions = []
++        sys._xoptions = {'utf8': True}
++        
++        args = get_child_arguments()
++        print(f"Test 2 - With -X utf8: {args}")
++        assert any(arg == '-Xutf8' for arg in args), "Should include -Xutf8 option"
++        
++        # Test case 3: With multiple -X options
++        sys.argv = ['test_manage.py', 'runserver']
++        sys.warnoptions = []
++        sys._xoptions = {'utf8': True, 'dev': True}
++        
++        args = get_child_arguments()
++        print(f"Test 3 - Multiple -X options: {args}")
++        assert any(arg == '-Xutf8' for arg in args), "Should include -Xutf8 option"
++        assert any(arg == '-Xdev' for arg in args), "Should include -Xdev option"
++        
++        # Test case 4: With both -W and -X options
++        sys.argv = ['test_manage.py', 'runserver']
++        sys.warnoptions = ['ignore', 'error::ResourceWarning']
++        sys._xoptions = {'utf8': True}
++        
++        args = get_child_arguments()
++        print(f"Test 4 - Both -W and -X options: {args}")
++        assert any(arg.startswith('-W') for arg in args), "Should include -W options"
++        assert any(arg == '-Xutf8' for arg in args), "Should include -Xutf8 option"
++        
++        print("✓ All tests passed!")
++        
++    finally:
++        # Restore original values
++        sys.argv = original_argv
++        sys.warnoptions = original_warnoptions
++        sys._xoptions = original_xoptions
++
++if __name__ == "__main__":
++    test_get_child_arguments()
+\ No newline at end of file
+diff --git a/test_django_server.py b/test_django_server.py
+new file mode 100644
+index 0000000000..b5ba08e51c
+--- /dev/null
++++ b/test_django_server.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++"""
++Test script to simulate Django development server with -X options.
++"""
++import sys
++import os
++import tempfile
++from pathlib import Path
++
++def test_django_server_with_xoptions():
++    """Test that Django server properly passes -X options in auto-reloader"""
++    
++    # Set up a test environment
++    with tempfile.TemporaryDirectory() as temp_dir:
++        temp_path = Path(temp_dir)
++        
++        # Create a simple Django project structure
++        manage_py = temp_path / "manage.py"
++        manage_py.write_text("""
++#!/usr/bin/env python
++import os
++import sys
++
++if __name__ == "__main__":
++    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_project.settings')
++    try:
++        from django.core.management import execute_from_command_line
++    except ImportError as exc:
++        raise ImportError(
++            "Couldn't import Django. Are you sure it's installed and "
++            "available on your PYTHONPATH environment variable? Did you "
++            "forget to activate a virtual environment?"
++        ) from exc
++    execute_from_command_line(sys.argv)
++""")
++        
++        # Create a simple settings file
++        settings_dir = temp_path / "test_project"
++        settings_dir.mkdir()
++        settings_file = settings_dir / "settings.py"
++        settings_file.write_text("""
++SECRET_KEY = 'test-secret-key'
++DEBUG = True
++ALLOWED_HOSTS = ['*']
++INSTALLED_APPS = ['django.contrib.staticfiles']
++ROOT_URLCONF = 'test_project.urls'
++USE_TZ = True
++""")
++        
++        # Create urls.py
++        urls_file = settings_dir / "urls.py"
++        urls_file.write_text("""
++from django.urls import path
++from django.http import HttpResponse
++
++def test_view(request):
++    return HttpResponse("Test response")
++
++urlpatterns = [
++    path('test/', test_view),
++]
++""")
++        
++        # Create __init__.py files
++        (settings_dir / "__init__.py").write_text("")
++        
++        # Test the get_child_arguments function with Django-like environment
++        original_argv = sys.argv.copy()
++        original_cwd = os.getcwd()
++        
++        try:
++            os.chdir(temp_dir)
++            sys.argv = ['manage.py', 'runserver', '--noreload']
++            
++            # Test with -X utf8 option
++            sys._xoptions = {'utf8': True}
++            
++            from django.utils.autoreload import get_child_arguments
++            args = get_child_arguments()
++            
++            print(f"Django server command with -X utf8: {args}")
++            
++            # Verify -X utf8 is included
++            assert any(arg == '-Xutf8' for arg in args), "Should include -Xutf8 option in Django server command"
++            
++            # Verify the command structure is correct
++            assert args[0] == sys.executable, "First argument should be Python executable"
++            assert 'manage.py' in args, "Should include manage.py in arguments"
++            assert 'runserver' in args, "Should include runserver in arguments"
++            
++            print("✓ Django server test passed!")
++            
++        finally:
++            os.chdir(original_cwd)
++            sys.argv = original_argv
++
++if __name__ == "__main__":
++    test_django_server_with_xoptions()
+\ No newline at end of file
+diff --git a/test_file.txt b/test_file.txt
+new file mode 100644
+index 0000000000..3f3f005b29
+--- /dev/null
++++ b/test_file.txt
+@@ -0,0 +1 @@
++Test content
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..76839fc2f8
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++"""
++Test script that reproduces the exact GitHub issue scenario.
++This tests that -X options are preserved during auto-reload.
++"""
++import sys
++import os
++import tempfile
++from pathlib import Path
++
++def test_github_issue_scenario():
++    """Test the exact scenario described in the GitHub issue"""
++    
++    print("Testing GitHub issue scenario: Auto-reloader should pass -X options")
++    
++    # Simulate running with -X utf8 option
++    original_xoptions = sys._xoptions.copy()
++    
++    try:
++        # Set -X utf8 and -X dev options (as described in the issue)
++        sys._xoptions = {'utf8': True, 'dev': True}
++        
++        print(f"Original sys._xoptions: {sys._xoptions}")
++        
++        # Import the modified get_child_arguments function
++        from django.utils.autoreload import get_child_arguments
++        
++        # Test what happens when we call get_child_arguments
++        # (this is what happens during auto-reload)
++        args = get_child_arguments()
++        
++        print(f"Generated command arguments: {args}")
++        
++        # Verify that both -X options are included in the arguments
++        has_x_utf8 = any(arg == '-Xutf8' for arg in args)
++        has_x_dev = any(arg == '-Xdev' for arg in args)
++        print(f"Contains -Xutf8: {has_x_utf8}")
++        print(f"Contains -Xdev: {has_x_dev}")
++        
++        if has_x_utf8 and has_x_dev:
++            print("✓ SUCCESS: Both -X options are preserved in auto-reloader!")
++        else:
++            print("✗ FAILURE: Not all -X options are preserved in auto-reloader!")
++            return False
++        
++        # Test the encoding behavior that depends on -X utf8
++        # (as shown in the GitHub issue example)
++        test_file = "test_encoding.txt"
++        
++        with open(test_file, "w", encoding="utf-8") as f:
++            f.write("Test content with unicode: ñáéíóú")
++        
++        with open(test_file, "r") as f:
++            encoding = f.encoding
++            content = f.read()
++            print(f"File encoding: {encoding}")
++            print(f"File content: {content}")
++        
++        # Clean up
++        if os.path.exists(test_file):
++            os.remove(test_file)
++            
++        return True
++        
++    finally:
++        # Restore original xoptions
++        sys._xoptions = original_xoptions
++
++if __name__ == "__main__":
++    success = test_github_issue_scenario()
++    if success:
++        print("\n🎉 GitHub issue has been FIXED!")
++        print("The auto-reloader now properly passes -X options to child processes.")
++    else:
++        print("\n❌ GitHub issue is NOT fixed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_manage.py b/test_manage.py
+new file mode 100644
+index 0000000000..700fae2bd9
+--- /dev/null
++++ b/test_manage.py
+@@ -0,0 +1 @@
++print('test script')
+\ No newline at end of file
+diff --git a/tests/utils_tests/test_autoreload.py b/tests/utils_tests/test_autoreload.py
+index 7c28a9d4d0..0f9dd28c82 100644
+--- a/tests/utils_tests/test_autoreload.py
++++ b/tests/utils_tests/test_autoreload.py
+@@ -246,6 +246,26 @@ class TestChildArguments(SimpleTestCase):
+                 [sys.executable, __file__, 'runserver']
+             )
+ 
++    @mock.patch('__main__.__spec__', None)
++    @mock.patch('sys.argv', [__file__, 'runserver'])
++    @mock.patch('sys.warnoptions', [])
++    def test_xoptions(self):
++        with mock.patch('sys._xoptions', {'utf8': True, 'dev': True}):
++            self.assertEqual(
++                autoreload.get_child_arguments(),
++                [sys.executable, '-Xutf8', '-Xdev', __file__, 'runserver']
++            )
++
++    @mock.patch('__main__.__spec__', None)
++    @mock.patch('sys.argv', [__file__, 'runserver'])
++    @mock.patch('sys.warnoptions', ['error'])
++    def test_warnoptions_and_xoptions(self):
++        with mock.patch('sys._xoptions', {'utf8': True}):
++            self.assertEqual(
++                autoreload.get_child_arguments(),
++                [sys.executable, '-Werror', '-Xutf8', __file__, 'runserver']
++            )
++
+ 
+ class TestUtilities(SimpleTestCase):
+     def test_is_django_module(self):

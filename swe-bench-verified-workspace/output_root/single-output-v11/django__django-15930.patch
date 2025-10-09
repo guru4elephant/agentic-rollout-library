@@ -1,0 +1,368 @@
+diff --git a/debug_issue.py b/debug_issue.py
+new file mode 100644
+index 0000000000..e1ae9bd93d
+--- /dev/null
++++ b/debug_issue.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++"""
++Script to debug the Case() crash with ~Q(pk__in=[])
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Case, When, Q, Value, BooleanField
++from django.db.models.sql import compiler
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def debug_case_with_empty_in():
++    """Debug the problematic Case expression"""
++    print("Debugging Case() with ~Q(pk__in=[])...")
++    
++    # Create the When expression
++    when_expr = When(~Q(pk__in=[]), then=Value(True))
++    print(f"When expression: {when_expr}")
++    print(f"When condition: {when_expr.condition}")
++    print(f"When result: {when_expr.result}")
++    
++    # Check if condition is empty
++    print(f"Condition is empty: {not bool(when_expr.condition)}")
++    
++    # Resolve the entire When expression to see what it becomes
++    query = TestModel.objects.all().query
++    resolved_when = when_expr.resolve_expression(query)
++    print(f"Resolved When type: {type(resolved_when)}")
++    print(f"Resolved When condition: {resolved_when.condition}")
++    print(f"Resolved When condition type: {type(resolved_when.condition)}")
++    
++    # Try to compile the resolved condition
++    compiler = query.get_compiler('default')
++    try:
++        condition_sql, condition_params = compiler.compile(resolved_when.condition)
++        print(f"Resolved condition SQL: '{condition_sql}'")
++        print(f"Resolved condition params: {condition_params}")
++        
++        # Now try to compile the resolved When expression
++        when_sql, when_params = compiler.compile(resolved_when)
++        print(f"Resolved When SQL: '{when_sql}'")
++        print(f"Resolved When params: {when_params}")
++        
++    except Exception as e:
++        print(f"ERROR compiling: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    debug_case_with_empty_in()
+\ No newline at end of file
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 822968ef56..5f9012b80f 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -1299,6 +1299,15 @@ class When(Expression):
+         template_params = extra_context
+         sql_params = []
+         condition_sql, condition_params = compiler.compile(self.condition)
++        
++        # Handle empty condition (e.g., ~Q(pk__in=[]))
++        if not condition_sql:
++            # An empty condition should be treated as always true
++            # Return just the result without the WHEN/THEN wrapper
++            result_sql, result_params = compiler.compile(self.result)
++            sql_params.extend(result_params)
++            return result_sql, sql_params
++        
+         template_params["condition"] = condition_sql
+         sql_params.extend(condition_params)
+         result_sql, result_params = compiler.compile(self.result)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..b777805dba
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the Case() crash with ~Q(pk__in=[])
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Case, When, Q, Value, BooleanField
++from django.contrib.auth.models import User
++
++# Create a simple test model if User doesn't exist
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_case_with_empty_in():
++    """Test the problematic Case expression"""
++    print("Testing Case() with ~Q(pk__in=[])...")
++    
++    try:
++        # This should not crash
++        queryset = TestModel.objects.annotate(
++            _a=Case(
++                When(~Q(pk__in=[]), then=Value(True)),
++                default=Value(False),
++                output_field=BooleanField(),
++            )
++        ).order_by("-_a").values("pk")
++        
++        print("SUCCESS: Query executed without error")
++        print(f"Generated SQL: {str(queryset.query)}")
++        
++    except Exception as e:
++        print(f"ERROR: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_case_with_empty_in()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..5a1ca5f70f
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the Case() fix with empty conditions
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Case, When, Q, Value, BooleanField
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_edge_cases():
++    """Test various edge cases for empty conditions"""
++    print("Testing edge cases for Case() with empty conditions...")
++    
++    # Test 1: Original issue - ~Q(pk__in=[])
++    try:
++        queryset = TestModel.objects.annotate(
++            _a=Case(
++                When(~Q(pk__in=[]), then=Value(True)),
++                default=Value(False),
++                output_field=BooleanField(),
++            )
++        ).order_by("-_a").values("pk")
++        print("✓ Test 1 PASSED: ~Q(pk__in=[])")
++        print(f"  SQL: {str(queryset.query)}")
++    except Exception as e:
++        print(f"✗ Test 1 FAILED: {e}")
++    
++    # Test 2: Multiple empty conditions
++    try:
++        queryset = TestModel.objects.annotate(
++            _a=Case(
++                When(~Q(pk__in=[]), then=Value('A')),
++                When(~Q(name__in=[]), then=Value('B')),
++                default=Value('C'),
++                output_field=models.CharField(),
++            )
++        ).order_by("-_a").values("pk")
++        print("✓ Test 2 PASSED: Multiple empty conditions")
++        print(f"  SQL: {str(queryset.query)}")
++    except Exception as e:
++        print(f"✗ Test 2 FAILED: {e}")
++    
++    # Test 3: Mixed empty and non-empty conditions
++    try:
++        queryset = TestModel.objects.annotate(
++            _a=Case(
++                When(~Q(pk__in=[]), then=Value('A')),
++                When(Q(pk__in=[1, 2, 3]), then=Value('B')),
++                default=Value('C'),
++                output_field=models.CharField(),
++            )
++        ).order_by("-_a").values("pk")
++        print("✓ Test 3 PASSED: Mixed empty and non-empty conditions")
++        print(f"  SQL: {str(queryset.query)}")
++    except Exception as e:
++        print(f"✗ Test 3 FAILED: {e}")
++    
++    # Test 4: Normal condition (should still work)
++    try:
++        queryset = TestModel.objects.annotate(
++            _a=Case(
++                When(Q(pk__in=[1, 2, 3]), then=Value(True)),
++                default=Value(False),
++                output_field=BooleanField(),
++            )
++        ).order_by("-_a").values("pk")
++        print("✓ Test 4 PASSED: Normal condition")
++        print(f"  SQL: {str(queryset.query)}")
++    except Exception as e:
++        print(f"✗ Test 4 FAILED: {e}")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..a1cd9db11b
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""
++Test the exact issue reported in the GitHub issue
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Case, When, Q, Value, BooleanField
++from django.contrib.auth.models import User
++
++def test_github_issue():
++    """Test the exact issue reported in the GitHub issue"""
++    print("Testing the exact GitHub issue...")
++    
++    # This is the exact code from the GitHub issue
++    try:
++        queryset = User.objects.annotate(
++            _a=Case(
++                When(~Q(pk__in=[]), then=Value(True)),
++                default=Value(False),
++                output_field=BooleanField(),
++            )
++        ).order_by("-_a").values("pk")
++        
++        # Check that the query executes without error
++        print("✓ Query executed without error")
++        
++        # Check that the SQL is valid (no syntax error)
++        sql = str(queryset.query)
++        print(f"Generated SQL: {sql}")
++        
++        # The SQL should NOT contain "WHEN THEN" (which would be invalid)
++        if "WHEN THEN" in sql:
++            print("✗ FAILED: SQL contains invalid 'WHEN THEN' syntax")
++            return False
++        
++        # The SQL should contain valid CASE syntax
++        if "CASE" in sql and "END" in sql:
++            print("✓ SQL contains valid CASE syntax")
++        else:
++            print("✗ FAILED: SQL missing valid CASE syntax")
++            return False
++            
++        print("✓ GitHub issue is FIXED!")
++        return True
++        
++    except Exception as e:
++        print(f"✗ FAILED: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    success = test_github_issue()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

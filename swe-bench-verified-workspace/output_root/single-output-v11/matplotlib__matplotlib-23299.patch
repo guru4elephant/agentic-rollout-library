@@ -1,0 +1,187 @@
+diff --git a/debug_issue.py b/debug_issue.py
+new file mode 100644
+index 0000000000..6e28e0230c
+--- /dev/null
++++ b/debug_issue.py
+@@ -0,0 +1,35 @@
++import matplotlib.pyplot as plt
++from matplotlib import get_backend, rc_context
++import matplotlib.rcsetup as rcsetup
++
++# Check if the backend is auto sentinel in the default params
++print('Default backend:', repr(plt.rcParamsDefault['backend']))
++print('Default is auto sentinel:', plt.rcParamsDefault['backend'] is rcsetup._auto_backend_sentinel)
++
++# Check current backend
++print('Current backend:', repr(plt.rcParams['backend']))
++print('Current is auto sentinel:', plt.rcParams['backend'] is rcsetup._auto_backend_sentinel)
++
++# Check if there's a difference between rcParams and rcParamsDefault
++print('Backend same as default:', plt.rcParams['backend'] == plt.rcParamsDefault['backend'])
++
++with rc_context():
++    fig2 = plt.figure()
++    print('Inside rc_context - backend:', repr(plt.rcParams['backend']))
++    print('Inside rc_context - is auto sentinel:', plt.rcParams['backend'] is rcsetup._auto_backend_sentinel)
++
++print('After rc_context - backend:', repr(plt.rcParams['backend']))
++print('After rc_context - is auto sentinel:', plt.rcParams['backend'] is rcsetup._auto_backend_sentinel)
++
++before = f'{id(plt._pylab_helpers.Gcf)} {plt._pylab_helpers.Gcf.figs!r}'
++print('Before get_backend():', before)
++
++# Let's see what get_backend() returns
++backend_value = get_backend()
++print('get_backend() returned:', repr(backend_value))
++
++after = f'{id(plt._pylab_helpers.Gcf)} {plt._pylab_helpers.Gcf.figs!r}'
++print('After get_backend():', after)
++
++print('Backend after get_backend():', repr(plt.rcParams['backend']))
++print('Is auto sentinel after get_backend():', plt.rcParams['backend'] is rcsetup._auto_backend_sentinel)
+\ No newline at end of file
+diff --git a/lib/matplotlib/__init__.py b/lib/matplotlib/__init__.py
+index c268a56724..80b5c5b1ec 100644
+--- a/lib/matplotlib/__init__.py
++++ b/lib/matplotlib/__init__.py
+@@ -1175,7 +1175,41 @@ def get_backend():
+     --------
+     matplotlib.use
+     """
+-    return rcParams['backend']
++    backend = dict.__getitem__(rcParams, "backend")
++    if backend is rcsetup._auto_backend_sentinel:
++        # If backend is auto sentinel, we need to resolve it without triggering
++        # automatic switching which would close all figures
++        from matplotlib import pyplot as plt
++        # Use the same logic as switch_backend to determine the backend
++        # but without actually switching
++        current_framework = cbook._get_running_interactive_framework()
++        mapping = {'qt': 'qtagg',
++                   'gtk3': 'gtk3agg',
++                   'gtk4': 'gtk4agg',
++                   'wx': 'wxagg',
++                   'tk': 'tkagg',
++                   'macosx': 'macosx',
++                   'headless': 'agg'}
++
++        best_guess = mapping.get(current_framework, None)
++        if best_guess is not None:
++            candidates = [best_guess]
++        else:
++            candidates = []
++        candidates += [
++            "macosx", "qtagg", "gtk4agg", "gtk3agg", "tkagg", "wxagg"]
++
++        # Try to find an available backend without actually switching
++        for candidate in candidates:
++            try:
++                importlib.import_module(cbook._backend_module_name(candidate))
++                return candidate
++            except ImportError:
++                continue
++        
++        # Fall back to agg if no other backend is available
++        return "agg"
++    return backend
+ 
+ 
+ def interactive(b):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..0376f53206
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,25 @@
++import matplotlib.pyplot as plt
++from matplotlib import get_backend, rc_context
++import matplotlib.rcsetup as rcsetup
++
++print('Initial backend:', repr(plt.rcParams['backend']))
++print('Is auto sentinel initially:', plt.rcParams['backend'] is rcsetup._auto_backend_sentinel)
++
++# fig1 = plt.figure()  # <- UNCOMMENT THIS LINE AND IT WILL WORK
++# plt.ion()            # <- ALTERNATIVELY, UNCOMMENT THIS LINE AND IT WILL ALSO WORK
++with rc_context():
++    fig2 = plt.figure()
++    print('Inside rc_context - backend:', repr(plt.rcParams['backend']))
++    print('Inside rc_context - is auto sentinel:', plt.rcParams['backend'] is rcsetup._auto_backend_sentinel)
++
++print('After rc_context - backend:', repr(plt.rcParams['backend']))
++print('After rc_context - is auto sentinel:', plt.rcParams['backend'] is rcsetup._auto_backend_sentinel)
++
++before = f'{id(plt._pylab_helpers.Gcf)} {plt._pylab_helpers.Gcf.figs!r}'
++get_backend()
++after = f'{id(plt._pylab_helpers.Gcf)} {plt._pylab_helpers.Gcf.figs!r}'
++
++print('Before get_backend():', before)
++print('After get_backend():', after)
++
++assert before == after, '\n' + before + '\n' + after
+\ No newline at end of file
+diff --git a/reproduce_original.py b/reproduce_original.py
+new file mode 100644
+index 0000000000..f56fa665fc
+--- /dev/null
++++ b/reproduce_original.py
+@@ -0,0 +1,12 @@
++import matplotlib.pyplot as plt
++from matplotlib import get_backend, rc_context
++
++# fig1 = plt.figure()  # <- UNCOMMENT THIS LINE AND IT WILL WORK
++# plt.ion()            # <- ALTERNATIVELY, UNCOMMENT THIS LINE AND IT WILL ALSO WORK
++with rc_context():
++    fig2 = plt.figure()
++before = f'{id(plt._pylab_helpers.Gcf)} {plt._pylab_helpers.Gcf.figs!r}'
++get_backend()
++after = f'{id(plt._pylab_helpers.Gcf)} {plt._pylab_helpers.Gcf.figs!r}'
++
++assert before == after, '\n' + before + '\n' + after
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..ac295768a7
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,40 @@
++import matplotlib.pyplot as plt
++from matplotlib import get_backend, rc_context
++
++print("=== Test case 1: Figure created before rc_context ===")
++# Create a figure before rc_context (should work according to issue)
++fig1 = plt.figure()
++with rc_context():
++    fig2 = plt.figure()
++before = f'{id(plt._pylab_helpers.Gcf)} {plt._pylab_helpers.Gcf.figs!r}'
++get_backend()
++after = f'{id(plt._pylab_helpers.Gcf)} {plt._pylab_helpers.Gcf.figs!r}'
++
++print('Before get_backend():', before)
++print('After get_backend():', after)
++print('Figures preserved:', before == after)
++
++print("\n=== Test case 2: plt.ion() called ===")
++# Call plt.ion() (should work according to issue)
++plt.ion()
++with rc_context():
++    fig2 = plt.figure()
++before = f'{id(plt._pylab_helpers.Gcf)} {plt._pylab_helpers.Gcf.figs!r}'
++get_backend()
++after = f'{id(plt._pylab_helpers.Gcf)} {plt._pylab_helpers.Gcf.figs!r}'
++
++print('Before get_backend():', before)
++print('After get_backend():', after)
++print('Figures preserved:', before == after)
++
++print("\n=== Test case 3: Original issue case ===")
++# Original issue case (should now work with our fix)
++with rc_context():
++    fig2 = plt.figure()
++before = f'{id(plt._pylab_helpers.Gcf)} {plt._pylab_helpers.Gcf.figs!r}'
++get_backend()
++after = f'{id(plt._pylab_helpers.Gcf)} {plt._pylab_helpers.Gcf.figs!r}'
++
++print('Before get_backend():', before)
++print('After get_backend():', after)
++print('Figures preserved:', before == after)
+\ No newline at end of file

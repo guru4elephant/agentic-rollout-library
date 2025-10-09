@@ -1,0 +1,1071 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..ffd7df5ec6
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,152 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the cache culling fix works correctly.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        CACHES={
++            'default': {
++                'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
++                'LOCATION': 'test_cache_table',
++                'OPTIONS': {
++                    'MAX_ENTRIES': 5,  # Low to trigger culling
++                    'CULL_FREQUENCY': 2,
++                }
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def create_cache_table():
++    """Create the cache table manually"""
++    from django.db import connection
++    
++    with connection.cursor() as cursor:
++        cursor.execute("""
++            CREATE TABLE IF NOT EXISTS test_cache_table (
++                cache_key VARCHAR(255) NOT NULL PRIMARY KEY,
++                value TEXT NOT NULL,
++                expires DATETIME NOT NULL
++            )
++        """)
++        cursor.execute("DELETE FROM test_cache_table")  # Clear any existing data
++
++def test_basic_cache_operations():
++    """Test basic cache operations"""
++    from django.core.cache import cache
++    
++    print("Testing basic cache operations...")
++    
++    # Set some values
++    cache.set('test_key', 'test_value')
++    cache.set('test_key2', 'test_value2')
++    
++    # Get values back
++    result1 = cache.get('test_key')
++    result2 = cache.get('test_key2')
++    
++    print(f'test_key: {result1}')
++    print(f'test_key2: {result2}')
++    
++    assert result1 == 'test_value'
++    assert result2 == 'test_value2'
++    print("✓ Basic cache operations work correctly")
++
++def test_culling_scenario():
++    """Test the culling scenario that was problematic"""
++    from django.core.cache import cache
++    from django.db import connection
++    
++    print("\nTesting culling scenario...")
++    
++    # Fill cache with more items than MAX_ENTRIES to trigger culling
++    for i in range(10):  # More than MAX_ENTRIES (5)
++        cache.set(f'key_{i}', f'value_{i}')
++    
++    # Verify some items are still there (culling should have worked)
++    remaining_items = 0
++    for i in range(10):
++        if cache.get(f'key_{i}') is not None:
++            remaining_items += 1
++    
++    print(f"Remaining items after culling: {remaining_items}")
++    print("✓ Culling completed without errors")
++
++def test_edge_case_empty_table():
++    """Test the edge case with empty table"""
++    from django.core.cache.backends.db import DatabaseCache
++    from django.db import connections
++    
++    print("\nTesting edge case with empty table...")
++    
++    # Create a separate cache instance
++    cache = DatabaseCache('test_cache_table2', {
++        'MAX_ENTRIES': 5,
++        'CULL_FREQUENCY': 2,
++    })
++    
++    # Create the table
++    from django.db import connection
++    with connection.cursor() as cursor:
++        cursor.execute("""
++            CREATE TABLE IF NOT EXISTS test_cache_table2 (
++                cache_key VARCHAR(255) NOT NULL PRIMARY KEY,
++                value TEXT NOT NULL,
++                expires DATETIME NOT NULL
++            )
++        """)
++        cursor.execute("DELETE FROM test_cache_table2")  # Ensure it's empty
++    
++    # Test the _cull method directly with empty table
++    db = 'default'
++    connection = connections[db]
++    
++    with connection.cursor() as cursor:
++        try:
++            cache._cull(db, cursor, django.utils.timezone.now())
++            print("✓ Empty table culling handled correctly")
++        except TypeError as e:
++            if "'NoneType' object is not subscriptable" in str(e):
++                print(f"✗ Error still occurs: {e}")
++                return False
++            else:
++                print(f"✗ Different error: {e}")
++                return False
++    
++    return True
++
++if __name__ == "__main__":
++    try:
++        create_cache_table()
++        test_basic_cache_operations()
++        test_culling_scenario()
++        success = test_edge_case_empty_table()
++        
++        if success:
++            print("\n🎉 All tests passed! The fix is working correctly.")
++        else:
++            print("\n❌ Some tests failed.")
++            
++    except Exception as e:
++        print(f"\n❌ Test failed with error: {e}")
++        import traceback
++        traceback.print_exc()
+\ No newline at end of file
+diff --git a/django/core/cache/backends/db.py b/django/core/cache/backends/db.py
+index 33c79c5a14..0c8195c685 100644
+--- a/django/core/cache/backends/db.py
++++ b/django/core/cache/backends/db.py
+@@ -267,9 +267,12 @@ class DatabaseCache(BaseDatabaseCache):
+                 cursor.execute(
+                     connection.ops.cache_key_culling_sql() % table,
+                     [cull_num])
+-                cursor.execute("DELETE FROM %s "
+-                               "WHERE cache_key < %%s" % table,
+-                               [cursor.fetchone()[0]])
++                result = cursor.fetchone()
++                if result is not None:
++                    cursor.execute("DELETE FROM %s "
++                                   "WHERE cache_key < %%s" % table,
++                                   [result[0]])
++                # If result is None, there's nothing to cull
+ 
+     def clear(self):
+         db = router.db_for_write(self.cache_model_class)
+diff --git a/reproduce_exact_error.py b/reproduce_exact_error.py
+new file mode 100644
+index 0000000000..4078729630
+--- /dev/null
++++ b/reproduce_exact_error.py
+@@ -0,0 +1,146 @@
++#!/usr/bin/env python3
++"""
++Reproduce the exact error from the original _cull method.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        CACHES={
++            'default': {
++                'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
++                'LOCATION': 'test_cache_table',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def reproduce_error():
++    """Reproduce the exact error from the original _cull method"""
++    from django.core.cache.backends.db import DatabaseCache
++    from django.db import connection
++    
++    # Create cache table
++    with connection.cursor() as cursor:
++        cursor.execute("""
++            CREATE TABLE IF NOT EXISTS test_cache_table (
++                cache_key VARCHAR(255) NOT NULL PRIMARY KEY,
++                value TEXT NOT NULL,
++                expires DATETIME NOT NULL
++            )
++        """)
++        cursor.execute("DELETE FROM test_cache_table")  # Ensure it's empty
++    
++    # Create cache instance
++    cache = DatabaseCache('test_cache_table', {
++        'MAX_ENTRIES': 10,
++        'CULL_FREQUENCY': 2,
++    })
++    
++    # Test the exact problematic code from _cull method
++    from django.db import connections
++    db = 'default'
++    connection = connections[db]
++    
++    with connection.cursor() as cursor:
++        # Simulate the exact scenario from _cull method
++        table = connection.ops.quote_name('test_cache_table')
++        
++        # First, delete expired entries
++        cursor.execute("DELETE FROM %s WHERE expires < %%s" % table,
++                       [connection.ops.adapt_datetimefield_value(django.utils.timezone.now())])
++        
++        # Count remaining entries (should be 0)
++        cursor.execute("SELECT COUNT(*) FROM %s" % table)
++        num = cursor.fetchone()[0]
++        print(f"Number of entries after deleting expired: {num}")
++        
++        if num > cache._max_entries:  # This should be False since num is 0
++            cull_num = num // cache._cull_frequency
++            
++            # This is the problematic code - it will execute even when num <= max_entries
++            # due to the condition check above
++            cursor.execute(
++                connection.ops.cache_key_culling_sql() % table,
++                [cull_num]
++            )
++            
++            # This line will cause the error when fetchone() returns None
++            try:
++                result = cursor.fetchone()[0]  # This is the problematic line
++                print(f"Cache key: {result}")
++            except TypeError as e:
++                print(f"Error occurred: {e}")
++                return True
++    
++    return False
++
++def test_original_cull_method():
++    """Test the original _cull method directly"""
++    from django.core.cache.backends.db import DatabaseCache
++    from django.db import connection
++    
++    # Create cache table
++    with connection.cursor() as cursor:
++        cursor.execute("""
++            CREATE TABLE IF NOT EXISTS test_cache_table (
++                cache_key VARCHAR(255) NOT NULL PRIMARY KEY,
++                value TEXT NOT NULL,
++                expires DATETIME NOT NULL
++            )
++        """)
++        cursor.execute("DELETE FROM test_cache_table")  # Ensure it's empty
++    
++    # Create cache instance
++    cache = DatabaseCache('test_cache_table', {
++        'MAX_ENTRIES': 10,
++        'CULL_FREQUENCY': 2,
++    })
++    
++    # Test the original _cull method
++    from django.db import connections
++    db = 'default'
++    connection = connections[db]
++    
++    with connection.cursor() as cursor:
++        try:
++            # This should trigger the error
++            cache._cull(db, cursor, django.utils.timezone.now())
++            print("No error occurred")
++            return False
++        except TypeError as e:
++            if "'NoneType' object is not subscriptable" in str(e):
++                print(f"Successfully reproduced the issue: {e}")
++                return True
++            else:
++                print(f"Different error: {e}")
++                return False
++
++if __name__ == "__main__":
++    print("Testing exact error reproduction...")
++    error_reproduced = reproduce_error()
++    
++    print("\nTesting original _cull method...")
++    cull_error = test_original_cull_method()
++    
++    if error_reproduced or cull_error:
++        print("\nIssue confirmed!")
++    else:
++        print("\nCould not reproduce the issue")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..ef966224e6
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the cache backend issue described in the GitHub issue.
++The issue occurs when _cull method tries to fetch data from an empty result set.
++"""
++
++import os
++import django
++from django.conf import settings
++from django.core.cache.backends.db import DatabaseCache
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        CACHES={
++            'default': {
++                'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
++                'LOCATION': 'test_cache_table',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_cull_issue():
++    """Test the _cull method with empty cache table"""
++    
++    # Create a cache instance
++    cache = DatabaseCache('test_cache_table', {
++        'MAX_ENTRIES': 10,
++        'CULL_FREQUENCY': 2,
++    })
++    
++    # Create the cache table manually
++    from django.db import connection, models
++    from django.db.backends.utils import truncate_name
++    
++    table_name = 'test_cache_table'
++    
++    # Check if table exists
++    if table_name not in connection.introspection.table_names():
++        # Create the table
++        with connection.cursor() as cursor:
++            cursor.execute("""
++                CREATE TABLE test_cache_table (
++                    cache_key VARCHAR(255) NOT NULL PRIMARY KEY,
++                    value TEXT NOT NULL,
++                    expires DATETIME NOT NULL
++                )
++            """)
++    
++    # Clear any existing data
++    cache.clear()
++    
++    # Create a connection and cursor to simulate the _cull scenario
++    from django.db import connections
++    db = 'default'
++    connection = connections[db]
++    
++    with connection.cursor() as cursor:
++        # Simulate the scenario where cache_key_culling_sql() returns no results
++        # This should trigger the NoneType error
++        try:
++            cache._cull(db, cursor, django.utils.timezone.now())
++            print("No error occurred - the issue might be fixed or not reproducible")
++        except TypeError as e:
++            if "'NoneType' object is not subscriptable" in str(e):
++                print("Successfully reproduced the issue!")
++                print(f"Error: {e}")
++                return True
++            else:
++                print(f"Different TypeError: {e}")
++                return False
++        except Exception as e:
++            print(f"Unexpected error: {e}")
++            return False
++    
++    return False
++
++if __name__ == "__main__":
++    reproduced = test_cull_issue()
++    if reproduced:
++        print("Issue reproduced successfully!")
++    else:
++        print("Could not reproduce the issue.")
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..d58ff6af3b
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++"""
++Simple test to reproduce the culling issue.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_culling_issue():
++    """Test the specific culling issue"""
++    from django.db import connection
++    
++    # Create cache table
++    with connection.cursor() as cursor:
++        cursor.execute("""
++            CREATE TABLE IF NOT EXISTS test_cache_table (
++                cache_key VARCHAR(255) NOT NULL PRIMARY KEY,
++                value TEXT NOT NULL,
++                expires DATETIME NOT NULL
++            )
++        """)
++    
++    # Test the problematic query directly
++    with connection.cursor() as cursor:
++        table = connection.ops.quote_name('test_cache_table')
++        cull_num = 5  # High offset that will return no results
++        
++        # This is the exact query from cache_key_culling_sql()
++        cursor.execute(
++            "SELECT cache_key FROM %s ORDER BY cache_key LIMIT 1 OFFSET %%s" % table,
++            [cull_num]
++        )
++        
++        result = cursor.fetchone()
++        print(f"Result from fetchone(): {result}")
++        
++        # This is the problematic line from the original code
++        try:
++            cache_key = result[0]  # This will fail if result is None
++            print(f"Cache key: {cache_key}")
++            return False
++        except TypeError as e:
++            if "'NoneType' object is not subscriptable" in str(e):
++                print(f"Successfully reproduced the issue: {e}")
++                return True
++            else:
++                print(f"Different error: {e}")
++                return False
++
++if __name__ == "__main__":
++    if test_culling_issue():
++        print("Issue reproduced successfully!")
++    else:
++        print("Could not reproduce the issue")
+\ No newline at end of file
+diff --git a/test_cull_fix.py b/test_cull_fix.py
+new file mode 100644
+index 0000000000..640548fecb
+--- /dev/null
++++ b/test_cull_fix.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce and fix the cache culling issue.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        CACHES={
++            'default': {
++                'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
++                'LOCATION': 'test_cache_table',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_cull_with_empty_table():
++    """Test the _cull method with an empty cache table"""
++    from django.core.cache.backends.db import DatabaseCache
++    from django.db import connection
++    
++    # Create cache table
++    with connection.cursor() as cursor:
++        cursor.execute("""
++            CREATE TABLE IF NOT EXISTS test_cache_table (
++                cache_key VARCHAR(255) NOT NULL PRIMARY KEY,
++                value TEXT NOT NULL,
++                expires DATETIME NOT NULL
++            )
++        """)
++        cursor.execute("DELETE FROM test_cache_table")  # Ensure it's empty
++    
++    # Create cache instance
++    cache = DatabaseCache('test_cache_table', {
++        'MAX_ENTRIES': 10,
++        'CULL_FREQUENCY': 2,
++    })
++    
++    # Test the problematic code directly
++    from django.db import connections
++    db = 'default'
++    connection = connections[db]
++    
++    with connection.cursor() as cursor:
++        # Simulate the exact scenario from _cull method
++        table = connection.ops.quote_name('test_cache_table')
++        cull_num = 5  # This will cause OFFSET 5 on empty table
++        
++        # This is the problematic code from the original _cull method
++        cursor.execute(
++            connection.ops.cache_key_culling_sql() % table,
++            [cull_num]
++        )
++        
++        result = cursor.fetchone()
++        print(f"Result from fetchone(): {result}")
++        
++        # This is where the error occurs - trying to access [0] on None
++        try:
++            if result is not None:
++                cache_key = result[0]
++                print(f"Cache key: {cache_key}")
++            else:
++                print("No result returned from cache_key_culling_sql()")
++                # This should be handled gracefully instead of causing an error
++        except TypeError as e:
++            print(f"Error occurred: {e}")
++            return True
++    
++    return False
++
++if __name__ == "__main__":
++    has_issue = test_cull_with_empty_table()
++    if has_issue:
++        print("Issue confirmed: fetchone() returns None when table is empty")
++    else:
++        print("No issue detected")
+\ No newline at end of file
+diff --git a/test_culling_scenario.py b/test_culling_scenario.py
+new file mode 100644
+index 0000000000..e9a051efd9
+--- /dev/null
++++ b/test_culling_scenario.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/env python3
++"""
++Test scenario where culling query returns no results.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        CACHES={
++            'default': {
++                'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
++                'LOCATION': 'test_cache_table',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_culling_with_few_entries():
++    """Test culling when there are few entries but offset is too high"""
++    from django.core.cache.backends.db import DatabaseCache
++    from django.db import connection
++    
++    # Create cache table
++    with connection.cursor() as cursor:
++        cursor.execute("""
++            CREATE TABLE IF NOT EXISTS test_cache_table (
++                cache_key VARCHAR(255) NOT NULL PRIMARY KEY,
++                value TEXT NOT NULL,
++                expires DATETIME NOT NULL
++            )
++        """)
++        cursor.execute("DELETE FROM test_cache_table")  # Ensure it's empty
++    
++    # Add a few cache entries
++    with connection.cursor() as cursor:
++        now = django.utils.timezone.now()
++        future = now.replace(year=now.year + 1)  # Future date
++        cursor.execute("INSERT INTO test_cache_table (cache_key, value, expires) VALUES (?, ?, ?)", 
++                      ['key1', 'value1', future])
++        cursor.execute("INSERT INTO test_cache_table (cache_key, value, expires) VALUES (?, ?, ?)", 
++                      ['key2', 'value2', future])
++    
++    # Create cache instance with very low max_entries to force culling
++    cache = DatabaseCache('test_cache_table', {
++        'MAX_ENTRIES': 1,  # Very low to force culling
++        'CULL_FREQUENCY': 2,
++    })
++    
++    # Test the original _cull method
++    from django.db import connections
++    db = 'default'
++    connection = connections[db]
++    
++    with connection.cursor() as cursor:
++        try:
++            # This should trigger the error when cull_num is too high
++            cache._cull(db, cursor, django.utils.timezone.now())
++            print("No error occurred")
++            return False
++        except TypeError as e:
++            if "'NoneType' object is not subscriptable" in str(e):
++                print(f"Successfully reproduced the issue: {e}")
++                return True
++            else:
++                print(f"Different error: {e}")
++                return False
++
++def test_direct_culling_query():
++    """Test the culling query directly with high offset"""
++    from django.db import connection
++    
++    # Create cache table
++    with connection.cursor() as cursor:
++        cursor.execute("""
++            CREATE TABLE IF NOT EXISTS test_cache_table (
++                cache_key VARCHAR(255) NOT NULL PRIMARY KEY,
++                value TEXT NOT NULL,
++                expires DATETIME NOT NULL
++            )
++        """)
++        cursor.execute("DELETE FROM test_cache_table")  # Ensure it's empty
++    
++    # Add a few cache entries
++    with connection.cursor() as cursor:
++        now = django.utils.timezone.now()
++        future = now.replace(year=now.year + 1)  # Future date
++        cursor.execute("INSERT INTO test_cache_table (cache_key, value, expires) VALUES (?, ?, ?)", 
++                      ['key1', 'value1', future])
++        cursor.execute("INSERT INTO test_cache_table (cache_key, value, expires) VALUES (?, ?, ?)", 
++                      ['key2', 'value2', future])
++    
++    # Test the culling query directly with high offset
++    with connection.cursor() as cursor:
++        table = connection.ops.quote_name('test_cache_table')
++        cull_num = 10  # High offset that will return no results
++        
++        cursor.execute(
++            connection.ops.cache_key_culling_sql() % table,
++            [cull_num]
++        )
++        
++        result = cursor.fetchone()
++        print(f"Result from fetchone(): {result}")
++        
++        # This is the problematic code from the original _cull method
++        try:
++            cache_key = result[0]  # This will fail if result is None
++            print(f"Cache key: {cache_key}")
++            return False
++        except TypeError as e:
++            print(f"Error occurred: {e}")
++            return True
++
++if __name__ == "__main__":
++    print("Testing culling with few entries...")
++    error1 = test_culling_with_few_entries()
++    
++    print("\nTesting direct culling query with high offset...")
++    error2 = test_direct_culling_query()
++    
++    if error1 or error2:
++        print("\nIssue confirmed!")
++    else:
++        print("\nCould not reproduce the issue")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..6a8bf5e382
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the cache culling fix.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        CACHES={
++            'default': {
++                'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
++                'LOCATION': 'test_cache_table',
++                'OPTIONS': {
++                    'MAX_ENTRIES': 3,  # Very low to trigger culling
++                    'CULL_FREQUENCY': 2,
++                }
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def create_cache_table():
++    """Create the cache table manually"""
++    from django.db import connection
++    
++    with connection.cursor() as cursor:
++        cursor.execute("""
++            CREATE TABLE IF NOT EXISTS test_cache_table (
++                cache_key VARCHAR(255) NOT NULL PRIMARY KEY,
++                value TEXT NOT NULL,
++                expires DATETIME NOT NULL
++            )
++        """)
++        cursor.execute("DELETE FROM test_cache_table")  # Clear any existing data
++
++def test_high_offset_scenario():
++    """Test scenario where culling offset is higher than available entries"""
++    from django.core.cache.backends.db import DatabaseCache
++    from django.db import connections
++    
++    print("Testing high offset scenario...")
++    
++    # Create cache instance
++    cache = DatabaseCache('test_cache_table', {
++        'MAX_ENTRIES': 3,  # Very low
++        'CULL_FREQUENCY': 2,
++    })
++    
++    # Add only 2 entries (fewer than MAX_ENTRIES)
++    from django.core.cache import cache as default_cache
++    default_cache.set('key1', 'value1')
++    default_cache.set('key2', 'value2')
++    
++    # Test the _cull method directly - this should trigger the problematic code path
++    db = 'default'
++    connection = connections[db]
++    
++    with connection.cursor() as cursor:
++        try:
++            # Manually trigger the culling logic that was problematic
++            table = connection.ops.quote_name('test_cache_table')
++            
++            # Delete expired entries first
++            cursor.execute("DELETE FROM %s WHERE expires < %%s" % table,
++                           [connection.ops.adapt_datetimefield_value(django.utils.timezone.now())])
++            
++            # Count remaining entries
++            cursor.execute("SELECT COUNT(*) FROM %s" % table)
++            num = cursor.fetchone()[0]
++            print(f"Number of entries: {num}")
++            
++            if num > cache._max_entries:  # This condition should be False
++                cull_num = num // cache._cull_frequency
++                
++                # This is the problematic code that we fixed
++                cursor.execute(
++                    connection.ops.cache_key_culling_sql() % table,
++                    [cull_num]
++                )
++                result = cursor.fetchone()
++                
++                if result is not None:
++                    cursor.execute("DELETE FROM %s WHERE cache_key < %%s" % table, [result[0]])
++                # If result is None, there's nothing to cull (this is the fix)
++                
++            print("✓ High offset scenario handled correctly")
++            return True
++            
++        except TypeError as e:
++            if "'NoneType' object is not subscriptable" in str(e):
++                print(f"✗ Error still occurs: {e}")
++                return False
++            else:
++                print(f"✗ Different error: {e}")
++                return False
++
++def test_direct_culling_query():
++    """Test the culling query directly"""
++    from django.db import connection
++    
++    print("\nTesting direct culling query...")
++    
++    with connection.cursor() as cursor:
++        table = connection.ops.quote_name('test_cache_table')
++        cull_num = 10  # Very high offset that will return no results
++        
++        cursor.execute(
++            "SELECT cache_key FROM %s ORDER BY cache_key LIMIT 1 OFFSET %%s" % table,
++            [cull_num]
++        )
++        
++        result = cursor.fetchone()
++        print(f"Result from fetchone(): {result}")
++        
++        # Test our fix logic
++        if result is not None:
++            cache_key = result[0]
++            print(f"Cache key: {cache_key}")
++        else:
++            print("No result returned (this is expected and handled correctly)")
++        
++        print("✓ Direct culling query handled correctly")
++        return True
++
++if __name__ == "__main__":
++    try:
++        create_cache_table()
++        success1 = test_high_offset_scenario()
++        success2 = test_direct_culling_query()
++        
++        if success1 and success2:
++            print("\n🎉 All edge case tests passed!")
++        else:
++            print("\n❌ Some edge case tests failed.")
++            
++    except Exception as e:
++        print(f"\n❌ Test failed with error: {e}")
++        import traceback
++        traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..7a07f49da8
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,138 @@
++#!/usr/bin/env python3
++"""
++Test the fix for the culling issue.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        CACHES={
++            'default': {
++                'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
++                'LOCATION': 'test_cache_table',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_fixed_cull_method():
++    """Test the fixed _cull method"""
++    from django.core.cache.backends.db import DatabaseCache
++    from django.db import connection
++    
++    # Create cache table
++    with connection.cursor() as cursor:
++        cursor.execute("""
++            CREATE TABLE IF NOT EXISTS test_cache_table (
++                cache_key VARCHAR(255) NOT NULL PRIMARY KEY,
++                value TEXT NOT NULL,
++                expires DATETIME NOT NULL
++            )
++        """)
++        cursor.execute("DELETE FROM test_cache_table")  # Ensure it's empty
++    
++    # Create cache instance with very low max_entries to force culling
++    cache = DatabaseCache('test_cache_table', {
++        'MAX_ENTRIES': 1,  # Very low to force culling
++        'CULL_FREQUENCY': 2,
++    })
++    
++    # Add a few cache entries
++    with connection.cursor() as cursor:
++        now = django.utils.timezone.now()
++        future = now.replace(year=now.year + 1)  # Future date
++        cursor.execute("INSERT INTO test_cache_table (cache_key, value, expires) VALUES (%s, %s, %s)", 
++                      ['key1', 'value1', future])
++        cursor.execute("INSERT INTO test_cache_table (cache_key, value, expires) VALUES (%s, %s, %s)", 
++                      ['key2', 'value2', future])
++    
++    # Test the fixed _cull method
++    from django.db import connections
++    db = 'default'
++    connection = connections[db]
++    
++    with connection.cursor() as cursor:
++        try:
++            # This should NOT trigger the error anymore
++            cache._cull(db, cursor, django.utils.timezone.now())
++            print("No error occurred - fix is working!")
++            return True
++        except TypeError as e:
++            if "'NoneType' object is not subscriptable" in str(e):
++                print(f"Error still occurs: {e}")
++                return False
++            else:
++                print(f"Different error: {e}")
++                return False
++        except Exception as e:
++            print(f"Unexpected error: {e}")
++            return False
++
++def test_edge_case_empty_table():
++    """Test the _cull method with empty table"""
++    from django.core.cache.backends.db import DatabaseCache
++    from django.db import connection
++    
++    # Create cache table
++    with connection.cursor() as cursor:
++        cursor.execute("""
++            CREATE TABLE IF NOT EXISTS test_cache_table (
++                cache_key VARCHAR(255) NOT NULL PRIMARY KEY,
++                value TEXT NOT NULL,
++                expires DATETIME NOT NULL
++            )
++        """)
++        cursor.execute("DELETE FROM test_cache_table")  # Ensure it's empty
++    
++    # Create cache instance
++    cache = DatabaseCache('test_cache_table', {
++        'MAX_ENTRIES': 10,
++        'CULL_FREQUENCY': 2,
++    })
++    
++    # Test the _cull method with empty table
++    from django.db import connections
++    db = 'default'
++    connection = connections[db]
++    
++    with connection.cursor() as cursor:
++        try:
++            cache._cull(db, cursor, django.utils.timezone.now())
++            print("No error with empty table - fix is working!")
++            return True
++        except TypeError as e:
++            if "'NoneType' object is not subscriptable" in str(e):
++                print(f"Error with empty table: {e}")
++                return False
++            else:
++                print(f"Different error: {e}")
++                return False
++
++if __name__ == "__main__":
++    print("Testing fixed _cull method...")
++    success1 = test_fixed_cull_method()
++    
++    print("\nTesting edge case with empty table...")
++    success2 = test_edge_case_empty_table()
++    
++    if success1 and success2:
++        print("\nFix is working correctly!")
++    else:
++        print("\nFix needs more work")
+\ No newline at end of file

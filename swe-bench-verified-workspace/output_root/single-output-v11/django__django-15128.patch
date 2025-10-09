@@ -1,0 +1,1812 @@
+diff --git a/debug_alias_generation.py b/debug_alias_generation.py
+new file mode 100644
+index 0000000000..4a64f0612b
+--- /dev/null
++++ b/debug_alias_generation.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++"""
++Debug alias generation to understand what's happening
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++
++print("Debugging alias generation...")
++
++query = Query(None)
++query.alias_prefix = 'T'
++
++# Add multiple aliases for the same table
++print("Adding aliases for same_table:")
++for i in range(5):
++    alias, is_new = query.table_alias('same_table', create=True)
++    print(f"  {i+1}. {alias}, is_new: {is_new}")
++
++print("Current alias_map:", list(query.alias_map.keys()))
++print("table_map for same_table:", query.table_map.get('same_table', []))
++
++# Now let's see what happens when we try to generate with excluded aliases
++print("\nTesting with excluded aliases:")
++excluded = ['T5']
++alias, is_new = query.table_alias('same_table', create=True, excluded_aliases=excluded)
++print(f"Alias with excluded T5: {alias}, is_new: {is_new}")
++
++# Let's also check what the counter logic does
++print(f"len(alias_map): {len(query.alias_map)}")
++print(f"Next sequential would be: T{len(query.alias_map) + 1}")
++
++# Let's manually test the counter logic
++counter = len(query.alias_map) + 1
++while True:
++    alias = f'T{counter}'
++    if alias not in excluded:
++        break
++    counter += 1
++    print(f"  Skipping {alias}, trying T{counter}")
++
++print(f"Final alias would be: {alias}")
+\ No newline at end of file
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index aaf35ee37c..80a41eb47f 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -604,7 +604,7 @@ class Query(BaseExpression):
+             # If the left side of the join was already relabeled, use the
+             # updated alias.
+             join = join.relabeled_clone(change_map)
+-            new_alias = self.join(join, reuse=reuse)
++            new_alias = self.join(join, reuse=reuse, excluded_aliases=set(change_map.keys()) | set(change_map.values()))
+             if join.join_type == INNER:
+                 rhs_votes.add(new_alias)
+             # We can't reuse the same join again in the query. If we have two
+@@ -745,13 +745,16 @@ class Query(BaseExpression):
+             for model, values in seen.items():
+                 callback(target, model, values)
+ 
+-    def table_alias(self, table_name, create=False, filtered_relation=None):
++    def table_alias(self, table_name, create=False, filtered_relation=None, excluded_aliases=None):
+         """
+         Return a table alias for the given table_name and whether this is a
+         new alias or not.
+ 
+         If 'create' is true, a new alias is always created. Otherwise, the
+         most recently created alias for the table (if one exists) is reused.
++
++        If 'excluded_aliases' is provided, the generated alias will not be in
++        this set to avoid conflicts during query combination.
+         """
+         alias_list = self.table_map.get(table_name)
+         if not create and alias_list:
+@@ -761,7 +764,16 @@ class Query(BaseExpression):
+ 
+         # Create a new alias for this table.
+         if alias_list:
+-            alias = '%s%d' % (self.alias_prefix, len(self.alias_map) + 1)
++            # Generate a new alias that is not in excluded_aliases
++            if excluded_aliases is not None:
++                counter = len(self.alias_map) + 1
++                while True:
++                    alias = '%s%d' % (self.alias_prefix, counter)
++                    if alias not in excluded_aliases:
++                        break
++                    counter += 1
++            else:
++                alias = '%s%d' % (self.alias_prefix, len(self.alias_map) + 1)
+             alias_list.append(alias)
+         else:
+             # The first occurrence of a table uses the table name directly.
+@@ -937,7 +949,7 @@ class Query(BaseExpression):
+             alias = self.base_table
+             self.ref_alias(alias)
+         else:
+-            alias = self.join(self.base_table_class(self.get_meta().db_table, None))
++            alias = self.join(self.base_table_class(self.get_meta().db_table, None), excluded_aliases=None)
+         return alias
+ 
+     def count_active_tables(self):
+@@ -948,7 +960,7 @@ class Query(BaseExpression):
+         """
+         return len([1 for count in self.alias_refcount.values() if count])
+ 
+-    def join(self, join, reuse=None):
++    def join(self, join, reuse=None, excluded_aliases=None):
+         """
+         Return an alias for the 'join', either reusing an existing alias for
+         that join or creating a new one. 'join' is either a base_table_class or
+@@ -957,6 +969,9 @@ class Query(BaseExpression):
+         The 'reuse' parameter can be either None which means all joins are
+         reusable, or it can be a set containing the aliases that can be reused.
+ 
++        The 'excluded_aliases' parameter can be used to avoid generating aliases
++        that are already in use as keys in a change_map during query combination.
++
+         A join is always created as LOUTER if the lhs alias is LOUTER to make
+         sure chains like t1 LOUTER t2 INNER t3 aren't generated. All new
+         joins are created as LOUTER if the join is nullable.
+@@ -976,7 +991,7 @@ class Query(BaseExpression):
+             return reuse_alias
+ 
+         # No reuse is possible, so we need a new alias.
+-        alias, _ = self.table_alias(join.table_name, create=True, filtered_relation=join.filtered_relation)
++        alias, _ = self.table_alias(join.table_name, create=True, filtered_relation=join.filtered_relation, excluded_aliases=excluded_aliases)
+         if join.join_type:
+             if self.alias_map[join.parent_alias].join_type == LOUTER or join.nullable:
+                 join_type = LOUTER
+@@ -1659,7 +1674,7 @@ class Query(BaseExpression):
+                 nullable, filtered_relation=filtered_relation,
+             )
+             reuse = can_reuse if join.m2m else None
+-            alias = self.join(connection, reuse=reuse)
++            alias = self.join(connection, reuse=reuse, excluded_aliases=None)
+             joins.append(alias)
+             if filtered_relation:
+                 filtered_relation.path = joins[:]
+diff --git a/reproduce_bug.py b/reproduce_bug.py
+new file mode 100644
+index 0000000000..385a504c10
+--- /dev/null
++++ b/reproduce_bug.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for Query.change_aliases AssertionError
++Uses the existing test infrastructure
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q
++
++# Create models similar to the issue
++class Foo(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_bug'
++
++class Bar(models.Model):
++    foo = models.ForeignKey(Foo, on_delete=models.CASCADE, related_name="bars")
++    another_foo = models.ForeignKey(Foo, on_delete=models.CASCADE, related_name="other_bars")
++    
++    class Meta:
++        app_label = 'test_bug'
++
++class Baz(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_bug'
++
++class Qux(models.Model):
++    name = models.CharField(max_length=100)
++    bazes = models.ManyToManyField(Baz, related_name="quxes")
++    
++    class Meta:
++        app_label = 'test_bug'
++
++# Create tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Foo)
++    schema_editor.create_model(Bar)
++    schema_editor.create_model(Baz)
++    schema_editor.create_model(Qux)
++
++# Create test data
++qux = Qux.objects.create(name='test')
++baz = Baz.objects.create(name='baz')
++qux.bazes.add(baz)
++
++foo = Foo.objects.create(name='foo')
++bar1 = Bar.objects.create(foo=foo, another_foo=foo)
++bar2 = Bar.objects.create(foo=foo, another_foo=foo)
++
++# Create the problematic queries
++qs1 = qux.foos.all()
++qs2 = Foo.objects.filter(
++    Q(bars__another_foo=foo) | Q(other_bars__another_foo=foo)
++)
++
++print("Testing qs2 | qs1 (should work)...")
++try:
++    result1 = qs2 | qs1
++    print("✓ qs2 | qs1 worked fine")
++except Exception as e:
++    print(f"✗ qs2 | qs1 failed: {e}")
++
++print("\nTesting qs1 | qs2 (should fail)...")
++try:
++    result2 = qs1 | qs2
++    print("✓ qs1 | qs2 worked fine")
++except Exception as e:
++    print(f"✗ qs1 | qs2 failed: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..f3f8012d9a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the Query.change_aliases AssertionError issue
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure Django settings if not already configured
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q
++from django.core.management.color import no_style
++from django.db import connection
++
++# Define the models from the issue
++class Foo(models.Model):
++    qux = models.ForeignKey("app.Qux", on_delete=models.CASCADE, related_name="foos")
++    
++    class Meta:
++        app_label = 'app'
++
++class Bar(models.Model):
++    foo = models.ForeignKey("app.Foo", on_delete=models.CASCADE, related_name="bars")
++    another_foo = models.ForeignKey("app.Foo", on_delete=models.CASCADE, related_name="other_bars")
++    baz = models.ForeignKey("app.Baz", on_delete=models.CASCADE, related_name="bars")
++    
++    class Meta:
++        app_label = 'app'
++
++class Baz(models.Model):
++    class Meta:
++        app_label = 'app'
++
++class Qux(models.Model):
++    bazes = models.ManyToManyField("app.Baz", related_name="quxes")
++    
++    class Meta:
++        app_label = 'app'
++
++# Create test data
++qux = Qux.objects.create()
++qs1 = qux.foos.all()
++qs2 = Foo.objects.filter(
++    Q(bars__baz__in=qux.bazes.all()) | Q(other_bars__baz__in=qux.bazes.all())
++)
++
++print("Testing qs2 | qs1 (should work)...")
++try:
++    result1 = qs2 | qs1
++    print("✓ qs2 | qs1 worked fine")
++except Exception as e:
++    print(f"✗ qs2 | qs1 failed: {e}")
++
++print("\nTesting qs1 | qs2 (should fail)...")
++try:
++    result2 = qs1 | qs2
++    print("✓ qs1 | qs2 worked fine")
++except Exception as e:
++    print(f"✗ qs1 | qs2 failed: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..1e7022d93f
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++"""
++Simple script to reproduce the Query.change_aliases AssertionError issue
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure Django settings if not already configured
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q
++
++# Create simple models to reproduce the issue
++class M1(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class M2(models.Model):
++    m1 = models.ForeignKey(M1, on_delete=models.CASCADE, related_name='m2s')
++    another_m1 = models.ForeignKey(M1, on_delete=models.CASCADE, related_name='other_m2s')
++    
++    class Meta:
++        app_label = 'test'
++
++# Create tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(M1)
++    schema_editor.create_model(M2)
++
++# Create test data
++m1 = M1.objects.create(name='test')
++qs1 = m1.m2s.all()
++qs2 = M1.objects.filter(
++    Q(m2s__m1=m1) | Q(other_m2s__m1=m1)
++)
++
++print("Testing qs2 | qs1 (should work)...")
++try:
++    result1 = qs2 | qs1
++    print("✓ qs2 | qs1 worked fine")
++except Exception as e:
++    print(f"✗ qs2 | qs1 failed: {e}")
++
++print("\nTesting qs1 | qs2 (should fail)...")
++try:
++    result2 = qs1 | qs2
++    print("✓ qs1 | qs2 worked fine")
++except Exception as e:
++    print(f"✗ qs1 | qs2 failed: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_assertion.py b/test_assertion.py
+new file mode 100644
+index 0000000000..ce730e8539
+--- /dev/null
++++ b/test_assertion.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the assertion error in change_aliases
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++
++# Create a simple test case
++query = Query(None)
++
++# Create a change_map that violates the assertion
++change_map = {'T4': 'T5', 'T5': 'T6'}
++
++print("Testing change_aliases with problematic change_map...")
++try:
++    query.change_aliases(change_map)
++    print("✓ No assertion error")
++except AssertionError as e:
++    print(f"✗ AssertionError: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_basic_functionality.py b/test_basic_functionality.py
+new file mode 100644
+index 0000000000..1993e21810
+--- /dev/null
++++ b/test_basic_functionality.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++"""
++Test basic functionality to ensure the changes don't break anything
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++
++# Test basic query functionality
++print("Testing basic query functionality...")
++
++# Create a simple query
++query = Query(None)
++query.alias_prefix = 'T'
++
++# Test table_alias method
++alias1, is_new1 = query.table_alias('test_table', create=True)
++print(f"✓ table_alias works: {alias1}, {is_new1}")
++
++# Test join method
++from django.db.models.sql.datastructures import BaseTable
++base_table = BaseTable('test_table', None)
++alias2 = query.join(base_table)
++print(f"✓ join works: {alias2}")
++
++# Test change_aliases method with valid change_map
++valid_change_map = {'T1': 'T2', 'T3': 'T4'}
++try:
++    query.change_aliases(valid_change_map)
++    print("✓ change_aliases works with valid change_map")
++except Exception as e:
++    print(f"✗ change_aliases failed: {e}")
++
++# Test change_aliases method with invalid change_map (should still fail)
++invalid_change_map = {'T1': 'T2', 'T2': 'T3'}
++try:
++    query.change_aliases(invalid_change_map)
++    print("✗ change_aliases should have failed with invalid change_map")
++except AssertionError:
++    print("✓ change_aliases correctly fails with invalid change_map")
++
++print("All basic functionality tests passed!")
+\ No newline at end of file
+diff --git a/test_combine_fix.py b/test_combine_fix.py
+new file mode 100644
+index 0000000000..7edf0dcf64
+--- /dev/null
++++ b/test_combine_fix.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++"""
++Test the actual combine method to verify the fix works
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++
++print("Testing the actual combine method fix...")
++
++# Create two queries to simulate the combine operation
++query1 = Query(None)
++query1.alias_prefix = 'T'
++
++query2 = Query(None) 
++query2.alias_prefix = 'T'
++
++# Manually populate query2 (rhs) with some aliases to simulate the problematic scenario
++query2.alias_map['T4'] = None
++query2.alias_map['T5'] = None
++query2.alias_refcount['T4'] = 1
++query2.alias_refcount['T5'] = 1
++
++# Add some aliases to query1 to affect the alias counter
++query1.alias_map['T1'] = None
++query1.alias_map['T2'] = None
++query1.alias_map['T3'] = None
++query1.alias_refcount['T1'] = 1
++query1.alias_refcount['T2'] = 1
++query1.alias_refcount['T3'] = 1
++
++print("query1 aliases:", list(query1.alias_map.keys()))
++print("query2 aliases:", list(query2.alias_map.keys()))
++
++# Now call the combine method
++try:
++    query1.combine(query2, 'OR')
++    print("✓ combine succeeded - no assertion error!")
++except AssertionError as e:
++    print(f"✗ combine failed with assertion: {e}")
++except Exception as e:
++    print(f"Other error during combine: {e}")
++
++print("Combine test completed!")
+\ No newline at end of file
+diff --git a/test_combine_scenario.py b/test_combine_scenario.py
+new file mode 100644
+index 0000000000..6213cd154c
+--- /dev/null
++++ b/test_combine_scenario.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++"""
++Test the specific scenario that was causing the AssertionError
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++from django.db.models.sql.datastructures import BaseTable
++
++print("Testing the specific combine scenario that was causing issues...")
++
++# Create two queries to simulate the combine operation
++query1 = Query(None)
++query1.alias_prefix = 'T'
++
++query2 = Query(None) 
++query2.alias_prefix = 'T'
++
++# Add some aliases to query2 (simulating the rhs query)
++query2.table_alias('table1', create=True)  # Creates T1
++query2.table_alias('table2', create=True)  # Creates T2
++query2.table_alias('table3', create=True)  # Creates T3
++query2.table_alias('table4', create=True)  # Creates T4
++
++# Add some aliases to query1 (simulating the lhs query)
++query1.table_alias('table5', create=True)  # Creates T5
++query1.table_alias('table6', create=True)  # Creates T6
++
++# Now simulate the combine operation - this is where the issue occurred
++change_map = {}
++rhs_tables = list(query2.alias_map)[1:]  # Skip the base table
++
++for alias in rhs_tables:
++    # Simulate the join operation from the combine method
++    join = query2.alias_map[alias]
++    join = join.relabeled_clone(change_map)
++    
++    # This is the critical call that was generating problematic aliases
++    new_alias = query1.join(join, excluded_aliases=change_map.keys())
++    
++    if alias != new_alias:
++        change_map[alias] = new_alias
++
++print(f"Final change_map: {change_map}")
++
++# Test that the change_map doesn't violate the assertion
++try:
++    query1.change_aliases(change_map)
++    print("✓ change_aliases succeeded - no assertion error!")
++except AssertionError as e:
++    print(f"✗ change_aliases failed with assertion: {e}")
++    print("This indicates the fix didn't work properly")
++
++# Verify that the change_map keys and values are disjoint
++keys = set(change_map.keys())
++values = set(change_map.values())
++intersection = keys & values
++
++if intersection:
++    print(f"✗ Problem: change_map keys and values intersect: {intersection}")
++else:
++    print("✓ change_map keys and values are properly disjoint")
++
++print("Test completed!")
+\ No newline at end of file
+diff --git a/test_core_fix.py b/test_core_fix.py
+new file mode 100644
+index 0000000000..776c2409c6
+--- /dev/null
++++ b/test_core_fix.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python3
++"""
++Test the core fix for the table_alias method with excluded_aliases
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++
++print("Testing the core fix for table_alias with excluded_aliases...")
++
++query = Query(None)
++query.alias_prefix = 'T'
++
++# Add some initial aliases to simulate a query with existing aliases
++query.table_alias('table1', create=True)  # T1
++query.table_alias('table2', create=True)  # T2
++query.table_alias('table3', create=True)  # T3
++
++print("Current aliases in query:", list(query.alias_map.keys()))
++
++# Test 1: Normal alias generation (should create T4)
++alias1, is_new1 = query.table_alias('table4', create=True)
++print(f"Normal alias generation: {alias1}, is_new: {is_new1}")
++
++# Test 2: Alias generation with excluded_aliases containing T5
++alias2, is_new2 = query.table_alias('table5', create=True, excluded_aliases=['T5'])
++print(f"With excluded T5: {alias2}, is_new: {is_new2}")
++
++# Test 3: Alias generation with multiple excluded aliases including the next sequential
++alias3, is_new3 = query.table_alias('table6', create=True, excluded_aliases=['T5', 'T6'])
++print(f"With excluded T5, T6: {alias3}, is_new: {is_new3}")
++
++# Test 4: Verify that the method correctly skips excluded aliases
++alias4, is_new4 = query.table_alias('table7', create=True, excluded_aliases=['T7', 'T8'])
++print(f"With excluded T7, T8: {alias4}, is_new: {is_new4}")
++
++print("\nTesting that the fix prevents the specific issue scenario...")
++
++# Simulate the problematic scenario: 
++# - We have a change_map that already contains {'T4': 'T5'}
++# - We need to generate a new alias for T5, but T5 is already a key in change_map
++# - Before the fix: would generate T6 for T5, creating change_map = {'T4': 'T5', 'T5': 'T6'}
++# - After the fix: should generate T7 for T5, creating change_map = {'T4': 'T5', 'T5': 'T7'}
++
++change_map = {'T4': 'T5'}
++excluded_aliases = change_map.keys()  # This contains 'T4'
++
++# Generate a new alias for a table, excluding ALL keys that are or will be in change_map
++# We need to exclude both existing keys (T4) and the key we're about to add (T5)
++all_excluded = set(change_map.keys()) | {'T5'}
++alias_for_t5, is_new = query.table_alias('table_for_t5', create=True, excluded_aliases=all_excluded)
++change_map['T5'] = alias_for_t5
++
++print(f"Change map after generating alias for T5: {change_map}")
++
++# Verify that the change_map doesn't have intersecting keys and values
++keys = set(change_map.keys())
++values = set(change_map.values())
++intersection = keys & values
++
++if intersection:
++    print(f"✗ FAILED: change_map has intersecting keys and values: {intersection}")
++else:
++    print("✓ SUCCESS: change_map keys and values are properly disjoint")
++
++print("Core fix test completed!")
+\ No newline at end of file
+diff --git a/test_final.py b/test_final.py
+new file mode 100644
+index 0000000000..190bc6cbc2
+--- /dev/null
++++ b/test_final.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++"""
++Final test to verify the fix works correctly
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++
++print("Testing the final fix...")
++
++# Create a query and populate it with some aliases to simulate a real scenario
++query = Query(None)
++query.alias_prefix = 'T'
++
++# Add several aliases to get the counter to a higher number
++for i in range(1, 10):
++    query.table_alias(f'table{i}', create=True)
++
++print("Current aliases in query:", list(query.alias_map.keys()))
++print("Alias counter would be at:", len(query.alias_map) + 1)
++
++# Now simulate the problematic scenario
++# We have a change_map that already contains {'T4': 'T5'}
++# We need to generate a new alias for T5, but T5 is already a key in change_map
++
++change_map = {'T4': 'T5'}
++
++# Generate a new alias, excluding all keys in change_map
++# This should generate T10 (not T6, which would conflict with change_map keys)
++new_alias, is_new = query.table_alias('new_table', create=True, excluded_aliases=change_map.keys())
++change_map['T5'] = new_alias
++
++print(f"Change map: {change_map}")
++print(f"New alias generated: {new_alias}")
++
++# Test that the change_map doesn't violate the assertion
++try:
++    query.change_aliases(change_map)
++    print("✓ change_aliases succeeded - no assertion error!")
++except AssertionError as e:
++    print(f"✗ change_aliases failed with assertion: {e}")
++
++# Verify that the change_map keys and values are disjoint
++keys = set(change_map.keys())
++values = set(change_map.values())
++intersection = keys & values
++
++if intersection:
++    print(f"✗ Problem: change_map keys and values intersect: {intersection}")
++else:
++    print("✓ change_map keys and values are properly disjoint")
++
++print("Final test completed!")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..6d4267c2e1
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for Query.change_aliases AssertionError
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++
++# Test the table_alias method with excluded_aliases
++query = Query(None)
++query.alias_prefix = 'T'
++
++# Test normal alias generation
++alias1, is_new1 = query.table_alias('table1', create=True)
++print(f"Normal alias: {alias1}, is_new: {is_new1}")
++
++# Test alias generation with excluded aliases
++alias2, is_new2 = query.table_alias('table2', create=True, excluded_aliases=['T2'])
++print(f"With excluded T2: {alias2}, is_new: {is_new2}")
++
++# Test alias generation with multiple excluded aliases
++alias3, is_new3 = query.table_alias('table3', create=True, excluded_aliases=['T2', 'T3'])
++print(f"With excluded T2, T3: {alias3}, is_new: {is_new3}")
++
++# Test that the join method works with excluded_aliases
++from django.db.models.sql.datastructures import BaseTable
++base_table = BaseTable('test_table', None)
++alias4 = query.join(base_table, excluded_aliases=['T4'])
++print(f"Join with excluded T4: {alias4}")
++
++print("\nTesting that the fix prevents problematic change_maps...")
++
++# Create a scenario that would previously generate a problematic change_map
++query1 = Query(None)
++query1.alias_prefix = 'T'
++
++# Add some aliases to query1
++query1.table_alias('table1', create=True)
++query1.table_alias('table2', create=True)
++
++query2 = Query(None)
++query2.alias_prefix = 'T'
++
++# Add aliases T3 and T4 to query2 (simulating rhs query)
++query2.table_alias('table3', create=True)  # This creates T3
++query2.table_alias('table4', create=True)  # This creates T4
++
++# Now simulate the combine operation
++change_map = {}
++# This should generate T3 and T4, but T4 should not conflict with change_map keys
++new_alias1 = query1.join(BaseTable('table3', None), excluded_aliases=change_map.keys())
++change_map['T3'] = new_alias1
++
++new_alias2 = query1.join(BaseTable('table4', None), excluded_aliases=change_map.keys())
++change_map['T4'] = new_alias2
++
++print(f"Change map: {change_map}")
++print("✓ No assertion error - fix is working!")
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..d36f3657e5
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++"""
++Test the exact scenario described in the GitHub issue
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++
++print("Testing the exact GitHub issue scenario...")
++
++# The issue describes a change_map like {'T4': 'T5', 'T5': 'T6'}
++# This violates the assertion because T5 appears both as key and value
++
++# Create a query to test the change_aliases method
++query = Query(None)
++
++# Test the problematic change_map
++problematic_change_map = {'T4': 'T5', 'T5': 'T6'}
++
++print(f"Testing with problematic change_map: {problematic_change_map}")
++
++try:
++    query.change_aliases(problematic_change_map)
++    print("✓ change_aliases succeeded (unexpected!)")
++except AssertionError as e:
++    print(f"✗ change_aliases failed with assertion: {e}")
++    print("This is expected - the assertion should catch this error")
++
++# Now test that our fix prevents such change_maps from being created
++print("\nTesting that our fix prevents problematic change_maps...")
++
++# Simulate the scenario where we need to generate aliases without conflicts
++query = Query(None)
++query.alias_prefix = 'T'
++
++# Manually populate alias_map to simulate a real scenario
++query.alias_map['T1'] = None
++query.alias_map['T2'] = None
++query.alias_map['T3'] = None
++query.alias_map['T4'] = None
++query.alias_refcount['T1'] = 1
++query.alias_refcount['T2'] = 1
++query.alias_refcount['T3'] = 1
++query.alias_refcount['T4'] = 1
++
++# Set up table_map to trigger sequential alias generation
++query.table_map['test_table'] = ['test_table', 'T1', 'T2', 'T3', 'T4']
++
++# Simulate the combine operation
++change_map = {}
++
++# First, generate an alias for T4 (should generate T5)
++alias_for_t4, is_new = query.table_alias('test_table', create=True, excluded_aliases=change_map.keys())
++change_map['T4'] = alias_for_t4
++print(f"Generated alias for T4: {alias_for_t4}")
++
++# Now generate an alias for T5, excluding all keys in change_map
++# This should generate T6 (not T5, which would conflict)
++alias_for_t5, is_new = query.table_alias('test_table', create=True, excluded_aliases=change_map.keys())
++change_map['T5'] = alias_for_t5
++print(f"Generated alias for T5: {alias_for_t5}")
++
++print(f"Final change_map: {change_map}")
++
++# Test that the change_map doesn't violate the assertion
++try:
++    query.change_aliases(change_map)
++    print("✓ change_aliases succeeded - no assertion error!")
++except AssertionError as e:
++    print(f"✗ change_aliases failed with assertion: {e}")
++
++# Verify that the change_map keys and values are disjoint
++keys = set(change_map.keys())
++values = set(change_map.values())
++intersection = keys & values
++
++if intersection:
++    print(f"✗ Problem: change_map keys and values intersect: {intersection}")
++else:
++    print("✓ change_map keys and values are properly disjoint")
++
++print("GitHub issue test completed!")
+\ No newline at end of file
+diff --git a/test_proper_alias_map.py b/test_proper_alias_map.py
+new file mode 100644
+index 0000000000..8a37297e46
+--- /dev/null
++++ b/test_proper_alias_map.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++"""
++Test with proper alias_map population
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++from django.db.models.sql.datastructures import BaseTable
++
++print("Testing with proper alias_map population...")
++
++query = Query(None)
++query.alias_prefix = 'T'
++
++# Manually populate alias_map to simulate a real scenario
++query.alias_map['T1'] = BaseTable('table1', None)
++query.alias_map['T2'] = BaseTable('table2', None)
++query.alias_map['T3'] = BaseTable('table3', None)
++query.alias_map['T4'] = BaseTable('table4', None)
++
++query.alias_refcount['T1'] = 1
++query.alias_refcount['T2'] = 1
++query.alias_refcount['T3'] = 1
++query.alias_refcount['T4'] = 1
++
++# Set up table_map to trigger sequential alias generation
++query.table_map['test_table'] = ['test_table', 'T1', 'T2', 'T3', 'T4']
++
++print("alias_map keys:", list(query.alias_map.keys()))
++print("table_map for test_table:", query.table_map['test_table'])
++print("len(alias_map):", len(query.alias_map))
++
++# Test the table_alias method with excluded_aliases
++# This should generate T5 (not T4, which is excluded)
++alias1, is_new1 = query.table_alias('test_table', create=True, excluded_aliases=['T4'])
++print(f"With excluded T4: {alias1}, is_new: {is_new1}")
++
++# Test with multiple excluded aliases including the next sequential
++alias2, is_new2 = query.table_alias('test_table', create=True, excluded_aliases=['T5', 'T6'])
++print(f"With excluded T5, T6: {alias2}, is_new: {is_new2}")
++
++# Test the scenario that would cause the original issue
++# We have change_map = {'T4': 'T5'} and need to generate an alias for T5
++change_map = {'T4': 'T5'}
++# We need to exclude both existing keys (T4) and the key we're about to add (T5)
++all_excluded = set(change_map.keys()) | {'T5'}
++alias3, is_new3 = query.table_alias('test_table', create=True, excluded_aliases=all_excluded)
++change_map['T5'] = alias3
++
++print(f"Change map: {change_map}")
++print(f"Alias generated for T5: {alias3}")
++
++# Verify that the change_map keys and values are disjoint
++keys = set(change_map.keys())
++values = set(change_map.values())
++intersection = keys & values
++
++if intersection:
++    print(f"✗ Problem: change_map keys and values intersect: {intersection}")
++else:
++    print("✓ change_map keys and values are properly disjoint")
++
++print("Proper alias_map test completed!")
+\ No newline at end of file
+diff --git a/test_proper_sequential.py b/test_proper_sequential.py
+new file mode 100644
+index 0000000000..943f256e32
+--- /dev/null
++++ b/test_proper_sequential.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++"""
++Proper test for sequential alias generation
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++
++print("Testing proper sequential alias generation...")
++
++# Create a query and add multiple aliases for the SAME table
++# This will trigger sequential alias generation (T1, T2, T3, etc.)
++query = Query(None)
++query.alias_prefix = 'T'
++
++# Add multiple aliases for the same table to trigger sequential generation
++query.table_alias('same_table', create=True)  # Creates 'same_table' (first occurrence)
++query.table_alias('same_table', create=True)  # Creates 'T2' (second occurrence)
++query.table_alias('same_table', create=True)  # Creates 'T3' (third occurrence)
++query.table_alias('same_table', create=True)  # Creates 'T4' (fourth occurrence)
++query.table_alias('same_table', create=True)  # Creates 'T5' (fifth occurrence)
++
++print("Current aliases in query:", list(query.alias_map.keys()))
++
++# Now simulate the problematic scenario
++change_map = {'T4': 'T5'}  # This simulates a change_map that already maps T4 -> T5
++
++# Generate a new alias for the same table, excluding keys from change_map
++# This should generate T6 (not T5, which would conflict)
++new_alias, is_new = query.table_alias('same_table', create=True, excluded_aliases=change_map.keys())
++change_map['T5'] = new_alias
++
++print(f"Change map: {change_map}")
++print(f"New alias generated: {new_alias}")
++
++# Test that the change_map doesn't violate the assertion
++try:
++    query.change_aliases(change_map)
++    print("✓ change_aliases succeeded - no assertion error!")
++except AssertionError as e:
++    print(f"✗ change_aliases failed with assertion: {e}")
++
++# Verify that the change_map keys and values are disjoint
++keys = set(change_map.keys())
++values = set(change_map.values())
++intersection = keys & values
++
++if intersection:
++    print(f"✗ Problem: change_map keys and values intersect: {intersection}")
++else:
++    print("✓ change_map keys and values are properly disjoint")
++
++print("Proper sequential test completed!")
+\ No newline at end of file
+diff --git a/test_realistic_scenario.py b/test_realistic_scenario.py
+new file mode 100644
+index 0000000000..4774615dba
+--- /dev/null
++++ b/test_realistic_scenario.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python3
++"""
++Test a more realistic scenario that mimics the actual issue
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++from django.db.models.sql.datastructures import Join
++
++print("Testing a more realistic scenario...")
++
++# Create two queries where the rhs query has sequential aliases
++query1 = Query(None)
++query1.alias_prefix = 'T'
++
++query2 = Query(None) 
++query2.alias_prefix = 'T'
++
++# Manually set up alias_map and table_map to simulate the problematic scenario
++# where rhs has aliases T4 and T5 that need to be relabeled
++
++# Add some aliases to query1 (lhs) - this will affect the alias counter
++query1.table_alias('table1', create=True)  # Creates T1
++query1.table_alias('table2', create=True)  # Creates T2  
++query1.table_alias('table3', create=True)  # Creates T3
++
++# Now manually add T4 and T5 to query2 (rhs) to simulate the issue
++# We need to bypass the normal table_alias method to create specific aliases
++query2.alias_map['T4'] = Join('table4', 'T4', None, None, None)
++query2.alias_refcount['T4'] = 1
++query2.table_map['table4'] = ['T4']
++
++query2.alias_map['T5'] = Join('table5', 'T5', None, None, None)  
++query2.alias_refcount['T5'] = 1
++query2.table_map['table5'] = ['T5']
++
++print("query1 aliases:", list(query1.alias_map.keys()))
++print("query2 aliases:", list(query2.alias_map.keys()))
++
++# Now simulate the combine operation
++change_map = {}
++rhs_tables = list(query2.alias_map)[1:]  # Skip the base table
++
++print("Processing rhs tables:", rhs_tables)
++
++for alias in rhs_tables:
++    # Simulate the join operation from the combine method
++    join = query2.alias_map[alias]
++    join = join.relabeled_clone(change_map)
++    
++    # This is the critical call that was generating problematic aliases
++    # Before the fix, this would generate T5 for T4 and T6 for T5
++    # creating change_map = {'T4': 'T5', 'T5': 'T6'} which violates the assertion
++    new_alias = query1.join(join, excluded_aliases=change_map.keys())
++    
++    if alias != new_alias:
++        change_map[alias] = new_alias
++        print(f"Added to change_map: {alias} -> {new_alias}")
++
++print(f"Final change_map: {change_map}")
++
++# Test that the change_map doesn't violate the assertion
++try:
++    query1.change_aliases(change_map)
++    print("✓ change_aliases succeeded - no assertion error!")
++except AssertionError as e:
++    print(f"✗ change_aliases failed with assertion: {e}")
++    print("This indicates the fix didn't work properly")
++
++# Verify that the change_map keys and values are disjoint
++keys = set(change_map.keys())
++values = set(change_map.values())
++intersection = keys & values
++
++if intersection:
++    print(f"✗ Problem: change_map keys and values intersect: {intersection}")
++else:
++    print("✓ change_map keys and values are properly disjoint")
++
++print("Test completed!")
+\ No newline at end of file
+diff --git a/test_sequential_aliases.py b/test_sequential_aliases.py
+new file mode 100644
+index 0000000000..10189a1047
+--- /dev/null
++++ b/test_sequential_aliases.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++"""
++Test the sequential alias generation with excluded_aliases
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++
++print("Testing sequential alias generation with excluded_aliases...")
++
++query = Query(None)
++query.alias_prefix = 'T'
++
++# First, create some aliases for the same table to trigger sequential alias generation
++query.table_alias('mytable', create=True)  # Creates 'mytable' (first occurrence)
++query.table_alias('mytable', create=True)  # Creates 'T2' (second occurrence - sequential)
++query.table_alias('mytable', create=True)  # Creates 'T3' (third occurrence - sequential)
++
++print("Current aliases in query:", list(query.alias_map.keys()))
++
++# Test 1: Normal sequential alias generation (should create T4)
++alias1, is_new1 = query.table_alias('mytable', create=True)
++print(f"Normal sequential alias: {alias1}, is_new: {is_new1}")
++
++# Test 2: Sequential alias generation with excluded_aliases containing T5
++alias2, is_new2 = query.table_alias('mytable', create=True, excluded_aliases=['T5'])
++print(f"With excluded T5: {alias2}, is_new: {is_new2}")
++
++# Test 3: Sequential alias generation with multiple excluded aliases including the next sequential
++alias3, is_new3 = query.table_alias('mytable', create=True, excluded_aliases=['T5', 'T6'])
++print(f"With excluded T5, T6: {alias3}, is_new: {is_new3}")
++
++# Test 4: Verify that the method correctly skips multiple excluded aliases
++alias4, is_new4 = query.table_alias('mytable', create=True, excluded_aliases=['T7', 'T8'])
++print(f"With excluded T7, T8: {alias4}, is_new: {is_new4}")
++
++print("\nTesting the specific issue scenario with sequential aliases...")
++
++# Simulate the problematic scenario where change_map already contains {'T4': 'T5'}
++# and we need to generate an alias for T5 without creating T6 (which would conflict)
++change_map = {'T4': 'T5'}
++
++# Generate a new alias for the same table, excluding all keys in change_map
++alias_for_t5, is_new = query.table_alias('mytable', create=True, excluded_aliases=change_map.keys())
++change_map['T5'] = alias_for_t5
++
++print(f"Change map after generating alias for T5: {change_map}")
++
++# Verify that the change_map doesn't have intersecting keys and values
++keys = set(change_map.keys())
++values = set(change_map.values())
++intersection = keys & values
++
++if intersection:
++    print(f"✗ FAILED: change_map has intersecting keys and values: {intersection}")
++else:
++    print("✓ SUCCESS: change_map keys and values are properly disjoint")
++
++print("Sequential alias test completed!")
+\ No newline at end of file
+diff --git a/test_sequential_with_join.py b/test_sequential_with_join.py
+new file mode 100644
+index 0000000000..b2525f880f
+--- /dev/null
++++ b/test_sequential_with_join.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++"""
++Test sequential alias generation using join with the same table
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++from django.db.models.sql.datastructures import Join
++
++print("Testing sequential alias generation using multiple joins on same table...")
++
++query = Query(None)
++query.alias_prefix = 'T'
++
++# Create multiple joins for the same table to trigger sequential alias generation
++join1 = Join('same_table', None, None, None, None, False)
++alias1 = query.join(join1)
++print(f"Join 1: {alias1}")
++
++join2 = Join('same_table', None, None, None, None, False)
++alias2 = query.join(join2)
++print(f"Join 2: {alias2}")
++
++join3 = Join('same_table', None, None, None, None, False)
++alias3 = query.join(join3)
++print(f"Join 3: {alias3}")
++
++join4 = Join('same_table', None, None, None, None, False)
++alias4 = query.join(join4)
++print(f"Join 4: {alias4}")
++
++join5 = Join('same_table', None, None, None, None, False)
++alias5 = query.join(join5)
++print(f"Join 5: {alias5}")
++
++print("Current alias_map:", list(query.alias_map.keys()))
++print("Current table_map:", query.table_map)
++
++# Now simulate the problematic scenario
++change_map = {'T4': 'T5'}  # This simulates a change_map that already maps T4 -> T5
++
++# Generate a new join for the same table, excluding keys from change_map
++# This should generate T6 (not T5, which would conflict)
++join6 = Join('same_table', None, None, None, None, False)
++new_alias = query.join(join6, excluded_aliases=change_map.keys())
++change_map['T5'] = new_alias
++
++print(f"Change map: {change_map}")
++print(f"New alias generated: {new_alias}")
++
++# Test that the change_map doesn't violate the assertion
++try:
++    query.change_aliases(change_map)
++    print("✓ change_aliases succeeded - no assertion error!")
++except AssertionError as e:
++    print(f"✗ change_aliases failed with assertion: {e}")
++
++# Verify that the change_map keys and values are disjoint
++keys = set(change_map.keys())
++values = set(change_map.values())
++intersection = keys & values
++
++if intersection:
++    print(f"✗ Problem: change_map keys and values intersect: {intersection}")
++else:
++    print("✓ change_map keys and values are properly disjoint")
++
++print("Sequential join test completed!")
+\ No newline at end of file
+diff --git a/test_table_alias_logic.py b/test_table_alias_logic.py
+new file mode 100644
+index 0000000000..806a164475
+--- /dev/null
++++ b/test_table_alias_logic.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++"""
++Test the core logic of table_alias method with excluded_aliases
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++
++print("Testing the core logic of table_alias method...")
++
++query = Query(None)
++query.alias_prefix = 'T'
++
++# Manually set up table_map to simulate a scenario where sequential aliases are generated
++query.table_map['test_table'] = ['test_table', 'T1', 'T2', 'T3', 'T4']
++
++print("table_map for test_table:", query.table_map['test_table'])
++
++# Test the table_alias method with excluded_aliases
++# This should generate T5 (not T4, which is excluded)
++alias1, is_new1 = query.table_alias('test_table', create=True, excluded_aliases=['T4'])
++print(f"With excluded T4: {alias1}, is_new: {is_new1}")
++
++# Test with multiple excluded aliases including the next sequential
++alias2, is_new2 = query.table_alias('test_table', create=True, excluded_aliases=['T5', 'T6'])
++print(f"With excluded T5, T6: {alias2}, is_new: {is_new2}")
++
++# Test the scenario that would cause the original issue
++# We have change_map = {'T4': 'T5'} and need to generate an alias for T5
++change_map = {'T4': 'T5'}
++alias3, is_new3 = query.table_alias('test_table', create=True, excluded_aliases=change_map.keys())
++change_map['T5'] = alias3
++
++print(f"Change map: {change_map}")
++print(f"Alias generated for T5: {alias3}")
++
++# Verify that the change_map keys and values are disjoint
++keys = set(change_map.keys())
++values = set(change_map.values())
++intersection = keys & values
++
++if intersection:
++    print(f"✗ Problem: change_map keys and values intersect: {intersection}")
++else:
++    print("✓ change_map keys and values are properly disjoint")
++
++print("Core logic test completed!")
+\ No newline at end of file
+diff --git a/test_with_join.py b/test_with_join.py
+new file mode 100644
+index 0000000000..f4bb50844c
+--- /dev/null
++++ b/test_with_join.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++"""
++Test using the join method to properly simulate the real scenario
++"""
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++from django.db.models.sql.datastructures import BaseTable
++
++print("Testing with join method to properly populate alias_map...")
++
++query = Query(None)
++query.alias_prefix = 'T'
++
++# Create joins to properly populate alias_map
++base_table1 = BaseTable('table1', None)
++alias1 = query.join(base_table1)
++print(f"Join 1: {alias1}")
++
++base_table2 = BaseTable('table2', None)  
++alias2 = query.join(base_table2)
++print(f"Join 2: {alias2}")
++
++base_table3 = BaseTable('table3', None)
++alias3 = query.join(base_table3)
++print(f"Join 3: {alias3}")
++
++base_table4 = BaseTable('table4', None)
++alias4 = query.join(base_table4)
++print(f"Join 4: {alias4}")
++
++base_table5 = BaseTable('table5', None)
++alias5 = query.join(base_table5)
++print(f"Join 5: {alias5}")
++
++print("Current alias_map:", list(query.alias_map.keys()))
++print("Current table_map:", query.table_map)
++
++# Now simulate the problematic scenario
++change_map = {'T4': 'T5'}  # This simulates a change_map that already maps T4 -> T5
++
++# Generate a new join, excluding keys from change_map
++# This should generate T6 (not T5, which would conflict)
++base_table6 = BaseTable('table6', None)
++new_alias = query.join(base_table6, excluded_aliases=change_map.keys())
++change_map['T5'] = new_alias
++
++print(f"Change map: {change_map}")
++print(f"New alias generated: {new_alias}")
++
++# Test that the change_map doesn't violate the assertion
++try:
++    query.change_aliases(change_map)
++    print("✓ change_aliases succeeded - no assertion error!")
++except AssertionError as e:
++    print(f"✗ change_aliases failed with assertion: {e}")
++
++# Verify that the change_map keys and values are disjoint
++keys = set(change_map.keys())
++values = set(change_map.values())
++intersection = keys & values
++
++if intersection:
++    print(f"✗ Problem: change_map keys and values intersect: {intersection}")
++else:
++    print("✓ change_map keys and values are properly disjoint")
++
++print("Join test completed!")
+\ No newline at end of file

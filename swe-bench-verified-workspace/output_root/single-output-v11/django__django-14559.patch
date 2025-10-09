@@ -1,0 +1,617 @@
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 0000000000..232d3ffae4
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++"""
++Debug the test issue.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db import connection
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++
++class Note(models.Model):
++    note = models.CharField(max_length=100)
++    misc = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Set up database
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Note)
++
++# Create test objects
++notes = [
++    Note.objects.create(note=str(i), misc=str(i))
++    for i in range(5)
++]
++
++print("Before bulk_update:")
++for note in notes:
++    print(f"ID: {note.id}, Note: {note.note}, Misc: {note.misc}")
++
++# Update objects
++for note in notes:
++    note.note = 'new-note-%s' % note.id
++    note.misc = 'new-misc-%s' % note.id
++
++print("\nAfter modification (before bulk_update):")
++for note in notes:
++    print(f"ID: {note.id}, Note: {note.note}, Misc: {note.misc}")
++
++# Perform bulk update
++result = Note.objects.bulk_update(notes, ['note', 'misc'])
++print(f"\nbulk_update() returned: {result}")
++
++# Check what's in the database
++print("\nAfter bulk_update (from database):")
++updated_notes = Note.objects.all()
++for note in updated_notes:
++    print(f"ID: {note.id}, Note: {note.note}, Misc: {note.misc}")
++
++print("\nChecking assertions:")
++print("All notes start with 'new-note-':", all(note.note.startswith('new-note-') for note in updated_notes))
++print("All misc start with 'new-misc-':", all(note.misc.startswith('new-misc-') for note in updated_notes))
+\ No newline at end of file
+diff --git a/debug_test2.py b/debug_test2.py
+new file mode 100644
+index 0000000000..ad1879f19e
+--- /dev/null
++++ b/debug_test2.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++"""
++Debug the test issue more thoroughly.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db import connection
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++
++class Note(models.Model):
++    note = models.CharField(max_length=100)
++    misc = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Set up database
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Note)
++
++# Create test objects
++notes = [
++    Note.objects.create(note=str(i), misc=str(i))
++    for i in range(5)
++]
++
++print("Before bulk_update:")
++for note in Note.objects.all():
++    print(f"ID: {note.id}, Note: {note.note}, Misc: {note.misc}")
++
++# Update objects
++for note in notes:
++    note.note = 'new-note-%s' % note.id
++    note.misc = 'new-misc-%s' % note.id
++
++print("\nAfter modification (before bulk_update):")
++for note in notes:
++    print(f"ID: {note.id}, Note: {note.note}, Misc: {note.misc}")
++
++# Perform bulk update
++result = Note.objects.bulk_update(notes, ['note', 'misc'])
++print(f"\nbulk_update() returned: {result}")
++
++# Check what's in the database
++print("\nAfter bulk_update (from database):")
++updated_notes = list(Note.objects.all())
++for note in updated_notes:
++    print(f"ID: {note.id}, Note: {note.note}, Misc: {note.misc}")
++
++print("\nChecking assertions:")
++print("All notes start with 'new-note-':", all(note.note.startswith('new-note-') for note in updated_notes))
++print("All misc start with 'new-misc-':", all(note.misc.startswith('new-misc-') for note in updated_notes))
++
++print("\nIndividual checks:")
++for i, note in enumerate(updated_notes):
++    print(f"Note {i}: starts with 'new-note-': {note.note.startswith('new-note-')}")
++    print(f"Note {i}: starts with 'new-misc-': {note.misc.startswith('new-misc-')}")
+\ No newline at end of file
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 387deca527..5d0c8b1c39 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -541,7 +541,7 @@ class QuerySet:
+         if any(f.primary_key for f in fields):
+             raise ValueError('bulk_update() cannot be used with primary key fields.')
+         if not objs:
+-            return
++            return 0
+         # PK is used twice in the resulting update query, once in the filter
+         # and once in the WHEN. Each field will also have one CAST.
+         max_batch_size = connections[self.db].ops.bulk_batch_size(['pk', 'pk'] + fields, objs)
+@@ -563,9 +563,11 @@ class QuerySet:
+                     case_statement = Cast(case_statement, output_field=field)
+                 update_kwargs[field.attname] = case_statement
+             updates.append(([obj.pk for obj in batch_objs], update_kwargs))
++        total_rows = 0
+         with transaction.atomic(using=self.db, savepoint=False):
+             for pks, update_kwargs in updates:
+-                self.filter(pk__in=pks).update(**update_kwargs)
++                total_rows += self.filter(pk__in=pks).update(**update_kwargs)
++        return total_rows
+     bulk_update.alters_data = True
+ 
+     def get_or_create(self, defaults=None, **kwargs):
+diff --git a/final_comprehensive_test.py b/final_comprehensive_test.py
+new file mode 100644
+index 0000000000..242d8484e9
+--- /dev/null
++++ b/final_comprehensive_test.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python3
++"""
++Final comprehensive test to verify the bulk_update() return value fix.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db import connection
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++
++# Create a test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField(default=0)
++    active = models.BooleanField(default=True)
++    
++    class Meta:
++        app_label = 'test'
++
++def run_comprehensive_test():
++    """Run comprehensive tests for bulk_update() return value."""
++    
++    # Create database table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    print("=== Comprehensive bulk_update() Return Value Test ===")
++    print()
++    
++    # Test 1: Empty objects list
++    print("1. Testing empty objects list...")
++    result = TestModel.objects.bulk_update([], ['name'])
++    assert result == 0, f"Expected 0, got {result}"
++    assert isinstance(result, int), f"Expected int, got {type(result)}"
++    print("   ✓ Empty list returns 0 (int)")
++    
++    # Test 2: Single object
++    print("2. Testing single object...")
++    obj = TestModel.objects.create(name='single', value=1)
++    result = TestModel.objects.bulk_update([obj], ['name'])
++    assert result == 1, f"Expected 1, got {result}"
++    print("   ✓ Single object returns 1")
++    
++    # Test 3: Multiple objects
++    print("3. Testing multiple objects...")
++    objs = [TestModel.objects.create(name=f'obj{i}', value=i) for i in range(10)]
++    result = TestModel.objects.bulk_update(objs, ['name'])
++    assert result == 10, f"Expected 10, got {result}"
++    print("   ✓ 10 objects return 10")
++    
++    # Test 4: Multiple fields
++    print("4. Testing multiple fields...")
++    for obj in objs:
++        obj.name = f'updated-{obj.id}'
++        obj.value = obj.value * 2
++    result = TestModel.objects.bulk_update(objs, ['name', 'value'])
++    assert result == 10, f"Expected 10, got {result}"
++    print("   ✓ Multiple fields return correct count")
++    
++    # Test 5: Boolean field
++    print("5. Testing boolean field...")
++    for obj in objs:
++        obj.active = not obj.active
++    result = TestModel.objects.bulk_update(objs, ['active'])
++    assert result == 10, f"Expected 10, got {result}"
++    print("   ✓ Boolean field returns correct count")
++    
++    # Test 6: Compare with update() method
++    print("6. Comparing with update() method...")
++    update_result = TestModel.objects.all().update(value=999)
++    objs = list(TestModel.objects.all())
++    for obj in objs:
++        obj.value = 888
++    bulk_update_result = TestModel.objects.bulk_update(objs, ['value'])
++    assert update_result == bulk_update_result, f"update()={update_result}, bulk_update()={bulk_update_result}"
++    print(f"   ✓ Both methods return same count: {update_result}")
++    
++    # Test 7: Batch processing (large number of objects)
++    print("7. Testing batch processing...")
++    # Create more objects to test batching
++    many_objs = [TestModel.objects.create(name=f'many{i}', value=i) for i in range(50)]
++    for obj in many_objs:
++        obj.value = obj.value + 100
++    result = TestModel.objects.bulk_update(many_objs, ['value'])
++    assert result == 50, f"Expected 50, got {result}"
++    print("   ✓ 50 objects processed correctly with batching")
++    
++    print()
++    print("=== All tests passed! ===")
++    print("✓ bulk_update() now returns the number of rows matched (int)")
++    print("✓ Return value is consistent with update() method")
++    print("✓ Works for empty lists, single objects, and multiple objects")
++    print("✓ Works with multiple fields and different field types")
++    print("✓ Handles batch processing correctly")
++
++if __name__ == '__main__':
++    run_comprehensive_test()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..16b1e588de
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the bulk_update() return value issue.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core.management import execute_from_command_line
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_bulk_update_return_value():
++    """Test that bulk_update() returns the number of rows matched like update() does."""
++    
++    # Create some test objects
++    TestModel.objects.bulk_create([
++        TestModel(name='obj1', value=1),
++        TestModel(name='obj2', value=2),
++        TestModel(name='obj3', value=3),
++    ])
++    
++    # Test update() method - should return number of rows matched
++    update_result = TestModel.objects.all().update(value=100)
++    print(f"update() returned: {update_result}")
++    
++    # Get objects for bulk_update
++    objs = list(TestModel.objects.all())
++    
++    # Test bulk_update() method - currently returns None, should return number of rows matched
++    bulk_update_result = TestModel.objects.bulk_update(objs, ['value'])
++    print(f"bulk_update() returned: {bulk_update_result}")
++    
++    # Check if both return the same type of value
++    print(f"update() returns int: {isinstance(update_result, int)}")
++    print(f"bulk_update() returns int: {isinstance(bulk_update_result, int)}")
++
++if __name__ == '__main__':
++    # Create database tables using Django's migration system
++    from django.db import connection
++    from django.core.management.color import no_style
++    from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++    
++    # Create table directly
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    test_bulk_update_return_value()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..d96dd63f87
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++"""
++Script to test edge cases for bulk_update() return value.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db import connection
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_edge_cases():
++    """Test edge cases for bulk_update() return value."""
++    
++    # Create database table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Test 1: Empty objects list
++    print("Test 1: Empty objects list")
++    empty_result = TestModel.objects.bulk_update([], ['value'])
++    print(f"bulk_update([], ['value']) returned: {empty_result}")
++    print(f"Is 0: {empty_result == 0}")
++    print(f"Is int: {isinstance(empty_result, int)}")
++    print()
++    
++    # Test 2: Single object
++    print("Test 2: Single object")
++    obj = TestModel.objects.create(name='single', value=1)
++    single_result = TestModel.objects.bulk_update([obj], ['value'])
++    print(f"bulk_update([single_obj], ['value']) returned: {single_result}")
++    print(f"Is 1: {single_result == 1}")
++    print()
++    
++    # Test 3: Multiple objects
++    print("Test 3: Multiple objects")
++    objs = [
++        TestModel.objects.create(name=f'multi{i}', value=i)
++        for i in range(5)
++    ]
++    multi_result = TestModel.objects.bulk_update(objs, ['value'])
++    print(f"bulk_update([5_objects], ['value']) returned: {multi_result}")
++    print(f"Is 5: {multi_result == 5}")
++    print()
++    
++    # Test 4: Compare with update()
++    print("Test 4: Compare with update()")
++    update_result = TestModel.objects.all().update(value=100)
++    bulk_update_result = TestModel.objects.bulk_update(list(TestModel.objects.all()), ['value'])
++    print(f"update() returned: {update_result}")
++    print(f"bulk_update() returned: {bulk_update_result}")
++    print(f"Both equal: {update_result == bulk_update_result}")
++    print(f"Both integers: {isinstance(update_result, int) and isinstance(bulk_update_result, int)}")
++
++if __name__ == '__main__':
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_return_value_fix.py b/test_return_value_fix.py
+new file mode 100644
+index 0000000000..27d8c7a025
+--- /dev/null
++++ b/test_return_value_fix.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python3
++"""
++Test to verify that bulk_update() return value fix doesn't break existing functionality.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db import connection
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++
++# Create test models similar to those in the Django test suite
++class Note(models.Model):
++    note = models.CharField(max_length=100)
++    misc = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class TestBulkUpdateReturnValue:
++    """Test that bulk_update() return value fix works correctly."""
++    
++    def setup_method(self):
++        """Set up test database."""
++        with connection.schema_editor() as schema_editor:
++            schema_editor.create_model(Note)
++    
++    def test_bulk_update_return_value(self):
++        """Test that bulk_update() returns the number of rows matched."""
++        # Create test objects
++        notes = [
++            Note.objects.create(note=str(i), misc=str(i))
++            for i in range(10)
++        ]
++        
++        # Test that bulk_update returns the correct count
++        for note in notes:
++            note.note = 'test-%s' % note.id
++        
++        result = Note.objects.bulk_update(notes, ['note'])
++        assert result == 10, f"Expected 10, got {result}"
++        assert isinstance(result, int), f"Expected int, got {type(result)}"
++        
++        # Verify the updates actually happened
++        updated_notes = Note.objects.all()
++        assert all(note.note.startswith('test-') for note in updated_notes)
++    
++    def test_empty_objects(self):
++        """Test that bulk_update() returns 0 for empty objects list."""
++        result = Note.objects.bulk_update([], ['note'])
++        assert result == 0, f"Expected 0, got {result}"
++        assert isinstance(result, int), f"Expected int, got {type(result)}"
++    
++    def test_multiple_fields(self):
++        """Test that bulk_update() works with multiple fields."""
++        notes = [
++            Note.objects.create(note=str(i), misc=str(i))
++            for i in range(5)
++        ]
++        
++        for note in notes:
++            note.note = 'new-note-%s' % note.id
++            note.misc = 'new-misc-%s' % note.id
++        
++        result = Note.objects.bulk_update(notes, ['note', 'misc'])
++        assert result == 5, f"Expected 5, got {result}"
++        
++        # Verify both fields were updated - refresh from database
++        updated_notes = list(Note.objects.all())
++        assert all(note.note.startswith('new-note-') for note in updated_notes)
++        assert all(note.misc.startswith('new-misc-') for note in updated_notes)
++
++if __name__ == '__main__':
++    test_class = TestBulkUpdateReturnValue()
++    test_class.setup_method()
++    
++    print("Running test_bulk_update_return_value...")
++    test_class.test_bulk_update_return_value()
++    print("✓ test_bulk_update_return_value passed")
++    
++    print("Running test_empty_objects...")
++    test_class.test_empty_objects()
++    print("✓ test_empty_objects passed")
++    
++    # Reset database for the next test
++    with connection.schema_editor() as schema_editor:
++        schema_editor.delete_model(Note)
++        schema_editor.create_model(Note)
++    
++    print("Running test_multiple_fields...")
++    test_class.test_multiple_fields()
++    print("✓ test_multiple_fields passed")
++    
++    print("\nAll tests passed! The bulk_update() return value fix is working correctly.")
+\ No newline at end of file

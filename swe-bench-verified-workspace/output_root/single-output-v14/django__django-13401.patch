@@ -1,0 +1,335 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index 28374272f4..be27a7bdc9 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -516,17 +516,31 @@ class Field(RegisterLookupMixin):
+     def __eq__(self, other):
+         # Needed for @total_ordering
+         if isinstance(other, Field):
+-            return self.creation_counter == other.creation_counter
++            # Compare both creation_counter and model to avoid equality
++            # between fields from different models that share the same creation_counter
++            return (self.creation_counter == other.creation_counter and
++                    getattr(self, 'model', None) == getattr(other, 'model', None))
+         return NotImplemented
+ 
+     def __lt__(self, other):
+         # This is needed because bisect does not take a comparison function.
+         if isinstance(other, Field):
+-            return self.creation_counter < other.creation_counter
++            # First compare by creation_counter to maintain existing ordering
++            if self.creation_counter != other.creation_counter:
++                return self.creation_counter < other.creation_counter
++            # If creation_counters are equal, compare by model to ensure stable ordering
++            self_model = getattr(self, 'model', None)
++            other_model = getattr(other, 'model', None)
++            if self_model is not None and other_model is not None:
++                return str(self_model) < str(other_model)
++            # Fallback if models are not set or one is None
++            return id(self) < id(other)
+         return NotImplemented
+ 
+     def __hash__(self):
+-        return hash(self.creation_counter)
++        # Include model in the hash to avoid hash collisions between fields
++        # from different models that share the same creation_counter
++        return hash((self.creation_counter, getattr(self, 'model', None)))
+ 
+     def __deepcopy__(self, memodict):
+         # We don't have to deepcopy very much here, since most things are not
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..9419bc764a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create the test models as described in the issue
++class A(models.Model):
++    myfield = models.IntegerField()
++    
++    class Meta:
++        abstract = True
++
++class B(A):
++    class Meta:
++        app_label = 'test'
++
++class C(A):
++    class Meta:
++        app_label = 'test'
++
++# Test the issue
++print("Testing field equality issue...")
++
++# Get the fields
++field_b = B._meta.get_field('myfield')
++field_c = C._meta.get_field('myfield')
++
++print(f"Field B: {field_b}")
++print(f"Field C: {field_c}")
++print(f"Field B model: {field_b.model}")
++print(f"Field C model: {field_c.model}")
++print(f"Field B creation_counter: {field_b.creation_counter}")
++print(f"Field C creation_counter: {field_c.creation_counter}")
++print(f"Field B == Field C: {field_b == field_c}")
++print(f"len(set([field_b, field_c])): {len({field_b, field_c})}")
++
++# Test hashing
++print(f"hash(field_b): {hash(field_b)}")
++print(f"hash(field_c): {hash(field_c)}")
++
++# Test ordering
++print(f"field_b < field_c: {field_b < field_c}")
++print(f"field_c < field_b: {field_c < field_b}")
+\ No newline at end of file
+diff --git a/test_basic_functionality.py b/test_basic_functionality.py
+new file mode 100644
+index 0000000000..0eb8e8df23
+--- /dev/null
++++ b/test_basic_functionality.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Test basic field functionality
++class TestModel(models.Model):
++    char_field = models.CharField(max_length=100)
++    int_field = models.IntegerField()
++    bool_field = models.BooleanField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Test that fields work correctly
++fields = TestModel._meta.fields
++print(f"Number of fields: {len(fields)}")
++for field in fields:
++    print(f"Field: {field.name}, Type: {type(field).__name__}")
++
++# Test that we can create instances
++instance = TestModel(char_field="test", int_field=42, bool_field=True)
++print(f"Instance created: {instance}")
++
++# Test field comparison within same model
++char_field1 = TestModel._meta.get_field('char_field')
++char_field2 = TestModel._meta.get_field('char_field')
++int_field = TestModel._meta.get_field('int_field')
++
++print(f"Same field equality: {char_field1 == char_field2}")
++print(f"Different field equality: {char_field1 == int_field}")
++
++print("All basic functionality tests passed!")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..f482a482e7
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Test edge case: Fields without model (should not crash)
++print("Testing fields without model association...")
++field1 = models.IntegerField()
++field2 = models.IntegerField()
++
++# These should work without crashing
++print(f"Field1 hash: {hash(field1)}")
++print(f"Field2 hash: {hash(field2)}")
++print(f"Field1 == Field2: {field1 == field2}")
++print(f"Field1 < Field2: {field1 < field2}")
++
++# Test edge case: Comparing with non-Field objects
++print("\nTesting comparison with non-Field objects...")
++result = field1 == "not a field"
++print(f"Field == string: {result} (should be NotImplemented)")
++
++# Test edge case: One field has model, other doesn't
++print("\nTesting mixed model/no-model comparison...")
++class TestModel(models.Model):
++    field = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++field_with_model = TestModel._meta.get_field('field')
++field_no_model = models.IntegerField()
++
++print(f"Field with model == field without model: {field_with_model == field_no_model}")
++print(f"Field with model hash: {hash(field_with_model)}")
++print(f"Field without model hash: {hash(field_no_model)}")
++
++print("All edge case tests passed!")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..067bb01a27
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Test 1: Original issue - fields from different models should not be equal
++class A(models.Model):
++    myfield = models.IntegerField()
++    
++    class Meta:
++        abstract = True
++
++class B(A):
++    class Meta:
++        app_label = 'test'
++
++class C(A):
++    class Meta:
++        app_label = 'test'
++
++field_b = B._meta.get_field('myfield')
++field_c = C._meta.get_field('myfield')
++
++print("Test 1: Fields from different models")
++print(f"Field B == Field C: {field_b == field_c} (should be False)")
++print(f"len(set([field_b, field_c])): {len({field_b, field_c})} (should be 2)")
++print()
++
++# Test 2: Fields from same model should still be equal if they're the same field
++field_b2 = B._meta.get_field('myfield')
++print("Test 2: Same field from same model")
++print(f"Field B == Field B2: {field_b == field_b2} (should be True)")
++print(f"hash(Field B) == hash(Field B2): {hash(field_b) == hash(field_b2)} (should be True)")
++print()
++
++# Test 3: Test ordering stability
++class D(models.Model):
++    field1 = models.IntegerField()
++    field2 = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++field_d1 = D._meta.get_field('field1')
++field_d2 = D._meta.get_field('field2')
++
++print("Test 3: Fields from same model with different creation counters")
++print(f"Field D1 creation_counter: {field_d1.creation_counter}")
++print(f"Field D2 creation_counter: {field_d2.creation_counter}")
++print(f"Field D1 < Field D2: {field_d1 < field_d2} (should be True if creation_counter D1 < D2)")
++print()
++
++# Test 4: Fields without model association (should still work)
++field_no_model = models.IntegerField()
++field_no_model2 = models.IntegerField()
++print("Test 4: Fields without model association")
++print(f"Field no model == Field no model2: {field_no_model == field_no_model2} (should be False if different creation counters)")
++print(f"hash(Field no model): {hash(field_no_model)}")
++print(f"hash(Field no model2): {hash(field_no_model2)}")
+\ No newline at end of file

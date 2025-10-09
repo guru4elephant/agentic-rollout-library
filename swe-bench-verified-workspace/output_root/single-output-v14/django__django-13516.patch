@@ -1,0 +1,202 @@
+diff --git a/django/core/management/base.py b/django/core/management/base.py
+index e6cbf8c64f..14c0355dd8 100644
+--- a/django/core/management/base.py
++++ b/django/core/management/base.py
+@@ -150,6 +150,10 @@ class OutputWrapper(TextIOBase):
+         style_func = style_func or self.style_func
+         self._out.write(style_func(msg))
+ 
++    def flush(self):
++        if hasattr(self._out, 'flush'):
++            self._out.flush()
++
+ 
+ class BaseCommand:
+     """
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..8e0339368e
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the flush() issue with Django management commands.
++This simulates what happens during a migrate command.
++"""
++
++import sys
++from io import TextIOBase
++
++class MockOutputWrapper(TextIOBase):
++    """
++    Simplified version of Django's OutputWrapper to demonstrate the issue
++    """
++    def __init__(self, out, ending='\n'):
++        self._out = out
++        self.ending = ending
++    
++    def __getattr__(self, name):
++        return getattr(self._out, name)
++    
++    def write(self, msg='', ending=None):
++        ending = self.ending if ending is None else ending
++        if ending and not msg.endswith(ending):
++            msg += ending
++        self._out.write(msg)
++    
++    # Let's test what happens if we explicitly define flush
++    def flush(self):
++        print(f"DEBUG: OutputWrapper.flush() called, delegating to {self._out}")
++        if hasattr(self._out, 'flush'):
++            return self._out.flush()
++        else:
++            print(f"DEBUG: {self._out} has no flush method")
++
++def simulate_migrate_command():
++    print("=== Simulating migrate command behavior ===")
++    
++    # Create wrapped stdout/stderr like Django does
++    stdout_wrapper = MockOutputWrapper(sys.stdout)
++    stderr_wrapper = MockOutputWrapper(sys.stderr)
++    
++    print("Operations to perform:")
++    print("  Apply all migrations: myapp")
++    print("Running migrations:")
++    
++    # This simulates what happens during a long migration
++    print("  Applying myapp.0002_auto_20200817_1030...", end="")
++    
++    # Try to flush to see the output immediately
++    try:
++        stdout_wrapper.flush()
++        stderr_wrapper.flush()
++        print(" (flush() called)")
++    except Exception as e:
++        print(f" (flush() failed: {e})")
++    
++    # Simulate long-running work
++    import time
++    time.sleep(2)
++    
++    print(" OK")
++
++if __name__ == "__main__":
++    simulate_migrate_command()
+\ No newline at end of file
+diff --git a/test_flush_issue.py b/test_flush_issue.py
+new file mode 100644
+index 0000000000..2f5a9c7077
+--- /dev/null
++++ b/test_flush_issue.py
+@@ -0,0 +1,42 @@
++#!/usr/bin/env python3
++"""
++Test to understand the flush() issue with OutputWrapper
++"""
++
++import sys
++from django.core.management.base import OutputWrapper
++
++def test_output_wrapper_flush():
++    print("=== Testing OutputWrapper flush behavior ===")
++    
++    # Create OutputWrapper instances like Django does
++    stdout_wrapper = OutputWrapper(sys.stdout)
++    stderr_wrapper = OutputWrapper(sys.stderr)
++    
++    # Check if flush method exists
++    print(f"Has stdout_wrapper.flush: {hasattr(stdout_wrapper, 'flush')}")
++    print(f"Has stderr_wrapper.flush: {hasattr(stderr_wrapper, 'flush')}")
++    
++    # Check what type of objects we're wrapping
++    print(f"stdout_wrapper._out: {stdout_wrapper._out}")
++    print(f"stderr_wrapper._out: {stderr_wrapper._out}")
++    
++    # Check if underlying objects have flush
++    print(f"Has sys.stdout.flush: {hasattr(sys.stdout, 'flush')}")
++    print(f"Has sys.stderr.flush: {hasattr(sys.stderr, 'flush')}")
++    
++    # Try to call flush
++    try:
++        stdout_wrapper.flush()
++        print("stdout_wrapper.flush() succeeded")
++    except Exception as e:
++        print(f"stdout_wrapper.flush() failed: {e}")
++    
++    try:
++        stderr_wrapper.flush()
++        print("stderr_wrapper.flush() succeeded")
++    except Exception as e:
++        print(f"stderr_wrapper.flush() failed: {e}")
++
++if __name__ == "__main__":
++    test_output_wrapper_flush()
+\ No newline at end of file
+diff --git a/test_migrate_simulation.py b/test_migrate_simulation.py
+new file mode 100644
+index 0000000000..20b68cfdb1
+--- /dev/null
++++ b/test_migrate_simulation.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++"""
++Test to simulate the exact behavior of migrate command with OutputWrapper
++"""
++
++import sys
++import time
++from django.core.management.base import OutputWrapper
++
++def simulate_migrate_with_buffering():
++    print("=== Simulating migrate command with potential buffering issues ===")
++    
++    # Create OutputWrapper instances like Django does
++    stdout_wrapper = OutputWrapper(sys.stdout)
++    stderr_wrapper = OutputWrapper(sys.stderr)
++    
++    # Simulate the exact migrate command output pattern
++    stdout_wrapper.write('Operations to perform:', style_func=lambda x: x)
++    stdout_wrapper.write('  Apply all migrations: myapp')
++    stdout_wrapper.write('Running migrations:')
++    
++    # This is the critical part - writing without newline and then flushing
++    stdout_wrapper.write('  Applying myapp.0002_auto_20200817_1030...', ending="")
++    
++    # Try to flush like the migrate command does
++    print("\nAbout to call flush()...")
++    try:
++        stdout_wrapper.flush()
++        stderr_wrapper.flush()
++        print("Flush completed")
++    except Exception as e:
++        print(f"Flush failed: {e}")
++    
++    # Simulate long-running migration work
++    print("Simulating 2 seconds of migration work...")
++    time.sleep(2)
++    
++    stdout_wrapper.write(' OK')
++    print("Migration completed")
++
++def test_buffered_io():
++    print("\n=== Testing with potentially buffered IO ===")
++    
++    # Try with a different type of output that might have buffering
++    from io import StringIO
++    buffered_output = StringIO()
++    buffered_wrapper = OutputWrapper(buffered_output)
++    
++    buffered_wrapper.write('Testing...', ending="")
++    print(f"Before flush: '{buffered_output.getvalue()}'")
++    
++    try:
++        buffered_wrapper.flush()
++        print(f"After flush: '{buffered_output.getvalue()}'")
++    except Exception as e:
++        print(f"Flush failed: {e}")
++
++if __name__ == "__main__":
++    simulate_migrate_with_buffering()
++    test_buffered_io()
+\ No newline at end of file

@@ -1,0 +1,819 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..04dc918998
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,140 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Manager
++from django.core import serializers
++
++# Test 1: Regular M2M relationship without custom manager
++class RegularTag(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++
++class RegularTest(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(RegularTag, blank=True)
++
++# Test 2: M2M relationship with custom manager using select_related (the original issue)
++class TestTagManager(Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        qs = qs.select_related("master")  # follow master when retrieving object by default
++        return qs
++
++class TestTagMaster(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++
++class TestTag(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    objects = TestTagManager()
++    name = models.CharField(max_length=120)
++    master = models.ForeignKey(TestTagMaster, on_delete=models.SET_NULL, null=True)
++
++class Test(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(TestTag, blank=True)
++
++# Test 3: Prefetched objects
++class PrefetchTag(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++
++class PrefetchModel(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(PrefetchTag, blank=True)
++
++# Create the database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(RegularTag)
++    schema_editor.create_model(RegularTest)
++    schema_editor.create_model(TestTagMaster)
++    schema_editor.create_model(TestTag)
++    schema_editor.create_model(Test)
++    schema_editor.create_model(PrefetchTag)
++    schema_editor.create_model(PrefetchModel)
++
++print("=== Test 1: Regular M2M relationship without custom manager ===")
++regular_tag = RegularTag.objects.create(name="regular_tag")
++regular_test = RegularTest.objects.create(name="regular_test")
++regular_test.tags.add(regular_tag)
++regular_test.save()
++
++try:
++    result = serializers.serialize("json", [regular_test])
++    print("✓ Regular M2M serialization successful!")
++    print(result)
++except Exception as e:
++    print(f"✗ Regular M2M serialization failed: {e}")
++
++print("\n=== Test 2: M2M relationship with custom manager using select_related ===")
++tag_master = TestTagMaster.objects.create(name="master")
++tag = TestTag.objects.create(name="tag", master=tag_master)
++test = Test.objects.create(name="test")
++test.tags.add(tag)
++test.save()
++
++try:
++    result = serializers.serialize("json", [test])
++    print("✓ Custom manager M2M serialization successful!")
++    print(result)
++except Exception as e:
++    print(f"✗ Custom manager M2M serialization failed: {e}")
++
++print("\n=== Test 3: Prefetched objects ===")
++prefetch_tag = PrefetchTag.objects.create(name="prefetch_tag")
++prefetch_model = PrefetchModel.objects.create(name="prefetch_model")
++prefetch_model.tags.add(prefetch_tag)
++prefetch_model.save()
++
++# Prefetch the tags
++prefetch_model = PrefetchModel.objects.prefetch_related('tags').get(pk=prefetch_model.pk)
++
++try:
++    result = serializers.serialize("json", [prefetch_model])
++    print("✓ Prefetched M2M serialization successful!")
++    print(result)
++except Exception as e:
++    print(f"✗ Prefetched M2M serialization failed: {e}")
++
++print("\n=== All tests completed ===")
+\ No newline at end of file
+diff --git a/django/core/serializers/python.py b/django/core/serializers/python.py
+index 36048601af..1597ad9dee 100644
+--- a/django/core/serializers/python.py
++++ b/django/core/serializers/python.py
+@@ -79,7 +79,18 @@ class Serializer(base.Serializer):
+                     return self._value_from_field(value, value._meta.pk)
+ 
+                 def queryset_iterator(obj, field):
+-                    return getattr(obj, field.name).only("pk").iterator()
++                    # Get the actual related objects through the through model
++                    through_model = field.remote_field.through
++                    
++                    # Get the primary keys of the related objects
++                    through_objects = through_model.objects.filter(**{
++                        field.m2m_field_name(): obj.pk
++                    })
++                    pks = through_objects.values_list(field.m2m_reverse_field_name(), flat=True)
++                    
++                    # Return a queryset with just the primary keys
++                    # Use _base_manager instead of _default_manager to avoid custom managers
++                    return field.remote_field.model._base_manager.filter(pk__in=pks).only("pk").iterator()
+ 
+             m2m_iter = getattr(obj, "_prefetched_objects_cache", {}).get(
+                 field.name,
+diff --git a/edge_case_test.py b/edge_case_test.py
+new file mode 100644
+index 0000000000..f8b043680e
+--- /dev/null
++++ b/edge_case_test.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Manager
++from django.core import serializers
++
++# Test: Custom manager without select_related (should work normally)
++class SimpleTagManager(Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        # No select_related here, should work normally
++        return qs
++
++class SimpleTag(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    objects = SimpleTagManager()
++    name = models.CharField(max_length=120)
++
++class SimpleTest(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(SimpleTag, blank=True)
++
++# Create the database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(SimpleTag)
++    schema_editor.create_model(SimpleTest)
++
++print("=== Test: Custom manager without select_related ===")
++simple_tag = SimpleTag.objects.create(name="simple_tag")
++simple_test = SimpleTest.objects.create(name="simple_test")
++simple_test.tags.add(simple_tag)
++simple_test.save()
++
++try:
++    result = serializers.serialize("json", [simple_test])
++    print("✓ Custom manager without select_related serialization successful!")
++    print(result)
++except Exception as e:
++    print(f"✗ Custom manager without select_related serialization failed: {e}")
++
++print("\n=== Test completed ===")
+\ No newline at end of file
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..2e88e3ba55
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Manager
++from django.core import serializers
++
++# Define the models exactly as described in the GitHub issue
++class TestTagManager(Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        qs = qs.select_related("master")  # follow master when retrieving object by default
++        return qs
++
++class TestTagMaster(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++
++class TestTag(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    objects = TestTagManager()
++    name = models.CharField(max_length=120)
++    master = models.ForeignKey(TestTagMaster, on_delete=models.SET_NULL, null=True)
++
++class Test(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(TestTag, blank=True)
++
++# Create the database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestTagMaster)
++    schema_editor.create_model(TestTag)
++    schema_editor.create_model(Test)
++
++# Reproduce the exact scenario from the GitHub issue
++tag_master = TestTagMaster.objects.create(name="master")
++tag = TestTag.objects.create(name="tag", master=tag_master)
++test = Test.objects.create(name="test")
++test.tags.add(tag)
++test.save()
++
++# Test serialization - this should now work
++print("Attempting to serialize...")
++try:
++    result = serializers.serialize("json", [test])
++    print("Serialization successful!")
++    print(result)
++except Exception as e:
++    print(f"Error occurred: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..22cc2a1980
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'test_app',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Manager
++from django.core import serializers
++
++# Define the models as described in the issue
++class TestTagManager(Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        qs = qs.select_related("master")  # follow master when retrieving object by default
++        return qs
++
++class TestTagMaster(models.Model):
++    class Meta:
++        app_label = 'test_app'
++    
++    name = models.CharField(max_length=120)
++
++class TestTag(models.Model):
++    class Meta:
++        app_label = 'test_app'
++    
++    # default = Manager() # solution is to define custom default manager, which is used by RelatedManager
++    objects = TestTagManager()
++    name = models.CharField(max_length=120)
++    master = models.ForeignKey(TestTagMaster, on_delete=models.SET_NULL, null=True)
++
++class Test(models.Model):
++    class Meta:
++        app_label = 'test_app'
++    
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(TestTag, blank=True)
++
++# Create the database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestTagMaster)
++    schema_editor.create_model(TestTag)
++    schema_editor.create_model(Test)
++
++# Reproduce the issue
++try:
++    tag_master = TestTagMaster.objects.create(name="master")
++    tag = TestTag.objects.create(name="tag", master=tag_master)
++    test = Test.objects.create(name="test")
++    test.tags.add(tag)
++    test.save()
++    
++    print("Attempting to serialize...")
++    result = serializers.serialize("json", [test])
++    print("Serialization successful!")
++    print(result)
++except Exception as e:
++    print(f"Error occurred: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/serialization_test.py b/serialization_test.py
+new file mode 100644
+index 0000000000..d01d0327a9
+--- /dev/null
++++ b/serialization_test.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Manager
++from django.core import serializers
++
++# Define the models as described in the issue
++class TestTagManager(Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        qs = qs.select_related("master")  # follow master when retrieving object by default
++        return qs
++
++class TestTagMaster(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++
++class TestTag(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    objects = TestTagManager()
++    name = models.CharField(max_length=120)
++    master = models.ForeignKey(TestTagMaster, on_delete=models.SET_NULL, null=True)
++
++class MyTest(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(TestTag, blank=True)
++
++# Create the database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestTagMaster)
++    schema_editor.create_model(TestTag)
++    schema_editor.create_model(MyTest)
++
++# Create test data as described in the issue
++tag_master = TestTagMaster.objects.create(name="master")
++tag = TestTag.objects.create(name="tag", master=tag_master)
++test_instance = MyTest.objects.create(name="test")
++test_instance.tags.add(tag)
++test_instance.save()
++
++# Test serialization - this should reproduce the issue
++print("Attempting to serialize...")
++try:
++    result = serializers.serialize("json", [test_instance])
++    print("Serialization successful!")
++    print(result)
++except Exception as e:
++    print(f"Error occurred: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/simple_comprehensive_test.py b/simple_comprehensive_test.py
+new file mode 100644
+index 0000000000..191e02b05b
+--- /dev/null
++++ b/simple_comprehensive_test.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Manager
++from django.core import serializers
++
++# Test 1: Regular M2M relationship without custom manager
++class RegularTag(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++
++class RegularTest(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(RegularTag, blank=True)
++
++# Test 2: M2M relationship with custom manager using select_related (the original issue)
++class TestTagManager(Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        qs = qs.select_related("master")  # follow master when retrieving object by default
++        return qs
++
++class TestTagMaster(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++
++class TestTag(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    objects = TestTagManager()
++    name = models.CharField(max_length=120)
++    master = models.ForeignKey(TestTagMaster, on_delete=models.SET_NULL, null=True)
++
++class TestModel(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(TestTag, blank=True)
++
++# Create the database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(RegularTag)
++    schema_editor.create_model(RegularTest)
++    schema_editor.create_model(TestTagMaster)
++    schema_editor.create_model(TestTag)
++    schema_editor.create_model(TestModel)
++
++print("=== Test 1: Regular M2M relationship without custom manager ===")
++regular_tag = RegularTag.objects.create(name="regular_tag")
++regular_test = RegularTest.objects.create(name="regular_test")
++regular_test.tags.add(regular_tag)
++regular_test.save()
++
++try:
++    result = serializers.serialize("json", [regular_test])
++    print("✓ Regular M2M serialization successful!")
++    print(result)
++except Exception as e:
++    print(f"✗ Regular M2M serialization failed: {e}")
++
++print("\n=== Test 2: M2M relationship with custom manager using select_related ===")
++tag_master = TestTagMaster.objects.create(name="master")
++tag = TestTag.objects.create(name="tag", master=tag_master)
++test_model = TestModel.objects.create(name="test_model")
++test_model.tags.add(tag)
++test_model.save()
++
++try:
++    result = serializers.serialize("json", [test_model])
++    print("✓ Custom manager M2M serialization successful!")
++    print(result)
++except Exception as e:
++    print(f"✗ Custom manager M2M serialization failed: {e}")
++
++print("\n=== All tests completed ===")
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..998999e521
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Manager
++from django.core import serializers
++
++# Define the models as described in the issue
++class TestTagManager(Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        qs = qs.select_related("master")  # follow master when retrieving object by default
++        return qs
++
++class TestTagMaster(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++
++class TestTag(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    objects = TestTagManager()
++    name = models.CharField(max_length=120)
++    master = models.ForeignKey(TestTagMaster, on_delete=models.SET_NULL, null=True)
++
++class TestModel(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(TestTag, blank=True)
++
++# Create the database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestTagMaster)
++    schema_editor.create_model(TestTag)
++    schema_editor.create_model(TestModel)
++
++# Create test data
++tag_master = TestTagMaster.objects.create(name="master")
++tag = TestTag.objects.create(name="tag", master=tag_master)
++test_instance = TestModel.objects.create(name="test_instance")  # Changed from 'test' to avoid conflict
++
++# Test the M2M relationship directly
++print("Testing M2M relationship...")
++test_instance.tags.add(tag)
++test_instance.save()
++
++# Test the queryset
++print("Testing queryset...")
++qs = test_instance.tags.all()
++print(f"Queryset type: {type(qs)}")
++print(f"Queryset query: {qs.query}")
++
++# Test serialization
++print("Testing serialization...")
++try:
++    result = serializers.serialize("json", [test_instance])
++    print("Serialization successful!")
++    print(result)
++except Exception as e:
++    print(f"Error occurred: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..0d0fb91604
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Manager
++from django.core import serializers
++
++# Define the models as described in the issue
++class TestTagManager(Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        qs = qs.select_related("master")  # follow master when retrieving object by default
++        return qs
++
++class TestTagMaster(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++
++class TestTag(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    objects = TestTagManager()
++    name = models.CharField(max_length=120)
++    master = models.ForeignKey(TestTagMaster, on_delete=models.SET_NULL, null=True)
++
++class Test(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(TestTag, blank=True)
++
++# Create the database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestTagMaster)
++    schema_editor.create_model(TestTag)
++    schema_editor.create_model(Test)
++
++# Reproduce the issue
++try:
++    tag_master = TestTagMaster.objects.create(name="master")
++    tag = TestTag.objects.create(name="tag", master=tag_master)
++    test = Test.objects.create(name="test")
++    test.tags.add(tag)
++    test.save()
++    
++    print("Attempting to serialize...")
++    
++    # Debug: check what the queryset looks like
++    qs = test.tags.all()
++    print(f"Queryset: {qs}")
++    print(f"Query: {qs.query}")
++    print(f"Select related: {qs.query.select_related}")
++    
++    result = serializers.serialize("json", [test])
++    print("Serialization successful!")
++    print(result)
++except Exception as e:
++    print(f"Error occurred: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file

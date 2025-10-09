@@ -1,0 +1,489 @@
+diff --git a/django/views/generic/base.py b/django/views/generic/base.py
+index db1842e3e5..b593b12b9f 100644
+--- a/django/views/generic/base.py
++++ b/django/views/generic/base.py
+@@ -148,7 +148,16 @@ class View:
+             request.path,
+             extra={"status_code": 405, "request": request},
+         )
+-        return HttpResponseNotAllowed(self._allowed_methods())
++        response = HttpResponseNotAllowed(self._allowed_methods())
++        
++        if self.view_is_async:
++
++            async def func():
++                return response
++
++            return func()
++        else:
++            return response
+ 
+     def options(self, request, *args, **kwargs):
+         """Handle responding to requests for the OPTIONS HTTP verb."""
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..5a4fa7081c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++from django.http import HttpRequest
++from django.views import View
++from django.http import HttpResponse
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF=__name__,
++        INSTALLED_APPS=[],
++        MIDDLEWARE=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++class Demo(View):
++    """This basic view supports only POST requests"""
++    async def post(self, request):
++        return HttpResponse("ok")
++
++# Create a mock request
++request = HttpRequest()
++request.method = 'GET'
++request.path = '/demo'
++
++# Test the view
++view = Demo()
++view.setup(request)
++
++try:
++    result = view.dispatch(request)
++    print("Result:", result)
++    print("Type:", type(result))
++    if hasattr(result, '__await__'):
++        print("Is awaitable:", True)
++        # Try to await it
++        import asyncio
++        async def test_await():
++            return await result
++        asyncio.run(test_await())
++    else:
++        print("Is awaitable:", False)
++except Exception as e:
++    print("Error:", e)
++    print("Error type:", type(e))
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_async_fix.py b/test_async_fix.py
+new file mode 100644
+index 0000000000..c68f31f051
+--- /dev/null
++++ b/test_async_fix.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++import asyncio
++from django.conf import settings
++from django.http import HttpRequest
++from django.views import View
++from django.http import HttpResponse
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF=__name__,
++        INSTALLED_APPS=[],
++        MIDDLEWARE=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++class Demo(View):
++    """This basic view supports only POST requests"""
++    async def post(self, request):
++        return HttpResponse("ok")
++
++async def test_async_context():
++    # Create a mock request
++    request = HttpRequest()
++    request.method = 'GET'
++    request.path = '/demo'
++
++    # Test the view in async context
++    view = Demo()
++    view.setup(request)
++
++    try:
++        result = view.dispatch(request)
++        print("Result:", result)
++        print("Type:", type(result))
++        
++        # This should work now - we can await the result
++        if hasattr(result, '__await__'):
++            print("Is awaitable:", True)
++            final_response = await result
++            print("Final response:", final_response)
++            print("Final response type:", type(final_response))
++            print("Status code:", final_response.status_code)
++        else:
++            print("Is awaitable:", False)
++            print("This would cause the original error")
++            
++    except Exception as e:
++        print("Error:", e)
++        print("Error type:", type(e))
++        import traceback
++        traceback.print_exc()
++
++# Run the test
++asyncio.run(test_async_context())
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..a93d8df028
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,104 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++import asyncio
++from django.conf import settings
++from django.http import HttpRequest
++from django.views.generic.base import View
++from django.http import HttpResponse
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF=__name__,
++        INSTALLED_APPS=[],
++        MIDDLEWARE=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++class AsyncView(View):
++    async def post(self, request):
++        return HttpResponse("async ok")
++
++class AsyncViewWithHead(View):
++    async def post(self, request):
++        return HttpResponse("async ok")
++    
++    async def head(self, request):
++        return HttpResponse("", status=200)
++
++def test_different_methods():
++    """Test that different HTTP methods all work correctly"""
++    view = AsyncView()
++    
++    for method in ['GET', 'PUT', 'DELETE', 'PATCH', 'TRACE']:
++        request = HttpRequest()
++        request.method = method
++        request.path = '/test'
++        
++        view.setup(request)
++        result = view.dispatch(request)
++        
++        print(f"Method {method}: {type(result)}, awaitable: {hasattr(result, '__await__')}")
++        
++        if hasattr(result, '__await__'):
++            final_response = asyncio.run(result)
++            assert final_response.status_code == 405
++        else:
++            assert result.status_code == 405
++
++def test_head_method():
++    """Test HEAD method specifically (should be allowed if HEAD handler exists)"""
++    view = AsyncViewWithHead()
++    
++    # HEAD should work (since we have head method)
++    request = HttpRequest()
++    request.method = 'HEAD'
++    request.path = '/test'
++    
++    view.setup(request)
++    result = view.dispatch(request)
++    
++    print(f"HEAD method: {type(result)}, awaitable: {hasattr(result, '__await__')}")
++    
++    # HEAD should be allowed, so we should get a normal response
++    if hasattr(result, '__await__'):
++        final_response = asyncio.run(result)
++        assert final_response.status_code == 200
++    else:
++        assert result.status_code == 200
++
++def test_options_method():
++    """Test OPTIONS method specifically"""
++    view = AsyncView()
++    
++    request = HttpRequest()
++    request.method = 'OPTIONS'
++    request.path = '/test'
++    
++    view.setup(request)
++    result = view.dispatch(request)
++    
++    print(f"OPTIONS method: {type(result)}, awaitable: {hasattr(result, '__await__')}")
++    
++    # OPTIONS should return awaitable response
++    assert hasattr(result, '__await__')
++    final_response = asyncio.run(result)
++    assert final_response.status_code == 200  # OPTIONS returns 200, not 405
++
++# Run tests
++print("Testing different HTTP methods...")
++test_different_methods()
++
++print("\nTesting HEAD method...")
++test_head_method()
++
++print("\nTesting OPTIONS method...")
++test_options_method()
++
++print("\nAll edge case tests passed!")
+\ No newline at end of file
+diff --git a/test_github_issue_reproduction.py b/test_github_issue_reproduction.py
+new file mode 100644
+index 0000000000..c090375fdb
+--- /dev/null
++++ b/test_github_issue_reproduction.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++"""
++This test reproduces the exact scenario described in the GitHub issue.
++"""
++import os
++import sys
++import django
++import asyncio
++from django.conf import settings
++from django.http import HttpRequest
++from django.views import View
++from django.http import HttpResponse
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF=__name__,
++        INSTALLED_APPS=[],
++        MIDDLEWARE=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++class Demo(View):
++    """This basic view supports only POST requests"""
++    async def post(self, request):
++        return HttpResponse("ok")
++
++async def test_original_issue():
++    """Test the exact scenario from the GitHub issue"""
++    print("Testing the original GitHub issue scenario...")
++    
++    # Create a GET request to the async view (which only supports POST)
++    request = HttpRequest()
++    request.method = 'GET'
++    request.path = '/demo'
++    
++    # Create and setup the view
++    view = Demo()
++    view.setup(request)
++    
++    try:
++        # This should work now without throwing "TypeError: object HttpResponseNotAllowed can't be used in 'await' expression"
++        result = view.dispatch(request)
++        
++        print(f"Result type: {type(result)}")
++        print(f"Is awaitable: {hasattr(result, '__await__')}")
++        
++        # The key fix: we should be able to await the result in async context
++        if hasattr(result, '__await__'):
++            final_response = await result
++            print(f"Final response: {final_response}")
++            print(f"Final response type: {type(final_response)}")
++            print(f"Status code: {final_response.status_code}")
++            
++            # Should be a 405 Method Not Allowed
++            assert final_response.status_code == 405
++            assert isinstance(final_response, HttpResponse)
++            print("✓ Successfully awaited HttpResponseNotAllowed in async context!")
++        else:
++            print("✗ Expected awaitable response but got non-awaitable")
++            sys.exit(1)
++            
++    except TypeError as e:
++        if "can't be used in 'await' expression" in str(e):
++            print(f"✗ Original issue still exists: {e}")
++            sys.exit(1)
++        else:
++            print(f"✗ Unexpected TypeError: {e}")
++            sys.exit(1)
++    except Exception as e:
++        print(f"✗ Unexpected error: {e}")
++        sys.exit(1)
++
++# Run the test
++asyncio.run(test_original_issue())
++print("\n✓ GitHub issue has been successfully fixed!")
+\ No newline at end of file
+diff --git a/test_http_method_not_allowed_fix.py b/test_http_method_not_allowed_fix.py
+new file mode 100644
+index 0000000000..406577ec00
+--- /dev/null
++++ b/test_http_method_not_allowed_fix.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++import asyncio
++from django.conf import settings
++from django.http import HttpRequest
++from django.views.generic.base import View
++from django.http import HttpResponse
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF=__name__,
++        INSTALLED_APPS=[],
++        MIDDLEWARE=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++class SyncView(View):
++    def post(self, request):
++        return HttpResponse("sync ok")
++
++class AsyncView(View):
++    async def post(self, request):
++        return HttpResponse("async ok")
++
++def test_sync_view():
++    """Test that sync views return non-awaitable HttpResponseNotAllowed"""
++    request = HttpRequest()
++    request.method = 'GET'
++    request.path = '/test'
++    
++    view = SyncView()
++    view.setup(request)
++    
++    result = view.dispatch(request)
++    print("Sync view result:", type(result))
++    print("Is awaitable:", hasattr(result, '__await__'))
++    
++    # Should be HttpResponseNotAllowed directly
++    assert not hasattr(result, '__await__'), "Sync view should return non-awaitable response"
++    assert result.status_code == 405
++    print("✓ Sync view test passed")
++
++async def test_async_view():
++    """Test that async views return awaitable HttpResponseNotAllowed"""
++    request = HttpRequest()
++    request.method = 'GET'
++    request.path = '/test'
++    
++    view = AsyncView()
++    view.setup(request)
++    
++    result = view.dispatch(request)
++    print("Async view result:", type(result))
++    print("Is awaitable:", hasattr(result, '__await__'))
++    
++    # Should be awaitable coroutine
++    assert hasattr(result, '__await__'), "Async view should return awaitable response"
++    
++    # Await it to get the actual response
++    final_response = await result
++    print("Final response type:", type(final_response))
++    assert final_response.status_code == 405
++    print("✓ Async view test passed")
++
++# Run tests
++print("Testing sync view...")
++test_sync_view()
++
++print("\nTesting async view...")
++asyncio.run(test_async_view())
++
++print("\nAll tests passed! The fix is working correctly.")
+\ No newline at end of file
+diff --git a/test_sync_views.py b/test_sync_views.py
+new file mode 100644
+index 0000000000..aeb3df905b
+--- /dev/null
++++ b/test_sync_views.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++from django.http import HttpRequest
++from django.views import View
++from django.http import HttpResponse
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF=__name__,
++        INSTALLED_APPS=[],
++        MIDDLEWARE=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++class SyncDemo(View):
++    """This basic view supports only POST requests (synchronous)"""
++    def post(self, request):
++        return HttpResponse("ok")
++
++# Test with synchronous view
++request = HttpRequest()
++request.method = 'GET'
++request.path = '/demo'
++
++view = SyncDemo()
++view.setup(request)
++
++try:
++    result = view.dispatch(request)
++    print("Sync view result:", result)
++    print("Sync view result type:", type(result))
++    print("Is awaitable:", hasattr(result, '__await__'))
++    print("Status code:", result.status_code)
++except Exception as e:
++    print("Error:", e)
++    print("Error type:", type(e))
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file

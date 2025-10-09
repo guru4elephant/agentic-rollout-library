@@ -1,0 +1,436 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index e3b14a41a0..747fc40013 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -847,12 +847,14 @@ class Model(metaclass=ModelBase):
+         if not pk_set and (force_update or update_fields):
+             raise ValueError("Cannot force an update in save() with no primary key.")
+         updated = False
+-        # Skip an UPDATE when adding an instance and primary key has a default.
++        # Skip an UPDATE when adding an instance and primary key has a default,
++        # but only if the primary key value was not explicitly provided.
+         if (
+             not force_insert and
+             self._state.adding and
+             self._meta.pk.default and
+-            self._meta.pk.default is not NOT_PROVIDED
++            self._meta.pk.default is not NOT_PROVIDED and
++            pk_val is None  # Only force insert if pk_val was not explicitly provided
+         ):
+             force_insert = True
+         # If possible, try an UPDATE. If that doesn't update anything, do an INSERT.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..9fbeaf1a87
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from uuid import uuid4
++from django.db import models
++
++class Sample(models.Model):
++    id = models.UUIDField(primary_key=True, default=uuid4)
++    name = models.CharField(blank=True, max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Sample)
++
++print("Testing the issue...")
++
++# Create first instance
++s0 = Sample.objects.create()
++print(f"Created s0 with pk: {s0.pk}")
++
++# Create second instance with explicit pk from s0
++s1 = Sample(pk=s0.pk, name='Test 1')
++print(f"Created s1 with explicit pk: {s1.pk}")
++
++try:
++    s1.save()
++    print("SUCCESS: s1.save() completed without error")
++    print(f"s1 after save: pk={s1.pk}, name='{s1.name}'")
++except Exception as e:
++    print(f"ERROR: {e}")
++    print("This demonstrates the issue - it tried to INSERT instead of UPDATE")
++
++# Test without default to show the difference
++class SampleNoDefault(models.Model):
++    id = models.UUIDField(primary_key=True)
++    name = models.CharField(blank=True, max_length=100)
++    
++    class Meta:
++        app_label = 'test2'
++
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(SampleNoDefault)
++
++print("\nTesting without default...")
++s2 = SampleNoDefault(pk=s0.pk, name='Test 2')
++print(f"Created s2 with explicit pk: {s2.pk}")
++
++try:
++    s2.save()
++    print("SUCCESS: s2.save() completed without error")
++    print(f"s2 after save: pk={s2.pk}, name='{s2.name}'")
++except Exception as e:
++    print(f"ERROR: {e}")
+\ No newline at end of file
+diff --git a/run_uuid_tests.py b/run_uuid_tests.py
+new file mode 100644
+index 0000000000..8337d0bd4e
+--- /dev/null
++++ b/run_uuid_tests.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Now run the UUID field tests
++from django.test.utils import get_runner
++
++TestRunner = get_runner(settings)
++test_runner = TestRunner(verbosity=2)
++failures = test_runner.run_tests(['django.tests.model_fields.test_uuid'])
++
++if failures:
++    print(f"Tests failed: {failures}")
++else:
++    print("All tests passed!")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..b64ce25efc
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from uuid import uuid4
++from django.db import models
++
++class Sample(models.Model):
++    id = models.UUIDField(primary_key=True, default=uuid4)
++    name = models.CharField(blank=True, max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Sample)
++
++print("Testing comprehensive scenarios...")
++
++# Test 1: Normal INSERT (no explicit pk)
++print("\nTest 1: Normal INSERT without explicit pk")
++s1 = Sample(name='Test 1')
++s1.save()
++print(f"SUCCESS: INSERT with generated pk {s1.pk}")
++
++# Test 2: UPDATE with explicit pk (the main fix)
++print("\nTest 2: UPDATE with explicit pk")
++s2 = Sample(pk=s1.pk, name='Test 2')
++s2.save()
++print(f"SUCCESS: UPDATE with explicit pk {s2.pk}")
++
++# Verify the update worked
++s2_refreshed = Sample.objects.get(pk=s2.pk)
++assert s2_refreshed.name == 'Test 2', f"Expected 'Test 2', got '{s2_refreshed.name}'"
++print("CONFIRMED: Update was successful")
++
++# Test 3: New INSERT with different explicit pk
++print("\nTest 3: New INSERT with different explicit pk")
++new_pk = uuid4()
++s3 = Sample(pk=new_pk, name='Test 3')
++s3.save()
++print(f"SUCCESS: INSERT with different explicit pk {s3.pk}")
++
++# Test 4: Force INSERT with explicit pk (should fail)
++print("\nTest 4: Force INSERT with duplicate explicit pk (should fail)")
++s4 = Sample(pk=s1.pk, name='Test 4')
++try:
++    s4.save(force_insert=True)
++    print("UNEXPECTED: Force INSERT succeeded")
++except Exception as e:
++    print(f"EXPECTED ERROR: {e}")
++
++# Test 5: Multiple updates
++print("\nTest 5: Multiple updates to same object")
++s5 = Sample.objects.get(pk=s1.pk)
++s5.name = 'Test 5'
++s5.save()
++print(f"SUCCESS: Multiple update with pk {s5.pk}")
++
++# Test 6: Object with default pk (should be generated on creation)
++print("\nTest 6: Object with default pk (should be generated on creation)")
++s6 = Sample(name='Test 6')
++assert s6.pk is not None, "PK should be generated on creation"
++s6.save()
++print(f"SUCCESS: PK generated correctly: {s6.pk}")
++
++print("\nAll comprehensive tests passed!")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..d0466a2609
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from uuid import uuid4
++from django.db import models
++
++class Sample(models.Model):
++    id = models.UUIDField(primary_key=True, default=uuid4)
++    name = models.CharField(blank=True, max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Sample)
++
++print("Testing edge cases...")
++
++# Test 1: Normal case - should INSERT (no explicit pk)
++print("\nTest 1: Normal case without explicit pk")
++s1 = Sample(name='Test 1')
++print(f"Created s1 with pk: {s1.pk}")
++s1.save()
++print(f"SUCCESS: s1.save() completed, pk={s1.pk}")
++
++# Test 2: Explicit pk case - should UPDATE
++print("\nTest 2: Explicit pk provided")
++s2 = Sample(pk=s1.pk, name='Test 2')
++print(f"Created s2 with explicit pk: {s2.pk}")
++s2.save()
++print(f"SUCCESS: s2.save() completed, pk={s2.pk}, name='{s2.name}'")
++
++# Verify the update worked
++s2_refreshed = Sample.objects.get(pk=s2.pk)
++print(f"After save: pk={s2_refreshed.pk}, name='{s2_refreshed.name}'")
++
++# Test 3: New instance with different explicit pk - should INSERT
++print("\nTest 3: New instance with different explicit pk")
++new_pk = uuid4()
++s3 = Sample(pk=new_pk, name='Test 3')
++print(f"Created s3 with different explicit pk: {s3.pk}")
++s3.save()
++print(f"SUCCESS: s3.save() completed, pk={s3.pk}")
++
++# Test 4: Force insert with explicit pk - should INSERT (and likely fail with duplicate key)
++print("\nTest 4: Force insert with explicit pk (should fail)")
++s4 = Sample(pk=s1.pk, name='Test 4')
++print(f"Created s4 with explicit pk: {s4.pk}")
++try:
++    s4.save(force_insert=True)
++    print(f"SUCCESS: s4.save(force_insert=True) completed, pk={s4.pk}")
++except Exception as e:
++    print(f"EXPECTED ERROR: {e}")
++
++print("\nAll edge cases completed!")
+\ No newline at end of file
+diff --git a/test_settings.py b/test_settings.py
+new file mode 100644
+index 0000000000..0b144875ed
+--- /dev/null
++++ b/test_settings.py
+@@ -0,0 +1,13 @@
++DEBUG = True
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++INSTALLED_APPS = [
++    'django.contrib.contenttypes',
++    'django.contrib.auth',
++]
++USE_TZ = True
++SECRET_KEY = 'test-secret-key'
+\ No newline at end of file
+diff --git a/test_specific_fix.py b/test_specific_fix.py
+new file mode 100644
+index 0000000000..7e1ba1ff3d
+--- /dev/null
++++ b/test_specific_fix.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from uuid import uuid4
++from django.db import models
++
++# Test the specific issue mentioned in the GitHub issue
++class Sample(models.Model):
++    id = models.UUIDField(primary_key=True, default=uuid4)
++    name = models.CharField(blank=True, max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Sample)
++
++print("Testing the specific issue from GitHub...")
++
++# Test the exact scenario from the GitHub issue
++s0 = Sample.objects.create()
++print(f"Created s0 with pk: {s0.pk}")
++
++s1 = Sample(pk=s0.pk, name='Test 1')
++print(f"Created s1 with explicit pk: {s1.pk}")
++
++try:
++    s1.save()
++    print("SUCCESS: s1.save() completed without error")
++    print(f"s1 after save: pk={s1.pk}, name='{s1.name}'")
++    
++    # Verify it was an UPDATE, not an INSERT
++    # The name should be updated to 'Test 1'
++    s1_refreshed = Sample.objects.get(pk=s1.pk)
++    if s1_refreshed.name == 'Test 1':
++        print("CONFIRMED: The save() performed an UPDATE (name was changed)")
++    else:
++        print(f"UNEXPECTED: Name is '{s1_refreshed.name}', expected 'Test 1'")
++        
++except Exception as e:
++    print(f"ERROR: {e}")
++    print("This demonstrates the issue - it tried to INSERT instead of UPDATE")
++
++print("\nTesting that normal INSERTs still work...")
++
++# Test that normal INSERTs still work (no explicit pk)
++s2 = Sample(name='Test 2')
++print(f"Created s2 without explicit pk: {s2.pk}")
++s2.save()
++print(f"SUCCESS: s2.save() completed, pk={s2.pk}")
++
++print("\nAll tests completed!")
+\ No newline at end of file

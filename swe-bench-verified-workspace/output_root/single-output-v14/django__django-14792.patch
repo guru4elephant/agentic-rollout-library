@@ -1,0 +1,405 @@
+diff --git a/django/db/backends/postgresql/operations.py b/django/db/backends/postgresql/operations.py
+index 8d19872bea..b365af74c4 100644
+--- a/django/db/backends/postgresql/operations.py
++++ b/django/db/backends/postgresql/operations.py
+@@ -44,10 +44,14 @@ class DatabaseOperations(BaseDatabaseOperations):
+         return "DATE_TRUNC('%s', %s)" % (lookup_type, field_name)
+ 
+     def _prepare_tzname_delta(self, tzname):
+-        if '+' in tzname:
+-            return tzname.replace('+', '-')
+-        elif '-' in tzname:
+-            return tzname.replace('-', '+')
++        # Only reverse signs for simple offsets (e.g., "+10", "-10")
++        # Don't reverse signs for timezone names (e.g., "Etc/GMT-10", "UTC")
++        if (tzname.startswith('+') or tzname.startswith('-')) and len(tzname) > 1:
++            # Simple offset format: reverse the sign
++            if tzname.startswith('+'):
++                return '-' + tzname[1:]
++            elif tzname.startswith('-'):
++                return '+' + tzname[1:]
+         return tzname
+ 
+     def _convert_field_to_tz(self, field_name, tzname):
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..aeef1706dd
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++
++def _prepare_tzname_delta_fixed(tzname):
++    """
++    Fixed version of _prepare_tzname_delta for PostgreSQL.
++    Only reverse signs for simple offsets (e.g., "+10", "-10")
++    Don't reverse signs for timezone names (e.g., "Etc/GMT-10", "UTC")
++    """
++    if (tzname.startswith('+') or tzname.startswith('-')) and len(tzname) > 1:
++        # Simple offset format: reverse the sign
++        if tzname.startswith('+'):
++            return '-' + tzname[1:]
++        elif tzname.startswith('-'):
++            return '+' + tzname[1:]
++    return tzname
++
++def test_fix():
++    print("Final test of the timezone fix...")
++    print("=" * 50)
++    
++    # Test the main issue from GitHub
++    test_cases = [
++        # (input, expected_output, description)
++        ("+10", "-10", "Simple positive offset"),
++        ("-10", "+10", "Simple negative offset"),
++        ("Etc/GMT-10", "Etc/GMT-10", "Timezone name with minus (GitHub issue)"),
++        ("Etc/GMT+10", "Etc/GMT+10", "Timezone name with plus (GitHub issue)"),
++        ("UTC", "UTC", "UTC timezone"),
++        ("US/Eastern", "US/Eastern", "Named timezone"),
++        ("+05:30", "-05:30", "Positive offset with minutes"),
++        ("-08:00", "+08:00", "Negative offset with minutes"),
++    ]
++    
++    all_passed = True
++    
++    for input_tz, expected, description in test_cases:
++        result = _prepare_tzname_delta_fixed(input_tz)
++        passed = result == expected
++        status = "✓" if passed else "✗"
++        print(f"{status} {description:40} {input_tz} -> {result} (expected: {expected})")
++        if not passed:
++            all_passed = False
++    
++    print("=" * 50)
++    
++    if all_passed:
++        print("🎉 All tests passed! The fix resolves the GitHub issue.")
++        print()
++        print("Summary of the fix:")
++        print("- Before: _prepare_tzname_delta('Etc/GMT-10') -> 'Etc/GMT+10' (WRONG)")
++        print("- After:  _prepare_tzname_delta('Etc/GMT-10') -> 'Etc/GMT-10' (CORRECT)")
++        print()
++        print("The fix correctly distinguishes between:")
++        print("1. Simple offsets (e.g., '+10', '-10') - signs are reversed")
++        print("2. Timezone names (e.g., 'Etc/GMT-10', 'UTC') - signs are NOT reversed")
++    else:
++        print("❌ Some tests failed. The fix needs more work.")
++    
++    return all_passed
++
++if __name__ == "__main__":
++    test_fix()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..90aac74b7c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import pytz
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++from django.utils import timezone
++
++def test_timezone_conversion():
++    print("Testing timezone conversion issue...")
++    
++    # Test with pytz timezone
++    tz_pytz = pytz.timezone("Etc/GMT-10")
++    tz_name_pytz = timezone._get_timezone_name(tz_pytz)
++    print(f"pytz Etc/GMT-10 -> {tz_name_pytz}")
++    
++    # Test with positive offset
++    tz_pytz_plus = pytz.timezone("Etc/GMT+10")
++    tz_name_pytz_plus = timezone._get_timezone_name(tz_pytz_plus)
++    print(f"pytz Etc/GMT+10 -> {tz_name_pytz_plus}")
++    
++    # Test _prepare_tzname_delta method logic
++    def _prepare_tzname_delta(tzname):
++        if '+' in tzname:
++            return tzname.replace('+', '-')
++        elif '-' in tzname:
++            return tzname.replace('-', '+')
++        return tzname
++    
++    print("\nTesting _prepare_tzname_delta logic:")
++    print(f"_prepare_tzname_delta('+10') -> {_prepare_tzname_delta('+10')}")
++    print(f"_prepare_tzname_delta('-10') -> {_prepare_tzname_delta('-10')}")
++    print(f"_prepare_tzname_delta('Etc/GMT-10') -> {_prepare_tzname_delta('Etc/GMT-10')}")
++    print(f"_prepare_tzname_delta('Etc/GMT+10') -> {_prepare_tzname_delta('Etc/GMT+10')}")
++
++if __name__ == "__main__":
++    test_timezone_conversion()
+\ No newline at end of file
+diff --git a/test_comprehensive_fix.py b/test_comprehensive_fix.py
+new file mode 100644
+index 0000000000..c62d4d040a
+--- /dev/null
++++ b/test_comprehensive_fix.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import pytz
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++from django.utils import timezone
++from django.db.models.functions.datetime import Extract, Trunc
++
++def test_timezone_behavior():
++    print("Testing comprehensive timezone behavior fix...")
++    
++    # Test the _get_timezone_name function behavior
++    tz_etc_gmt_minus_10 = pytz.timezone("Etc/GMT-10")
++    tz_name = timezone._get_timezone_name(tz_etc_gmt_minus_10)
++    print(f"timezone._get_timezone_name(pytz.timezone('Etc/GMT-10')) = '{tz_name}'")
++    
++    tz_etc_gmt_plus_10 = pytz.timezone("Etc/GMT+10")
++    tz_name_plus = timezone._get_timezone_name(tz_etc_gmt_plus_10)
++    print(f"timezone._get_timezone_name(pytz.timezone('Etc/GMT+10')) = '{tz_name_plus}'")
++    
++    # Test what the TimezoneMixin.get_tzname() would return
++    class TestTimezoneMixin:
++        tzinfo = None
++        
++        def get_tzname(self):
++            if self.tzinfo is None:
++                return timezone.get_current_timezone_name()
++            else:
++                return timezone._get_timezone_name(self.tzinfo)
++    
++    mixin = TestTimezoneMixin()
++    mixin.tzinfo = tz_etc_gmt_minus_10
++    tzname_from_mixin = mixin.get_tzname()
++    print(f"TimezoneMixin.get_tzname() with Etc/GMT-10 = '{tzname_from_mixin}'")
++    
++    # Test the fixed _prepare_tzname_delta logic
++    def _prepare_tzname_delta_fixed(tzname):
++        # Only reverse signs for simple offsets (e.g., "+10", "-10")
++        # Don't reverse signs for timezone names (e.g., "Etc/GMT-10", "UTC")
++        if tzname.startswith('+') or tzname.startswith('-'):
++            # Simple offset format: reverse the sign
++            if tzname.startswith('+'):
++                return tzname.replace('+', '-', 1)
++            elif tzname.startswith('-'):
++                return tzname.replace('-', '+', 1)
++        return tzname
++    
++    # Test cases
++    test_cases = [
++        # (input, expected_output, description)
++        ("+10", "-10", "Simple positive offset"),
++        ("-10", "+10", "Simple negative offset"),
++        ("+05:30", "-05:30", "Simple positive offset with minutes"),
++        ("-08:00", "+08:00", "Simple negative offset with minutes"),
++        ("Etc/GMT-10", "Etc/GMT-10", "Timezone name with minus"),
++        ("Etc/GMT+10", "Etc/GMT+10", "Timezone name with plus"),
++        ("UTC", "UTC", "UTC timezone"),
++        ("US/Eastern", "US/Eastern", "Named timezone"),
++    ]
++    
++    print("\nTesting _prepare_tzname_delta logic:")
++    for input_tz, expected, description in test_cases:
++        result = _prepare_tzname_delta_fixed(input_tz)
++        status = "✓" if result == expected else "✗"
++        print(f"{status} {description:40} {input_tz} -> {result} (expected: {expected})")
++    
++    # Test the specific issue from the GitHub issue
++    print("\nTesting GitHub issue scenario:")
++    print("Django 3.1 behavior: _get_timezone_name('Etc/GMT-10') returned '+10'")
++    print("Django 3.2 behavior: _get_timezone_name('Etc/GMT-10') returns 'Etc/GMT-10'")
++    print()
++    print("With Django 3.1:")
++    print("  _prepare_tzname_delta('+10') -> '-10' (correct)")
++    print()
++    print("With Django 3.2 (before fix):")
++    print("  _prepare_tzname_delta('Etc/GMT-10') -> 'Etc/GMT+10' (INCORRECT - reversed direction)")
++    print()
++    print("With Django 3.2 (after fix):")
++    print("  _prepare_tzname_delta('Etc/GMT-10') -> 'Etc/GMT-10' (CORRECT - same direction)")
++
++if __name__ == "__main__":
++    test_timezone_behavior()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..953f2609e0
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++
++def _prepare_tzname_delta_fixed(tzname):
++    # Only reverse signs for simple offsets (e.g., "+10", "-10")
++    # Don't reverse signs for timezone names (e.g., "Etc/GMT-10", "UTC")
++    if (tzname.startswith('+') or tzname.startswith('-')) and len(tzname) > 1:
++        # Simple offset format: reverse the sign
++        if tzname.startswith('+'):
++            return '-' + tzname[1:]
++        elif tzname.startswith('-'):
++            return '+' + tzname[1:]
++    return tzname
++
++def test_edge_cases():
++    print("Testing edge cases for _prepare_tzname_delta fix:")
++    
++    edge_cases = [
++        # Edge cases that should have signs reversed (simple offsets)
++        ("+0", "-0"),
++        ("-0", "+0"),
++        ("+00:00", "-00:00"),
++        ("-00:00", "+00:00"),
++        ("+12", "-12"),
++        ("-12", "+12"),
++        ("+13:45", "-13:45"),
++        ("-13:45", "+13:45"),
++        
++        # Edge cases that should NOT have signs reversed (timezone names)
++        ("Etc/GMT+0", "Etc/GMT+0"),
++        ("Etc/GMT-0", "Etc/GMT-0"),
++        ("Etc/GMT+14", "Etc/GMT+14"),
++        ("Etc/GMT-14", "Etc/GMT-14"),
++        ("GMT+8", "GMT+8"),
++        ("GMT-8", "GMT-8"),
++        ("UTC+5", "UTC+5"),
++        ("UTC-5", "UTC-5"),
++        
++        # Mixed cases with special characters
++        ("+", "+"),  # Just a plus sign
++        ("-", "-"),  # Just a minus sign
++        ("++10", "++10"),  # Should not be processed
++        ("--10", "--10"),  # Should not be processed
++        ("10+", "10+"),  # Should not be processed
++        ("10-", "10-"),  # Should not be processed
++    ]
++    
++    for input_tz, expected in edge_cases:
++        result = _prepare_tzname_delta_fixed(input_tz)
++        status = "✓" if result == expected else "✗"
++        print(f"{status} {input_tz:15} -> {result:15} (expected: {expected})")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..b141a3a9ff
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,47 @@
++#!/usr/bin/env python3
++
++def _prepare_tzname_delta(tzname):
++    # Only reverse signs for simple offsets (e.g., "+10", "-10")
++    # Don't reverse signs for timezone names (e.g., "Etc/GMT-10", "UTC")
++    if tzname.startswith('+') or tzname.startswith('-'):
++        # Simple offset format: reverse the sign
++        if tzname.startswith('+'):
++            return tzname.replace('+', '-', 1)
++        elif tzname.startswith('-'):
++            return tzname.replace('-', '+', 1)
++    return tzname
++
++def test_prepare_tzname_delta():
++    print("Testing fixed _prepare_tzname_delta method:")
++    
++    # Test cases that should have signs reversed (simple offsets)
++    simple_offsets = [
++        ("+10", "-10"),
++        ("-10", "+10"),
++        ("+05:30", "-05:30"),
++        ("-08:00", "+08:00"),
++    ]
++    
++    for input_tz, expected in simple_offsets:
++        result = _prepare_tzname_delta(input_tz)
++        status = "✓" if result == expected else "✗"
++        print(f"{status} {input_tz} -> {result} (expected: {expected})")
++    
++    print()
++    
++    # Test cases that should NOT have signs reversed (timezone names)
++    tz_names = [
++        ("Etc/GMT-10", "Etc/GMT-10"),
++        ("Etc/GMT+10", "Etc/GMT+10"),
++        ("UTC", "UTC"),
++        ("US/Eastern", "US/Eastern"),
++        ("Europe/London", "Europe/London"),
++    ]
++    
++    for input_tz, expected in tz_names:
++        result = _prepare_tzname_delta(input_tz)
++        status = "✓" if result == expected else "✗"
++        print(f"{status} {input_tz} -> {result} (expected: {expected})")
++
++if __name__ == "__main__":
++    test_prepare_tzname_delta()
+\ No newline at end of file
+diff --git a/test_timezone_fix.py b/test_timezone_fix.py
+new file mode 100644
+index 0000000000..fb01397bbf
+--- /dev/null
++++ b/test_timezone_fix.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import pytz
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++from django.utils import timezone
++
++def test_timezone_behavior():
++    print("Testing timezone behavior...")
++    
++    # Test various timezone types
++    test_timezones = [
++        "Etc/GMT-10",  # 10 hours ahead of UTC
++        "Etc/GMT+10",  # 10 hours behind UTC  
++        "UTC",
++        "US/Eastern",
++        "Europe/London",
++    ]
++    
++    for tz_name in test_timezones:
++        try:
++            tz = pytz.timezone(tz_name)
++            tz_str = timezone._get_timezone_name(tz)
++            print(f"{tz_name} -> {tz_str}")
++        except Exception as e:
++            print(f"{tz_name} -> Error: {e}")
++    
++    print("\nTesting what _prepare_tzname_delta should do:")
++    
++    # Test cases that should have signs reversed (simple offsets)
++    simple_offsets = ["+10", "-10", "+05:30", "-08:00"]
++    for offset in simple_offsets:
++        # For PostgreSQL, simple offsets should have their signs reversed
++        if '+' in offset:
++            expected = offset.replace('+', '-')
++        elif '-' in offset:
++            expected = offset.replace('-', '+')
++        else:
++            expected = offset
++        print(f"Simple offset {offset} should become {expected}")
++    
++    # Test cases that should NOT have signs reversed (timezone names)
++    tz_names = ["Etc/GMT-10", "Etc/GMT+10", "UTC", "US/Eastern"]
++    for tz_name in tz_names:
++        print(f"Timezone name {tz_name} should stay as {tz_name}")
++
++if __name__ == "__main__":
++    test_timezone_behavior()
+\ No newline at end of file

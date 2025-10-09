@@ -1,0 +1,344 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 90d90119d0..a9ee24c33a 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -23,7 +23,10 @@ class SQLiteNumericMixin:
+     def as_sqlite(self, compiler, connection, **extra_context):
+         sql, params = self.as_sql(compiler, connection, **extra_context)
+         try:
+-            if self.output_field.get_internal_type() == 'DecimalField':
++            # Skip casting if this expression is being used in a window context
++            # The Window class will handle the casting for the entire expression
++            if not getattr(self, '_in_window_context', False) and \
++               self.output_field.get_internal_type() == 'DecimalField':
+                 sql = 'CAST(%s AS NUMERIC)' % sql
+         except FieldError:
+             pass
+@@ -1302,12 +1305,18 @@ class Window(Expression):
+         connection.ops.check_expression_support(self)
+         if not connection.features.supports_over_clause:
+             raise NotSupportedError('This backend does not support window expressions.')
++        # Mark the source expression as being in a window context
++        # to prevent double casting in SQLiteNumericMixin
++        original_in_window_context = getattr(self.source_expression, '_in_window_context', False)
++        self.source_expression._in_window_context = True
+         expr_sql, params = compiler.compile(self.source_expression)
++        # Restore the original state
++        self.source_expression._in_window_context = original_in_window_context
+         window_sql, window_params = [], []
+ 
+         if self.partition_by is not None:
+             sql_expr, sql_params = self.partition_by.as_sql(
+-                compiler=compiler, connection=connection,
++                compiler=compiler,connection=connection,
+                 template='PARTITION BY %(expressions)s',
+             )
+             window_sql.extend(sql_expr)
+@@ -1346,6 +1355,23 @@ class Window(Expression):
+     def get_group_by_cols(self, alias=None):
+         return []
+ 
++    def as_sqlite(self, compiler, connection, **extra_context):
++        # For SQLite, we need to handle the case where the source expression
++        # requires casting (e.g., DecimalField) but the CAST should wrap the
++        # entire window expression, not just the inner function.
++        sql, params = self.as_sql(compiler, connection, **extra_context)
++        
++        # Check if the source expression requires numeric casting for SQLite
++        try:
++            if hasattr(self.source_expression, 'output_field') and \
++               self.source_expression.output_field.get_internal_type() == 'DecimalField':
++                # Wrap the entire window expression in CAST(... AS NUMERIC)
++                sql = 'CAST(%s AS NUMERIC)' % sql
++        except FieldError:
++            pass
++            
++        return sql, params
++
+ 
+ class WindowFrame(Expression):
+     """
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..fc14239a8b
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F
++from django.db.models.functions import Lag
++from django.db.models import Window
++from django.db.models.fields import FloatField, DecimalField
++
++# Create the test model
++class LagTest(models.Model):
++    modified = models.DateField()
++    data = models.FloatField()
++    amount = models.DecimalField(decimal_places=4, max_digits=7)
++
++    class Meta:
++        app_label = 'test'
++
++# Create database tables
++from django.db import connection
++
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(LagTest)
++
++# Test the issue
++print("Testing Lag with DecimalField...")
++try:
++    w = Window(expression=Lag('amount', 7), partition_by=[F('modified')], order_by=F('modified').asc())
++    q = LagTest.objects.all().annotate(w=w)
++    print("Query:", q.query)
++    # Try to execute the query to trigger the error
++    result = list(q)
++    print("Success: No error occurred")
++except Exception as e:
++    print("Error:", str(e))
++    print("Type:", type(e).__name__)
++
++print("\nTesting Lag with FloatField...")
++try:
++    w = Window(expression=Lag('data', 7), partition_by=[F('modified')], order_by=F('modified').asc())
++    q = LagTest.objects.all().annotate(w=w)
++    print("Query:", q.query)
++    print("Success: No error occurred")
++except Exception as e:
++    print("Error:", str(e))
++    print("Type:", type(e).__name__)
++
++print("\nTesting Lag with DecimalField and output_field=FloatField...")
++try:
++    w = Window(expression=Lag('amount', 7, output_field=FloatField()), partition_by=[F('modified')], order_by=F('modified').asc())
++    q = LagTest.objects.all().annotate(w=w)
++    print("Query:", q.query)
++    print("Success: No error occurred")
++except Exception as e:
++    print("Error:", str(e))
++    print("Type:", type(e).__name__)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..2e1c49b9ef
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,100 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F
++from django.db.models.functions import Lag, Lead
++from django.db.models import Window
++from django.db.models.fields import FloatField, DecimalField
++
++# Create test models
++class LagTest(models.Model):
++    modified = models.DateField()
++    data = models.FloatField()
++    amount = models.DecimalField(decimal_places=4, max_digits=7)
++
++    class Meta:
++        app_label = 'test'
++
++class LeadTest(models.Model):
++    value = models.DecimalField(decimal_places=2, max_digits=5)
++    category = models.CharField(max_length=10)
++
++    class Meta:
++        app_label = 'test'
++
++# Create database tables
++from django.db import connection
++
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(LagTest)
++    schema_editor.create_model(LeadTest)
++
++# Test various scenarios
++print("=== Testing Lag with DecimalField ===")
++try:
++    w = Window(expression=Lag('amount', 7), partition_by=[F('modified')], order_by=F('modified').asc())
++    q = LagTest.objects.all().annotate(w=w)
++    print("Query:", q.query)
++    result = list(q)
++    print("Success: No error occurred")
++except Exception as e:
++    print("Error:", str(e))
++    print("Type:", type(e).__name__)
++
++print("\n=== Testing Lead with DecimalField ===")
++try:
++    w = Window(expression=Lead('value', 1), partition_by=[F('category')], order_by=F('value').asc())
++    q = LeadTest.objects.all().annotate(w=w)
++    print("Query:", q.query)
++    result = list(q)
++    print("Success: No error occurred")
++except Exception as e:
++    print("Error:", str(e))
++    print("Type:", type(e).__name__)
++
++print("\n=== Testing regular DecimalField expressions (not in window) ===")
++try:
++    from django.db.models.functions import Cast
++    q = LagTest.objects.annotate(cast_amount=Cast('amount', FloatField()))
++    print("Query:", q.query)
++    result = list(q)
++    print("Success: No error occurred")
++except Exception as e:
++    print("Error:", str(e))
++    print("Type:", type(e).__name__)
++
++print("\n=== Testing window functions with non-Decimal fields ===")
++try:
++    w = Window(expression=Lag('data', 7), partition_by=[F('modified')], order_by=F('modified').asc())
++    q = LagTest.objects.all().annotate(w=w)
++    print("Query:", q.query)
++    result = list(q)
++    print("Success: No error occurred")
++except Exception as e:
++    print("Error:", str(e))
++    print("Type:", type(e).__name__)
++
++print("\nAll tests completed!")
+\ No newline at end of file
+diff --git a/test_final_verification.py b/test_final_verification.py
+new file mode 100644
+index 0000000000..b75bf66da5
+--- /dev/null
++++ b/test_final_verification.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F
++from django.db.models.functions import Lag, Lead
++from django.db.models import Window
++from django.db.models.fields import FloatField, DecimalField
++
++# Create test model that matches the issue description exactly
++class LagTest(models.Model):
++    modified = models.DateField()
++    data = models.FloatField()
++    amount = models.DecimalField(decimal_places=4, max_digits=7)
++
++    class Meta:
++        app_label = 'test'
++
++# Create database tables
++from django.db import connection
++
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(LagTest)
++
++# Test the exact scenario from the GitHub issue
++print("=== Testing exact issue scenario ===")
++try:
++    w = Window(expression=Lag('amount', 7), partition_by=[F('modified')], order_by=F('modified').asc())
++    q = LagTest.objects.all().annotate(w=w)
++    print("Generated SQL:", q.query)
++    # Try to execute the query
++    result = list(q)
++    print("✓ SUCCESS: Query executed without error")
++    print("✓ The issue has been fixed!")
++except Exception as e:
++    print("✗ FAILED: Error occurred:", str(e))
++    print("✗ The issue is not fixed")
++
++# Test the workaround mentioned in the issue
++print("\n=== Testing workaround with output_field=FloatField ===")
++try:
++    w = Window(expression=Lag('amount', 7, output_field=FloatField()), partition_by=[F('modified')], order_by=F('modified').asc())
++    q = LagTest.objects.all().annotate(w=w)
++    print("Generated SQL:", q.query)
++    result = list(q)
++    print("✓ SUCCESS: Workaround still works")
++except Exception as e:
++    print("✗ FAILED: Workaround broken:", str(e))
++
++# Test that non-Decimal fields still work
++print("\n=== Testing non-Decimal field (should work before and after fix) ===")
++try:
++    w = Window(expression=Lag('data', 7), partition_by=[F('modified')], order_by=F('modified').asc())
++    q = LagTest.objects.all().annotate(w=w)
++    print("Generated SQL:", q.query)
++    result = list(q)
++    print("✓ SUCCESS: Non-Decimal fields work correctly")
++except Exception as e:
++    print("✗ FAILED: Non-Decimal field broken:", str(e))
++
++print("\n=== Summary ===")
++print("The fix ensures that CAST() wraps the entire window expression")
++print("instead of just the inner function, which was causing the syntax error.")
+\ No newline at end of file

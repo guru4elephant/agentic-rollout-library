@@ -1,0 +1,411 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index f8d848e926..f2f9797d88 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -670,7 +670,7 @@ class QuerySet:
+                 when_statements = []
+                 for obj in batch_objs:
+                     attr = getattr(obj, field.attname)
+-                    if not isinstance(attr, Expression):
++                    if not hasattr(attr, 'resolve_expression'):
+                         attr = Value(attr, output_field=field)
+                     when_statements.append(When(pk=obj.pk, then=attr))
+                 case_statement = Case(*when_statements, output_field=field)
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..7d03d21379
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models import F
++
++# Create the exact model from the issue
++class SelfRef(models.Model):
++    name = models.CharField(max_length=100)
++    c8 = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'exampleapp'
++
++def test_exact_issue_reproduction():
++    """Reproduce the exact scenario from the GitHub issue"""
++    print("=== Reproducing exact GitHub issue scenario ===")
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SelfRef)
++
++    # Create a test instance
++    o = SelfRef.objects.create(name='test_name', c8='initial_value')
++    print(f"Initial: name='{o.name}', c8='{o.c8}'")
++
++    # Reproduce the exact steps from the issue
++    o.c8 = F('name')  # model has char fields 'c8' and 'name'
++    result = SelfRef.objects.bulk_update([o], ['c8'])
++    print(f"bulk_update result: {result}")
++
++    o.refresh_from_db()
++    print(f"After refresh: name='{o.name}', c8='{o.c8}'")
++
++    # Check the SQL that was executed
++    if connection.queries:
++        update_query = connection.queries[-2]  # The UPDATE query should be second to last
++        print(f"Update SQL: {update_query['sql']}")
++
++    # Verify the fix
++    if o.c8 == 'test_name':
++        print("✅ SUCCESS: F expression was properly resolved!")
++        print("✅ The issue has been fixed!")
++        return True
++    elif o.c8 == 'F(name)':
++        print("❌ FAILURE: F expression was treated as string!")
++        print("❌ The issue is NOT fixed!")
++        return False
++    else:
++        print(f"❌ UNEXPECTED: Got unexpected value '{o.c8}'")
++        return False
++
++if __name__ == '__main__':
++    success = test_exact_issue_reproduction()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..2a28312fd8
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models import F
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    c8 = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'testapp'
++
++# Create the table
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create a test instance
++obj = TestModel.objects.create(name='test_name', c8='initial_value')
++
++print("Before bulk_update:")
++print(f"obj.name: {obj.name}")
++print(f"obj.c8: {obj.c8}")
++
++# Try to update with F expression
++obj.c8 = F('name')  # This should set c8 to the value of name field
++TestModel.objects.bulk_update([obj], ['c8'])
++
++# Refresh and check the result
++obj.refresh_from_db()
++print("\nAfter bulk_update:")
++print(f"obj.name: {obj.name}")
++print(f"obj.c8: {obj.c8}")
++
++# Check the SQL that was executed
++if connection.queries:
++    last_query = connection.queries[-1]
++    print(f"\nLast SQL query: {last_query['sql']}")
++
++# Expected: obj.c8 should be 'test_name' (same as obj.name)
++# Actual bug: obj.c8 becomes 'F(name)' (string representation of F expression)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..7f71be9fc3
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models import F, Value, Expression
++from django.db.models.expressions import Func
++
++# Create a test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'testapp'
++
++def test_edge_cases():
++    """Test edge cases for the bulk_update fix"""
++    print("=== Testing edge cases ===")
++    
++    # Recreate the table
++    try:
++        with connection.schema_editor() as schema_editor:
++            schema_editor.delete_model(TestModel)
++    except:
++        pass
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++
++    # Create test instance
++    obj = TestModel.objects.create(name='test_name', value=10)
++
++    # Test 1: Complex F expression
++    obj.value = F('value') * 2 + 1
++    TestModel.objects.bulk_update([obj], ['value'])
++    obj.refresh_from_db()
++    print(f"Complex F expression: {obj.value} (expected: 21)")
++    assert obj.value == 21, f"Expected 21, got {obj.value}"
++
++    # Test 2: Value expression (should work as before)
++    obj.value = Value(99)
++    TestModel.objects.bulk_update([obj], ['value'])
++    obj.refresh_from_db()
++    print(f"Value expression: {obj.value} (expected: 99)")
++    assert obj.value == 99, f"Expected 99, got {obj.value}"
++
++    # Test 3: Regular integer (should work as before)
++    obj.value = 42
++    TestModel.objects.bulk_update([obj], ['value'])
++    obj.refresh_from_db()
++    print(f"Regular integer: {obj.value} (expected: 42)")
++    assert obj.value == 42, f"Expected 42, got {obj.value}"
++
++    print("✅ All edge case tests passed!")
++
++if __name__ == '__main__':
++    try:
++        test_edge_cases()
++        print("\n🎉 All edge case tests passed! The fix is robust.")
++    except Exception as e:
++        print(f"\n❌ Edge case test failed: {e}")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 0000000000..be1be66643
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,146 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models import F, Value
++from django.db.models.expressions import Expression
++
++# Create a test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    c8 = models.CharField(max_length=100)
++    count = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'testapp'
++
++def test_bulk_update_with_f_expression():
++    """Test the original issue: F expressions in bulk_update"""
++    print("=== Testing F expressions in bulk_update ===")
++    
++    # Recreate the table (drop if exists first)
++    try:
++        with connection.schema_editor() as schema_editor:
++            schema_editor.delete_model(TestModel)
++    except:
++        pass  # Table might not exist yet
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++
++    # Create test instances
++    obj1 = TestModel.objects.create(name='test_name_1', c8='initial_1', count=5)
++    obj2 = TestModel.objects.create(name='test_name_2', c8='initial_2', count=10)
++
++    # Test 1: F expression with string field
++    obj1.c8 = F('name')
++    TestModel.objects.bulk_update([obj1], ['c8'])
++    obj1.refresh_from_db()
++    print(f"Test 1 - F('name') result: {obj1.c8} (expected: test_name_1)")
++    assert obj1.c8 == 'test_name_1', f"Expected 'test_name_1', got '{obj1.c8}'"
++
++    # Test 2: F expression with integer field
++    obj2.count = F('count') + 1
++    TestModel.objects.bulk_update([obj2], ['count'])
++    obj2.refresh_from_db()
++    print(f"Test 2 - F('count') + 1 result: {obj2.count} (expected: 11)")
++    assert obj2.count == 11, f"Expected 11, got {obj2.count}"
++
++    # Test 3: Mixed F expressions and regular values
++    obj1.c8 = 'manual_value'
++    obj2.count = F('count') * 2
++    TestModel.objects.bulk_update([obj1, obj2], ['c8', 'count'])
++    obj1.refresh_from_db()
++    obj2.refresh_from_db()
++    print(f"Test 3 - Mixed: c8={obj1.c8} (expected: manual_value), count={obj2.count} (expected: 22)")
++    assert obj1.c8 == 'manual_value', f"Expected 'manual_value', got '{obj1.c8}'"
++    assert obj2.count == 22, f"Expected 22, got {obj2.count}"
++
++    print("✅ All F expression tests passed!")
++
++def test_bulk_update_with_regular_values():
++    """Test that regular values still work correctly"""
++    print("\n=== Testing regular values in bulk_update ===")
++    
++    # Recreate the table (drop if exists first)
++    try:
++        with connection.schema_editor() as schema_editor:
++            schema_editor.delete_model(TestModel)
++    except:
++        pass  # Table might not exist yet
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++
++    # Create test instance
++    obj = TestModel.objects.create(name='test_name', c8='initial', count=0)
++
++    # Test regular string value
++    obj.c8 = 'regular_string'
++    TestModel.objects.bulk_update([obj], ['c8'])
++    obj.refresh_from_db()
++    print(f"Regular string: {obj.c8} (expected: regular_string)")
++    assert obj.c8 == 'regular_string', f"Expected 'regular_string', got '{obj.c8}'"
++
++    # Test regular integer value
++    obj.count = 42
++    TestModel.objects.bulk_update([obj], ['count'])
++    obj.refresh_from_db()
++    print(f"Regular integer: {obj.count} (expected: 42)")
++    assert obj.count == 42, f"Expected 42, got {obj.count}"
++
++    # Test empty string instead of None (since CharField doesn't allow NULL by default)
++    obj.c8 = ''
++    TestModel.objects.bulk_update([obj], ['c8'])
++    obj.refresh_from_db()
++    print(f"Empty string: {obj.c8} (expected: '')")
++    assert obj.c8 == '', f"Expected '', got '{obj.c8}'"
++
++    print("✅ All regular value tests passed!")
++
++def test_expression_handling():
++    """Test that the hasattr(attr, 'resolve_expression') check works correctly"""
++    print("\n=== Testing expression handling ===")
++    
++    # Test that F objects have resolve_expression
++    f_expr = F('name')
++    assert hasattr(f_expr, 'resolve_expression'), "F objects should have resolve_expression method"
++    print("✅ F objects have resolve_expression method")
++
++    # Test that regular values don't have resolve_expression
++    assert not hasattr('string_value', 'resolve_expression'), "Strings should not have resolve_expression"
++    assert not hasattr(42, 'resolve_expression'), "Integers should not have resolve_expression"
++    assert not hasattr(None, 'resolve_expression'), "None should not have resolve_expression"
++    print("✅ Regular values do not have resolve_expression method")
++
++    print("✅ All expression handling tests passed!")
++
++if __name__ == '__main__':
++    try:
++        test_expression_handling()
++        test_bulk_update_with_regular_values()
++        test_bulk_update_with_f_expression()
++        print("\n🎉 All tests passed! The fix is working correctly.")
++    except Exception as e:
++        print(f"\n❌ Test failed: {e}")
++        sys.exit(1)
+\ No newline at end of file

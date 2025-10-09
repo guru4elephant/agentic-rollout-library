@@ -1,0 +1,476 @@
+diff --git a/debug_datetime_addition.py b/debug_datetime_addition.py
+new file mode 100644
+index 0000000000..0fdd9936fb
+--- /dev/null
++++ b/debug_datetime_addition.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Value
++from django.db.models.fields import DurationField, DateTimeField
++import datetime
++
++class Experiment(models.Model):
++    start = models.DateTimeField()
++    end = models.DateTimeField()
++
++    class Meta:
++        app_label = 'test'
++
++# Test DateTime addition
++try:
++    result = Experiment.objects.annotate(delta=F('end') + F('start'))
++    print("DateTime addition annotation created")
++    
++    # Check the output field
++    print(f"Output field: {result.query.annotations['delta'].output_field}")
++    print(f"Output field type: {type(result.query.annotations['delta'].output_field)}")
++    
++    # Check source expressions
++    print("Source expressions:")
++    for expr in result.query.annotations['delta'].get_source_expressions():
++        print(f"  - {expr}: {type(expr)}")
++        if hasattr(expr, 'output_field'):
++            print(f"    Output field: {expr.output_field}")
++            print(f"    Output field type: {type(expr.output_field)}")
++    
++    # Try to compile
++    compiler = result.query.get_compiler(using='default')
++    sql, params = compiler.as_sql()
++    print(f"SQL: {sql}")
++    
++except Exception as e:
++    print(f"ERROR: {e}")
++    print(f"Error type: {type(e)}")
+\ No newline at end of file
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index d913658291..ec7cef51c0 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -302,6 +302,17 @@ class BaseExpression:
+         for output_field in sources_iter:
+             for source in sources_iter:
+                 if not isinstance(output_field, source.__class__):
++                    # Allow specific combinations of field types that make sense together
++                    # For example, DateTimeField and DurationField in temporal operations
++                    from django.db.models.fields import DateTimeField, DurationField, DateField, TimeField
++                    datetime_fields = (DateTimeField, DateField, TimeField)
++                    
++                    # Allow DateTime/Date/Time fields with DurationField (temporal operations)
++                    if ((isinstance(output_field, DateTimeField) or isinstance(output_field, DateField) or isinstance(output_field, TimeField)) and isinstance(source, DurationField)) or \
++                       (isinstance(output_field, DurationField) and (isinstance(source, DateTimeField) or isinstance(source, DateField) or isinstance(source, TimeField))):
++                        # For temporal operations, return DurationField as the result type
++                        return DurationField()
++                    
+                     raise FieldError(
+                         'Expression contains mixed types: %s, %s. You must '
+                         'set output_field.' % (
+@@ -442,6 +453,27 @@ class CombinedExpression(SQLiteNumericMixin, Expression):
+     def set_source_expressions(self, exprs):
+         self.lhs, self.rhs = exprs
+ 
++    def _resolve_output_field(self):
++        """
++        Resolve output field for CombinedExpression, handling special cases
++        like temporal operations with duration fields.
++        """
++        # Handle temporal subtraction followed by duration addition
++        if self.connector == self.ADD:
++            # Check if this is a temporal subtraction result being added to a duration
++            if hasattr(self.lhs, 'output_field') and hasattr(self.rhs, 'output_field'):
++                lhs_type = self.lhs.output_field.get_internal_type()
++                rhs_type = self.rhs.output_field.get_internal_type()
++                
++                # Handle case where temporal subtraction (resulting in DurationField)
++                # is being added to a DurationField
++                if lhs_type == 'DurationField' and rhs_type == 'DurationField':
++                    from django.db.models.fields import DurationField
++                    return DurationField()
++        
++        # Fall back to the default implementation for other cases
++        return super()._resolve_output_field()
++
+     def as_sql(self, compiler, connection):
+         try:
+             lhs_type = self.lhs.output_field.get_internal_type()
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..c4e3db8a2c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Value
++from django.db.models.fields import DurationField
++import datetime
++
++class Experiment(models.Model):
++    start = models.DateTimeField()
++    end = models.DateTimeField()
++
++    class Meta:
++        app_label = 'test'
++
++# Try to reproduce the issue
++try:
++    # This should trigger the error
++    result = Experiment.objects.annotate(
++        delta=F('end') - F('start') + Value(datetime.timedelta(), output_field=DurationField())
++    )
++    print("SUCCESS: Annotation created without error")
++    
++    # Try to compile the query to see if the mixed types error is fixed
++    from django.db import connection
++    compiler = result.query.get_compiler(using='default')
++    sql, params = compiler.as_sql()
++    print("SUCCESS: Query compiled without error")
++    print(f"SQL: {sql}")
++    print(f"Params: {params}")
++except Exception as e:
++    print(f"ERROR: {e}")
++    print(f"Error type: {type(e)}")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..f3b24066b2
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Value
++from django.db.models.fields import DurationField
++import datetime
++
++class Experiment(models.Model):
++    start = models.DateTimeField()
++    end = models.DateTimeField()
++
++    class Meta:
++        app_label = 'test'
++
++def test_case(description, expression):
++    print(f"\nTesting: {description}")
++    try:
++        result = Experiment.objects.annotate(delta=expression)
++        compiler = result.query.get_compiler(using='default')
++        sql, params = compiler.as_sql()
++        print("SUCCESS: Query compiled without error")
++        print(f"SQL: {sql}")
++        return True
++    except Exception as e:
++        print(f"ERROR: {e}")
++        print(f"Error type: {type(e)}")
++        return False
++
++# Test cases
++test_cases = [
++    ("Original issue: DateTime subtraction + Duration addition", 
++     F('end') - F('start') + Value(datetime.timedelta(), output_field=DurationField())),
++    
++    ("Duration addition + DateTime subtraction", 
++     Value(datetime.timedelta(), output_field=DurationField()) + (F('end') - F('start'))),
++    
++    ("DateTime subtraction only", 
++     F('end') - F('start')),
++    
++    ("Duration addition only", 
++     Value(datetime.timedelta(), output_field=DurationField()) + Value(datetime.timedelta(hours=1), output_field=DurationField())),
++    
++    ("DateTime addition (should fail)", 
++     F('end') + F('start')),
++]
++
++all_passed = True
++for description, expression in test_cases:
++    if not test_case(description, expression):
++        all_passed = False
++
++print(f"\nOverall result: {'ALL TESTS PASSED' if all_passed else 'SOME TESTS FAILED'}")
+\ No newline at end of file
+diff --git a/test_existing_functionality.py b/test_existing_functionality.py
+new file mode 100644
+index 0000000000..45c3f352b1
+--- /dev/null
++++ b/test_existing_functionality.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Value
++from django.db.models.fields import DurationField, DateTimeField, IntegerField
++import datetime
++
++class TestModel(models.Model):
++    int_field = models.IntegerField()
++    datetime_field = models.DateTimeField()
++    duration_field = models.DurationField()
++
++    class Meta:
++        app_label = 'test'
++
++def test_case(description, expression, should_succeed=True):
++    print(f"\nTesting: {description}")
++    try:
++        result = TestModel.objects.annotate(result=expression)
++        compiler = result.query.get_compiler(using='default')
++        sql, params = compiler.as_sql()
++        if should_succeed:
++            print("SUCCESS: Query compiled without error")
++            print(f"SQL: {sql}")
++            return True
++        else:
++            print("UNEXPECTED SUCCESS: Query should have failed but didn't")
++            return False
++    except Exception as e:
++        if not should_succeed:
++            print(f"EXPECTED ERROR: {e}")
++            return True
++        else:
++            print(f"UNEXPECTED ERROR: {e}")
++            return False
++
++# Test cases that should succeed (same field types)
++test_cases_succeed = [
++    ("Integer + Integer", F('int_field') + F('int_field')),
++    ("DateTime + DateTime", F('datetime_field') + F('datetime_field')),
++    ("Duration + Duration", F('duration_field') + F('duration_field')),
++]
++
++# Test cases that should fail (mixed field types)
++test_cases_fail = [
++    ("Integer + DateTime", F('int_field') + F('datetime_field')),
++    ("DateTime + Integer", F('datetime_field') + F('int_field')),
++    ("Integer + Duration", F('int_field') + F('duration_field')),
++    ("Duration + Integer", F('duration_field') + F('int_field')),
++]
++
++# Test cases that should succeed with our fix (DateTime + Duration)
++test_cases_fixed = [
++    ("DateTime + Duration", F('datetime_field') + F('duration_field')),
++    ("Duration + DateTime", F('duration_field') + F('datetime_field')),
++]
++
++all_passed = True
++
++print("=== Testing existing functionality (should succeed) ===")
++for description, expression in test_cases_succeed:
++    if not test_case(description, expression, should_succeed=True):
++        all_passed = False
++
++print("\n=== Testing mixed types that should fail ===")
++for description, expression in test_cases_fail:
++    if not test_case(description, expression, should_succeed=False):
++        all_passed = False
++
++print("\n=== Testing our fix (DateTime + Duration should succeed) ===")
++for description, expression in test_cases_fixed:
++    if not test_case(description, expression, should_succeed=True):
++        all_passed = False
++
++print(f"\nOverall result: {'ALL TESTS PASSED' if all_passed else 'SOME TESTS FAILED'}")
+\ No newline at end of file
+diff --git a/test_specific_cases.py b/test_specific_cases.py
+new file mode 100644
+index 0000000000..ba1cea0561
+--- /dev/null
++++ b/test_specific_cases.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Value
++from django.db.models.fields import DurationField, DateTimeField, IntegerField
++import datetime
++
++class Experiment(models.Model):
++    start = models.DateTimeField()
++    end = models.DateTimeField()
++    count = models.IntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++def test_case(description, expression, should_succeed=True):
++    print(f"\nTesting: {description}")
++    try:
++        result = Experiment.objects.annotate(delta=expression)
++        compiler = result.query.get_compiler(using='default')
++        sql, params = compiler.as_sql()
++        if should_succeed:
++            print("SUCCESS: Query compiled without error")
++            print(f"SQL: {sql}")
++            return True
++        else:
++            print("UNEXPECTED SUCCESS: Query should have failed but didn't")
++            return False
++    except Exception as e:
++        if not should_succeed:
++            print(f"EXPECTED ERROR: {e}")
++            return True
++        else:
++            print(f"UNEXPECTED ERROR: {e}")
++            return False
++
++# Test cases that should succeed
++test_cases_succeed = [
++    ("DateTime subtraction + Duration addition", 
++     F('end') - F('start') + Value(datetime.timedelta(), output_field=DurationField())),
++    
++    ("Duration addition + DateTime subtraction", 
++     Value(datetime.timedelta(), output_field=DurationField()) + (F('end') - F('start'))),
++    
++    ("DateTime subtraction only", 
++     F('end') - F('start')),
++    
++    ("Duration addition only", 
++     Value(datetime.timedelta(), output_field=DurationField()) + Value(datetime.timedelta(hours=1), output_field=DurationField())),
++]
++
++# Test cases that should fail
++test_cases_fail = [
++    ("DateTime addition (invalid)", 
++     F('end') + F('start')),
++    
++    ("Integer + DateTime (invalid)", 
++     F('count') + F('start')),
++    
++    ("DateTime + Integer (invalid)", 
++     F('start') + F('count')),
++]
++
++all_passed = True
++for description, expression in test_cases_succeed:
++    if not test_case(description, expression, should_succeed=True):
++        all_passed = False
++
++for description, expression in test_cases_fail:
++    if not test_case(description, expression, should_succeed=False):
++        all_passed = False
++
++print(f"\nOverall result: {'ALL TESTS PASSED' if all_passed else 'SOME TESTS FAILED'}")
+\ No newline at end of file

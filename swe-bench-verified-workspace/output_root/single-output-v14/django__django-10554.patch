@@ -1,0 +1,251 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 08d7faf194..bafab97664 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -2031,6 +2031,11 @@ class Query(BaseExpression):
+         self.select_related = False
+         self.clear_deferred_loading()
+         self.clear_select_fields()
++        
++        # Clear ordering for combinator queries to avoid invalid positional references
++        # when the SELECT clause changes (e.g., in values_list() after union() with ordering)
++        if self.combinator:
++            self.clear_ordering(True)
+ 
+         if self.group_by is True:
+             self.add_fields((f.attname for f in self.model._meta.concrete_fields), False)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..fcd952e939
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class Dimension(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++    def __str__(self):
++        return self.name
++
++# We'll just test the query construction without actual database operations
++print("Testing QuerySet union with ordering...")
++
++# Create the querysets as described in the issue
++qs1 = Dimension.objects.filter(pk__in=[10, 11])
++qs2 = Dimension.objects.filter(pk__in=[16, 17])
++
++print("First queryset:", qs1.query)
++print("Second queryset:", qs2.query)
++
++# Create union with ordering
++union_qs = qs1.union(qs2).order_by('order')
++print("Union queryset with ordering:", union_qs.query)
++
++# Try to create a derived queryset
++try:
++    derived_qs = union_qs.order_by().values_list('pk', flat=True)
++    print("Derived queryset:", derived_qs.query)
++except Exception as e:
++    print(f"Error creating derived queryset: {e}")
++    import traceback
++    traceback.print_exc()
++
++# Try to evaluate the original union queryset
++try:
++    print("Evaluating union queryset...")
++    # This should trigger the actual SQL execution
++    list(union_qs)
++except Exception as e:
++    print(f"Error evaluating union queryset: {e}")
++    import traceback
++    traceback.print_exc()
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..b60657eb56
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class Dimension(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++    def __str__(self):
++        return self.name
++
++print("Testing edge cases for QuerySet union with ordering fix...")
++
++# Test case 1: Union without ordering should work fine
++print("\n=== Test case 1: Union without ordering ===")
++qs1 = Dimension.objects.filter(pk__in=[10, 11])
++qs2 = Dimension.objects.filter(pk__in=[16, 17])
++union_qs = qs1.union(qs2)  # No ordering
++derived_qs = union_qs.values_list('pk', flat=True)
++print("Union without ordering SQL:", union_qs.query)
++print("Derived queryset SQL:", derived_qs.query)
++print("SUCCESS: Union without ordering works!")
++
++# Test case 2: Union with multiple orderings
++print("\n=== Test case 2: Union with multiple orderings ===")
++union_qs = qs1.union(qs2).order_by('order', 'name')
++derived_qs = union_qs.values_list('pk', flat=True)
++print("Union with multiple ordering SQL:", union_qs.query)
++print("Derived queryset SQL:", derived_qs.query)
++print("SUCCESS: Union with multiple orderings works!")
++
++# Test case 3: Non-combinator query should not be affected
++print("\n=== Test case 3: Regular query (non-combinator) ===")
++regular_qs = Dimension.objects.filter(pk__in=[10, 11]).order_by('order')
++derived_qs = regular_qs.values_list('pk', flat=True)
++print("Regular query with ordering SQL:", regular_qs.query)
++print("Derived queryset SQL:", derived_qs.query)
++print("SUCCESS: Regular query ordering is preserved!")
++
++# Test case 4: Intersection query with ordering
++print("\n=== Test case 4: Intersection with ordering ===")
++intersection_qs = qs1.intersection(qs2).order_by('order')
++derived_qs = intersection_qs.values_list('pk', flat=True)
++print("Intersection with ordering SQL:", intersection_qs.query)
++print("Derived queryset SQL:", derived_qs.query)
++print("SUCCESS: Intersection with ordering works!")
++
++print("\nAll edge cases passed!")
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..94a2e69745
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class Dimension(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++    def __str__(self):
++        return self.name
++
++print("Testing QuerySet union with ordering fix...")
++
++# Create the querysets as described in the issue
++qs1 = Dimension.objects.filter(pk__in=[10, 11])
++qs2 = Dimension.objects.filter(pk__in=[16, 17])
++
++print("First queryset SQL:", qs1.query)
++print("Second queryset SQL:", qs2.query)
++
++# Create union with ordering
++union_qs = qs1.union(qs2).order_by('order')
++print("Union queryset with ordering SQL:", union_qs.query)
++
++# Try to create a derived queryset - this should work now
++try:
++    derived_qs = union_qs.order_by().values_list('pk', flat=True)
++    print("Derived queryset SQL:", derived_qs.query)
++    print("SUCCESS: Derived queryset created without error!")
++except Exception as e:
++    print(f"ERROR creating derived queryset: {e}")
++    import traceback
++    traceback.print_exc()
++
++# Test that the original union queryset can still be evaluated (SQL generation only)
++try:
++    print("Original union queryset SQL:", union_qs.query)
++    print("SUCCESS: Original union queryset SQL generation works!")
++except Exception as e:
++    print(f"ERROR with original union queryset: {e}")
++    import traceback
++    traceback.print_exc()

@@ -1,0 +1,267 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..416b9e20
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,31 @@
++#!/usr/bin/env python3
++
++import requests
++from requests.auth import HTTPDigestAuth
++
++# Create a simple test to see the current digest header format
++auth = HTTPDigestAuth('user', 'pass')
++
++# Simulate the challenge data that would come from a server
++auth.chal = {
++    'realm': 'testrealm@host.com',
++    'nonce': 'dcd98b7102dd2f0e8b11d0f600bfb0c093',
++    'qop': 'auth'
++}
++
++# Build the digest header
++digest_header = auth.build_digest_header('GET', 'http://example.com/path')
++print("Current digest header:")
++print(digest_header)
++
++# Check if qop is properly quoted
++if 'qop="auth"' in digest_header:
++    print("✓ qop is properly quoted")
++else:
++    print("✗ qop is NOT properly quoted - this is the bug!")
++    print("Expected: qop=\"auth\"")
++    print("Found: ", end="")
++    if 'qop=auth' in digest_header:
++        print("qop=auth (unquoted)")
++    else:
++        print("qop parameter not found or malformed")
+\ No newline at end of file
+diff --git a/requests/auth.py b/requests/auth.py
+index a3de123d..48416e5f 100644
+--- a/requests/auth.py
++++ b/requests/auth.py
+@@ -144,7 +144,7 @@ class HTTPDigestAuth(AuthBase):
+         if entdig:
+             base += ', digest="%s"' % entdig
+         if qop:
+-            base += ', qop=auth, nc=%s, cnonce="%s"' % (ncvalue, cnonce)
++            base += ', qop="auth", nc=%s, cnonce="%s"' % (ncvalue, cnonce)
+ 
+         return 'Digest %s' % (base)
+ 
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 00000000..0806ca57
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++
++import requests
++from requests.auth import HTTPDigestAuth
++
++def test_qop_quoting():
++    print("Testing qop quoting in various scenarios...")
++    
++    # Test 1: Basic auth qop
++    auth = HTTPDigestAuth('user', 'pass')
++    auth.chal = {
++        'realm': 'testrealm@host.com',
++        'nonce': 'dcd98b7102dd2f0e8b11d0f600bfb0c093',
++        'qop': 'auth'
++    }
++    
++    digest_header = auth.build_digest_header('GET', 'http://example.com/path')
++    print(f"Test 1 - Basic auth: {digest_header}")
++    assert 'qop="auth"' in digest_header, "qop should be quoted for auth"
++    print("✓ Test 1 passed")
++    
++    # Test 2: auth-int qop is not implemented in current codebase
++    # (see TODO comment in auth.py), so we skip this test
++    print("Test 2 - auth-int: Skipped (not implemented in current version)")
++    print("✓ Test 2 skipped - auth-int not implemented")
++    
++    # Test 3: Multiple qop options (server sends comma-separated list)
++    auth3 = HTTPDigestAuth('user', 'pass')
++    auth3.chal = {
++        'realm': 'testrealm@host.com',
++        'nonce': 'dcd98b7102dd2f0e8b11d0f600bfb0c093',
++        'qop': 'auth,auth-int'
++    }
++    
++    digest_header3 = auth3.build_digest_header('GET', 'http://example.com/path')
++    print(f"Test 3 - Multiple qop: {digest_header3}")
++    # Should still quote the selected qop value (auth)
++    assert 'qop="auth"' in digest_header3, "selected qop should still be quoted"
++    print("✓ Test 3 passed")
++    
++    # Test 4: No qop (should not include qop parameter)
++    auth4 = HTTPDigestAuth('user', 'pass')
++    auth4.chal = {
++        'realm': 'testrealm@host.com',
++        'nonce': 'dcd98b7102dd2f0e8b11d0f600bfb0c093'
++        # No qop key
++    }
++    
++    digest_header4 = auth4.build_digest_header('GET', 'http://example.com/path')
++    print(f"Test 4 - No qop: {digest_header4}")
++    assert 'qop=' not in digest_header4, "qop should not be present when not in challenge"
++    print("✓ Test 4 passed")
++    
++    print("\nAll edge case tests passed! ✓")
++
++if __name__ == "__main__":
++    test_qop_quoting()
+\ No newline at end of file
+diff --git a/test_fix_verification.py b/test_fix_verification.py
+new file mode 100644
+index 00000000..4ef582f6
+--- /dev/null
++++ b/test_fix_verification.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++
++import sys
++sys.path.insert(0, '/testbed')
++
++from requests.auth import HTTPDigestAuth
++
++def test_qop_quoting_fix():
++    """Test that qop parameter is properly quoted in Digest authentication headers"""
++    
++    print("Testing qop quoting fix...")
++    
++    # Create auth instance
++    auth = HTTPDigestAuth('user', 'pass')
++    
++    # Set up challenge data
++    auth.chal = {
++        'realm': 'testrealm@host.com',
++        'nonce': 'dcd98b7102dd2f0e8b11d0f600bfb0c093',
++        'qop': 'auth'
++    }
++    
++    # Build digest header
++    digest_header = auth.build_digest_header('GET', 'http://example.com/path')
++    
++    print(f"Generated header: {digest_header}")
++    
++    # Verify that qop is properly quoted
++    if 'qop="auth"' in digest_header:
++        print("✓ SUCCESS: qop parameter is properly quoted with double quotes")
++        return True
++    else:
++        print("✗ FAILURE: qop parameter is not properly quoted")
++        print(f"Expected: qop=\"auth\"")
++        print(f"Actual header: {digest_header}")
++        return False
++
++def test_backward_compatibility():
++    """Test that our change doesn't break existing functionality"""
++    
++    print("\nTesting backward compatibility...")
++    
++    auth = HTTPDigestAuth('user', 'pass')
++    
++    # Test case 1: No qop in challenge
++    auth.chal = {
++        'realm': 'testrealm@host.com',
++        'nonce': 'dcd98b7102dd2f0e8b11d0f600bfb0c093'
++        # No qop key
++    }
++    
++    digest_header = auth.build_digest_header('GET', 'http://example.com/path')
++    print(f"No qop header: {digest_header}")
++    
++    if 'qop=' not in digest_header:
++        print("✓ SUCCESS: No qop parameter when not in challenge")
++    else:
++        print("✗ FAILURE: qop parameter incorrectly added")
++        return False
++    
++    # Test case 2: Multiple qop options
++    auth.chal = {
++        'realm': 'testrealm@host.com',
++        'nonce': 'dcd98b7102dd2f0e8b11d0f600bfb0c093',
++        'qop': 'auth,auth-int'
++    }
++    
++    digest_header = auth.build_digest_header('GET', 'http://example.com/path')
++    print(f"Multiple qop header: {digest_header}")
++    
++    if 'qop="auth"' in digest_header:
++        print("✓ SUCCESS: Selected qop is properly quoted even with multiple options")
++        return True
++    else:
++        print("✗ FAILURE: qop parameter not properly handled with multiple options")
++        return False
++
++if __name__ == "__main__":
++    success1 = test_qop_quoting_fix()
++    success2 = test_backward_compatibility()
++    
++    if success1 and success2:
++        print("\n🎉 All tests passed! The fix is working correctly.")
++        sys.exit(0)
++    else:
++        print("\n❌ Some tests failed.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_rfc_compliance.py b/test_rfc_compliance.py
+new file mode 100644
+index 00000000..0c60e673
+--- /dev/null
++++ b/test_rfc_compliance.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++
++import sys
++sys.path.insert(0, '/testbed')
++
++from requests.auth import HTTPDigestAuth
++
++def test_rfc_2617_compliance():
++    """
++    Test that the qop-options directive is properly quoted according to RFC2617.
++    The RFC states: "it is a quoted string of one or more tokens"
++    """
++    
++    print("Testing RFC 2617 compliance for qop-options directive...")
++    print("RFC 2617 states: 'it is a quoted string of one or more tokens'")
++    print()
++    
++    auth = HTTPDigestAuth('user', 'pass')
++    auth.chal = {
++        'realm': 'testrealm@host.com',
++        'nonce': 'dcd98b7102dd2f0e8b11d0f600bfb0c093',
++        'qop': 'auth'
++    }
++    
++    digest_header = auth.build_digest_header('GET', 'http://example.com/path')
++    
++    print(f"Generated Digest header:")
++    print(f"  {digest_header}")
++    print()
++    
++    # Check if qop is properly quoted
++    if 'qop="auth"' in digest_header:
++        print("✓ SUCCESS: qop parameter is properly quoted with double quotes as required by RFC 2617")
++        print("✓ This matches the behavior of curl and other RFC-compliant implementations")
++        return True
++    elif 'qop=auth' in digest_header:
++        print("✗ FAILURE: qop parameter is not quoted (violates RFC 2617)")
++        print("✗ This would cause issues with server-side implementations that require quotes")
++        return False
++    else:
++        print("✗ FAILURE: qop parameter not found or malformed")
++        return False
++
++if __name__ == "__main__":
++    if test_rfc_2617_compliance():
++        print("\n🎉 RFC 2617 compliance test passed!")
++        print("The fix ensures proper quoting of qop-options as required by the specification.")
++        sys.exit(0)
++    else:
++        print("\n❌ RFC 2617 compliance test failed!")
++        sys.exit(1)
+\ No newline at end of file

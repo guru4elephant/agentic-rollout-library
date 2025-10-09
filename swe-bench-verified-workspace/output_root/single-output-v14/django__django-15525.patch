@@ -1,0 +1,145 @@
+diff --git a/django/core/serializers/base.py b/django/core/serializers/base.py
+index da85cb4b92..e98c6a2289 100644
+--- a/django/core/serializers/base.py
++++ b/django/core/serializers/base.py
+@@ -336,7 +336,11 @@ def build_instance(Model, data, db):
+         and hasattr(default_manager, "get_by_natural_key")
+         and hasattr(Model, "natural_key")
+     ):
+-        natural_key = Model(**data).natural_key()
++        # Create instance with the correct database connection to ensure
++        # foreign key relationships are resolved using the right database
++        instance = Model(**data)
++        instance._state.db = db
++        natural_key = instance.natural_key()
+         try:
+             data[Model._meta.pk.attname] = Model._meta.pk.to_python(
+                 default_manager.db_manager(db).get_by_natural_key(*natural_key).pk
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..4daaa00e47
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,121 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Add the current directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++            'other': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Define the models from the issue
++class AuthorManager(models.Manager):
++    def get_by_natural_key(self, name):
++        return self.get(name=name)
++
++class Author(models.Model):
++    id = models.AutoField(primary_key=True)
++    name = models.CharField(max_length=255, unique=True)
++    objects = AuthorManager()
++    
++    class Meta:
++        app_label = 'contenttypes'
++    
++    def natural_key(self):
++        return (self.name,)
++    
++    def __str__(self):
++        return f"{self.id} {self.name}"
++
++class BookManager(models.Manager):
++    def get_by_natural_key(self, title, author):
++        return self.get(title=title, author__name=author)
++
++class Book(models.Model):
++    id = models.AutoField(primary_key=True)
++    title = models.CharField(max_length=255)
++    author = models.ForeignKey(Author, models.DO_NOTHING, related_name="books")
++    objects = BookManager()
++    
++    class Meta:
++        app_label = 'contenttypes'
++        unique_together = [["title", "author"]]
++    
++    def natural_key(self):
++        return (self.title,) + self.author.natural_key()
++    
++    natural_key.dependencies = ["contenttypes.Author"]
++    
++    def __str__(self):
++        return f"{self.id}: '{self.title}' by {self.author}"
++
++# Create the test data
++from django.core import serializers
++
++# Create tables manually
++with django.db.connections['default'].cursor() as cursor:
++    cursor.execute("CREATE TABLE contenttypes_author (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(255) UNIQUE)")
++    cursor.execute("CREATE TABLE contenttypes_book (id INTEGER PRIMARY KEY AUTOINCREMENT, title VARCHAR(255), author_id INTEGER)")
++
++with django.db.connections['other'].cursor() as cursor:
++    cursor.execute("CREATE TABLE contenttypes_author (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(255) UNIQUE)")
++    cursor.execute("CREATE TABLE contenttypes_book (id INTEGER PRIMARY KEY AUTOINCREMENT, title VARCHAR(255), author_id INTEGER)")
++
++# Create an author only in the default database (to test forward references)
++Author.objects.using('default').create(name="JR Tolkien")
++
++# Try to load data into the other database - this should fail
++test_data = '''[
++{
++ "model": "contenttypes.author",
++ "fields": {
++    "name": "JR Tolkien"
++ }
++},
++{
++ "model": "contenttypes.book",
++ "fields": {
++    "title": "The Ring",
++    "author": [
++     "JR Tolkien"
++    ]
++ }
++}
++]'''
++
++print("Attempting to load data into 'other' database...")
++try:
++    from django.core.serializers import deserialize
++    objects = list(deserialize('json', test_data, using='other', handle_forward_references=True))
++    print("SUCCESS: Data loaded successfully!")
++except Exception as e:
++    print(f"ERROR: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file

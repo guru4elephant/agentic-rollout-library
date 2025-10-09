@@ -1,0 +1,331 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 850734709d..752ff9305c 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -128,7 +128,9 @@ class SQLCompiler:
+         for expr, (sql, params, is_ref) in order_by:
+             # Skip References to the select clause, as all expressions in the
+             # select clause are already part of the group by.
+-            if not is_ref:
++            # Also skip expressions that come from Meta.ordering as they should
++            # only affect ORDER BY, not GROUP BY.
++            if not is_ref and not self._is_meta_ordering_expr(expr):
+                 expressions.extend(expr.get_group_by_cols())
+         having_group_by = self.having.get_group_by_cols() if self.having else ()
+         for expr in having_group_by:
+@@ -196,6 +198,34 @@ class SQLCompiler:
+             ]
+         return expressions
+ 
++    def _is_meta_ordering_expr(self, expr):
++        """
++        Check if the expression comes from Meta.ordering.
++        Meta.ordering expressions should only affect ORDER BY, not GROUP BY.
++        """
++        if not self._meta_ordering:
++            return False
++        
++        # Check if this expression corresponds to a Meta.ordering field
++        # The expr is an OrderBy object, we need to check its underlying expression
++        try:
++            # For OrderBy expressions, check the underlying expression
++            if hasattr(expr, 'expression'):
++                underlying_expr = expr.expression
++                # For simple column references, check if the field name matches
++                if hasattr(underlying_expr, 'target') and hasattr(underlying_expr.target, 'name'):
++                    field_name = underlying_expr.target.name
++                    # Check if this field is in Meta.ordering
++                    for ordering_field in self._meta_ordering:
++                        if ordering_field.lstrip('-') == field_name:
++                            return True
++        except (AttributeError, TypeError):
++            pass
++        
++        # Debug: print what we're checking
++        print(f"DEBUG: _is_meta_ordering_expr called with expr={expr}, _meta_ordering={self._meta_ordering}")
++        return False
++
+     def get_select(self):
+         """
+         Return three values:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..ab971f4155
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count
++
++# Create a test model with Meta.ordering
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    category = models.CharField(max_length=50)
++    
++    class Meta:
++        ordering = ['name']
++        app_label = 'testapp'
++        
++    def __str__(self):
++        return self.name
++
++# Create another model without ordering for comparison
++class TestModelNoOrdering(models.Model):
++    name = models.CharField(max_length=100)
++    category = models.CharField(max_length=50)
++    
++    class Meta:
++        app_label = 'testapp'
++        
++    def __str__(self):
++        return self.name
++
++def test_meta_ordering_group_by():
++    print("Testing Meta.ordering with GROUP BY...")
++    
++    # Just examine the query generation without actually executing
++    from django.db.models.sql.query import Query
++    
++    # Create query objects to examine the SQL generation
++    query1 = Query(TestModel)
++    query1.values('category')
++    query1.annotate(count=Count('id'))
++    
++    query2 = Query(TestModelNoOrdering) 
++    query2.values('category')
++    query2.annotate(count=Count('id'))
++    
++    query3 = Query(TestModel)
++    query3.values('category')
++    query3.annotate(count=Count('id'))
++    query3.order_by()  # Explicit empty order_by
++    
++    # Get the SQL compiler for each query
++    from django.db import connection
++    compiler1 = query1.get_compiler(connection=connection)
++    compiler2 = query2.get_compiler(connection=connection)
++    compiler3 = query3.get_compiler(connection=connection)
++    
++    print("\n1. Query with Meta.ordering:")
++    sql1, params1 = compiler1.as_sql()
++    print("SQL:", sql1)
++    print("GROUP BY fields from get_group_by():", compiler1.get_group_by([], []))
++    
++    print("\n2. Query without Meta.ordering:")
++    sql2, params2 = compiler2.as_sql()
++    print("SQL:", sql2)
++    print("GROUP BY fields from get_group_by():", compiler2.get_group_by([], []))
++    
++    print("\n3. Query with Meta.ordering but explicit order_by():")
++    sql3, params3 = compiler3.as_sql()
++    print("SQL:", sql3)
++    print("GROUP BY fields from get_group_by():", compiler3.get_group_by([], []))
++
++if __name__ == '__main__':
++    test_meta_ordering_group_by()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..b640c90c33
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count
++
++# Create a simple test model with Meta.ordering
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    category = models.CharField(max_length=50)
++    
++    class Meta:
++        ordering = ['name']
++        app_label = 'testapp'
++        
++    def __str__(self):
++        return self.name
++
++def test_meta_ordering_issue():
++    print("Testing the Meta.ordering GROUP BY issue...")
++    
++    # Create a simple query that would trigger the issue
++    from django.db.models.sql.query import Query
++    from django.db import connection
++    
++    # Create query with Meta.ordering
++    query = Query(TestModel)
++    query.add_annotation(Count('id'), 'count')
++    query.group_by = True
++    
++    # Get compiler
++    compiler = query.get_compiler(connection=connection)
++    
++    # Setup the query properly using pre_sql_setup
++    extra_select, order_by, group_by = compiler.pre_sql_setup()
++    
++    print("Order by from Meta.ordering:", order_by)
++    # Debug: check what the expression looks like
++    for expr, (sql, params, is_ref) in order_by:
++        print(f"Expression: {expr}, type: {type(expr)}")
++        if hasattr(expr, 'expression'):
++            print(f"  Expression.expression: {expr.expression}, type: {type(expr.expression)}")
++        if hasattr(expr, 'target'):
++            print(f"  Expression.target: {expr.target}")
++    
++    print("GROUP BY (includes Meta.ordering fields):", group_by)
++    
++    # The fix: Meta.ordering fields should be excluded from GROUP BY
++    print("\nThe issue is that Meta.ordering fields are incorrectly included in GROUP BY")
++    print("They should only be used for ORDER BY, not GROUP BY")
++
++if __name__ == '__main__':
++    test_meta_ordering_issue()
+\ No newline at end of file
+diff --git a/test_meta_ordering_groupby.py b/test_meta_ordering_groupby.py
+new file mode 100644
+index 0000000000..c1134c298d
+--- /dev/null
++++ b/test_meta_ordering_groupby.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.aggregation',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count
++from tests.aggregation.models import Author
++
++# Create a copy of Author with Meta.ordering
++class AuthorWithOrdering(Author):
++    class Meta:
++        ordering = ['name']
++        app_label = 'aggregation'
++        
++    def __str__(self):
++        return self.name
++
++def test_meta_ordering_group_by():
++    print("Testing Meta.ordering with GROUP BY...")
++    
++    # Create query objects
++    from django.db.models.sql.query import Query
++    from django.db import connection
++    
++    # Query with Meta.ordering
++    query1 = Query(AuthorWithOrdering)
++    query1.add_annotation(Count('id'), 'count')
++    query1.group_by = True
++    query1.set_values(['age'])
++    
++    # Query without Meta.ordering (using original Author)
++    query2 = Query(Author)
++    query2.add_annotation(Count('id'), 'count') 
++    query2.group_by = True
++    query2.set_values(['age'])
++    
++    # Get compilers
++    compiler1 = query1.get_compiler(connection=connection)
++    compiler2 = query2.get_compiler(connection=connection)
++    
++    # Get the select and order_by for get_group_by
++    compiler1.setup_query()
++    compiler2.setup_query()
++    
++    select1, klass_info1, annotation_col_map1 = compiler1.get_select()
++    select2, klass_info2, annotation_col_map2 = compiler2.get_select()
++    
++    order_by1 = compiler1.get_order_by()
++    order_by2 = compiler2.get_order_by()
++    
++    print("\n1. Query with Meta.ordering:")
++    print("Order by:", order_by1)
++    group_by1 = compiler1.get_group_by(select1, order_by1)
++    print("GROUP BY:", group_by1)
++    
++    print("\n2. Query without Meta.ordering:")
++    print("Order by:", order_by2) 
++    group_by2 = compiler2.get_group_by(select2, order_by2)
++    print("GROUP BY:", group_by2)
++    
++    # The issue: Meta.ordering fields should not be in GROUP BY
++    # even though they are in order_by when it comes from Meta.ordering
++    
++    print("\nAnalysis:")
++    print("Both queries should have the same GROUP BY clauses")
++    print("Meta.ordering fields should not affect GROUP BY")
++
++if __name__ == '__main__':
++    test_meta_ordering_group_by()
+\ No newline at end of file

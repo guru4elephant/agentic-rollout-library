@@ -1,0 +1,460 @@
+diff --git a/django/db/models/fields/reverse_related.py b/django/db/models/fields/reverse_related.py
+index ccc2223a5f..65950590e2 100644
+--- a/django/db/models/fields/reverse_related.py
++++ b/django/db/models/fields/reverse_related.py
+@@ -310,7 +310,7 @@ class ManyToManyRel(ForeignObjectRel):
+     def identity(self):
+         return super().identity + (
+             self.through,
+-            self.through_fields,
++            make_hashable(self.through_fields),
+             self.db_constraint,
+         )
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..2d66fe878a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create the models from the issue description
++class Parent(models.Model):
++    name = models.CharField(max_length=256)
++    
++    class Meta:
++        app_label = 'test'
++
++class ProxyParent(Parent):
++    class Meta:
++        proxy = True
++        app_label = 'test'
++
++class Child(models.Model):
++    parent = models.ForeignKey(Parent, on_delete=models.CASCADE)
++    many_to_many_field = models.ManyToManyField(
++        to=Parent,
++        through="ManyToManyModel",
++        through_fields=['child', 'parent'],
++        related_name="something"
++    )
++    
++    class Meta:
++        app_label = 'test'
++
++class ManyToManyModel(models.Model):
++    parent = models.ForeignKey(Parent, on_delete=models.CASCADE, related_name='+')
++    child = models.ForeignKey(Child, on_delete=models.CASCADE, related_name='+')
++    second_child = models.ForeignKey(Child, on_delete=models.CASCADE, null=True, default=None)
++    
++    class Meta:
++        app_label = 'test'
++
++if __name__ == '__main__':
++    # This should trigger the error described in the issue
++    try:
++        # Force the model checks that would trigger the field name clash detection
++        from django.core.checks.registry import registry
++        from django.core.checks.model_checks import check_all_models
++        
++        # Get all models and run checks on them
++        from django.apps import apps
++        models = apps.get_models()
++        
++        for model in models:
++            if hasattr(model, '_meta') and hasattr(model._meta, 'app_label'):
++                if model._meta.app_label == 'test':
++                    print(f"Checking model: {model._meta.model_name}")
++                    errors = model.check()
++                    print(f"Model {model._meta.model_name} check completed with {len(errors)} errors")
++                    
++        # Also try to access the hash directly to trigger the error
++        from django.db.models.fields.reverse_related import ManyToManyRel
++        from django.db.models import ManyToManyField
++        
++        # Create a ManyToManyRel instance with through_fields as a list
++        field = ManyToManyField(
++            to=Parent,
++            through="ManyToManyModel",
++            through_fields=['child', 'parent'],
++            related_name="something"
++        )
++        
++        # Force creation of the reverse relation
++        field.contribute_to_class(Child, 'many_to_many_field')
++        
++        # Try to hash the remote_field
++        rel = Child._meta.get_field('many_to_many_field').remote_field
++        print(f"Remote field type: {type(rel)}")
++        print(f"Through fields: {rel.through_fields}")
++        print(f"Through fields type: {type(rel.through_fields)}")
++        
++        # This should trigger the error
++        try:
++            hash_value = hash(rel)
++            print(f"Hash successful: {hash_value}")
++        except Exception as e:
++            print(f"Hash failed: {type(e).__name__}: {e}")
++            import traceback
++            traceback.print_exc()
++            
++    except Exception as e:
++        print(f"Error occurred: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..2c2acf3ab5
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,183 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Test various scenarios with through_fields
++class TestModel1(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class TestModel2(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test case 1: through_fields as list
++class ThroughModel1(models.Model):
++    model1 = models.ForeignKey(TestModel1, on_delete=models.CASCADE)
++    model2 = models.ForeignKey(TestModel2, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++class ModelWithM2M1(models.Model):
++    name = models.CharField(max_length=100)
++    m2m_field = models.ManyToManyField(
++        TestModel1,
++        through=ThroughModel1,
++        through_fields=['model2', 'model1']  # List
++    )
++    
++    class Meta:
++        app_label = 'test'
++
++# Test case 2: through_fields as tuple
++class ThroughModel2(models.Model):
++    model1 = models.ForeignKey(TestModel1, on_delete=models.CASCADE)
++    model2 = models.ForeignKey(TestModel2, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++class ModelWithM2M2(models.Model):
++    name = models.CharField(max_length=100)
++    m2m_field = models.ManyToManyField(
++        TestModel1,
++        through=ThroughModel2,
++        through_fields=('model2', 'model1')  # Tuple
++    )
++    
++    class Meta:
++        app_label = 'test'
++
++# Test case 3: through_fields as None
++class ThroughModel3(models.Model):
++    model1 = models.ForeignKey(TestModel1, on_delete=models.CASCADE)
++    model2 = models.ForeignKey(TestModel2, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++class ModelWithM2M3(models.Model):
++    name = models.CharField(max_length=100)
++    m2m_field = models.ManyToManyField(
++        TestModel1,
++        through=ThroughModel3,
++        through_fields=None  # None
++    )
++    
++    class Meta:
++        app_label = 'test'
++
++def test_hash_operations():
++    """Test that ManyToManyRel instances can be hashed in all scenarios"""
++    print("Testing hash operations on ManyToManyRel instances...")
++    
++    # Test case 1: through_fields as list
++    rel1 = ModelWithM2M1._meta.get_field('m2m_field').remote_field
++    print(f"Test 1 - through_fields as list: {rel1.through_fields}")
++    try:
++        hash1 = hash(rel1)
++        print(f"✓ Hash successful: {hash1}")
++    except Exception as e:
++        print(f"✗ Hash failed: {e}")
++        return False
++    
++    # Test case 2: through_fields as tuple  
++    rel2 = ModelWithM2M2._meta.get_field('m2m_field').remote_field
++    print(f"Test 2 - through_fields as tuple: {rel2.through_fields}")
++    try:
++        hash2 = hash(rel2)
++        print(f"✓ Hash successful: {hash2}")
++    except Exception as e:
++        print(f"✗ Hash failed: {e}")
++        return False
++    
++    # Test case 3: through_fields as None
++    rel3 = ModelWithM2M3._meta.get_field('m2m_field').remote_field
++    print(f"Test 3 - through_fields as None: {rel3.through_fields}")
++    try:
++        hash3 = hash(rel3)
++        print(f"✓ Hash successful: {hash3}")
++    except Exception as e:
++        print(f"✗ Hash failed: {e}")
++        return False
++    
++    # Test equality operations
++    print("\nTesting equality operations...")
++    try:
++        # These should not be equal (different through models)
++        print(f"rel1 == rel2: {rel1 == rel2}")
++        print(f"rel1 == rel3: {rel1 == rel3}")
++        print("✓ Equality operations successful")
++    except Exception as e:
++        print(f"✗ Equality operations failed: {e}")
++        return False
++    
++    return True
++
++def test_set_operations():
++    """Test that ManyToManyRel instances can be used in sets"""
++    print("\nTesting set operations...")
++    
++    rels = [
++        ModelWithM2M1._meta.get_field('m2m_field').remote_field,
++        ModelWithM2M2._meta.get_field('m2m_field').remote_field,
++        ModelWithM2M3._meta.get_field('m2m_field').remote_field,
++    ]
++    
++    try:
++        rel_set = set(rels)
++        print(f"✓ Set creation successful: {len(rel_set)} unique items")
++        
++        # Test set membership
++        for rel in rels:
++            if rel in rel_set:
++                print(f"✓ Set membership test passed for {rel.through_fields}")
++            else:
++                print(f"✗ Set membership test failed for {rel.through_fields}")
++                return False
++                
++    except Exception as e:
++        print(f"✗ Set operations failed: {e}")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    success = True
++    success &= test_hash_operations()
++    success &= test_set_operations()
++    
++    if success:
++        print("\n🎉 All tests passed!")
++    else:
++        print("\n❌ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..29b0084898
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,131 @@
++#!/usr/bin/env python3
++"""
++Test to verify the original GitHub issue is fixed.
++This reproduces the exact scenario described in the issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Exact models from the GitHub issue
++class Parent(models.Model):
++    name = models.CharField(max_length=256)
++    
++    class Meta:
++        app_label = 'test_issue'
++
++class ProxyParent(Parent):
++    class Meta:
++        proxy = True
++        app_label = 'test_issue'
++
++class Child(models.Model):
++    parent = models.ForeignKey(Parent, on_delete=models.CASCADE)
++    many_to_many_field = models.ManyToManyField(
++        to=Parent,
++        through="ManyToManyModel",
++        through_fields=['child', 'parent'],
++        related_name="something"
++    )
++    
++    class Meta:
++        app_label = 'test_issue'
++
++class ManyToManyModel(models.Model):
++    parent = models.ForeignKey(Parent, on_delete=models.CASCADE, related_name='+')
++    child = models.ForeignKey(Child, on_delete=models.CASCADE, related_name='+')
++    second_child = models.ForeignKey(Child, on_delete=models.CASCADE, null=True, default=None)
++    
++    class Meta:
++        app_label = 'test_issue'
++
++def test_original_issue():
++    """Test that the exact scenario from the GitHub issue works"""
++    print("Testing the original GitHub issue scenario...")
++    
++    # This should trigger the model checks that would cause the error
++    from django.core.checks.registry import registry
++    from django.core.checks.model_checks import check_all_models
++    
++    # Get all models and run checks on them - this is where the error occurred
++    from django.apps import apps
++    models = apps.get_models()
++    
++    errors_found = []
++    for model in models:
++        if hasattr(model, '_meta') and hasattr(model._meta, 'app_label'):
++            if model._meta.app_label == 'test_issue':
++                print(f"Running checks on model: {model._meta.model_name}")
++                try:
++                    errors = model.check()
++                    if errors:
++                        errors_found.extend(errors)
++                        print(f"  Found {len(errors)} validation errors")
++                    else:
++                        print(f"  No validation errors")
++                except Exception as e:
++                    print(f"  ❌ Exception during model check: {e}")
++                    return False
++    
++    # Test that the ManyToManyRel can be hashed (this was the core issue)
++    try:
++        rel = Child._meta.get_field('many_to_many_field').remote_field
++        print(f"ManyToManyRel through_fields: {rel.through_fields} (type: {type(rel.through_fields)})")
++        
++        # This was the line that failed before the fix
++        hash_value = hash(rel)
++        print(f"✓ Hash operation successful: {hash_value}")
++        
++        # Test set operations (this also requires hashing)
++        rel_set = {rel}
++        print(f"✓ Set operations successful: {len(rel_set)} items in set")
++        
++        # Test equality
++        self_equality = (rel == rel)
++        print(f"✓ Equality check successful: {self_equality}")
++        
++    except Exception as e:
++        print(f"❌ Hash/Set/Equality operations failed: {e}")
++        return False
++    
++    if errors_found:
++        print(f"⚠️  Found {len(errors_found)} validation warnings (expected):")
++        for error in errors_found:
++            print(f"  {error}")
++    else:
++        print("✓ No validation errors found")
++    
++    return True
++
++if __name__ == '__main__':
++    success = test_original_issue()
++    
++    if success:
++        print("\n🎉 Original GitHub issue is FIXED!")
++        sys.exit(0)
++    else:
++        print("\n❌ Original GitHub issue is NOT fixed!")
++        sys.exit(1)
+\ No newline at end of file

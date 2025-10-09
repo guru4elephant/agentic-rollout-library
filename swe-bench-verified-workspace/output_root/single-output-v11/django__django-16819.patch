@@ -1,0 +1,328 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index 967a91fdc8..19994f31a7 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -861,6 +861,15 @@ class AddIndex(IndexOperation):
+     def migration_name_fragment(self):
+         return "%s_%s" % (self.model_name_lower, self.index.name.lower())
+ 
++    def reduce(self, operation, app_label):
++        if (
++            isinstance(operation, RemoveIndex)
++            and self.model_name_lower == operation.model_name_lower
++            and self.index.name == operation.name
++        ):
++            return []
++        return super().reduce(operation, app_label)
++
+ 
+ class RemoveIndex(IndexOperation):
+     """Remove an index from a model."""
+@@ -904,6 +913,15 @@ class RemoveIndex(IndexOperation):
+     def migration_name_fragment(self):
+         return "remove_%s_%s" % (self.model_name_lower, self.name.lower())
+ 
++    def reduce(self, operation, app_label):
++        if (
++            isinstance(operation, AddIndex)
++            and self.model_name_lower == operation.model_name_lower
++            and self.name == operation.index.name
++        ):
++            return []
++        return super().reduce(operation, app_label)
++
+ 
+ class RenameIndex(IndexOperation):
+     """Rename an index."""
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..9ab7c09182
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python3
++
++"""Script to reproduce the AddIndex/RemoveIndex optimization issue."""
++
++from django.db.migrations.operations.models import AddIndex, RemoveIndex
++from django.db import models
++
++# Create a simple index for testing
++class TestIndex(models.Index):
++    def __init__(self):
++        super().__init__(fields=['test_field'], name='test_index')
++
++def test_reduce_operations():
++    """Test if AddIndex and RemoveIndex can be reduced."""
++    
++    # Create AddIndex and RemoveIndex operations for the same index
++    add_index_op = AddIndex('TestModel', TestIndex())
++    remove_index_op = RemoveIndex('TestModel', 'test_index')
++    
++    print("Testing AddIndex.reduce with RemoveIndex:")
++    result = add_index_op.reduce(remove_index_op, 'test_app')
++    print(f"Result: {result}")
++    
++    print("\nTesting RemoveIndex.reduce with AddIndex:")
++    result = remove_index_op.reduce(add_index_op, 'test_app')
++    print(f"Result: {result}")
++    
++    print("\nTesting with different index names (should not reduce):")
++    remove_index_diff = RemoveIndex('TestModel', 'different_index')
++    result = add_index_op.reduce(remove_index_diff, 'test_app')
++    print(f"Result: {result}")
++    
++    print("\nTesting with different model names (should not reduce):")
++    remove_index_diff_model = RemoveIndex('DifferentModel', 'test_index')
++    result = add_index_op.reduce(remove_index_diff_model, 'test_app')
++    print(f"Result: {result}")
++
++if __name__ == '__main__':
++    test_reduce_operations()
+\ No newline at end of file
+diff --git a/test_both_directions.py b/test_both_directions.py
+new file mode 100644
+index 0000000000..64fd444cd3
+--- /dev/null
++++ b/test_both_directions.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++
++"""Test script to verify both directions of AddIndex/RemoveIndex reduce functionality."""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++    django.setup()
++
++from django.db.migrations.operations.models import AddIndex, RemoveIndex
++from django.db import models
++
++# Create a simple index for testing
++class TestIndex(models.Index):
++    def __init__(self):
++        super().__init__(fields=['test_field'], name='test_index')
++
++def test_both_directions():
++    """Test both directions of AddIndex/RemoveIndex reduce functionality."""
++    
++    print("Testing both directions of AddIndex/RemoveIndex reduce functionality...")
++    
++    # Create operations
++    add_index_op = AddIndex('TestModel', TestIndex())
++    remove_index_op = RemoveIndex('TestModel', 'test_index')
++    
++    # Test 1: AddIndex.reduce(RemoveIndex) - should return []
++    print("\n1. Testing AddIndex.reduce(RemoveIndex):")
++    result = add_index_op.reduce(remove_index_op, 'test_app')
++    print(f"   Result: {result}")
++    assert result == [], "AddIndex.reduce(RemoveIndex) should return empty list"
++    
++    # Test 2: RemoveIndex.reduce(AddIndex) - should return []
++    print("\n2. Testing RemoveIndex.reduce(AddIndex):")
++    result = remove_index_op.reduce(add_index_op, 'test_app')
++    print(f"   Result: {result}")
++    assert result == [], "RemoveIndex.reduce(AddIndex) should return empty list"
++    
++    # Test 3: Verify that both operations cancel each other out
++    print("\n3. Testing that both operations cancel each other:")
++    result1 = add_index_op.reduce(remove_index_op, 'test_app')
++    result2 = remove_index_op.reduce(add_index_op, 'test_app')
++    assert result1 == [] and result2 == [], "Both operations should cancel each other"
++    print("   ✅ Both operations successfully cancel each other")
++    
++    print("\n✅ Both directions work correctly! The implementation is complete.")
++
++if __name__ == '__main__':
++    test_both_directions()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..7d449d2447
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++
++"""Test script to verify edge cases for AddIndex/RemoveIndex reduce functionality."""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++    django.setup()
++
++from django.db.migrations.operations.models import AddIndex, RemoveIndex, RenameIndex
++from django.db import models
++
++# Create a simple index for testing
++class TestIndex(models.Index):
++    def __init__(self):
++        super().__init__(fields=['test_field'], name='test_index')
++
++def test_edge_cases():
++    """Test edge cases for AddIndex/RemoveIndex reduce functionality."""
++    
++    print("Testing edge cases for AddIndex/RemoveIndex reduce functionality...")
++    
++    # Create operations
++    add_index_op = AddIndex('TestModel', TestIndex())
++    remove_index_op = RemoveIndex('TestModel', 'test_index')
++    
++    # Test 1: RenameIndex should not interfere with AddIndex/RemoveIndex reduction
++    print("\n1. Testing RenameIndex with AddIndex (should not reduce):")
++    rename_index_op = RenameIndex('TestModel', 'new_index_name', old_name='test_index')
++    result = add_index_op.reduce(rename_index_op, 'test_app')
++    print(f"   Result: {result}")
++    assert result is False, "AddIndex should not reduce with RenameIndex"
++    
++    # Test 2: RenameIndex with RemoveIndex (should not reduce)
++    print("\n2. Testing RenameIndex with RemoveIndex (should not reduce):")
++    result = remove_index_op.reduce(rename_index_op, 'test_app')
++    print(f"   Result: {result}")
++    assert result is False, "RemoveIndex should not reduce with RenameIndex"
++    
++    # Test 3: AddIndex with itself (should not reduce)
++    print("\n3. Testing AddIndex with itself (should not reduce):")
++    result = add_index_op.reduce(add_index_op, 'test_app')
++    print(f"   Result: {result}")
++    assert result is False, "AddIndex should not reduce with itself"
++    
++    # Test 4: RemoveIndex with itself (should not reduce)
++    print("\n4. Testing RemoveIndex with itself (should not reduce):")
++    result = remove_index_op.reduce(remove_index_op, 'test_app')
++    print(f"   Result: {result}")
++    assert result is False, "RemoveIndex should not reduce with itself"
++    
++    # Test 5: AddIndex with different operation types (should not reduce)
++    print("\n5. Testing AddIndex with different operation types:")
++    from django.db.migrations.operations.models import AddField
++    add_field_op = AddField('TestModel', 'new_field', models.CharField(max_length=100))
++    result = add_index_op.reduce(add_field_op, 'test_app')
++    print(f"   Result: {result}")
++    assert result is False, "AddIndex should not reduce with AddField"
++    
++    # Test 6: RemoveIndex with different operation types (should not reduce)
++    print("\n6. Testing RemoveIndex with different operation types:")
++    result = remove_index_op.reduce(add_field_op, 'test_app')
++    print(f"   Result: {result}")
++    assert result is False, "RemoveIndex should not reduce with AddField"
++    
++    print("\n✅ All edge case tests passed! The implementation is robust.")
++
++if __name__ == '__main__':
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_reduce_functionality.py b/test_reduce_functionality.py
+new file mode 100644
+index 0000000000..3d07287ae2
+--- /dev/null
++++ b/test_reduce_functionality.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++
++"""Test script to verify AddIndex/RemoveIndex reduce functionality."""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++    django.setup()
++
++from django.db.migrations.operations.models import AddIndex, RemoveIndex
++from django.db import models
++
++# Create a simple index for testing
++class TestIndex(models.Index):
++    def __init__(self):
++        super().__init__(fields=['test_field'], name='test_index')
++
++def test_reduce_operations():
++    """Test if AddIndex and RemoveIndex can be reduced."""
++    
++    print("Testing AddIndex/RemoveIndex reduce functionality...")
++    
++    # Test 1: AddIndex followed by RemoveIndex for same index
++    add_index_op = AddIndex('TestModel', TestIndex())
++    remove_index_op = RemoveIndex('TestModel', 'test_index')
++    
++    print("\n1. Testing AddIndex.reduce with RemoveIndex:")
++    result = add_index_op.reduce(remove_index_op, 'test_app')
++    print(f"   Result: {result}")
++    assert result == [], "AddIndex should reduce with RemoveIndex to empty list"
++    
++    print("\n2. Testing RemoveIndex.reduce with AddIndex:")
++    result = remove_index_op.reduce(add_index_op, 'test_app')
++    print(f"   Result: {result}")
++    assert result == [], "RemoveIndex should reduce with AddIndex to empty list"
++    
++    # Test 2: Different index names (should not reduce)
++    print("\n3. Testing with different index names (should not reduce):")
++    remove_index_diff = RemoveIndex('TestModel', 'different_index')
++    result = add_index_op.reduce(remove_index_diff, 'test_app')
++    print(f"   Result: {result}")
++    assert result is False, "Different index names should not reduce"
++    
++    # Test 3: Different model names (should not reduce)
++    print("\n4. Testing with different model names (should not reduce):")
++    remove_index_diff_model = RemoveIndex('DifferentModel', 'test_index')
++    result = add_index_op.reduce(remove_index_diff_model, 'test_app')
++    print(f"   Result: {result}")
++    assert result is False, "Different model names should not reduce"
++    
++    # Test 4: AddIndex with non-RemoveIndex operation (should not reduce)
++    print("\n5. Testing AddIndex with non-RemoveIndex operation:")
++    from django.db.migrations.operations.models import AddField
++    add_field_op = AddField('TestModel', 'new_field', models.CharField(max_length=100))
++    result = add_index_op.reduce(add_field_op, 'test_app')
++    print(f"   Result: {result}")
++    assert result is False, "AddIndex should not reduce with non-RemoveIndex operations"
++    
++    print("\n✅ All tests passed! AddIndex/RemoveIndex reduction is working correctly.")
++
++if __name__ == '__main__':
++    test_reduce_operations()
+\ No newline at end of file

@@ -1,0 +1,733 @@
+diff --git a/django/forms/models.py b/django/forms/models.py
+index dafc11f995..dd6843ea43 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -1146,8 +1146,11 @@ class ModelChoiceIterator:
+         self.queryset = field.queryset
+ 
+     def __iter__(self):
++        # For RadioSelect widgets with required fields, don't include empty option
+         if self.field.empty_label is not None:
+-            yield ("", self.field.empty_label)
++            from django.forms.widgets import RadioSelect
++            if not (isinstance(self.field.widget, RadioSelect) and self.field.required):
++                yield ("", self.field.empty_label)
+         queryset = self.queryset
+         # Can't use iterator() when queryset uses prefetch_related()
+         if not queryset._prefetch_related_lookups:
+@@ -1159,10 +1162,20 @@ class ModelChoiceIterator:
+         # count() adds a query but uses less memory since the QuerySet results
+         # won't be cached. In most cases, the choices will only be iterated on,
+         # and __len__() won't be called.
+-        return self.queryset.count() + (1 if self.field.empty_label is not None else 0)
++        from django.forms.widgets import RadioSelect
++        empty_option_included = (
++            self.field.empty_label is not None and
++            not (isinstance(self.field.widget, RadioSelect) and self.field.required)
++        )
++        return self.queryset.count() + (1 if empty_option_included else 0)
+ 
+     def __bool__(self):
+-        return self.field.empty_label is not None or self.queryset.exists()
++        from django.forms.widgets import RadioSelect
++        empty_option_included = (
++            self.field.empty_label is not None and
++            not (isinstance(self.field.widget, RadioSelect) and self.field.required)
++        )
++        return empty_option_included or self.queryset.exists()
+ 
+     def choice(self, obj):
+         return (
+diff --git a/reproduce_github_issue.py b/reproduce_github_issue.py
+new file mode 100644
+index 0000000000..c1c3f3e5ae
+--- /dev/null
++++ b/reproduce_github_issue.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
++
++import django
++from django.conf import settings
++from django.db import models
++from django.forms import ModelForm
++from django.forms.widgets import RadioSelect, Select
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Reproduce the exact issue from GitHub
++class BatchData(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++    
++    def __str__(self):
++        return self.name
++
++class TestRun(models.Model):
++    data_file = models.ForeignKey(BatchData, on_delete=models.SET_NULL, null=True, blank=False)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class TestRunForm(ModelForm):
++    class Meta:
++        model = TestRun
++        fields = ['data_file']
++        widgets = {'data_file': RadioSelect()}
++
++# Test the ModelChoiceIterator logic directly
++from django.forms.models import ModelChoiceIterator
++
++class TestQueryset:
++    _prefetch_related_lookups = []
++    
++    def __iter__(self):
++        return iter([MockBatchData(1, "First Data File"), MockBatchData(2, "Second Data File")])
++    
++    def iterator(self):
++        return self
++    
++    def count(self):
++        return 2
++
++class MockBatchData:
++    def __init__(self, pk, name):
++        self.pk = pk
++        self.name = name
++    
++    def __str__(self):
++        return self.name
++
++class TestField:
++    def __init__(self, empty_label, required, widget):
++        self.empty_label = empty_label
++        self.required = required
++        self.widget = widget
++        self.queryset = TestQueryset()
++
++class TestIterator(ModelChoiceIterator):
++    def __init__(self, empty_label, required, widget):
++        field = TestField(empty_label, required, widget)
++        super().__init__(field)
++    
++    def choice(self, obj):
++        return (obj.pk, str(obj))
++
++# Test the exact scenario from GitHub issue
++print("=== Reproducing GitHub Issue ===")
++print("TestRunForm with RadioSelect widget, blank=False on model field")
++print("Before fix: Would include '---------' empty option")
++print("After fix: Should NOT include empty option for RadioSelect with required field")
++
++iterator = TestIterator("---------", True, RadioSelect())
++choices = list(iterator)
++
++print("\nGenerated choices:")
++for value, label in choices:
++    print(f"Value: {value}, Label: {label}")
++
++if any(value == "" for value, label in choices):
++    print("\n❌ FAILED: Empty option is still present")
++else:
++    print("\n✅ SUCCESS: Empty option is not present for RadioSelect with required field")
++
++# Compare with Select widget (should include empty option)
++print("\n=== Comparison with Select widget ===")
++iterator_select = TestIterator("---------", True, Select())
++choices_select = list(iterator_select)
++
++print("Generated choices for Select widget:")
++for value, label in choices_select:
++    print(f"Value: {value}, Label: {label}")
++
++if any(value == "" for value, label in choices_select):
++    print("\n✅ CORRECT: Select widget includes empty option (expected behavior)")
++else:
++    print("\n❌ UNEXPECTED: Select widget does not include empty option")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..eb361ceb49
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
++
++import django
++from django.conf import settings
++from django.db import models
++from django.forms import ModelForm
++from django.forms.widgets import RadioSelect
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++from django.core.management.color import no_style
++style = no_style()
++
++# Create test models
++class BatchData(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++    
++    def __str__(self):
++        return self.name
++
++class TestRun(models.Model):
++    data_file = models.ForeignKey(BatchData, on_delete=models.SET_NULL, null=True, blank=False)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class TestRunForm(ModelForm):
++    class Meta:
++        model = TestRun
++        fields = ['data_file']
++        widgets = {'data_file': RadioSelect()}
++
++# Create a form instance without database data
++form = TestRunForm()
++
++# Print the form output to see the issue
++print("Form output:")
++print(form['data_file'])
++
++# Let's also examine the choices that are being generated
++print("\nChoices:")
++for value, label in form.fields['data_file'].choices:
++    print(f"Value: {value}, Label: {label}")
++
++print("\nIs field required?", form.fields['data_file'].required)
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..fddf544977
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
++
++import django
++from django.conf import settings
++from django.db import models
++from django.forms import ModelForm
++from django.forms.widgets import RadioSelect
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create test models
++class BatchData(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++    
++    def __str__(self):
++        return self.name
++
++class TestRun(models.Model):
++    data_file = models.ForeignKey(BatchData, on_delete=models.SET_NULL, null=True, blank=False)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class TestRunForm(ModelForm):
++    class Meta:
++        model = TestRun
++        fields = ['data_file']
++        widgets = {'data_file': RadioSelect()}
++
++# Create a form instance
++form = TestRunForm()
++
++# Let's examine the choices that are being generated
++print("Choices:")
++for value, label in form.fields['data_file'].choices:
++    print(f"Value: {value}, Label: {label}")
++
++print("\nIs field required?", form.fields['data_file'].required)
++print("Empty label:", form.fields['data_file'].empty_label)
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..c99dd2f890
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
++
++import django
++from django.conf import settings
++from django.forms.widgets import RadioSelect
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Test the logic directly
++from django.forms.models import ModelChoiceIterator
++
++# Create a simple test class that mimics the field behavior
++class TestQueryset:
++    _prefetch_related_lookups = []
++    
++    def __iter__(self):
++        return iter([])
++    
++    def iterator(self):
++        return self
++    
++    def count(self):
++        return 0
++
++class TestField:
++    def __init__(self, empty_label, required, widget):
++        self.empty_label = empty_label
++        self.required = required
++        self.widget = widget
++        self.queryset = TestQueryset()
++
++class TestIterator(ModelChoiceIterator):
++    def __init__(self, empty_label, required, widget):
++        field = TestField(empty_label, required, widget)
++        super().__init__(field)
++
++# Test cases
++print("Testing RadioSelect with required=True:")
++iterator1 = TestIterator("---------", True, RadioSelect())
++choices1 = list(iterator1)
++print(f"Choices: {choices1}")
++
++print("\nTesting non-RadioSelect with required=True:")
++iterator2 = TestIterator("---------", True, object())  # Not a RadioSelect
++choices2 = list(iterator2)
++print(f"Choices: {choices2}")
++
++print("\nTesting RadioSelect with required=False:")
++iterator3 = TestIterator("---------", False, RadioSelect())
++choices3 = list(iterator3)
++print(f"Choices: {choices3}")
++
++print("\nTesting with empty_label=None:")
++iterator4 = TestIterator(None, True, RadioSelect())
++choices4 = list(iterator4)
++print(f"Choices: {choices4}")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..286c344cce
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,138 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
++
++import django
++from django.conf import settings
++from django.db import models
++from django.forms import ModelForm
++from django.forms.widgets import RadioSelect, Select
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create test models
++class BatchData(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++    
++    def __str__(self):
++        return self.name
++
++class TestRun(models.Model):
++    data_file = models.ForeignKey(BatchData, on_delete=models.SET_NULL, null=True, blank=False)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class TestRunOptional(models.Model):
++    data_file = models.ForeignKey(BatchData, on_delete=models.SET_NULL, null=True, blank=True)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Test forms
++class TestRunForm(ModelForm):
++    class Meta:
++        model = TestRun
++        fields = ['data_file']
++        widgets = {'data_file': RadioSelect()}
++
++class TestRunFormSelect(ModelForm):
++    class Meta:
++        model = TestRun
++        fields = ['data_file']
++        # Default Select widget
++
++class TestRunOptionalForm(ModelForm):
++    class Meta:
++        model = TestRunOptional
++        fields = ['data_file']
++        widgets = {'data_file': RadioSelect()}
++
++# Test the ModelChoiceIterator logic directly
++from django.forms.models import ModelChoiceIterator
++
++class TestQueryset:
++    _prefetch_related_lookups = []
++    
++    def __iter__(self):
++        return iter([])
++    
++    def iterator(self):
++        return self
++    
++    def count(self):
++        return 0
++
++class TestField:
++    def __init__(self, empty_label, required, widget):
++        self.empty_label = empty_label
++        self.required = required
++        self.widget = widget
++        self.queryset = TestQueryset()
++
++class TestIterator(ModelChoiceIterator):
++    def __init__(self, empty_label, required, widget):
++        field = TestField(empty_label, required, widget)
++        super().__init__(field)
++
++# Test cases
++print("=== Testing ModelChoiceIterator directly ===")
++print("RadioSelect with required=True:")
++iterator1 = TestIterator("---------", True, RadioSelect())
++choices1 = list(iterator1)
++print(f"Choices: {choices1}")
++
++print("\nNon-RadioSelect with required=True:")
++iterator2 = TestIterator("---------", True, Select())
++choices2 = list(iterator2)
++print(f"Choices: {choices2}")
++
++print("\nRadioSelect with required=False:")
++iterator3 = TestIterator("---------", False, RadioSelect())
++choices3 = list(iterator3)
++print(f"Choices: {choices3}")
++
++print("\nWith empty_label=None:")
++iterator4 = TestIterator(None, True, RadioSelect())
++choices4 = list(iterator4)
++print(f"Choices: {choices4}")
++
++print("\n=== Testing form fields ===")
++# Test form fields (these will fail due to database but we can check the choices generation)
++form1 = TestRunForm()
++print("TestRunForm (RadioSelect, blank=False):")
++print("Field required:", form1.fields['data_file'].required)
++print("Empty label:", form1.fields['data_file'].empty_label)
++
++form2 = TestRunFormSelect()
++print("\nTestRunFormSelect (Select, blank=False):")
++print("Field required:", form2.fields['data_file'].required)
++print("Empty label:", form2.fields['data_file'].empty_label)
++
++form3 = TestRunOptionalForm()
++print("\nTestRunOptionalForm (RadioSelect, blank=True):")
++print("Field required:", form3.fields['data_file'].required)
++print("Empty label:", form3.fields['data_file'].empty_label)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..0f4e517472
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
++
++import django
++from django.conf import settings
++from django.forms.widgets import RadioSelect
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Test edge cases
++from django.forms.models import ModelChoiceIterator
++
++class TestQueryset:
++    _prefetch_related_lookups = []
++    
++    def __iter__(self):
++        return iter([])
++    
++    def iterator(self):
++        return self
++    
++    def count(self):
++        return 0
++
++class TestField:
++    def __init__(self, empty_label, required, widget):
++        self.empty_label = empty_label
++        self.required = required
++        self.widget = widget
++        self.queryset = TestQueryset()
++
++class TestIterator(ModelChoiceIterator):
++    def __init__(self, empty_label, required, widget):
++        field = TestField(empty_label, required, widget)
++        super().__init__(field)
++
++# Test RadioSelect subclass
++class CustomRadioSelect(RadioSelect):
++    pass
++
++print("=== Testing Edge Cases ===")
++
++# Test RadioSelect subclass with required=True
++print("CustomRadioSelect (subclass) with required=True:")
++iterator1 = TestIterator("---------", True, CustomRadioSelect())
++choices1 = list(iterator1)
++print(f"Choices: {choices1}")
++
++# Test RadioSelect subclass with required=False
++print("\nCustomRadioSelect (subclass) with required=False:")
++iterator2 = TestIterator("---------", False, CustomRadioSelect())
++choices2 = list(iterator2)
++print(f"Choices: {choices2}")
++
++# Test regular object (not a RadioSelect) with required=True
++print("\nRegular object (not RadioSelect) with required=True:")
++iterator3 = TestIterator("---------", True, object())
++choices3 = list(iterator3)
++print(f"Choices: {choices3}")
++
++# Test RadioSelect with empty_label=""
++print("\nRadioSelect with empty_label='' and required=True:")
++iterator4 = TestIterator("", True, RadioSelect())
++choices4 = list(iterator4)
++print(f"Choices: {choices4}")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..ec49d8f359
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,104 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
++
++import django
++from django.conf import settings
++from django.db import models
++from django.forms import ModelForm
++from django.forms.widgets import RadioSelect
++from django.forms.models import ModelChoiceIterator
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create test models
++class BatchData(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++    
++    def __str__(self):
++        return self.name
++
++class TestRun(models.Model):
++    data_file = models.ForeignKey(BatchData, on_delete=models.SET_NULL, null=True, blank=False)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Test the ModelChoiceIterator directly
++from django.forms import ModelChoiceField
++from unittest.mock import Mock
++
++# Create a mock field with RadioSelect widget and required=True
++mock_field = Mock()
++mock_field.empty_label = "---------"
++mock_field.required = True
++mock_field.widget = RadioSelect()
++mock_queryset = Mock()
++mock_queryset._prefetch_related_lookups = []
++mock_queryset.__iter__ = lambda self: iter([])
++mock_field.queryset = mock_queryset
++
++# Create iterator and test
++iterator = ModelChoiceIterator(mock_field)
++choices = list(iterator)
++
++print("Choices for RadioSelect with required=True:")
++for value, label in choices:
++    print(f"Value: {value}, Label: {label}")
++
++# Test with Select widget (should include empty option)
++mock_field_select = Mock()
++mock_field_select.empty_label = "---------"
++mock_field_select.required = True
++mock_field_select.widget = Mock()  # Not a RadioSelect
++mock_queryset_select = Mock()
++mock_queryset_select._prefetch_related_lookups = []
++mock_queryset_select.__iter__ = lambda self: iter([])
++mock_field_select.queryset = mock_queryset_select
++
++iterator_select = ModelChoiceIterator(mock_field_select)
++choices_select = list(iterator_select)
++
++print("\nChoices for non-RadioSelect with required=True:")
++for value, label in choices_select:
++    print(f"Value: {value}, Label: {label}")
++
++# Test with RadioSelect and required=False (should include empty option)
++mock_field_not_required = Mock()
++mock_field_not_required.empty_label = "---------"
++mock_field_not_required.required = False
++mock_field_not_required.widget = RadioSelect()
++mock_queryset_not_required = Mock()
++mock_queryset_not_required._prefetch_related_lookups = []
++mock_queryset_not_required.__iter__ = lambda self: iter([])
++mock_field_not_required.queryset = mock_queryset_not_required
++
++iterator_not_required = ModelChoiceIterator(mock_field_not_required)
++choices_not_required = list(iterator_not_required)
++
++print("\nChoices for RadioSelect with required=False:")
++for value, label in choices_not_required:
++    print(f"Value: {value}, Label: {label}")
+\ No newline at end of file

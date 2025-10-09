@@ -1,0 +1,179 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..afabfac06
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++"""Script to reproduce the pastebin issue with HTTP 400 errors."""
++
++import urllib.request
++from urllib.parse import urlencode
++
++def test_pastebin_issue():
++    """Test that demonstrates the HTTP 400 error with python3 lexer."""
++    
++    # Create some test content that might cause issues
++    # This simulates pytest output which can contain various characters
++    contents = b"""============================= test session starts ==============================
++platform linux -- Python 3.8.10, pytest-6.2.4, py-1.10.0, pluggy-0.13.1
++rootdir: /tmp
++collected 1 item
++
++test_example.py F                                              [100%]
++
++================================== FAILURES ===================================
++_____________________________ test_example_fail _______________________________
++
++    def test_example_fail():
++>       assert False
++E       assert False
++
++test_example.py:3: AssertionError
++=========================== short test summary info ===========================
++FAILED test_example.py::test_example_fail - assert False
++============================== 1 failed in 0.01s ==============================
++"""
++
++    # Test with python3 lexer (current implementation)
++    params_python3 = {
++        "code": contents,
++        "lexer": "python3",
++        "expiry": "1week",
++    }
++    
++    # Test with text lexer (proposed fix)
++    params_text = {
++        "code": contents,
++        "lexer": "text",
++        "expiry": "1week",
++    }
++    
++    url = "https://bpaste.net"
++    
++    print("Testing with python3 lexer...")
++    try:
++        response = urllib.request.urlopen(url, data=urlencode(params_python3).encode("ascii"))
++        print("SUCCESS: python3 lexer worked")
++        print(f"Response: {response.read()[:100]}...")
++    except Exception as e:
++        print(f"ERROR with python3 lexer: {e}")
++    
++    print("\nTesting with text lexer...")
++    try:
++        response = urllib.request.urlopen(url, data=urlencode(params_text).encode("ascii"))
++        print("SUCCESS: text lexer worked")
++        print(f"Response: {response.read()[:100]}...")
++    except Exception as e:
++        print(f"ERROR with text lexer: {e}")
++
++if __name__ == "__main__":
++    test_pastebin_issue()
+\ No newline at end of file
+diff --git a/src/_pytest/pastebin.py b/src/_pytest/pastebin.py
+index 41576a615..79b0d9d40 100644
+--- a/src/_pytest/pastebin.py
++++ b/src/_pytest/pastebin.py
+@@ -79,7 +79,7 @@ def create_new_paste(contents):
+ 
+     params = {
+         "code": contents,
+-        "lexer": "python3" if sys.version_info[0] >= 3 else "python",
++        "lexer": "text",
+         "expiry": "1week",
+     }
+     url = "https://bpaste.net"
+diff --git a/test_fix_verification.py b/test_fix_verification.py
+new file mode 100644
+index 000000000..8e992d11c
+--- /dev/null
++++ b/test_fix_verification.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++"""Test to verify our fix works correctly."""
++
++import sys
++from unittest.mock import patch, MagicMock
++from src._pytest.pastebin import create_new_paste
++
++def test_lexer_change():
++    """Test that create_new_paste uses 'text' lexer instead of 'python3'."""
++    
++    # Mock the urlopen response
++    mock_response = MagicMock()
++    mock_response.read.return_value = b'View <a href="/raw/abc123">raw</a>.'
++    
++    with patch('urllib.request.urlopen', return_value=mock_response) as mock_urlopen:
++        # Call the function
++        result = create_new_paste(b"test content")
++        
++        # Verify the URL was called
++        assert mock_urlopen.called
++        
++        # Get the data that was sent
++        call_args = mock_urlopen.call_args
++        print(f"Call args: {call_args}")
++        url = call_args[0][0]
++        data = call_args[1]['data']
++        
++        # Decode the data to check the parameters
++        decoded_data = data.decode('ascii')
++        
++        print(f"URL: {url}")
++        print(f"Data: {decoded_data}")
++        
++        # Verify the lexer is 'text' not 'python3'
++        assert "lexer=text" in decoded_data
++        assert "lexer=python3" not in decoded_data
++        assert "code=test+content" in decoded_data
++        assert "expiry=1week" in decoded_data
++        
++        print("✓ Test passed: lexer is correctly set to 'text'")
++        return True
++
++if __name__ == "__main__":
++    test_lexer_change()
+\ No newline at end of file
+diff --git a/test_network_issue.py b/test_network_issue.py
+new file mode 100644
+index 000000000..f6fa322a6
+--- /dev/null
++++ b/test_network_issue.py
+@@ -0,0 +1,22 @@
++#!/usr/bin/env python3
++"""Test to understand the network issue."""
++
++import socket
++
++def test_network():
++    """Test if we can connect to bpaste.net."""
++    try:
++        # Try to connect to bpaste.net
++        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++        sock.settimeout(5)
++        result = sock.connect_ex(('bpaste.net', 443))
++        if result == 0:
++            print("Network connection to bpaste.net is successful")
++        else:
++            print(f"Network connection failed with error code: {result}")
++        sock.close()
++    except Exception as e:
++        print(f"Network test failed: {e}")
++
++if __name__ == "__main__":
++    test_network()
+\ No newline at end of file
+diff --git a/testing/test_pastebin.py b/testing/test_pastebin.py
+index bac8f9802..aac0b651e 100644
+--- a/testing/test_pastebin.py
++++ b/testing/test_pastebin.py
+@@ -126,8 +126,7 @@ class TestPaste(object):
+         assert len(mocked_urlopen) == 1
+         url, data = mocked_urlopen[0]
+         assert type(data) is bytes
+-        lexer = "python3" if sys.version_info[0] >= 3 else "python"
+         assert url == "https://bpaste.net"
+-        assert "lexer=%s" % lexer in data.decode()
++        assert "lexer=text" in data.decode()
+         assert "code=full-paste-contents" in data.decode()
+         assert "expiry=1week" in data.decode()

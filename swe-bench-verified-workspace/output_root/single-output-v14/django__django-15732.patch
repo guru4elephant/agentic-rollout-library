@@ -1,0 +1,300 @@
+diff --git a/django/db/backends/base/schema.py b/django/db/backends/base/schema.py
+index f2ca8c8df9..b29dac12e4 100644
+--- a/django/db/backends/base/schema.py
++++ b/django/db/backends/base/schema.py
+@@ -568,16 +568,19 @@ class BaseDatabaseSchemaEditor:
+             exclude=meta_constraint_names | meta_index_names,
+             **constraint_kwargs,
+         )
+-        if len(constraint_names) != 1:
++        # Handle the case where there might be multiple constraints matching the criteria
++        # (e.g., primary key constraint and unique_together constraint on the same field)
++        if not constraint_names:
+             raise ValueError(
+-                "Found wrong number (%s) of constraints for %s(%s)"
++                "Found no constraints for %s(%s)"
+                 % (
+-                    len(constraint_names),
+                     model._meta.db_table,
+                     ", ".join(columns),
+                 )
+             )
+-        self.execute(self._delete_constraint_sql(sql, model, constraint_names[0]))
++        # Delete all matching constraints instead of expecting exactly one
++        for constraint_name in constraint_names:
++            self.execute(self._delete_constraint_sql(sql, model, constraint_name))
+ 
+     def alter_db_table(self, model, old_db_table, new_db_table):
+         """Rename the table a model points to."""
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..9f827e0519
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with dropping unique_together constraint
++when there's already a unique constraint on the same field.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings without database
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations.state import ProjectState, ModelState
++from django.db.migrations.operations.models import AlterUniqueTogether
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'testapp'
++        # This creates the problematic scenario: unique_together on id field
++        # which already has a primary key (unique) constraint
++        unique_together = [('id',)]
++
++def test_constraint_names_method():
++    """Test the _constraint_names method that causes the issue"""
++    
++    from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++    from django.db import connection
++    
++    # Create a project state with the model
++    state = ProjectState()
++    state.add_model(
++        ModelState(
++            'testapp',
++            'TestModel',
++            [
++                ('id', models.AutoField(primary_key=True)),
++                ('name', models.CharField(max_length=100))
++            ],
++            {
++                'unique_together': [('id',)]
++            }
++        )
++    )
++    
++    # Get the model from the state
++    model = state.apps.get_model('testapp', 'TestModel')
++    
++    # Create schema editor
++    schema_editor = BaseDatabaseSchemaEditor(connection)
++    
++    # This simulates what happens in _delete_composed_index
++    # It calls _constraint_names with columns=['id'] and unique=True
++    # This should find multiple constraints (primary key + unique_together)
++    try:
++        constraint_names = schema_editor._constraint_names(
++            model,
++            column_names=['id'],
++            unique=True
++        )
++        print(f"Found constraint names: {constraint_names}")
++        if len(constraint_names) > 1:
++            print("ISSUE REPRODUCED: Found multiple constraints for the same column!")
++            return False
++        else:
++            print("No issue found")
++            return True
++            
++    except ValueError as e:
++        print(f"ValueError occurred: {e}")
++        return False
++    except Exception as e:
++        print(f"Unexpected error: {e}")
++        return False
++
++if __name__ == '__main__':
++    print("Testing the unique_together constraint issue...")
++    success = test_constraint_names_method()
++    if not success:
++        print("Issue reproduced successfully!")
++    else:
++        print("Issue was not reproduced - test passed")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..a9cd550c47
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for the unique_together constraint issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings without database
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations.state import ProjectState, ModelState
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++from django.db import connection
++
++def test_delete_composed_index_fix():
++    """Test that _delete_composed_index can handle multiple constraints"""
++    
++    # Create a mock constraint names result that simulates finding multiple constraints
++    # This simulates the scenario where there are multiple unique constraints on the same field
++    class MockSchemaEditor(BaseDatabaseSchemaEditor):
++        def _constraint_names(self, model, column_names=None, **kwargs):
++            # Simulate finding multiple constraints (primary key + unique_together)
++            return ['primary_key_constraint', 'unique_together_constraint']
++        
++        def _delete_constraint_sql(self, sql, model, name):
++            # Mock the delete operation
++            print(f"Deleting constraint: {name}")
++            return f"DELETE CONSTRAINT {name}"
++            
++        def execute(self, sql):
++            # Mock the execute operation
++            print(f"Executing: {sql}")
++    
++    # Create a simple model
++    class TestModel(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'testapp'
++    
++    # Create schema editor
++    schema_editor = MockSchemaEditor(connection)
++    
++    # Test the _delete_composed_index method with multiple constraints
++    try:
++        schema_editor._delete_composed_index(
++            TestModel,
++            ['id'],
++            {'unique': True},
++            "DELETE_UNIQUE_SQL"
++        )
++        print("SUCCESS: _delete_composed_index handled multiple constraints correctly!")
++        return True
++    except ValueError as e:
++        print(f"ERROR: {e}")
++        return False
++    except Exception as e:
++        print(f"UNEXPECTED ERROR: {e}")
++        return False
++
++def test_original_behavior():
++    """Test the original behavior that should raise ValueError"""
++    
++    class MockSchemaEditor(BaseDatabaseSchemaEditor):
++        def _constraint_names(self, model, column_names=None, **kwargs):
++            # Simulate finding multiple constraints (primary key + unique_together)
++            return ['primary_key_constraint', 'unique_together_constraint']
++            
++        def _delete_constraint_sql(self, sql, model, name):
++            return f"DELETE CONSTRAINT {name}"
++            
++        def execute(self, sql):
++            pass
++    
++    # Create the original _delete_composed_index method for comparison
++    def original_delete_composed_index(self, model, fields, constraint_kwargs, sql):
++        meta_constraint_names = {
++            constraint.name for constraint in model._meta.constraints
++        }
++        meta_index_names = {constraint.name for constraint in model._meta.indexes}
++        columns = [model._meta.get_field(field).column for field in fields]
++        constraint_names = self._constraint_names(
++            model,
++            columns,
++            exclude=meta_constraint_names | meta_index_names,
++            **constraint_kwargs,
++        )
++        if len(constraint_names) != 1:
++            raise ValueError(
++                "Found wrong number (%s) of constraints for %s(%s)"
++                % (
++                    len(constraint_names),
++                    model._meta.db_table,
++                    ", ".join(columns),
++                )
++            )
++        self.execute(self._delete_constraint_sql(sql, model, constraint_names[0]))
++    
++    # Create a simple model
++    class TestModel(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'testapp'
++    
++    # Test the original behavior
++    schema_editor = MockSchemaEditor(connection)
++    try:
++        original_delete_composed_index(
++            schema_editor,
++            TestModel,
++            ['id'],
++            {'unique': True},
++            "DELETE_UNIQUE_SQL"
++        )
++        print("UNEXPECTED: Original behavior didn't raise an error")
++        return False
++    except ValueError as e:
++        print(f"ORIGINAL BEHAVIOR (expected error): {e}")
++        return True
++    except Exception as e:
++        print(f"UNEXPECTED ERROR: {e}")
++        return False
++
++if __name__ == '__main__':
++    print("Testing the fix for unique_together constraint issue...")
++    
++    print("\n1. Testing original behavior (should fail):")
++    original_fails = test_original_behavior()
++    
++    print("\n2. Testing fixed behavior (should succeed):")
++    fix_works = test_delete_composed_index_fix()
++    
++    if original_fails and fix_works:
++        print("\nSUCCESS: Fix works correctly!")
++    else:
++        print("\nFAILURE: Fix doesn't work as expected")
+\ No newline at end of file

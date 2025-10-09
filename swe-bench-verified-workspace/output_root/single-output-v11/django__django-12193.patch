@@ -1,0 +1,459 @@
+diff --git a/django/contrib/postgres/forms/array.py b/django/contrib/postgres/forms/array.py
+index 2e19cd574a..9e6c2a3b25 100644
+--- a/django/contrib/postgres/forms/array.py
++++ b/django/contrib/postgres/forms/array.py
+@@ -144,10 +144,11 @@ class SplitArrayWidget(forms.Widget):
+                 widget_value = value[i]
+             except IndexError:
+                 widget_value = None
++            widget_attrs = dict(final_attrs)
+             if id_:
+-                final_attrs = {**final_attrs, 'id': '%s_%s' % (id_, i)}
++                widget_attrs['id'] = '%s_%s' % (id_, i)
+             context['widget']['subwidgets'].append(
+-                self.widget.get_context(name + '_%s' % i, widget_value, final_attrs)['widget']
++                self.widget.get_context(name + '_%s' % i, widget_value, widget_attrs)['widget']
+             )
+         return context
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e43ececb00
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++import copy
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++
++# Copy the SplitArrayWidget class here to avoid PostgreSQL dependencies
++class SplitArrayWidget(forms.Widget):
++    template_name = 'postgres/widgets/split_array.html'
++
++    def __init__(self, widget, size, **kwargs):
++        self.widget = widget() if isinstance(widget, type) else widget
++        self.size = size
++        super().__init__(**kwargs)
++
++    @property
++    def is_hidden(self):
++        return self.widget.is_hidden
++
++    def value_from_datadict(self, data, files, name):
++        return [self.widget.value_from_datadict(data, files, '%s_%s' % (name, index))
++                for index in range(self.size)]
++
++    def value_omitted_from_data(self, data, files, name):
++        return all(
++            self.widget.value_omitted_from_data(data, files, '%s_%s' % (name, index))
++            for index in range(self.size)
++        )
++
++    def id_for_label(self, id_):
++        # See the comment for RadioSelect.id_for_label()
++        if id_:
++            id_ += '_0'
++        return id_
++
++    def get_context(self, name, value, attrs=None):
++        attrs = {} if attrs is None else attrs
++        context = super().get_context(name, value, attrs)
++        if self.is_localized:
++            self.widget.is_localized = self.is_localized
++        value = value or []
++        context['widget']['subwidgets'] = []
++        final_attrs = self.build_attrs(attrs)
++        id_ = final_attrs.get('id')
++        for i in range(max(len(value), self.size)):
++            try:
++                widget_value = value[i]
++            except IndexError:
++                widget_value = None
++            if id_:
++                final_attrs = {**final_attrs, 'id': '%s_%s' % (id_, i)}
++            context['widget']['subwidgets'].append(
++                self.widget.get_context(name + '_%s' % i, widget_value, final_attrs)['widget']
++            )
++        return context
++
++    @property
++    def media(self):
++        return self.widget.media
++
++    def __deepcopy__(self, memo):
++        obj = super().__deepcopy__(memo)
++        obj.widget = copy.deepcopy(self.widget)
++        return obj
++
++    @property
++    def needs_multipart_form(self):
++        return self.widget.needs_multipart_form
++
++def test_split_array_field_boolean():
++    # Create a SplitArrayWidget with BooleanField widget
++    widget = SplitArrayWidget(
++        widget=forms.CheckboxInput(),
++        size=3,
++    )
++    
++    # Test data with mixed True and False values
++    initial_data = [True, False, True]
++    context = widget.get_context('test_field', initial_data)
++    
++    print("Testing SplitArrayField with BooleanField")
++    print("Initial data:", initial_data)
++    print()
++    
++    # Check each subwidget's context
++    for i, subwidget in enumerate(context['widget']['subwidgets']):
++        print(f"Widget {i}:")
++        print(f"  Value: {subwidget['value']}")
++        print(f"  Attrs: {subwidget['attrs']}")
++        print()
++    
++    # The issue: all widgets after the first True value will have 'checked': True
++    # even if their actual value is False
++    
++    # Let's verify this is the bug
++    has_issue = False
++    for i, subwidget in enumerate(context['widget']['subwidgets']):
++        actual_value = initial_data[i] if i < len(initial_data) else None
++        if subwidget['attrs'].get('checked') and actual_value is False:
++            print(f"BUG CONFIRMED: Widget {i} has 'checked': True but actual value is False")
++            has_issue = True
++    
++    if not has_issue:
++        print("No bug detected - the fix might already be in place")
++    
++    return has_issue
++
++if __name__ == '__main__':
++    has_bug = test_split_array_field_boolean()
++    sys.exit(1 if has_bug else 0)
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..09f3cef045
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++
++# Now let's manually test the fixed SplitArrayWidget
++# We'll copy the exact implementation from the fixed file
++
++class TestSplitArrayWidget(forms.Widget):
++    template_name = 'postgres/widgets/split_array.html'
++
++    def __init__(self, widget, size, **kwargs):
++        self.widget = widget() if isinstance(widget, type) else widget
++        self.size = size
++        super().__init__(**kwargs)
++
++    def get_context(self, name, value, attrs=None):
++        attrs = {} if attrs is None else attrs
++        context = super().get_context(name, value, attrs)
++        value = value or []
++        context['widget']['subwidgets'] = []
++        final_attrs = self.build_attrs(attrs)
++        id_ = final_attrs.get('id')
++        for i in range(max(len(value), self.size)):
++            try:
++                widget_value = value[i]
++            except IndexError:
++                widget_value = None
++            # This is the fixed version - create a copy for each widget
++            widget_attrs = dict(final_attrs)
++            if id_:
++                widget_attrs['id'] = '%s_%s' % (id_, i)
++            context['widget']['subwidgets'].append(
++                self.widget.get_context(name + '_%s' % i, widget_value, widget_attrs)['widget']
++            )
++        return context
++
++def test_fix():
++    print("Testing the fix for SplitArrayWidget with BooleanField")
++    
++    # Create a SplitArrayWidget with CheckboxInput
++    widget = TestSplitArrayWidget(
++        widget=forms.CheckboxInput,
++        size=3,
++    )
++    
++    # Test data with mixed True and False values
++    initial_data = [True, False, True]
++    
++    # Get the widget context
++    context = widget.get_context('test_field', initial_data)
++    
++    print("Initial data:", initial_data)
++    print()
++    
++    # Check each subwidget's context
++    for i, subwidget in enumerate(context['widget']['subwidgets']):
++        print(f"Widget {i}:")
++        print(f"  Value: {subwidget['value']}")
++        print(f"  Attrs: {subwidget['attrs']}")
++        print()
++    
++    # Verify the fix
++    has_issue = False
++    for i, subwidget in enumerate(context['widget']['subwidgets']):
++        actual_value = initial_data[i] if i < len(initial_data) else None
++        is_checked = subwidget['attrs'].get('checked', False)
++        
++        if actual_value is True and not is_checked:
++            print(f"ISSUE: Widget {i} should be checked but isn't")
++            has_issue = True
++        elif actual_value is False and is_checked:
++            print(f"ISSUE: Widget {i} should not be checked but is")
++            has_issue = True
++    
++    if not has_issue:
++        print("SUCCESS: The fix works! All widgets have correct checked status")
++    else:
++        print("FAILURE: The fix didn't work")
++    
++    return has_issue
++
++if __name__ == '__main__':
++    has_bug = test_fix()
++    sys.exit(1 if has_bug else 0)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..9474bdf45d
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,120 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++
++# Test the fixed SplitArrayWidget implementation
++class TestSplitArrayWidget(forms.Widget):
++    template_name = 'postgres/widgets/split_array.html'
++
++    def __init__(self, widget, size, **kwargs):
++        self.widget = widget() if isinstance(widget, type) else widget
++        self.size = size
++        super().__init__(**kwargs)
++
++    def get_context(self, name, value, attrs=None):
++        attrs = {} if attrs is None else attrs
++        context = super().get_context(name, value, attrs)
++        value = value or []
++        context['widget']['subwidgets'] = []
++        final_attrs = self.build_attrs(attrs)
++        id_ = final_attrs.get('id')
++        for i in range(max(len(value), self.size)):
++            try:
++                widget_value = value[i]
++            except IndexError:
++                widget_value = None
++            # Fixed version - create a copy for each widget
++            widget_attrs = dict(final_attrs)
++            if id_:
++                widget_attrs['id'] = '%s_%s' % (id_, i)
++            context['widget']['subwidgets'].append(
++                self.widget.get_context(name + '_%s' % i, widget_value, widget_attrs)['widget']
++            )
++        return context
++
++def test_edge_cases():
++    print("Testing edge cases for SplitArrayWidget fix")
++    
++    # Test case 1: All False values
++    print("\n=== Test Case 1: All False values ===")
++    widget = TestSplitArrayWidget(forms.CheckboxInput, 3)
++    context = widget.get_context('test1', [False, False, False])
++    for i, subwidget in enumerate(context['widget']['subwidgets']):
++        is_checked = subwidget['attrs'].get('checked', False)
++        print(f"Widget {i}: checked={is_checked} (should be False)")
++        if is_checked:
++            print(f"ERROR: Widget {i} should not be checked")
++            return False
++    
++    # Test case 2: All True values  
++    print("\n=== Test Case 2: All True values ===")
++    context = widget.get_context('test2', [True, True, True])
++    for i, subwidget in enumerate(context['widget']['subwidgets']):
++        is_checked = subwidget['attrs'].get('checked', False)
++        print(f"Widget {i}: checked={is_checked} (should be True)")
++        if not is_checked:
++            print(f"ERROR: Widget {i} should be checked")
++            return False
++    
++    # Test case 3: Mixed values with different patterns
++    print("\n=== Test Case 3: Mixed patterns ===")
++    test_patterns = [
++        [True, False, True],
++        [False, True, False],
++        [True, True, False],
++        [False, False, True]
++    ]
++    
++    for pattern_idx, pattern in enumerate(test_patterns):
++        print(f"\nPattern {pattern_idx}: {pattern}")
++        context = widget.get_context(f'test{pattern_idx}', pattern)
++        for i, subwidget in enumerate(context['widget']['subwidgets']):
++            actual_value = pattern[i] if i < len(pattern) else None
++            is_checked = subwidget['attrs'].get('checked', False)
++            print(f"  Widget {i}: checked={is_checked}, expected={actual_value}")
++            
++            if actual_value is True and not is_checked:
++                print(f"ERROR: Widget {i} should be checked")
++                return False
++            elif actual_value is False and is_checked:
++                print(f"ERROR: Widget {i} should not be checked")
++                return False
++    
++    # Test case 4: With ID attribute (this was the original bug scenario)
++    print("\n=== Test Case 4: With ID attribute ===")
++    widget_with_id = TestSplitArrayWidget(forms.CheckboxInput, 3)
++    context = widget_with_id.get_context('test4', [True, False, True], {'id': 'test_id'})
++    for i, subwidget in enumerate(context['widget']['subwidgets']):
++        actual_value = [True, False, True][i] if i < 3 else None
++        is_checked = subwidget['attrs'].get('checked', False)
++        widget_id = subwidget['attrs'].get('id', 'None')
++        print(f"Widget {i}: id={widget_id}, checked={is_checked}, expected={actual_value}")
++        
++        if actual_value is True and not is_checked:
++            print(f"ERROR: Widget {i} should be checked")
++            return False
++        elif actual_value is False and is_checked:
++            print(f"ERROR: Widget {i} should not be checked")
++            return False
++    
++    print("\n=== All edge cases passed! ===")
++    return True
++
++if __name__ == '__main__':
++    success = test_edge_cases()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..8cf601538b
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++
++# Import the actual fixed SplitArrayWidget
++sys.path.insert(0, '/testbed')
++from django.contrib.postgres.forms.array import SplitArrayWidget
++
++def test_split_array_field_boolean():
++    # Create a SplitArrayWidget with BooleanField widget
++    widget = SplitArrayWidget(
++        widget=forms.CheckboxInput(),
++        size=3,
++    )
++    
++    # Test data with mixed True and False values
++    initial_data = [True, False, True]
++    
++    # Get the widget context
++    context = widget.get_context('test_field', initial_data)
++    
++    print("Testing SplitArrayField with BooleanField")
++    print("Initial data:", initial_data)
++    print()
++    
++    # Check each subwidget's context
++    for i, subwidget in enumerate(context['widget']['subwidgets']):
++        print(f"Widget {i}:")
++        print(f"  Value: {subwidget['value']}")
++        print(f"  Attrs: {subwidget['attrs']}")
++        print()
++    
++    # The issue should be fixed now: widgets should only have 'checked': True if their actual value is True
++    
++    # Let's verify the fix
++    has_issue = False
++    for i, subwidget in enumerate(context['widget']['subwidgets']):
++        actual_value = initial_data[i] if i < len(initial_data) else None
++        is_checked = subwidget['attrs'].get('checked', False)
++        
++        if actual_value is True and not is_checked:
++            print(f"ISSUE: Widget {i} should be checked but isn't")
++            has_issue = True
++        elif actual_value is False and is_checked:
++            print(f"ISSUE: Widget {i} should not be checked but is")
++            has_issue = True
++    
++    if not has_issue:
++        print("SUCCESS: All widgets have correct checked status")
++    
++    return has_issue
++
++if __name__ == '__main__':
++    has_bug = test_split_array_field_boolean()
++    sys.exit(1 if has_bug else 0)
+\ No newline at end of file

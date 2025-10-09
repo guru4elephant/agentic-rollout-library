@@ -1,0 +1,547 @@
+diff --git a/pom.xml b/pom.xml
+new file mode 100644
+index 000000000..55316121b
+--- /dev/null
++++ b/pom.xml
+@@ -0,0 +1,26 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<project>
++  <build>
++    <plugins>
++      <plugin>
++        <groupId>org.apache.maven.plugins</groupId>
++        <artifactId>maven-compiler-plugin</artifactId>
++        <version>3.8.0</version>
++        <configuration>
++          <source>1.8</source>
++          <target>1.8</target>
++          <debug>true</debug>
++          <encoding>UTF-8</encoding>
++        </configuration>
++      </plugin>
++      <plugin>
++        <groupId>com.github.ekryd.sortpom</groupId>
++        <artifactId>sortpom-maven-plugin</artifactId>
++        <version>2.15.0</version>
++        <configuration>
++          <verifyFailOn>strict</verifyFailOn>
++        </configuration>
++      </plugin>
++    </plugins>
++  </build>
++</project>
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..857d478b5
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""Reproduce the literalinclude prepend/append whitespace issue."""
++
++import os
++import tempfile
++from sphinx.directives.code import LiteralIncludeReader
++from sphinx.config import Config
++
++def create_test_files():
++    """Create test files for reproduction."""
++    # Create pom.xml file
++    pom_content = '''<?xml version="1.0" encoding="UTF-8"?>
++<project>
++  <build>
++    <plugins>
++      <plugin>
++        <groupId>org.apache.maven.plugins</groupId>
++        <artifactId>maven-compiler-plugin</artifactId>
++        <version>3.8.0</version>
++        <configuration>
++          <source>1.8</source>
++          <target>1.8</target>
++          <debug>true</debug>
++          <encoding>UTF-8</encoding>
++        </configuration>
++      </plugin>
++      <plugin>
++        <groupId>com.github.ekryd.sortpom</groupId>
++        <artifactId>sortpom-maven-plugin</artifactId>
++        <version>2.15.0</version>
++        <configuration>
++          <verifyFailOn>strict</verifyFailOn>
++        </configuration>
++      </plugin>
++    </plugins>
++  </build>
++</project>'''
++    
++    with open('pom.xml', 'w') as f:
++        f.write(pom_content)
++    
++    return 'pom.xml'
++
++def test_prepend_issue():
++    """Test the prepend whitespace issue."""
++    filename = create_test_files()
++    
++    # Create a mock config
++    class MockConfig:
++        source_encoding = 'utf-8'
++    
++    config = MockConfig()
++    
++    # Test options from the issue
++    options = {
++        'prepend': '      </plugin>',
++        'start-at': '<groupId>com.github.ekryd.sortpom</groupId>',
++        'end-at': '</plugin>',
++        'dedent': 5  # This should only apply to the included content, not prepend
++    }
++    
++    reader = LiteralIncludeReader(filename, options, config)
++    result, line_count = reader.read()
++    
++    print("Result with prepend and dedent:")
++    print(repr(result))
++    print("---")
++    print(result)
++    
++    # The issue: prepend content gets dedented too
++    # Expected: prepend should keep its whitespace, only included content should be dedented
++    expected_prepend = '      </plugin>\n'
++    if expected_prepend in result:
++        print("✓ Prepended content preserved its whitespace")
++    else:
++        print("✗ Prepended content lost its whitespace")
++        print(f"Expected: {repr(expected_prepend)}")
++        print(f"Actual: {repr(result.splitlines()[0] + chr(10))}")
++
++if __name__ == '__main__':
++    test_prepend_issue()
+\ No newline at end of file
+diff --git a/sphinx/directives/code.py b/sphinx/directives/code.py
+index dc44ed314..b5d60b5cb 100644
+--- a/sphinx/directives/code.py
++++ b/sphinx/directives/code.py
+@@ -356,7 +356,51 @@ class LiteralIncludeReader:
+ 
+     def dedent_filter(self, lines: List[str], location: Tuple[str, int] = None) -> List[str]:
+         if 'dedent' in self.options:
+-            return dedent_lines(lines, self.options.get('dedent'), location=location)
++            # If prepend or append options are present, we need to handle them specially
++            prepend = self.options.get('prepend')
++            append = self.options.get('append')
++            
++            if prepend or append:
++                # Separate prepended/appended lines from original content
++                original_lines = []
++                prepended_lines = []
++                appended_lines = []
++                
++                # Check if there are prepended lines (should be at the beginning)
++                if prepend:
++                    # The first line should be the prepended content
++                    prepended_lines = [lines[0]]
++                    original_lines = lines[1:]
++                else:
++                    original_lines = lines
++                
++                # Check if there are appended lines (should be at the end)
++                if append:
++                    if prepend:
++                        # If both prepend and append, original lines are in the middle
++                        appended_lines = [original_lines[-1]]
++                        original_lines = original_lines[:-1]
++                    else:
++                        # If only append, last line is appended content
++                        appended_lines = [original_lines[-1]]
++                        original_lines = original_lines[:-1]
++                
++                # Apply dedent only to original lines
++                dedent_amount = self.options.get('dedent')
++                dedented_original = dedent_lines(original_lines, dedent_amount, location=location)
++                
++                # Recombine the lines
++                result_lines = []
++                if prepend:
++                    result_lines.extend(prepended_lines)
++                result_lines.extend(dedented_original)
++                if append:
++                    result_lines.extend(appended_lines)
++                
++                return result_lines
++            else:
++                # No prepend/append, apply dedent to all lines normally
++                return dedent_lines(lines, self.options.get('dedent'), location=location)
+         else:
+             return lines
+ 
+diff --git a/test_append.py b/test_append.py
+new file mode 100644
+index 000000000..36996a09e
+--- /dev/null
++++ b/test_append.py
+@@ -0,0 +1,47 @@
++#!/usr/bin/env python3
++"""Test the append functionality with dedent."""
++
++from sphinx.directives.code import LiteralIncludeReader
++
++def test_append_issue():
++    """Test the append whitespace issue."""
++    # Create a mock config
++    class MockConfig:
++        source_encoding = 'utf-8'
++    
++    config = MockConfig()
++    
++    # Create test content
++    test_content = '''line1
++  line2
++    line3
++'''
++    
++    with open('test_file.txt', 'w') as f:
++        f.write(test_content)
++    
++    # Test options with append and dedent
++    options = {
++        'append': '      appended_line',
++        'dedent': 2  # Dedent by 2 spaces
++    }
++    
++    reader = LiteralIncludeReader('test_file.txt', options, config)
++    result, line_count = reader.read()
++    
++    print("Result with append and dedent:")
++    print(repr(result))
++    print("---")
++    print(result)
++    
++    # The appended content should keep its whitespace
++    expected_append = '      appended_line\n'
++    if expected_append in result:
++        print("✓ Appended content preserved its whitespace")
++    else:
++        print("✗ Appended content lost its whitespace")
++        print(f"Expected: {repr(expected_append)}")
++        print(f"Actual: {repr(result.splitlines()[-1] + chr(10))}")
++
++if __name__ == '__main__':
++    test_append_issue()
+\ No newline at end of file
+diff --git a/test_complex.txt b/test_complex.txt
+new file mode 100644
+index 000000000..d28f807a1
+--- /dev/null
++++ b/test_complex.txt
+@@ -0,0 +1,4 @@
++    line1
++  line2
++      line3
++line4
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 000000000..bfd8c882d
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""Test the comprehensive scenario from the GitHub issue."""
++
++from sphinx.directives.code import LiteralIncludeReader
++
++def test_comprehensive_issue():
++    """Test the comprehensive scenario from the GitHub issue."""
++    # Create a mock config
++    class MockConfig:
++        source_encoding = 'utf-8'
++    
++    config = MockConfig()
++    
++    # Create pom.xml file as in the issue
++    pom_content = '''<?xml version="1.0" encoding="UTF-8"?>
++<project>
++  <build>
++    <plugins>
++      <plugin>
++        <groupId>org.apache.maven.plugins</groupId>
++        <artifactId>maven-compiler-plugin</artifactId>
++        <version>3.8.0</version>
++        <configuration>
++          <source>1.8</source>
++          <target>1.8</target>
++          <debug>true</debug>
++          <encoding>UTF-8</encoding>
++        </configuration>
++      </plugin>
++      <plugin>
++        <groupId>com.github.ekryd.sortpom</groupId>
++        <artifactId>sortpom-maven-plugin</artifactId>
++        <version>2.15.0</version>
++        <configuration>
++          <verifyFailOn>strict</verifyFailOn>
++        </configuration>
++      </plugin>
++    </plugins>
++  </build>
++</project>'''
++    
++    with open('pom.xml', 'w') as f:
++        f.write(pom_content)
++    
++    # Test options from the issue
++    options = {
++        'prepend': '      </plugin>',
++        'start-at': '<groupId>com.github.ekryd.sortpom</groupId>',
++        'end-at': '</plugin>',
++        'dedent': 5  # This should only apply to the included content, not prepend
++    }
++    
++    reader = LiteralIncludeReader('pom.xml', options, config)
++    result, line_count = reader.read()
++    
++    print("Comprehensive test result:")
++    print(repr(result))
++    print("---")
++    print(result)
++    
++    # Check if prepend preserved its whitespace
++    lines = result.splitlines()
++    if lines and lines[0] == '      </plugin>':
++        print("✓ Prepended content preserved its whitespace (6 spaces)")
++    else:
++        print("✗ Prepended content lost its whitespace")
++        print(f"First line: {repr(lines[0])}")
++    
++    # Check if included content was dedented
++    if len(lines) > 1 and lines[1].startswith('   <groupId>'):
++        print("✓ Included content was properly dedented")
++    else:
++        print("✗ Included content was not properly dedented")
++        print(f"Second line: {repr(lines[1])}")
++
++if __name__ == '__main__':
++    test_comprehensive_issue()
+\ No newline at end of file
+diff --git a/test_file.txt b/test_file.txt
+new file mode 100644
+index 000000000..48b307005
+--- /dev/null
++++ b/test_file.txt
+@@ -0,0 +1,3 @@
++line1
++  line2
++    line3
+diff --git a/test_no_dedent.py b/test_no_dedent.py
+new file mode 100644
+index 000000000..1103d86e9
+--- /dev/null
++++ b/test_no_dedent.py
+@@ -0,0 +1,47 @@
++#!/usr/bin/env python3
++"""Test that normal functionality without dedent still works."""
++
++from sphinx.directives.code import LiteralIncludeReader
++
++def test_no_dedent():
++    """Test normal functionality without dedent."""
++    # Create a mock config
++    class MockConfig:
++        source_encoding = 'utf-8'
++    
++    config = MockConfig()
++    
++    # Create test content
++    test_content = '''line1
++  line2
++    line3
++'''
++    
++    with open('test_file.txt', 'w') as f:
++        f.write(test_content)
++    
++    # Test options with prepend but no dedent
++    options = {
++        'prepend': '  prepended',
++        'append': '  appended'
++    }
++    
++    reader = LiteralIncludeReader('test_file.txt', options, config)
++    result, line_count = reader.read()
++    
++    print("Result with prepend/append but no dedent:")
++    print(repr(result))
++    print("---")
++    print(result)
++    
++    # All content should remain unchanged
++    lines = result.splitlines()
++    if lines[0] == '  prepended' and lines[-1] == '  appended':
++        print("✓ Prepended and appended content preserved correctly")
++    else:
++        print("✗ Prepended or appended content was modified")
++        print(f"First line: {repr(lines[0])}")
++        print(f"Last line: {repr(lines[-1])}")
++
++if __name__ == '__main__':
++    test_no_dedent()
+\ No newline at end of file
+diff --git a/test_prepend_append_dedent.py b/test_prepend_append_dedent.py
+new file mode 100644
+index 000000000..c2420d122
+--- /dev/null
++++ b/test_prepend_append_dedent.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++"""Test the combination of prepend, append, and dedent options."""
++
++from sphinx.directives.code import LiteralIncludeReader
++
++def test_prepend_append_dedent():
++    """Test that prepend and append preserve whitespace when dedent is used."""
++    # Create a mock config
++    class MockConfig:
++        source_encoding = 'utf-8'
++    
++    config = MockConfig()
++    
++    # Create test file
++    test_content = '''    line1
++    line2
++    line3
++'''
++    
++    with open('test_prepend_append_dedent.txt', 'w') as f:
++        f.write(test_content)
++    
++    # Test options with prepend, append, and dedent
++    options = {
++        'prepend': '    PREPENDED',
++        'append': '    APPENDED',
++        'dedent': 2
++    }
++    
++    reader = LiteralIncludeReader('test_prepend_append_dedent.txt', options, config)
++    result, line_count = reader.read()
++    
++    print("Result with prepend, append, and dedent:")
++    print(repr(result))
++    print("---")
++    print(result)
++    
++    # The prepended and appended content should keep their whitespace, original content should be dedented
++    lines = result.splitlines()
++    if (lines[0] == '    PREPENDED' and  # prepend preserved (4 spaces)
++        lines[1] == '  line1' and        # dedented by 2 (4-2=2 spaces)
++        lines[2] == '  line2' and        # dedented by 2 (4-2=2 spaces)
++        lines[3] == '  line3' and        # dedented by 2 (4-2=2 spaces)
++        lines[4] == '    APPENDED'):     # append preserved (4 spaces)
++        print("SUCCESS: Prepended and appended content preserved, original content dedented")
++    else:
++        print("FAILED")
++        for i, line in enumerate(lines):
++            print(f"Line {i}: {repr(line)}")
++
++if __name__ == '__main__':
++    test_prepend_append_dedent()
+\ No newline at end of file
+diff --git a/test_prepend_append_dedent.txt b/test_prepend_append_dedent.txt
+new file mode 100644
+index 000000000..2e2ed8f09
+--- /dev/null
++++ b/test_prepend_append_dedent.txt
+@@ -0,0 +1,3 @@
++    line1
++    line2
++    line3
+diff --git a/test_prepend_dedent.txt b/test_prepend_dedent.txt
+new file mode 100644
+index 000000000..2e2ed8f09
+--- /dev/null
++++ b/test_prepend_dedent.txt
+@@ -0,0 +1,3 @@
++    line1
++    line2
++    line3
+diff --git a/test_prepend_dedent_combo.py b/test_prepend_dedent_combo.py
+new file mode 100644
+index 000000000..ffa90157c
+--- /dev/null
++++ b/test_prepend_dedent_combo.py
+@@ -0,0 +1,50 @@
++#!/usr/bin/env python3
++"""Test the combination of prepend and dedent options."""
++
++from sphinx.directives.code import LiteralIncludeReader
++
++def test_prepend_dedent_combo():
++    """Test that prepend preserves whitespace when dedent is used."""
++    # Create a mock config
++    class MockConfig:
++        source_encoding = 'utf-8'
++    
++    config = MockConfig()
++    
++    # Create test file
++    test_content = '''    line1
++    line2
++    line3
++'''
++    
++    with open('test_prepend_dedent.txt', 'w') as f:
++        f.write(test_content)
++    
++    # Test options with both prepend and dedent
++    options = {
++        'prepend': '    PREPENDED',
++        'dedent': 2
++    }
++    
++    reader = LiteralIncludeReader('test_prepend_dedent.txt', options, config)
++    result, line_count = reader.read()
++    
++    print("Result with prepend and dedent:")
++    print(repr(result))
++    print("---")
++    print(result)
++    
++    # The prepended content should keep its whitespace, original content should be dedented
++    lines = result.splitlines()
++    if (lines[0] == '    PREPENDED' and  # prepend preserved (4 spaces)
++        lines[1] == '  line1' and        # dedented by 2 (4-2=2 spaces)
++        lines[2] == '  line2' and        # dedented by 2 (4-2=2 spaces)
++        lines[3] == '  line3'):          # dedented by 2 (4-2=2 spaces)
++        print("SUCCESS: Prepended content preserved, original content dedented")
++    else:
++        print("FAILED")
++        for i, line in enumerate(lines):
++            print(f"Line {i}: {repr(line)}")
++
++if __name__ == '__main__':
++    test_prepend_dedent_combo()
+\ No newline at end of file
+diff --git a/test_start_at.txt b/test_start_at.txt
+new file mode 100644
+index 000000000..9e0e29e40
+--- /dev/null
++++ b/test_start_at.txt
+@@ -0,0 +1,5 @@
++line1
++line2
++TARGET_LINE
++line3
++line4
+diff --git a/tox.ini b/tox.ini
+index f0afd779b..30ca90275 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -28,7 +28,7 @@ setenv =
+     PYTHONWARNINGS = all
+     PYTEST_ADDOPTS = {env:PYTEST_ADDOPTS:} --color yes
+ commands=
+-    python -X dev -m pytest --durations 25 {posargs}
++    python -X dev -m pytest -rA --durations 25 {posargs}
+ 
+ [testenv:du-latest]
+ commands =

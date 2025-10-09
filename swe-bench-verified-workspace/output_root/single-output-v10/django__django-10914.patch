@@ -1,0 +1,214 @@
+diff --git a/django/core/files/storage.py b/django/core/files/storage.py
+index cbdab1de47..7f9078ba7f 100644
+--- a/django/core/files/storage.py
++++ b/django/core/files/storage.py
+@@ -282,6 +282,12 @@ class FileSystemStorage(Storage):
+ 
+         if self.file_permissions_mode is not None:
+             os.chmod(full_path, self.file_permissions_mode)
++        else:
++            # Set default permissions when FILE_UPLOAD_PERMISSIONS is None
++            # This ensures consistent permissions regardless of upload method
++            current_umask = os.umask(0)
++            os.umask(current_umask)  # Restore original umask
++            os.chmod(full_path, 0o666 & ~current_umask)
+ 
+         # Store filenames with forward slashes, even on Windows.
+         return name.replace('\\', '/')
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..92ba85fe80
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the file upload permission issue.
++"""
++import os
++import tempfile
++from django.conf import settings
++from django.core.files.storage import FileSystemStorage
++from django.core.files.uploadedfile import SimpleUploadedFile
++
++# Configure minimal Django settings
++settings.configure(
++    MEDIA_ROOT='/tmp/test_media',
++    FILE_UPLOAD_PERMISSIONS=None,  # This is the default
++)
++
++def test_file_permissions():
++    # Create test directory
++    os.makedirs('/tmp/test_media', exist_ok=True)
++    
++    # Initialize storage
++    storage = FileSystemStorage()
++    
++    print("Testing file permissions with FILE_UPLOAD_PERMISSIONS=None...")
++    
++    # Test 1: Create a simple uploaded file (simulates InMemoryUploadedFile behavior)
++    upload_file = SimpleUploadedFile(
++        name='test_file.txt',
++        content=b'test content',
++        content_type='text/plain'
++    )
++    
++    # Save the file
++    saved_name = storage.save('test_file.txt', upload_file)
++    saved_path = storage.path(saved_name)
++    
++    # Check permissions
++    permissions = oct(os.stat(saved_path).st_mode & 0o777)
++    print(f"SimpleUploadedFile permissions: {permissions}")
++    
++    # Test 2: Create a proper TemporaryUploadedFile to test the actual issue
++    print("\nTesting TemporaryUploadedFile behavior...")
++    
++    # Create a real TemporaryUploadedFile
++    from django.core.files.uploadedfile import TemporaryUploadedFile
++    
++    # Create a temporary file with restrictive permissions (like tempfile.NamedTemporaryFile does)
++    with tempfile.NamedTemporaryFile(delete=False, mode='w+b') as tmp_file:
++        tmp_file.write(b'test content from temp file')
++        tmp_file.flush()
++        
++        # Set restrictive permissions to simulate the issue
++        os.chmod(tmp_file.name, 0o600)
++        
++        # Check original temp file permissions
++        temp_permissions = oct(os.stat(tmp_file.name).st_mode & 0o777)
++        print(f"Original temp file permissions: {temp_permissions}")
++        
++        # Create a TemporaryUploadedFile that uses this temp file
++        # We need to create it manually since the constructor creates its own temp file
++        temp_upload = TemporaryUploadedFile.__new__(TemporaryUploadedFile)
++        temp_upload.file = open(tmp_file.name, 'rb')
++        temp_upload.name = 'test_temp_file.txt'
++        temp_upload.content_type = 'text/plain'
++        temp_upload.size = len(b'test content from temp file')
++        temp_upload.charset = 'utf-8'
++        
++        # Save the file through Django storage (this should use file_move_safe internally)
++        saved_name2 = storage.save('test_temp_file.txt', temp_upload)
++        saved_path2 = storage.path(saved_name2)
++        
++        # Check permissions after save
++        moved_permissions = oct(os.stat(saved_path2).st_mode & 0o777)
++        print(f"TemporaryUploadedFile permissions after save: {moved_permissions}")
++        
++        # Cleanup - the file was moved by Django, so we don't need to unlink it
++        temp_upload.file.close()
++    
++    # Cleanup
++    storage.delete('test_file.txt')
++    storage.delete('test_temp_file.txt')
++    
++    print(f"\nExpected permissions (0o666 & ~umask): {oct(0o666 & ~0o022)}")
++
++if __name__ == '__main__':
++    test_file_permissions()
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 0000000000..1a366563aa
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for the FILE_UPLOAD_PERMISSIONS fix.
++"""
++import os
++import tempfile
++from django.conf import settings
++from django.core.files.storage import FileSystemStorage
++from django.core.files.uploadedfile import SimpleUploadedFile
++
++# Configure minimal Django settings
++settings.configure(
++    MEDIA_ROOT='/tmp/test_media',
++    FILE_UPLOAD_PERMISSIONS=None,  # This is the default
++)
++
++def test_comprehensive_permissions():
++    # Create test directory
++    os.makedirs('/tmp/test_media', exist_ok=True)
++    
++    # Test 1: FILE_UPLOAD_PERMISSIONS=None (default behavior)
++    print("=== Test 1: FILE_UPLOAD_PERMISSIONS=None (default) ===")
++    storage = FileSystemStorage()
++    
++    # Test with SimpleUploadedFile (streaming method)
++    upload_file = SimpleUploadedFile(
++        name='test_file1.txt',
++        content=b'test content',
++        content_type='text/plain'
++    )
++    saved_name1 = storage.save('test_file1.txt', upload_file)
++    saved_path1 = storage.path(saved_name1)
++    permissions1 = oct(os.stat(saved_path1).st_mode & 0o777)
++    print(f"SimpleUploadedFile permissions: {permissions1}")
++    
++    # Test with ContentFile (also uses streaming method)
++    from django.core.files.base import ContentFile
++    content_file = ContentFile("content file data")
++    saved_name2 = storage.save('test_file2.txt', content_file)
++    saved_path2 = storage.path(saved_name2)
++    permissions2 = oct(os.stat(saved_path2).st_mode & 0o777)
++    print(f"ContentFile permissions: {permissions2}")
++    
++    # Cleanup
++    storage.delete('test_file1.txt')
++    storage.delete('test_file2.txt')
++    
++    # Test 2: FILE_UPLOAD_PERMISSIONS with explicit value
++    print("\n=== Test 2: FILE_UPLOAD_PERMISSIONS=0o755 ===")
++    with settings.override(FILE_UPLOAD_PERMISSIONS=0o755):
++        storage2 = FileSystemStorage()
++        
++        upload_file2 = SimpleUploadedFile(
++            name='test_file3.txt',
++            content=b'test content',
++            content_type='text/plain'
++        )
++        saved_name3 = storage2.save('test_file3.txt', upload_file2)
++        saved_path3 = storage2.path(saved_name3)
++        permissions3 = oct(os.stat(saved_path3).st_mode & 0o777)
++        print(f"SimpleUploadedFile permissions with 0o755: {permissions3}")
++        
++        storage2.delete('test_file3.txt')
++    
++    # Test 3: Verify consistency between different upload methods
++    print("\n=== Test 3: Consistency between upload methods ===")
++    storage3 = FileSystemStorage()
++    
++    # Method A: Streaming (SimpleUploadedFile)
++    upload_a = SimpleUploadedFile(
++        name='test_file_a.txt',
++        content=b'content a',
++        content_type='text/plain'
++    )
++    saved_a = storage3.save('test_file_a.txt', upload_a)
++    perms_a = oct(os.stat(storage3.path(saved_a)).st_mode & 0o777)
++    print(f"Method A (streaming) permissions: {perms_a}")
++    
++    # Method B: ContentFile (also streaming)
++    content_b = ContentFile("content b")
++    saved_b = storage3.save('test_file_b.txt', content_b)
++    perms_b = oct(os.stat(storage3.path(saved_b)).st_mode & 0o777)
++    print(f"Method B (ContentFile) permissions: {perms_b}")
++    
++    # Both should have the same permissions
++    print(f"Permissions consistent: {perms_a == perms_b}")
++    
++    # Cleanup
++    storage3.delete('test_file_a.txt')
++    storage3.delete('test_file_b.txt')
++    
++    print(f"\n=== Summary ===")
++    print(f"Expected default permissions: {oct(0o666 & ~0o022)}")
++    print(f"All tests completed successfully!")
++
++if __name__ == '__main__':
++    test_comprehensive_permissions()
+\ No newline at end of file

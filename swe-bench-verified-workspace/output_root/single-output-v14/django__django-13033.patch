@@ -1,0 +1,236 @@
+diff --git a/debug_names_to_path.py b/debug_names_to_path.py
+new file mode 100644
+index 0000000000..8019869f0d
+--- /dev/null
++++ b/debug_names_to_path.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'test_app',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from test_app.models import OneModel, TwoModel
++from django.db.models.sql.query import Query
++
++# Create a query
++query = Query(TwoModel)
++
++# Test what names_to_path returns for different order_by calls
++test_cases = [
++    ["record", "root_id"],
++    ["record", "root", "id"],
++]
++
++for case in test_cases:
++    print(f"\nTesting: {case}")
++    try:
++        path, final_field, targets, rest = query.names_to_path(
++            case, TwoModel._meta, allow_many=True, fail_on_missing=True
++        )
++        print(f"  path: {[str(p) for p in path]}")
++        print(f"  final_field: {final_field}")
++        print(f"  targets: {[str(t) for t in targets]}")
++        print(f"  rest: {rest}")
++        
++        # Check field properties
++        if hasattr(final_field, 'attname'):
++            print(f"  final_field.attname: {final_field.attname}")
++        if hasattr(final_field, 'is_relation'):
++            print(f"  final_field.is_relation: {final_field.is_relation}")
++            
++    except Exception as e:
++        print(f"  Error: {e}")
+\ No newline at end of file
+diff --git a/debug_ordering.py b/debug_ordering.py
+new file mode 100644
+index 0000000000..b1f38214f5
+--- /dev/null
++++ b/debug_ordering.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'test_app',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from test_app.models import OneModel, TwoModel
++
++# Create a simple test to understand what happens in find_ordering_name
++from django.db.models.sql.compiler import SQLCompiler
++from django.db.models.sql.query import Query
++
++# Create a query
++query = Query(TwoModel)
++compiler = SQLCompiler(query, connection=None, using='default')
++
++# Test what pieces contains for different order_by calls
++test_cases = [
++    "record__root_id",
++    "record__root__id", 
++    "record_id"
++]
++
++for case in test_cases:
++    print(f"\nTesting: {case}")
++    try:
++        # This will show us what pieces contains
++        name, order = compiler.get_order_dir(case, 'ASC')
++        print(f"  name: {name}, order: {order}")
++        pieces = name.split('__')
++        print(f"  pieces: {pieces}")
++        
++        # Try to simulate the setup_joins call
++        from django.db.models.sql.constants import LOOKUP_SEP
++        pieces = name.split(LOOKUP_SEP)
++        print(f"  LOOKUP_SEP pieces: {pieces}")
++        
++    except Exception as e:
++        print(f"  Error: {e}")
+\ No newline at end of file
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index abbb1e37cb..0a70c17ee5 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -727,6 +727,8 @@ class SQLCompiler:
+         # If we get to this point and the field is a relation to another model,
+         # append the default ordering for that model unless it is the pk
+         # shortcut or the attribute name of the field that is specified.
++        # DEBUG: Print values to understand the issue
++        # print(f"DEBUG: field.is_relation={field.is_relation}, opts.ordering={opts.ordering}, field.attname={getattr(field, 'attname', None)}, name={name}")
+         if field.is_relation and opts.ordering and getattr(field, 'attname', None) != name and name != 'pk':
+             # Firstly, avoid infinite loops.
+             already_seen = already_seen or set()
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..3d7b3a3f5d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'test_app',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from test_app.models import OneModel, TwoModel
++
++# We don't need to create actual tables, just examine the query
++
++# Test the issue
++print("=== Testing the issue ===")
++print("\n1. Query with order_by('record__root_id'):")
++qs = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++qs = qs.order_by("record__root_id")
++print(qs.query)
++print()
++
++print("\n2. Query with order_by('record__root__id'):")
++qs = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++qs = qs.order_by("record__root__id")
++print(qs.query)
++print()
++
++print("\n3. Query with order_by('-record__root_id'):")
++qs = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++qs = qs.order_by("-record__root_id")
++print(qs.query)
++print()
++
++print("\n4. Query with annotated field:")
++from django.db.models import F
++qs = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++qs = qs.annotate(root_id=F("record__root_id"))
++qs = qs.order_by("root_id")
++print(qs.query)
+\ No newline at end of file
+diff --git a/test_app/__init__.py b/test_app/__init__.py
+new file mode 100644
+index 0000000000..1692d26dd8
+--- /dev/null
++++ b/test_app/__init__.py
+@@ -0,0 +1 @@
++# Test app for reproducing the issue
+\ No newline at end of file
+diff --git a/test_app/models.py b/test_app/models.py
+new file mode 100644
+index 0000000000..b6815a6bdb
+--- /dev/null
++++ b/test_app/models.py
+@@ -0,0 +1,15 @@
++from django.db import models
++
++# Create the models from the issue
++class OneModel(models.Model):
++    class Meta:
++        ordering = ("-id",)
++    
++    id = models.BigAutoField(primary_key=True)
++    root = models.ForeignKey("OneModel", on_delete=models.CASCADE, null=True)
++    oneval = models.BigIntegerField(null=True)
++
++class TwoModel(models.Model):
++    id = models.BigAutoField(primary_key=True)
++    record = models.ForeignKey(OneModel, on_delete=models.CASCADE)
++    twoval = models.BigIntegerField(null=True)
+\ No newline at end of file

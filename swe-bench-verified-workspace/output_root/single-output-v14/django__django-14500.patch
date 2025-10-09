@@ -1,0 +1,265 @@
+diff --git a/django/db/migrations/executor.py b/django/db/migrations/executor.py
+index 57042a8690..1174fa2254 100644
+--- a/django/db/migrations/executor.py
++++ b/django/db/migrations/executor.py
+@@ -264,6 +264,8 @@ class MigrationExecutor:
+     def check_replacements(self):
+         """
+         Mark replacement migrations applied if their replaced set all are.
++        Mark replacement migrations unapplied if their replaced set are not all
++        applied and the replaced migration files are not on disk.
+ 
+         Do this unconditionally on every migrate, rather than just when
+         migrations are applied or unapplied, to correctly handle the case
+@@ -277,6 +279,13 @@ class MigrationExecutor:
+             all_applied = all(m in applied for m in migration.replaces)
+             if all_applied and key not in applied:
+                 self.recorder.record_applied(*key)
++            elif not all_applied and key in applied:
++                # Check if all replaced migration files are still on disk
++                # If they are, the squashed migration should remain applied
++                # If they aren't, the squashed migration should be unapplied
++                all_files_exist = all(m in self.loader.disk_migrations for m in migration.replaces)
++                if not all_files_exist:
++                    self.recorder.record_unapplied(*key)
+ 
+     def detect_soft_applied(self, project_state, migration):
+         """
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..5b87019da4
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,157 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import tempfile
++import shutil
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++import django
++from django.conf import settings
++from django.db import connection, migrations, models
++from django.db.migrations.executor import MigrationExecutor
++from django.db.migrations.recorder import MigrationRecorder
++from django.db.migrations.state import ProjectState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Create a simple test case
++def test_squashed_migration_unapply():
++    print("Testing squashed migration unapply behavior...")
++    
++    # Create a temporary directory for our test migrations
++    temp_dir = tempfile.mkdtemp()
++    app_dir = os.path.join(temp_dir, 'test_app')
++    os.makedirs(app_dir)
++    migrations_dir = os.path.join(app_dir, 'migrations')
++    os.makedirs(migrations_dir)
++    os.makedirs(os.path.join(migrations_dir, '__pycache__'))
++    
++    # Create __init__.py files
++    with open(os.path.join(app_dir, '__init__.py'), 'w') as f:
++        f.write('')
++    with open(os.path.join(migrations_dir, '__init__.py'), 'w') as f:
++        f.write('')
++    
++    # Create initial migration
++    initial_migration = '''
++from django.db import migrations, models
++
++class Migration(migrations.Migration):
++    initial = True
++    dependencies = []
++    
++    operations = [
++        migrations.CreateModel(
++            name='TestModel',
++            fields=[
++                ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
++                ('name', models.CharField(max_length=100)),
++            ],
++        ),
++    ]
++'''
++    with open(os.path.join(migrations_dir, '0001_initial.py'), 'w') as f:
++        f.write(initial_migration)
++    
++    # Create second migration
++    second_migration = '''
++from django.db import migrations, models
++
++class Migration(migrations.Migration):
++    dependencies = [('test_app', '0001_initial')]
++    
++    operations = [
++        migrations.AddField(
++            model_name='testmodel',
++            name='description',
++            field=models.TextField(blank=True),
++        ),
++    ]
++'''
++    with open(os.path.join(migrations_dir, '0002_second.py'), 'w') as f:
++        f.write(second_migration)
++    
++    # Create squashed migration
++    squashed_migration = '''
++from django.db import migrations, models
++
++class Migration(migrations.Migration):
++    replaces = [('test_app', '0001_initial'), ('test_app', '0002_second')]
++    
++    operations = [
++        migrations.CreateModel(
++            name='TestModel',
++            fields=[
++                ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
++                ('name', models.CharField(max_length=100)),
++                ('description', models.TextField(blank=True)),
++            ],
++        ),
++    ]
++'''
++    with open(os.path.join(migrations_dir, '0001_squashed_0002.py'), 'w') as f:
++        f.write(squashed_migration)
++    
++    # Add our test app to installed apps and Python path
++    settings.INSTALLED_APPS.append('test_app')
++    sys.path.insert(0, temp_dir)
++    
++    # Set the migration module
++    settings.MIGRATION_MODULES = {'test_app': 'test_app.migrations'}
++    
++    # Re-setup Django with new settings
++    django.setup()
++    
++    # Create executor
++    executor = MigrationExecutor(connection)
++    recorder = MigrationRecorder(connection)
++    
++    # Rebuild the graph to include our new migrations
++    executor.loader.build_graph()
++    
++    # Ensure schema exists
++    recorder.ensure_schema()
++    
++    print("1. Applying squashed migration...")
++    executor.migrate([('test_app', '0001_squashed_0002')], fake=True)
++    
++    print("2. Checking applied migrations:")
++    applied = recorder.applied_migrations()
++    for mig in applied:
++        print(f"   - {mig}")
++    
++    print("3. Unapplying all migrations...")
++    executor.migrate([('test_app', None)], fake=True)
++    
++    print("4. Checking applied migrations after unapply:")
++    applied = recorder.applied_migrations()
++    for mig in applied:
++        print(f"   - {mig}")
++    
++    # Clean up
++    shutil.rmtree(temp_dir)
++    
++    print("Test completed.")
++
++if __name__ == '__main__':
++    test_squashed_migration_unapply()
+\ No newline at end of file
+diff --git a/reproduce_issue_simple.py b/reproduce_issue_simple.py
+new file mode 100644
+index 0000000000..0c0b1caabd
+--- /dev/null
++++ b/reproduce_issue_simple.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.migrations.executor import MigrationExecutor
++from django.db.migrations.recorder import MigrationRecorder
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'migrations',
++        ],
++        SECRET_KEY='test-secret-key',
++        MIGRATION_MODULES={
++            "migrations": "migrations.test_migrations_squashed",
++        },
++    )
++
++django.setup()
++
++def test_squashed_migration_unapply():
++    print("Testing squashed migration unapply behavior...")
++    
++    # Create executor
++    executor = MigrationExecutor(connection)
++    recorder = MigrationRecorder(connection)
++    
++    # Ensure schema exists
++    recorder.ensure_schema()
++    
++    print("1. Applying squashed migration...")
++    executor.migrate([('migrations', '0001_squashed_0002')], fake=True)
++    
++    print("2. Checking applied migrations:")
++    applied = recorder.applied_migrations()
++    for mig in applied:
++        print(f"   - {mig}")
++    
++    print("3. Unapplying all migrations...")
++    executor.migrate([('migrations', None)], fake=True)
++    
++    print("4. Checking applied migrations after unapply:")
++    applied = recorder.applied_migrations()
++    for mig in applied:
++        print(f"   - {mig}")
++    
++    print("Test completed.")
++
++if __name__ == '__main__':
++    test_squashed_migration_unapply()
+\ No newline at end of file

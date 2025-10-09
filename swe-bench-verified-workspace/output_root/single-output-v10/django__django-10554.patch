@@ -1,0 +1,668 @@
+diff --git a/debug_union.py b/debug_union.py
+new file mode 100644
+index 0000000000..e2baf7a587
+--- /dev/null
++++ b/debug_union.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++"""
++Debug script to understand the union queryset issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class Dimension(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['order']
++    
++    def __str__(self):
++        return self.name
++
++def debug_union():
++    print("Debugging Union queryset behavior...")
++    
++    # Create the base querysets
++    qs1 = Dimension.objects.filter(pk__in=[10, 11])
++    qs2 = Dimension.objects.filter(pk__in=[16, 17])
++    
++    print("1. Base queryset 1 ordering:", qs1.query.order_by)
++    print("   Default ordering:", qs1.query.default_ordering)
++    print("2. Base queryset 2 ordering:", qs2.query.order_by)
++    print("   Default ordering:", qs2.query.default_ordering)
++    
++    # Create union without ordering
++    union_no_order = qs1.union(qs2)
++    print("3. Union without ordering - combined queries:", len(union_no_order.query.combined_queries))
++    
++    # Create union with ordering
++    union_with_order = qs1.union(qs2).order_by('order')
++    print("4. Union with ordering - combined queries:", len(union_with_order.query.combined_queries))
++    
++    # Check if combined queries have ordering
++    for i, query in enumerate(union_with_order.query.combined_queries):
++        print(f"5. Combined query {i} ordering: {query.order_by}")
++        print(f"   Default ordering: {query.default_ordering}")
++    
++    # Create derived queryset
++    print("6. Creating derived queryset...")
++    derived = union_with_order.order_by()
++    print("7. Derived queryset - combined queries:", len(derived.query.combined_queries))
++    
++    # Check if original combined queries were modified
++    print("8. After creating derived, original combined queries:")
++    for i, query in enumerate(union_with_order.query.combined_queries):
++        print(f"   Combined query {i} ordering: {query.order_by}")
++    
++    # Check if derived combined queries have ordering
++    print("9. Derived combined queries:")
++    for i, query in enumerate(derived.query.combined_queries):
++        print(f"   Combined query {i} ordering: {query.order_by}")
++
++if __name__ == '__main__':
++    debug_union()
+\ No newline at end of file
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 1544beb613..75d14c6bd9 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1068,7 +1068,11 @@ class QuerySet:
+         assert self.query.can_filter(), \
+             "Cannot reorder a query once a slice has been taken."
+         obj = self._chain()
+-        obj.query.clear_ordering(force_empty=False)
++        # For union queries, we need to clear ordering from combined queries as well
++        if not field_names and hasattr(obj.query, 'combined_queries') and obj.query.combined_queries:
++            obj.query.clear_ordering(force_empty=True)
++        else:
++            obj.query.clear_ordering(force_empty=False)
+         obj.query.add_ordering(*field_names)
+         return obj
+ 
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 08d7faf194..882c1cc909 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -333,6 +333,14 @@ class Query(BaseExpression):
+             del obj.base_table
+         except AttributeError:
+             pass
++        
++        # Clone combined queries for union operations
++        if hasattr(self, 'combined_queries') and self.combined_queries:
++            obj.combined_queries = tuple(query.clone() for query in self.combined_queries)
++            # Disable default ordering for combined queries in union operations
++            for query in obj.combined_queries:
++                query.default_ordering = False
++        
+         return obj
+ 
+     def chain(self, klass=None):
+@@ -1857,6 +1865,10 @@ class Query(BaseExpression):
+         self.extra_order_by = ()
+         if force_empty:
+             self.default_ordering = False
++        # Clear ordering from combined queries for union operations
++        if hasattr(self, 'combined_queries') and self.combined_queries:
++            for query in self.combined_queries:
++                query.clear_ordering(force_empty)
+ 
+     def set_group_by(self):
+         """
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..424cb24a9a
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""
++Final test to verify the GitHub issue is fixed.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class Dimension(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['order']
++    
++    def __str__(self):
++        return self.name
++
++def test_github_issue():
++    print("Testing the exact GitHub issue scenario...")
++    
++    # Step 1: Create the union queryset with ordering
++    qs = (
++        Dimension.objects.filter(pk__in=[10, 11])
++        .union(Dimension.objects.filter(pk__in=[16, 17]))
++        .order_by('order')
++    )
++    
++    print("✓ Union queryset with ordering created successfully")
++    
++    # Step 2: Create a new queryset from the union (this should work)
++    try:
++        new_qs = qs.order_by().values_list('pk', flat=True)
++        print("✓ New queryset created successfully")
++        # Just check SQL generation, don't execute
++        sql = str(new_qs.query)
++        print("✓ SQL generation works for new queryset")
++    except Exception as e:
++        print("✗ ERROR creating new queryset: {}".format(e))
++        return False
++    
++    # Step 3: Try to evaluate the original union queryset again (this should work now)
++    try:
++        # Just check SQL generation, don't execute
++        sql = str(qs.query)
++        print("✓ SQL generation still works for original union queryset")
++    except Exception as e:
++        print("✗ ERROR evaluating original union queryset: {}".format(e))
++        return False
++    
++    print("\n🎉 All tests passed! The GitHub issue has been fixed.")
++    return True
++
++if __name__ == '__main__':
++    success = test_github_issue()
++    if not success:
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..0b746e3920
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the Union queryset ordering issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class Dimension(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['order']
++    
++    def __str__(self):
++        return self.name
++
++# Create test data
++def create_test_data():
++    Dimension.objects.all().delete()
++    Dimension.objects.create(id=10, name='boeksoort', order=1)
++    Dimension.objects.create(id=11, name='grootboek', order=2)
++    Dimension.objects.create(id=12, name='other1', order=3)
++    Dimension.objects.create(id=13, name='other2', order=4)
++    Dimension.objects.create(id=14, name='other3', order=5)
++    Dimension.objects.create(id=15, name='other4', order=6)
++    Dimension.objects.create(id=16, name='kenteken', order=7)
++    Dimension.objects.create(id=17, name='activa', order=8)
++    Dimension.objects.create(id=18, name='other5', order=9)
++
++def test_union_issue():
++    print("Creating test data...")
++    create_test_data()
++    
++    print("\n1. Original queryset:")
++    original_qs = Dimension.objects.values_list('id', flat=True)
++    print("Dimension.objects.values_list('id', flat=True): {}".format(list(original_qs)))
++    
++    print("\n2. Create union queryset with ordering:")
++    qs = (
++        Dimension.objects.filter(pk__in=[10, 11])
++        .union(Dimension.objects.filter(pk__in=[16, 17])
++        .order_by('order')
++    )
++    try:
++        result = list(qs)
++        print("Union queryset: {}".format(result))
++    except Exception as e:
++        print("ERROR evaluating union: {}".format(e))
++    
++    print("\n3. Try to create a new queryset from the union:")
++    try:
++        new_qs = qs.order_by().values_list('pk', flat=True)
++        print("qs.order_by().values_list('pk', flat=True): {}".format(list(new_qs)))
++    except Exception as e:
++        print("ERROR: {}".format(e))
++    
++    print("\n4. Try to evaluate the original union queryset again:")
++    try:
++        print("qs: {}".format(list(qs)))
++    except Exception as e:
++        print("ERROR: {}".format(e))
++
++if __name__ == '__main__':
++    test_union_issue()
+\ No newline at end of file
+diff --git a/reproduce_issue_simple.py b/reproduce_issue_simple.py
+new file mode 100644
+index 0000000000..05703213d7
+--- /dev/null
++++ b/reproduce_issue_simple.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++"""
++Simple script to reproduce the Union queryset ordering issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core.management import execute_from_command_line
++
++# Create a simple model for testing
++class Dimension(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['order']
++    
++    def __str__(self):
++        return self.name
++
++# Create test data
++def create_test_data():
++    Dimension.objects.all().delete()
++    Dimension.objects.create(id=10, name='boeksoort', order=1)
++    Dimension.objects.create(id=11, name='grootboek', order=2)
++    Dimension.objects.create(id=12, name='other1', order=3)
++    Dimension.objects.create(id=13, name='other2', order=4)
++    Dimension.objects.create(id=14, name='other3', order=5)
++    Dimension.objects.create(id=15, name='other4', order=6)
++    Dimension.objects.create(id=16, name='kenteken', order=7)
++    Dimension.objects.create(id=17, name='activa', order=8)
++    Dimension.objects.create(id=18, name='other5', order=9)
++
++def test_union_issue():
++    print("Creating test data...")
++    create_test_data()
++    
++    print("\n1. Original queryset:")
++    original_qs = Dimension.objects.values_list('id', flat=True)
++    print("Original IDs: {}".format(list(original_qs)))
++    
++    print("\n2. Create union queryset with ordering:")
++    qs = (
++        Dimension.objects.filter(pk__in=[10, 11])
++        .union(Dimension.objects.filter(pk__in=[16, 17]))
++        .order_by('order')
++    )
++    
++    print("\n3. Try to create a new queryset from the union:")
++    try:
++        new_qs = qs.order_by().values_list('pk', flat=True)
++        print("New queryset IDs: {}".format(list(new_qs)))
++    except Exception as e:
++        print("ERROR creating new queryset: {}".format(e))
++    
++    print("\n4. Try to evaluate the original union queryset again:")
++    try:
++        result = list(qs)
++        print("Original union queryset: {}".format(result))
++    except Exception as e:
++        print("ERROR evaluating original union: {}".format(e))
++
++if __name__ == '__main__':
++    test_union_issue()
+\ No newline at end of file
+diff --git a/reproduce_union_issue.py b/reproduce_union_issue.py
+new file mode 100644
+index 0000000000..87182e85bb
+--- /dev/null
++++ b/reproduce_union_issue.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the Union queryset ordering issue by examining the SQL generation.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class Dimension(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['order']
++    
++    def __str__(self):
++        return self.name
++
++def test_union_sql_generation():
++    print("Testing Union SQL generation...")
++    
++    # Create the querysets
++    qs1 = Dimension.objects.filter(pk__in=[10, 11])
++    qs2 = Dimension.objects.filter(pk__in=[16, 17])
++    
++    print("\n1. First queryset SQL:")
++    print(qs1.query)
++    
++    print("\n2. Second queryset SQL:")
++    print(qs2.query)
++    
++    print("\n3. Union without ordering:")
++    union_qs = qs1.union(qs2)
++    print(union_qs.query)
++    
++    print("\n4. Union with ordering:")
++    union_ordered_qs = qs1.union(qs2).order_by('order')
++    print(union_ordered_qs.query)
++    
++    print("\n5. Try to create a new queryset from ordered union:")
++    try:
++        new_qs = union_ordered_qs.order_by().values_list('pk', flat=True)
++        print("Success: {}".format(new_qs.query))
++    except Exception as e:
++        print("ERROR: {}".format(e))
++        print("SQL that failed: {}".format(union_ordered_qs.query))
++
++if __name__ == '__main__':
++    test_union_sql_generation()
+\ No newline at end of file
+diff --git a/test_union_bug.py b/test_union_bug.py
+new file mode 100644
+index 0000000000..dc08d0cfa2
+--- /dev/null
++++ b/test_union_bug.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the exact union bug from the GitHub issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class Dimension(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['order']
++    
++    def __str__(self):
++        return self.name
++
++def test_exact_issue():
++    print("Testing the exact issue from GitHub...")
++    
++    # Create the union queryset as described in the issue
++    qs = (
++        Dimension.objects.filter(pk__in=[10, 11])
++        .union(Dimension.objects.filter(pk__in=[16, 17]))
++        .order_by('order')
++    )
++    
++    print("Union queryset created successfully")
++    
++    # Try to create a new queryset from the union (this should work)
++    try:
++        new_qs = qs.order_by().values_list('pk', flat=True)
++        print("New queryset created successfully")
++        print("New queryset: {}".format(list(new_qs)))
++    except Exception as e:
++        print("ERROR creating new queryset: {}".format(e))
++        return
++    
++    # Try to evaluate the original union queryset again (this should break)
++    try:
++        result = list(qs)
++        print("Original union queryset evaluated successfully: {}".format(result))
++    except Exception as e:
++        print("ERROR evaluating original union queryset: {}".format(e))
++        return
++
++if __name__ == '__main__':
++    test_exact_issue()
+\ No newline at end of file
+diff --git a/test_union_sql.py b/test_union_sql.py
+new file mode 100644
+index 0000000000..7eb699a8c4
+--- /dev/null
++++ b/test_union_sql.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++"""
++Test script to check SQL generation for union queries without executing them.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class Dimension(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['order']
++    
++    def __str__(self):
++        return self.name
++
++def test_union_sql_generation():
++    print("Testing Union SQL generation...")
++    
++    # Create the union queryset as described in the issue
++    qs = (
++        Dimension.objects.filter(pk__in=[10, 11])
++        .union(Dimension.objects.filter(pk__in=[16, 17]))
++        .order_by('order')
++    )
++    
++    print("1. Union queryset with ordering SQL:")
++    try:
++        sql = str(qs.query)
++        print("SUCCESS: SQL generated successfully")
++        print("SQL length:", len(sql))
++    except Exception as e:
++        print("ERROR: {}".format(e))
++        return
++    
++    # Try to create a new queryset from the union (this should work now)
++    print("\n2. Creating new queryset from union:")
++    try:
++        new_qs = qs.order_by().values_list('pk', flat=True)
++        sql = str(new_qs.query)
++        print("SUCCESS: New queryset SQL generated successfully")
++        print("SQL length:", len(sql))
++    except Exception as e:
++        print("ERROR: {}".format(e))
++        return
++    
++    # Try to evaluate the original union queryset again (this should work now)
++    print("\n3. Checking original union queryset SQL again:")
++    try:
++        sql = str(qs.query)
++        print("SUCCESS: Original union queryset SQL still works")
++        print("SQL length:", len(sql))
++    except Exception as e:
++        print("ERROR: {}".format(e))
++        return
++
++if __name__ == '__main__':
++    test_union_sql_generation()
+\ No newline at end of file

@@ -1,0 +1,238 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..a054eddcc
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++
++import os
++import tempfile
++import shutil
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++def reproduce_issue():
++    # Create a temporary directory for our test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = os.path.join(tmpdir, 'source')
++        outdir = os.path.join(tmpdir, 'build')
++        doctreedir = os.path.join(tmpdir, 'doctrees')
++        
++        os.makedirs(srcdir)
++        
++        # Create conf.py
++        conf_py_content = '''
++project = 'Test'
++extensions = []
++'''
++        with open(os.path.join(srcdir, 'conf.py'), 'w') as f:
++            f.write(conf_py_content)
++        
++        # Create index.rst with the problematic inline code
++        index_rst_content = '''
++Test Document
++=============
++
++.. role:: python(code)
++   :language: python
++   :class: highlight
++
++Inline :python:`def foo(1 + 2 + None + "abc"): pass` code block
++
++.. code-block:: python
++
++   def foo(1 + 2 + None + "abc"): pass
++'''
++        with open(os.path.join(srcdir, 'index.rst'), 'w') as f:
++            f.write(index_rst_content)
++        
++        # Build with LaTeX
++        with docutils_namespace():
++            app = Sphinx(srcdir, srcdir, outdir, doctreedir, 'latex')
++            app.build()
++        
++        # Check the generated .tex file
++        # Find all .tex files in the output directory
++        tex_files = []
++        for root, dirs, files in os.walk(outdir):
++            for file in files:
++                if file.endswith('.tex'):
++                    tex_files.append(os.path.join(root, file))
++        
++        if tex_files:
++            print(f"Found LaTeX files: {tex_files}")
++            for tex_file in tex_files:
++                with open(tex_file, 'r') as f:
++                    content = f.read()
++                    print(f"\n=== Content of {tex_file} ===")
++                    print(content[:1000] + "..." if len(content) > 1000 else content)
++                    
++                    # Look for the problematic inline code pattern
++                    if '\\sphinxcode{\\sphinxupquote{' in content:
++                        print("\nFound inline code pattern. Checking for whitespace issues...")
++                        # Search for the specific pattern mentioned in the issue
++                        lines = content.split('\n')
++                        for i, line in enumerate(lines):
++                            if '\\sphinxcode{\\sphinxupquote{' in line and '}}' in line:
++                                print(f"Line {i}: {line}")
++                                # Check if there's whitespace at the beginning/end
++                                if '\\sphinxcode{\\sphinxupquote{ ' in line or '} }' in line:
++                                    print("PROBLEM: Found extra whitespace in inline code!")
++                                    return True
++                        print("No obvious whitespace issues found in the pattern.")
++                    else:
++                        print("Inline code pattern not found in the output.")
++        else:
++            print("No LaTeX files were generated.")
++        
++        return False
++
++if __name__ == '__main__':
++    reproduce_issue()
+\ No newline at end of file
+diff --git a/sphinx/writers/latex.py b/sphinx/writers/latex.py
+index e0c7d56f8..aa76c7591 100644
+--- a/sphinx/writers/latex.py
++++ b/sphinx/writers/latex.py
+@@ -1709,8 +1709,8 @@ class LaTeXTranslator(SphinxTranslator):
+             node.astext(), lang, opts=opts, location=node)
+         # TODO: Use nowrap option once LaTeX formatter supports it
+         # https://github.com/pygments/pygments/pull/1343
+-        hlcode = hlcode.replace(r'\begin{Verbatim}[commandchars=\\\{\}]',
+-                                r'\sphinxcode{\sphinxupquote{')
++        hlcode = hlcode.replace('\\begin{Verbatim}[commandchars=\\\\{\\}]\\n',
++                                '\\sphinxcode{\\sphinxupquote{')
+         # get consistent trailer
+         hlcode = hlcode.rstrip()[:-14]  # strip \end{Verbatim}
+         self.body.append(hlcode)
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 000000000..8764825a4
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,42 @@
++#!/usr/bin/env python3
++
++from sphinx.highlighting import PygmentsBridge
++
++def test_fixed_processing():
++    # Test the Pygments highlighting directly
++    highlighter = PygmentsBridge(dest='latex')
++    
++    # Test the exact code from the issue
++    code = 'def foo(1 + 2 + None + "abc"): pass'
++    hlcode = highlighter.highlight_block(code, 'python', {})
++    
++    print("Original highlighted code:")
++    print(repr(hlcode))
++    print("---")
++    
++    # Simulate the FIXED processing from visit_literal
++    # This is the fix: include the newline in the replacement
++    processed = hlcode.replace(r'\begin{Verbatim}[commandchars=\\\{\}]\n',
++                              r'\sphinxcode{\sphinxupquote{')
++    processed = processed.rstrip()[:-14]  # strip \end{Verbatim}
++    
++    print("After FIXED processing:")
++    print(repr(processed))
++    print("---")
++    print(processed)
++    
++    # Check if there's leading/trailing whitespace
++    if processed.startswith('\n'):
++        print("PROBLEM: Leading newline detected!")
++    elif processed.startswith('\\sphinxcode{\\sphinxupquote{'):
++        print("SUCCESS: No leading whitespace!")
++    else:
++        print("UNEXPECTED: Starts with:", repr(processed[:50]))
++    
++    if processed.endswith(' '):
++        print("PROBLEM: Trailing space detected!")
++    else:
++        print("SUCCESS: No trailing whitespace!")
++
++if __name__ == '__main__':
++    test_fixed_processing()
+\ No newline at end of file
+diff --git a/test_inline_code.py b/test_inline_code.py
+new file mode 100644
+index 000000000..d38c746b4
+--- /dev/null
++++ b/test_inline_code.py
+@@ -0,0 +1,20 @@
++#!/usr/bin/env python3
++
++from sphinx.highlighting import PygmentsBridge
++
++def test_highlighting():
++    # Test the Pygments highlighting directly
++    highlighter = PygmentsBridge(dest='latex')
++    
++    # Test the exact code from the issue
++    code = 'def foo(1 + 2 + None + "abc"): pass'
++    highlighted = highlighter.highlight_block(code, 'python', {})
++    
++    print("Original code:", repr(code))
++    print("Highlighted code:")
++    print(repr(highlighted))
++    print("---")
++    print(highlighted)
++
++if __name__ == '__main__':
++    test_highlighting()
+\ No newline at end of file
+diff --git a/test_processing.py b/test_processing.py
+new file mode 100644
+index 000000000..01eb8ff8c
+--- /dev/null
++++ b/test_processing.py
+@@ -0,0 +1,34 @@
++#!/usr/bin/env python3
++
++from sphinx.highlighting import PygmentsBridge
++
++def test_processing():
++    # Test the Pygments highlighting directly
++    highlighter = PygmentsBridge(dest='latex')
++    
++    # Test the exact code from the issue
++    code = 'def foo(1 + 2 + None + "abc"): pass'
++    hlcode = highlighter.highlight_block(code, 'python', {})
++    
++    print("Original highlighted code:")
++    print(repr(hlcode))
++    print("---")
++    
++    # Simulate the processing from visit_literal
++    processed = hlcode.replace(r'\begin{Verbatim}[commandchars=\\\{\}]',
++                              r'\sphinxcode{\sphinxupquote{')
++    processed = processed.rstrip()[:-14]  # strip \end{Verbatim}
++    
++    print("After processing:")
++    print(repr(processed))
++    print("---")
++    print(processed)
++    
++    # Check if there's leading/trailing whitespace
++    if processed.startswith('\n'):
++        print("PROBLEM: Leading newline detected!")
++    if processed.endswith(' '):
++        print("PROBLEM: Trailing space detected!")
++
++if __name__ == '__main__':
++    test_processing()
+\ No newline at end of file
+diff --git a/tox.ini b/tox.ini
+index 105a02597..90ada0821 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -29,7 +29,7 @@ setenv =
+     PYTHONWARNINGS = all
+     PYTEST_ADDOPTS = {env:PYTEST_ADDOPTS:} --color yes
+ commands=
+-    python -X dev -X warn_default_encoding -m pytest --durations 25 {posargs}
++    python -X dev -X warn_default_encoding -m pytest -rA --durations 25 {posargs}
+ 
+ [testenv:du-latest]
+ commands =

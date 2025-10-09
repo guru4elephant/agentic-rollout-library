@@ -1,0 +1,368 @@
+diff --git a/django/core/mail/message.py b/django/core/mail/message.py
+index e393b4cf5c..27ee6a295c 100644
+--- a/django/core/mail/message.py
++++ b/django/core/mail/message.py
+@@ -17,6 +17,22 @@ from pathlib import Path
+ from django.conf import settings
+ from django.core.mail.utils import DNS_NAME
+ from django.utils.encoding import force_str
++import idna  # For punycode conversion of non-ASCII domain names
++
++
++def domain_to_punycode(domain):
++    """
++    Convert a domain name to punycode if it contains non-ASCII characters.
++    Returns the original domain if it's already ASCII-compatible.
++    """
++    try:
++        # Try to encode to ASCII - if it works, the domain is already ASCII
++        domain.encode('ascii')
++        return domain
++    except UnicodeEncodeError:
++        # Convert non-ASCII domain to punycode
++        return idna.encode(domain).decode('ascii')
++
+ 
+ # Don't BASE64-encode UTF-8 messages so that we avoid unwanted attention from
+ # some spam filters.
+@@ -256,8 +272,8 @@ class EmailMessage:
+             # will get picked up by formatdate().
+             msg['Date'] = formatdate(localtime=settings.EMAIL_USE_LOCALTIME)
+         if 'message-id' not in header_names:
+-            # Use cached DNS_NAME for performance
+-            msg['Message-ID'] = make_msgid(domain=DNS_NAME)
++            # Use cached DNS_NAME for performance, converting to punycode if needed
++            msg['Message-ID'] = make_msgid(domain=domain_to_punycode(str(DNS_NAME)))
+         for name, value in self.extra_headers.items():
+             if name.lower() != 'from':  # From is already handled
+                 msg[name] = value
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..5b9279aea4
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++"""
++Final comprehensive test for the non-ASCII domain fix.
++"""
++import sys
++import os
++sys.path.insert(0, '.')
++
++# Configure Django settings
++import django
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        EMAIL_USE_LOCALTIME=False,
++        SECRET_KEY='test-key-for-reproduction'
++    )
++    django.setup()
++
++from unittest.mock import patch
++from django.core.mail import EmailMessage
++
++def test_comprehensive():
++    """Test both ASCII and non-ASCII domains with different encodings"""
++    test_cases = [
++        # (domain, encoding, should_contain_punycode)
++        ("example.com", "iso-8859-1", False),
++        ("漢字", "iso-8859-1", True),
++        ("exámple.com", "iso-8859-1", True),
++        ("example.com", "utf-8", False),
++        ("漢字", "utf-8", True),
++    ]
++    
++    for domain, encoding, should_contain_punycode in test_cases:
++        try:
++            with patch("django.core.mail.message.DNS_NAME", domain):
++                email = EmailMessage('subject', 'body', 'from@example.com', ['to@example.com'])
++                email.encoding = encoding
++                message = email.message()
++                
++                msg_id = message['Message-ID']
++                print(f"Domain: {domain}, Encoding: {encoding}")
++                print(f"Message-ID: {msg_id}")
++                
++                if should_contain_punycode:
++                    if 'xn--' in msg_id:
++                        print("✓ PASS: Contains punycode as expected")
++                    else:
++                        print("✗ FAIL: Should contain punycode but doesn't")
++                        return False
++                else:
++                    if 'xn--' not in msg_id and domain in msg_id:
++                        print("✓ PASS: No punycode as expected")
++                    else:
++                        print("✗ FAIL: Should not contain punycode but does")
++                        return False
++                print()
++                
++        except Exception as e:
++            print(f"✗ ERROR with domain {domain}, encoding {encoding}: {e}")
++            return False
++    
++    return True
++
++if __name__ == "__main__":
++    print("Running comprehensive test for non-ASCII domain fix...")
++    print("=" * 60)
++    success = test_comprehensive()
++    if success:
++        print("All comprehensive tests passed! 🎉")
++        sys.exit(0)
++    else:
++        print("Some comprehensive tests failed! ❌")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..db78bbbd2b
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the non-ASCII domain email encoding issue.
++"""
++import sys
++import os
++sys.path.insert(0, '.')
++
++# Configure Django settings
++import django
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        EMAIL_USE_LOCALTIME=False,
++        SECRET_KEY='test-key-for-reproduction'
++    )
++    django.setup()
++
++from unittest.mock import patch
++from django.core.mail import EmailMessage
++from django.core.mail.utils import DNS_NAME
++
++def test_unicode_dns():
++    """Test the issue with non-ASCII domain names - reproduce the exact error from the issue"""
++    try:
++        # Use the exact test case from the GitHub issue
++        from unittest.mock import patch
++        from django.core.mail import EmailMessage
++        
++        # Patch the actual DNS_NAME object used in the message module
++        with patch("django.core.mail.message.DNS_NAME", "漢字"):
++            email = EmailMessage('subject', '', 'from@example.com', ['to@example.com'])
++            email.encoding = 'iso-8859-1'
++            message = email.message()
++            print("SUCCESS: Email message created successfully")
++            print(f"Message-ID: {message['Message-ID']}")
++            
++            # Check if the domain is properly encoded as punycode
++            if 'xn--p8s937b' in message['Message-ID']:
++                print("SUCCESS: Domain name properly converted to punycode")
++                return True
++            else:
++                print("WARNING: Domain name not converted to punycode")
++                return False
++                
++    except Exception as e:
++        print(f"ERROR: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    print("Testing non-ASCII domain name handling...")
++    success = test_unicode_dns()
++    if success:
++        print("Test passed!")
++        sys.exit(0)
++    else:
++        print("Test failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_ascii_domain.py b/test_ascii_domain.py
+new file mode 100644
+index 0000000000..877be67fab
+--- /dev/null
++++ b/test_ascii_domain.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++"""
++Test that ASCII domain names still work correctly after the fix.
++"""
++import sys
++import os
++sys.path.insert(0, '.')
++
++# Configure Django settings
++import django
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        EMAIL_USE_LOCALTIME=False,
++        SECRET_KEY='test-key-for-reproduction'
++    )
++    django.setup()
++
++from unittest.mock import patch
++from django.core.mail import EmailMessage
++
++def test_ascii_dns():
++    """Test that ASCII domain names work correctly"""
++    try:
++        # Patch with ASCII domain name
++        with patch("django.core.mail.message.DNS_NAME", "example.com"):
++            email = EmailMessage('subject', '', 'from@example.com', ['to@example.com'])
++            email.encoding = 'iso-8859-1'
++            message = email.message()
++            print("SUCCESS: Email message created successfully")
++            print(f"Message-ID: {message['Message-ID']}")
++            
++            # Check that the domain is still the original ASCII domain
++            if 'example.com' in message['Message-ID']:
++                print("SUCCESS: ASCII domain name preserved correctly")
++                return True
++            else:
++                print("ERROR: ASCII domain name was modified")
++                return False
++                
++    except Exception as e:
++        print(f"ERROR: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    print("Testing ASCII domain name handling...")
++    success = test_ascii_dns()
++    if success:
++        print("Test passed!")
++        sys.exit(0)
++    else:
++        print("Test failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..18e1d7cc24
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the domain_to_punycode function.
++"""
++import sys
++import os
++sys.path.insert(0, '.')
++
++# Configure Django settings
++import django
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key-for-reproduction'
++    )
++    django.setup()
++
++from django.core.mail.message import domain_to_punycode
++
++def test_edge_cases():
++    """Test various edge cases for domain_to_punycode function"""
++    test_cases = [
++        ("example.com", "example.com"),  # ASCII domain
++        ("漢字", "xn--p8s937b"),  # Non-ASCII domain
++        ("exámple.com", "xn--exmple-qta.com"),  # Mixed ASCII/non-ASCII
++        ("", ""),  # Empty string
++        ("123", "123"),  # Numeric
++        ("a.b.c", "a.b.c"),  # Multiple dots
++    ]
++    
++    for domain, expected in test_cases:
++        result = domain_to_punycode(domain)
++        print(f"Input: {domain}, Expected: {expected}, Got: {result}")
++        if result == expected:
++            print("✓ PASS")
++        else:
++            print("✗ FAIL")
++            return False
++    
++    return True
++
++if __name__ == "__main__":
++    print("Testing edge cases for domain_to_punycode function...")
++    success = test_edge_cases()
++    if success:
++        print("All edge case tests passed!")
++        sys.exit(0)
++    else:
++        print("Some edge case tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..0994053e16
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++"""
++Test the exact case described in the GitHub issue.
++"""
++import sys
++import os
++sys.path.insert(0, '.')
++
++# Configure Django settings
++import django
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        EMAIL_USE_LOCALTIME=False,
++        SECRET_KEY='test-key-for-reproduction'
++    )
++    django.setup()
++
++from unittest.mock import patch
++from django.core.mail import EmailMessage
++
++def test_github_issue():
++    """Test the exact case from the GitHub issue"""
++    try:
++        # Exact test case from the GitHub issue
++        with patch("django.core.mail.message.DNS_NAME", "漢字"):
++            email = EmailMessage('subject', '', 'from@example.com', ['to@example.com'])
++            email.encoding = 'iso-8859-1'
++            message = email.message()
++            
++            # Check that the domain is properly encoded as punycode
++            assert 'xn--p8s937b' in message['Message-ID'], "Message-ID should contain punycode"
++            
++            print("SUCCESS: GitHub issue test case passed!")
++            print(f"Message-ID: {message['Message-ID']}")
++            return True
++            
++    except Exception as e:
++        print(f"ERROR: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    print("Testing the exact GitHub issue case...")
++    success = test_github_issue()
++    if success:
++        print("GitHub issue is FIXED! ✅")
++        sys.exit(0)
++    else:
++        print("GitHub issue is NOT fixed! ❌")
++        sys.exit(1)
+\ No newline at end of file

@@ -1,0 +1,214 @@
+diff --git a/django/urls/base.py b/django/urls/base.py
+index 0e1c3d909c..8d742cb406 100644
+--- a/django/urls/base.py
++++ b/django/urls/base.py
+@@ -92,7 +92,8 @@ reverse_lazy = lazy(reverse, str)
+ 
+ def clear_url_caches():
+     get_callable.cache_clear()
+-    get_resolver.cache_clear()
++    from .resolvers import _get_resolver
++    _get_resolver.cache_clear()
+     get_ns_resolver.cache_clear()
+ 
+ 
+diff --git a/django/urls/resolvers.py b/django/urls/resolvers.py
+index 247e3680c0..dbafa43190 100644
+--- a/django/urls/resolvers.py
++++ b/django/urls/resolvers.py
+@@ -63,10 +63,16 @@ class ResolverMatch:
+         )
+ 
+ 
+-@functools.lru_cache(maxsize=None)
+ def get_resolver(urlconf=None):
++    if urlconf is None:
++        from .base import get_urlconf
++        urlconf = get_urlconf()
+     if urlconf is None:
+         urlconf = settings.ROOT_URLCONF
++    return _get_resolver(urlconf)
++
++@functools.lru_cache(maxsize=None)
++def _get_resolver(urlconf):
+     return URLResolver(RegexPattern(r'^/'), urlconf)
+ 
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..3dace1807e
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where multiple URLResolvers are constructed
++due to calls to get_resolver with different urlconf values.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF='test_urls',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from django.urls import resolvers, base
++
++def test_multiple_resolvers():
++    """Test that demonstrates the issue with multiple URLResolver instances."""
++    
++    # Clear any existing cache
++    resolvers._get_resolver.cache_clear()
++    
++    print("=== Testing get_resolver behavior ===")
++    
++    # Before set_urlconf is called, get_resolver(None) uses settings.ROOT_URLCONF
++    print("1. Calling get_resolver(None) before set_urlconf...")
++    resolver1 = resolvers.get_resolver(None)
++    print(f"   Resolver ID: {id(resolver1)}")
++    
++    # Now call set_urlconf (simulating what happens during request handling)
++    print("2. Calling set_urlconf(settings.ROOT_URLCONF)...")
++    base.set_urlconf(settings.ROOT_URLCONF)
++    
++    # After set_urlconf, get_resolver(None) should return the same resolver
++    # but due to the current implementation, it creates a new one
++    print("3. Calling get_resolver(None) after set_urlconf...")
++    resolver2 = resolvers.get_resolver(None)
++    print(f"   Resolver ID: {id(resolver2)}")
++    
++    # Also test get_resolver(settings.ROOT_URLCONF)
++    print("4. Calling get_resolver(settings.ROOT_URLCONF)...")
++    resolver3 = resolvers.get_resolver(settings.ROOT_URLCONF)
++    print(f"   Resolver ID: {id(resolver3)}")
++    
++    print("\n=== Results ===")
++    print(f"Resolver1 == Resolver2: {resolver1 is resolver2}")
++    print(f"Resolver1 == Resolver3: {resolver1 is resolver3}")
++    print(f"Resolver2 == Resolver3: {resolver2 is resolver3}")
++    
++    if not (resolver1 is resolver2 and resolver1 is resolver3):
++        print("❌ ISSUE REPRODUCED: Multiple URLResolver instances created!")
++        return False
++    else:
++        print("✅ All resolver instances are the same")
++        return True
++
++if __name__ == '__main__':
++    success = test_multiple_resolvers()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..e824ca227f
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the get_resolver fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF='test_urls',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from django.urls import resolvers, base
++
++def test_edge_cases():
++    """Test various edge cases for get_resolver."""
++    
++    print("=== Testing Edge Cases ===")
++    
++    # Clear cache
++    resolvers._get_resolver.cache_clear()
++    
++    # Test 1: None vs ROOT_URLCONF
++    print("1. Testing None vs ROOT_URLCONF equivalence...")
++    resolver1 = resolvers.get_resolver(None)
++    resolver2 = resolvers.get_resolver(settings.ROOT_URLCONF)
++    print(f"   Resolver1 ID: {id(resolver1)}")
++    print(f"   Resolver2 ID: {id(resolver2)}")
++    print(f"   Same instance: {resolver1 is resolver2}")
++    
++    # Test 2: Different urlconf values
++    print("2. Testing different urlconf values...")
++    resolver3 = resolvers.get_resolver('test_urls')  # Same as ROOT_URLCONF
++    resolver4 = resolvers.get_resolver('different_urls')  # Different
++    print(f"   Resolver3 ID: {id(resolver3)}")
++    print(f"   Resolver4 ID: {id(resolver4)}")
++    print(f"   Same instance: {resolver3 is resolver4}")
++    
++    # Test 3: Multiple calls with None
++    print("3. Testing multiple calls with None...")
++    resolver5 = resolvers.get_resolver(None)
++    resolver6 = resolvers.get_resolver(None)
++    print(f"   Resolver5 ID: {id(resolver5)}")
++    print(f"   Resolver6 ID: {id(resolver6)}")
++    print(f"   Same instance: {resolver5 is resolver6}")
++    
++    # Test 4: Cache behavior after clearing
++    print("4. Testing cache behavior after clearing...")
++    resolvers._get_resolver.cache_clear()
++    resolver7 = resolvers.get_resolver(None)
++    resolver8 = resolvers.get_resolver(None)
++    print(f"   Resolver7 ID: {id(resolver7)}")
++    print(f"   Resolver8 ID: {id(resolver8)}")
++    print(f"   Same instance: {resolver7 is resolver8}")
++    
++    # Test 5: With set_urlconf
++    print("5. Testing with set_urlconf...")
++    base.set_urlconf('custom_urls')
++    resolver9 = resolvers.get_resolver(None)  # Should use custom_urls
++    resolver10 = resolvers.get_resolver('custom_urls')  # Explicit
++    print(f"   Resolver9 ID: {id(resolver9)}")
++    print(f"   Resolver10 ID: {id(resolver10)}")
++    print(f"   Same instance: {resolver9 is resolver10}")
++    
++    print("\n=== All Tests Completed ===")
++    return True
++
++if __name__ == '__main__':
++    test_edge_cases()
++    sys.exit(0)
+\ No newline at end of file
+diff --git a/test_urls.py b/test_urls.py
+new file mode 100644
+index 0000000000..23fd6b75fe
+--- /dev/null
++++ b/test_urls.py
+@@ -0,0 +1,5 @@
++from django.urls import path
++
++urlpatterns = [
++    path('test/', lambda request: None, name='test-view'),
++]
+\ No newline at end of file

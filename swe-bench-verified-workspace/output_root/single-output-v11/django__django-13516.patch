@@ -1,0 +1,319 @@
+diff --git a/django/core/management/base.py b/django/core/management/base.py
+index e6cbf8c64f..14c0355dd8 100644
+--- a/django/core/management/base.py
++++ b/django/core/management/base.py
+@@ -150,6 +150,10 @@ class OutputWrapper(TextIOBase):
+         style_func = style_func or self.style_func
+         self._out.write(style_func(msg))
+ 
++    def flush(self):
++        if hasattr(self._out, 'flush'):
++            self._out.flush()
++
+ 
+ class BaseCommand:
+     """
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..47cafd2f4e
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the flush() issue with management commands.
++"""
++
++import sys
++import time
++from io import StringIO
++
++# Import just the OutputWrapper class directly
++sys.path.insert(0, './django')
++from django.core.management.base import OutputWrapper
++
++def test_output_wrapper_flush_realistic():
++    """Test OutputWrapper flush functionality with a more realistic scenario"""
++    print("Testing OutputWrapper.flush() with realistic scenario...")
++    
++    # Create a buffer to capture output
++    test_buffer = StringIO()
++    wrapper = OutputWrapper(test_buffer)
++    
++    # Simulate a long-running process like a migration
++    print("Simulating migration output...")
++    
++    # Initial output
++    wrapper.write("Operations to perform:")
++    wrapper.write("  Apply all migrations: myapp")
++    wrapper.write("Running migrations:")
++    wrapper.flush()  # This should flush immediately
++    
++    print(f"After initial flush: {repr(test_buffer.getvalue())}")
++    
++    # Simulate work being done (like a long migration)
++    time.sleep(1)
++    
++    # More output during migration
++    wrapper.write("  Applying myapp.0002_auto_20200817_1030...")
++    wrapper.flush()  # This should flush immediately
++    
++    print(f"After migration progress flush: {repr(test_buffer.getvalue())}")
++    
++    # Simulate more work
++    time.sleep(1)
++    
++    # Final output
++    wrapper.write("OK")
++    wrapper.flush()  # This should flush immediately
++    
++    final_output = test_buffer.getvalue()
++    print(f"Final output: {repr(final_output)}")
++    
++    # The issue described is that flush() doesn't work properly, causing
++    # all output to appear at the end instead of during the process
++    print("\nExpected behavior: Output should appear incrementally as flush() is called")
++    print("Actual behavior: Let's see if the output was flushed incrementally")
++
++def test_flush_with_real_stdout():
++    """Test flush with actual stdout to see the real-time behavior"""
++    print("\nTesting with actual stdout (should see output in real-time):")
++    
++    wrapper = OutputWrapper(sys.stdout)
++    
++    wrapper.write("Starting real-time test...")
++    wrapper.flush()
++    time.sleep(1)
++    
++    wrapper.write("Progress update...")
++    wrapper.flush()
++    time.sleep(1)
++    
++    wrapper.write("Test completed.")
++    wrapper.flush()
++
++if __name__ == '__main__':
++    test_output_wrapper_flush_realistic()
++    test_flush_with_real_stdout()
+\ No newline at end of file
+diff --git a/test_flush_comprehensive.py b/test_flush_comprehensive.py
+new file mode 100644
+index 0000000000..1624cb94c8
+--- /dev/null
++++ b/test_flush_comprehensive.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for the flush() fix in OutputWrapper.
++"""
++
++import sys
++import time
++from io import StringIO, BytesIO
++
++# Import the OutputWrapper class
++sys.path.insert(0, './django')
++from django.core.management.base import OutputWrapper
++
++class NoFlushStream:
++    """A stream that doesn't have a flush method"""
++    def __init__(self):
++        self.buffer = []
++    
++    def write(self, msg):
++        self.buffer.append(msg)
++    
++    def getvalue(self):
++        return ''.join(self.buffer)
++
++class CustomFlushStream:
++    """A stream with a custom flush method"""
++    def __init__(self):
++        self.buffer = []
++        self.flush_called = 0
++    
++    def write(self, msg):
++        self.buffer.append(msg)
++    
++    def flush(self):
++        self.flush_called += 1
++        # Custom flush behavior
++    
++    def getvalue(self):
++        return ''.join(self.buffer)
++
++def test_with_different_streams():
++    """Test OutputWrapper with different types of streams"""
++    print("Testing OutputWrapper with different stream types...")
++    
++    # Test 1: Stream with no flush method
++    print("\n1. Testing with stream that has no flush method:")
++    no_flush_stream = NoFlushStream()
++    wrapper = OutputWrapper(no_flush_stream)
++    
++    wrapper.write("Test message")
++    try:
++        wrapper.flush()  # This should not raise an error
++        print("✓ flush() worked without error on stream with no flush method")
++    except Exception as e:
++        print(f"✗ flush() failed: {e}")
++    
++    # Test 2: Stream with custom flush method
++    print("\n2. Testing with stream that has custom flush method:")
++    custom_stream = CustomFlushStream()
++    wrapper = OutputWrapper(custom_stream)
++    
++    wrapper.write("Test message")
++    wrapper.flush()
++    
++    if custom_stream.flush_called == 1:
++        print("✓ flush() correctly called custom flush method")
++    else:
++        print(f"✗ flush() didn't call custom method properly (called {custom_stream.flush_called} times)")
++    
++    # Test 3: StringIO (has flush method)
++    print("\n3. Testing with StringIO:")
++    stringio_stream = StringIO()
++    wrapper = OutputWrapper(stringio_stream)
++    
++    wrapper.write("Test message")
++    wrapper.flush()
++    
++    content = stringio_stream.getvalue()
++    if content == "Test message\n":
++        print("✓ flush() worked correctly with StringIO")
++    else:
++        print(f"✗ flush() didn't work with StringIO: {repr(content)}")
++    
++    # Test 4: Real stdout
++    print("\n4. Testing with real stdout:")
++    wrapper = OutputWrapper(sys.stdout)
++    
++    wrapper.write("Testing real stdout...")
++    wrapper.flush()
++    time.sleep(0.5)
++    wrapper.write(" flush worked!")
++    wrapper.flush()
++    print()  # New line
++
++def test_edge_cases():
++    """Test edge cases for the flush() implementation"""
++    print("\nTesting edge cases...")
++    
++    # Test with None stream (should not crash)
++    print("1. Testing with None stream:")
++    try:
++        wrapper = OutputWrapper(None)
++        wrapper.flush()
++        print("✓ flush() handled None stream gracefully")
++    except Exception as e:
++        print(f"✗ flush() failed with None stream: {e}")
++    
++    # Test with stream that has flush but it raises an exception
++    print("2. Testing with stream that has problematic flush:")
++    class ProblematicStream:
++        def write(self, msg):
++            pass
++        
++        def flush(self):
++            raise IOError("Flush failed!")
++    
++    problematic_stream = ProblematicStream()
++    wrapper = OutputWrapper(problematic_stream)
++    
++    try:
++        wrapper.flush()
++        print("✗ flush() should have raised an exception")
++    except IOError as e:
++        print(f"✓ flush() correctly propagated exception: {e}")
++
++if __name__ == '__main__':
++    test_with_different_streams()
++    test_edge_cases()
++    print("\nAll tests completed!")
+\ No newline at end of file
+diff --git a/test_migrate_flush.py b/test_migrate_flush.py
+new file mode 100644
+index 0000000000..9be443805c
+--- /dev/null
++++ b/test_migrate_flush.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++"""
++Test to reproduce the specific flush issue in migrate command.
++"""
++
++import sys
++import time
++from io import StringIO
++
++# Import the OutputWrapper class
++sys.path.insert(0, './django')
++from django.core.management.base import OutputWrapper
++
++def simulate_migrate_command():
++    """Simulate the migrate command behavior that has the flush issue"""
++    print("Simulating migrate command output...")
++    
++    # Create a buffer to capture output
++    buffer = StringIO()
++    stdout = OutputWrapper(buffer)
++    
++    # Simulate the migrate command output pattern
++    stdout.write("Operations to perform:")
++    stdout.write("  Apply all migrations: myapp")
++    stdout.write("Running migrations:")
++    stdout.flush()  # This should flush immediately
++    
++    print(f"After initial output + flush: {repr(buffer.getvalue())}")
++    
++    # Simulate a long migration process
++    print("Simulating long migration work...")
++    time.sleep(2)
++    
++    # This is where the issue occurs - the "Applying..." message should appear immediately
++    stdout.write("  Applying myapp.0002_auto_20200817_1030...", ending="")
++    stdout.flush()  # This should flush immediately but might not work
++    
++    print(f"After 'Applying...' + flush: {repr(buffer.getvalue())}")
++    
++    # Simulate more work during migration
++    time.sleep(2)
++    
++    # Final output
++    stdout.write(" OK")
++    stdout.flush()  # This should flush immediately
++    
++    final_output = buffer.getvalue()
++    print(f"Final output: {repr(final_output)}")
++    
++    # Check if the output appeared incrementally
++    print("\nAnalysis:")
++    print("Expected: Output should appear in real-time as flush() is called")
++    print("Issue: If all output appears at the end, flush() is not working properly")
++
++def test_with_real_stdout():
++    """Test with actual stdout to see real-time behavior"""
++    print("\nTesting with real stdout (should see output immediately):")
++    
++    stdout = OutputWrapper(sys.stdout)
++    
++    stdout.write("Operations to perform:")
++    stdout.write("  Apply all migrations: myapp")  
++    stdout.write("Running migrations:")
++    stdout.flush()
++    
++    time.sleep(2)
++    
++    stdout.write("  Applying myapp.0002_auto_20200817_1030...", ending="")
++    stdout.flush()  # This should appear immediately
++    
++    time.sleep(2)
++    
++    stdout.write(" OK")
++    stdout.flush()
++
++if __name__ == '__main__':
++    simulate_migrate_command()
++    test_with_real_stdout()
+\ No newline at end of file

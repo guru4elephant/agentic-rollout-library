@@ -1,0 +1,310 @@
+diff --git a/django/db/migrations/autodetector.py b/django/db/migrations/autodetector.py
+index 30616c0172..7633da3729 100644
+--- a/django/db/migrations/autodetector.py
++++ b/django/db/migrations/autodetector.py
+@@ -162,6 +162,9 @@ class MigrationAutodetector:
+         # Prepare lists of fields and generate through model map
+         self._prepare_field_lists()
+         self._generate_through_model_map()
++        
++        # Detect field moves from base class to subclass to avoid field clashes
++        self._detect_field_moves_to_subclass()
+ 
+         # Generate non-rename model operations
+         self.generate_deleted_models()
+@@ -236,6 +239,40 @@ class MigrationAutodetector:
+                     )
+                     self.through_users[through_key] = (app_label, old_model_name, field_name)
+ 
++    def _detect_field_moves_to_subclass(self):
++        """
++        Detect when fields are moved from a base class to a subclass to avoid
++        field name clashes during migration generation.
++        """
++        self.field_moves_to_subclass = set()
++        
++        # Find fields that are being removed from base classes
++        removed_fields = self.old_field_keys - self.new_field_keys
++        
++        for app_label, model_name, field_name in removed_fields:
++            # Check if this field is being added to a subclass
++            for new_app_label, new_model_name in self.new_model_keys:
++                if new_app_label != app_label:
++                    continue
++                    
++                # Get the new model state
++                new_model_state = self.to_state.models[new_app_label, new_model_name]
++                
++                # Check if this model inherits from the base class
++                base_classes = []
++                for base in new_model_state.bases:
++                    if isinstance(base, str) and "." in base:
++                        base_app, base_name = base.split(".", 1)
++                        if base_app == app_label and base_name == model_name:
++                            # This is a subclass of the base class
++                            base_classes.append((base_app, base_name))
++                
++                if base_classes:
++                    # Check if the subclass has a field with the same name
++                    if field_name in new_model_state.fields:
++                        # This is a field move from base class to subclass
++                        self.field_moves_to_subclass.add((app_label, model_name, field_name, new_model_name))
++
+     @staticmethod
+     def _resolve_dependency(dependency):
+         """
+@@ -888,19 +925,26 @@ class MigrationAutodetector:
+             self._generate_removed_field(app_label, model_name, field_name)
+ 
+     def _generate_removed_field(self, app_label, model_name, field_name):
++        # Check if this field is being moved to a subclass
++        dependencies = [
++            (app_label, model_name, field_name, "order_wrt_unset"),
++            (app_label, model_name, field_name, "foo_together_change"),
++        ]
++        
++        # Add dependency on subclass creation if this field is being moved to a subclass
++        for move in self.field_moves_to_subclass:
++            if move[0] == app_label and move[1] == model_name and move[2] == field_name:
++                subclass_name = move[3]
++                # Depend on the subclass being created first
++                dependencies.append((app_label, subclass_name, None, True))
++        
+         self.add_operation(
+             app_label,
+             operations.RemoveField(
+                 model_name=model_name,
+                 name=field_name,
+             ),
+-            # We might need to depend on the removal of an
+-            # order_with_respect_to or index/unique_together operation;
+-            # this is safely ignored if there isn't one
+-            dependencies=[
+-                (app_label, model_name, field_name, "order_wrt_unset"),
+-                (app_label, model_name, field_name, "foo_together_change"),
+-            ],
++            dependencies=dependencies,
+         )
+ 
+     def generate_altered_fields(self):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e5bc1a0d1d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations.state import ProjectState, ModelState
++from django.db.migrations.autodetector import MigrationAutodetector
++from django.db.migrations.operations import CreateModel, RemoveField
++
++def test_field_migration_issue():
++    """Test the issue where moving a field to a subclass causes FieldError"""
++    
++    # Initial state: Readable model with title field
++    initial_state = ProjectState()
++    initial_state.add_model(ModelState(
++        app_label='testapp',
++        name='Readable',
++        fields=[
++            ('id', models.AutoField(primary_key=True, serialize=False)),
++            ('title', models.CharField(max_length=200)),
++        ],
++        options={},
++        bases=(models.Model,),
++        managers=[],
++    ))
++    
++    # Final state: Readable model without title, Book subclass with title
++    final_state = ProjectState()
++    final_state.add_model(ModelState(
++        app_label='testapp',
++        name='Readable',
++        fields=[
++            ('id', models.AutoField(primary_key=True, serialize=False)),
++        ],
++        options={},
++        bases=(models.Model,),
++        managers=[],
++    ))
++    final_state.add_model(ModelState(
++        app_label='testapp',
++        name='Book',
++        fields=[
++            ('readable_ptr', models.OneToOneField(
++                auto_created=True,
++                on_delete=models.CASCADE,
++                parent_link=True,
++                primary_key=True,
++                serialize=False,
++                to='testapp.Readable',
++            )),
++            ('title', models.CharField(max_length=200)),
++        ],
++        options={},
++        bases=('testapp.Readable',),
++        managers=[],
++    ))
++    
++    # Use autodetector to generate migrations
++    autodetector = MigrationAutodetector(initial_state, final_state)
++    changes = autodetector._detect_changes()
++    
++    print("Detected changes:", changes)
++    
++    # Check the order of operations
++    if 'testapp' in changes:
++        testapp_changes = changes['testapp']
++        print("Operations for testapp:")
++        for migration in testapp_changes:
++            for i, op in enumerate(migration.operations):
++                print(f"{i}: {op}")
++                
++                # Check if the order is problematic
++                if isinstance(op, CreateModel) and op.name == 'Book':
++                    print("  - CreateModel Book operation")
++                elif isinstance(op, RemoveField) and op.model_name == 'Readable' and op.name == 'title':
++                    print("  - RemoveField title from Readable operation")
++    
++    # The issue is that the order should be:
++    # 1. CreateModel for Book (with title field)
++    # 2. RemoveField for Readable.title
++    # But the current order might be wrong
++
++if __name__ == '__main__':
++    test_field_migration_issue()
+\ No newline at end of file
+diff --git a/reproduce_simple.py b/reproduce_simple.py
+new file mode 100644
+index 0000000000..e71e994d4d
+--- /dev/null
++++ b/reproduce_simple.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations.state import ProjectState, ModelState
++from django.db.migrations.autodetector import MigrationAutodetector
++from django.db.migrations.operations import CreateModel, RemoveField
++
++def test_simple_case():
++    """Test the simple case described in the GitHub issue"""
++    
++    # Initial state: Readable model with title field
++    initial_state = ProjectState()
++    initial_state.add_model(ModelState(
++        app_label='testapp',
++        name='Readable',
++        fields=[
++            ('id', models.AutoField(primary_key=True, serialize=False)),
++            ('title', models.CharField(max_length=200)),
++        ],
++        options={},
++        bases=(models.Model,),
++        managers=[],
++    ))
++    
++    # Final state: Readable model without title, Book subclass with title
++    final_state = ProjectState()
++    final_state.add_model(ModelState(
++        app_label='testapp',
++        name='Readable',
++        fields=[
++            ('id', models.AutoField(primary_key=True, serialize=False)),
++        ],
++        options={},
++        bases=(models.Model,),
++        managers=[],
++    ))
++    final_state.add_model(ModelState(
++        app_label='testapp',
++        name='Book',
++        fields=[
++            ('readable_ptr', models.OneToOneField(
++                auto_created=True,
++                on_delete=models.CASCADE,
++                parent_link=True,
++                primary_key=True,
++                serialize=False,
++                to='testapp.Readable',
++            )),
++            ('title', models.CharField(max_length=200)),
++        ],
++        options={},
++        bases=('testapp.Readable',),
++        managers=[],
++    ))
++    
++    # Use autodetector to generate migrations
++    autodetector = MigrationAutodetector(initial_state, final_state)
++    changes = autodetector._detect_changes()
++    
++    print("=== DETECTED CHANGES ===")
++    for app_label, migrations in changes.items():
++        print(f"App: {app_label}")
++        for migration in migrations:
++            print(f"  Migration: {migration.name}")
++            for i, op in enumerate(migration.operations):
++                print(f"    {i}: {op}")
++                print(f"      Dependencies: {op._auto_deps}")
++                if isinstance(op, CreateModel) and op.name == 'Book':
++                    print("      ^-- CREATE MODEL BOOK")
++                elif isinstance(op, RemoveField) and op.model_name == 'Readable' and op.name == 'title':
++                    print("      ^-- REMOVE FIELD TITLE FROM READABLE")
++    
++    # The issue: The order should be:
++    # 1. CreateModel for Book (with title field)
++    # 2. RemoveField for Readable.title
++    # But the current order causes a field name clash
++
++if __name__ == '__main__':
++    test_simple_case()
+\ No newline at end of file

@@ -1,0 +1,300 @@
+diff --git a/django/contrib/admin/sites.py b/django/contrib/admin/sites.py
+index 59a4a0364d..74ef4c491e 100644
+--- a/django/contrib/admin/sites.py
++++ b/django/contrib/admin/sites.py
+@@ -420,7 +420,7 @@ class AdminSite:
+     def catch_all_view(self, request, url):
+         if settings.APPEND_SLASH and not url.endswith('/'):
+             urlconf = getattr(request, 'urlconf', None)
+-            path = '%s/' % request.path_info
++            path = '%s/' % request.path
+             try:
+                 match = resolve(path, urlconf)
+             except Resolver404:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..755bb24c58
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the FORCE_SCRIPT_NAME issue with catch_all_view
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import RequestFactory
++from django.contrib.admin.sites import AdminSite
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test-secret-key',
++    INSTALLED_APPS=[
++        'django.contrib.admin',
++        'django.contrib.auth',
++        'django.contrib.contenttypes',
++    ],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    ROOT_URLCONF='tests.urls',
++)
++
++# Initialize Django
++django.setup()
++
++def test_catch_all_view_with_force_script_name():
++    """Test that catch_all_view works correctly with FORCE_SCRIPT_NAME"""
++    
++    # Create a request with FORCE_SCRIPT_NAME context
++    factory = RequestFactory()
++    request = factory.get('/admin/some-page')
++    
++    # Simulate FORCE_SCRIPT_NAME by setting script_name
++    request.environ['SCRIPT_NAME'] = '/myscript'
++    
++    # Create admin site instance
++    admin_site = AdminSite()
++    
++    print("Testing catch_all_view with FORCE_SCRIPT_NAME...")
++    print(f"Request path: {request.path}")
++    print(f"Request path_info: {request.path_info}")
++    
++    # Test the current behavior
++    try:
++        admin_site.catch_all_view(request, 'some-page')
++    except Exception as e:
++        print(f"Exception: {e}")
++    
++    # The issue: request.path_info doesn't include script name
++    # request.path does include script name
++    print(f"\nCurrent implementation uses request.path_info: {'/admin/some-page/'}")
++    print(f"But it should use request.path: {'/myscript/admin/some-page/'}")
++    print("This is the bug - the redirect loses the script name context!")
++
++if __name__ == '__main__':
++    test_catch_all_view_with_force_script_name()
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..8c9a9ebfb0
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,31 @@
++#!/usr/bin/env python3
++"""
++Simple script to demonstrate the FORCE_SCRIPT_NAME issue with catch_all_view
++"""
++import sys
++sys.path.insert(0, '/testbed')
++
++from django.test import RequestFactory
++
++def demonstrate_path_vs_path_info():
++    """Show the difference between request.path and request.path_info"""
++    
++    # Create a request with SCRIPT_NAME (simulating FORCE_SCRIPT_NAME)
++    factory = RequestFactory()
++    request = factory.get('/admin/some-page')
++    
++    # Simulate FORCE_SCRIPT_NAME by setting script_name
++    request.environ['SCRIPT_NAME'] = '/myscript'
++    
++    print("Demonstrating the issue:")
++    print(f"Request path: {request.path}")  # Includes script name
++    print(f"Request path_info: {request.path_info}")  # Doesn't include script name
++    print(f"SCRIPT_NAME: {request.environ['SCRIPT_NAME']}")
++    
++    print(f"\nCurrent implementation would redirect to: '{request.path_info}/'")
++    print(f"But it should redirect to: '{request.path}/'")
++    print("The difference is that path_info doesn't include the script name!")
++    print("This means FORCE_SCRIPT_NAME context is lost in the redirect.")
++
++if __name__ == '__main__':
++    demonstrate_path_vs_path_info()
+\ No newline at end of file
+diff --git a/simple_verify.py b/simple_verify.py
+new file mode 100644
+index 0000000000..ebf08b6791
+--- /dev/null
++++ b/simple_verify.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++"""
++Simple script to verify the catch_all_view fix by reading the source file directly
++"""
++def verify_fix():
++    """Check if request.path_info was changed to request.path"""
++    
++    # Read the source file
++    with open('/testbed/django/contrib/admin/sites.py', 'r') as f:
++        content = f.read()
++    
++    print("Verifying catch_all_view fix...")
++    print("=" * 50)
++    
++    # Look for the specific line in catch_all_view
++    lines = content.split('\n')
++    found_catch_all = False
++    
++    for i, line in enumerate(lines, 1):
++        if 'def catch_all_view' in line:
++            found_catch_all = True
++            print(f"Found catch_all_view at line {i}")
++            continue
++            
++        if found_catch_all and 'request.path' in line:
++            print(f"Line {i}: {line.strip()}")
++            if 'request.path_info' in line:
++                print("✗ STILL USING request.path_info - FIX NOT APPLIED")
++                return False
++            elif 'request.path' in line:
++                print("✓ USING request.path - FIX APPLIED CORRECTLY")
++                # Show some context
++                print("\nContext around the fix:")
++                for j in range(max(1, i-2), min(len(lines), i+3)):
++                    marker = ">>> " if j == i else "    "
++                    print(f"{marker}{j}: {lines[j-1]}")
++                return True
++    
++    print("Could not find catch_all_view or request.path usage")
++    return False
++
++if __name__ == '__main__':
++    success = verify_fix()
++    if success:
++        print("\n✓ Fix verification successful!")
++        print("The catch_all_view function now uses request.path instead of request.path_info")
++        print("This preserves FORCE_SCRIPT_NAME context in redirects.")
++    else:
++        print("\n✗ Fix verification failed!")
++        print("The catch_all_view function still uses request.path_info")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..33a7e24493
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the FORCE_SCRIPT_NAME fix for catch_all_view
++"""
++import os
++import sys
++
++# Add testbed to path
++sys.path.insert(0, '/testbed')
++
++# Configure minimal Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++from django.conf import settings
++from django.test import RequestFactory, TestCase
++from django.contrib.admin.sites import AdminSite
++from django.http import Http404, HttpResponsePermanentRedirect
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        APPEND_SLASH=True,
++        USE_TZ=True,
++    )
++
++class TestCatchAllViewFix(TestCase):
++    
++    def test_catch_all_view_with_script_name(self):
++        """Test that catch_all_view preserves script name context"""
++        admin_site = AdminSite()
++        factory = RequestFactory()
++        
++        # Create request with script name (simulating FORCE_SCRIPT_NAME)
++        request = factory.get('/admin/some-page')
++        request.environ['SCRIPT_NAME'] = '/myscript'
++        
++        # Mock the resolve function to simulate a valid match
++        from unittest.mock import patch, MagicMock
++        
++        mock_match = MagicMock()
++        mock_match.func.should_append_slash = True
++        
++        with patch('django.contrib.admin.sites.resolve', return_value=mock_match):
++            # This should now redirect to the correct path with script name
++            response = admin_site.catch_all_view(request, 'some-page')
++            
++            # Verify it's a redirect
++            self.assertIsInstance(response, HttpResponsePermanentRedirect)
++            
++            # Verify the redirect location includes the script name
++            self.assertEqual(response.url, '/myscript/admin/some-page/')
++            
++            print("✓ Fix verified: Redirect includes script name correctly")
++            print(f"  Redirect URL: {response.url}")
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 0000000000..0bfcf96b28
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++"""
++Simple verification script for the catch_all_view fix
++"""
++import sys
++sys.path.insert(0, '/testbed')
++
++# Import the specific function to test
++from django.contrib.admin.sites import AdminSite
++from django.test import RequestFactory
++
++def test_catch_all_view_fix():
++    """Test that the fix works by examining the code directly"""
++    
++    # Create a mock request with script name
++    factory = RequestFactory()
++    request = factory.get('/admin/some-page')
++    request.environ['SCRIPT_NAME'] = '/myscript'
++    
++    admin_site = AdminSite()
++    
++    # Get the source code of the catch_all_view method
++    import inspect
++    source = inspect.getsource(admin_site.catch_all_view)
++    
++    print("Examining catch_all_view implementation:")
++    print("=" * 50)
++    
++    # Check if request.path is used instead of request.path_info
++    if 'request.path' in source and 'request.path_info' not in source:
++        print("✓ FIX VERIFIED: The code now uses request.path")
++        print(f"  - Request path: {request.path} (includes script name: /myscript)")
++        print(f"  - Request path_info: {request.path_info} (no script name)")
++        print("  - This means FORCE_SCRIPT_NAME context will be preserved!")
++    else:
++        print("✗ FIX NOT APPLIED: Still using request.path_info")
++        print("  The fix should change request.path_info to request.path")
++    
++    print("\nImplementation snippet:")
++    lines = source.split('\n')
++    for i, line in enumerate(lines, 1):
++        if 'request.path' in line or 'request.path_info' in line:
++            print(f"  Line {i}: {line.strip()}")
++
++if __name__ == '__main__':
++    test_catch_all_view_fix()
+\ No newline at end of file

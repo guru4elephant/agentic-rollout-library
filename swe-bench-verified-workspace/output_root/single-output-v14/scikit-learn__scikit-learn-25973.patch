@@ -1,0 +1,257 @@
+diff --git a/debug_cv.py b/debug_cv.py
+new file mode 100644
+index 000000000..c3c59c0b3
+--- /dev/null
++++ b/debug_cv.py
+@@ -0,0 +1,48 @@
++from sklearn.datasets import make_classification
++from sklearn.neighbors import KNeighborsClassifier
++from sklearn.model_selection import LeaveOneGroupOut
++from sklearn.model_selection._split import check_cv
++from sklearn.model_selection import cross_val_score
++import numpy as np
++
++X, y = make_classification()
++
++groups = np.zeros_like(y, dtype=int)
++groups[y.size//2:] = 1
++
++cv = LeaveOneGroupOut()
++splits = cv.split(X, y, groups=groups)
++
++print("Original splits type:", type(splits))
++
++# Check what check_cv returns
++wrapped_cv = check_cv(splits, y)
++print("Wrapped CV type:", type(wrapped_cv))
++
++# Check if the wrapped CV has splits
++splits_list = list(wrapped_cv.split(X, y, groups))
++print("Number of splits from wrapped CV:", len(splits_list))
++
++# Test cross_val_score with the wrapped CV
++clf = KNeighborsClassifier(n_neighbors=5)
++
++print("\n--- Testing cross_val_score with wrapped CV ---")
++try:
++    scores = cross_val_score(clf, X, y, cv=wrapped_cv, scoring='accuracy')
++    print("Cross val scores:", scores)
++    print("Number of scores:", len(scores))
++except Exception as e:
++    print("Error in cross_val_score:", e)
++    import traceback
++    traceback.print_exc()
++
++# Test cross_val_score with the original splits (should fail)
++print("\n--- Testing cross_val_score with original splits ---")
++try:
++    splits2 = cv.split(X, y, groups=groups)
++    scores2 = cross_val_score(clf, X, y, cv=splits2, scoring='accuracy')
++    print("Cross val scores with splits:", scores2)
++except Exception as e:
++    print("Error in cross_val_score with splits:", e)
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/debug_issue.py b/debug_issue.py
+new file mode 100644
+index 000000000..29c77cf73
+--- /dev/null
++++ b/debug_issue.py
+@@ -0,0 +1,53 @@
++from sklearn.datasets import make_classification
++from sklearn.feature_selection import SequentialFeatureSelector
++from sklearn.neighbors import KNeighborsClassifier
++from sklearn.model_selection import LeaveOneGroupOut
++from sklearn.model_selection._split import check_cv
++
++import numpy as np
++
++X, y = make_classification()
++
++groups = np.zeros_like(y, dtype=int)
++groups[y.size//2:] = 1
++
++cv = LeaveOneGroupOut()
++splits = cv.split(X, y, groups=groups)
++
++print("Original splits type:", type(splits))
++
++# Check what check_cv returns
++wrapped_cv = check_cv(splits, y)
++print("Wrapped CV type:", type(wrapped_cv))
++
++# Check if the wrapped CV has splits
++try:
++    splits_list = list(wrapped_cv.split(X, y, groups))
++    print("Number of splits from wrapped CV:", len(splits_list))
++    for i, (train, test) in enumerate(splits_list):
++        print(f"Split {i}: train={len(train)}, test={len(test)}")
++except Exception as e:
++    print("Error getting splits from wrapped CV:", e)
++
++# Now let's try the actual SequentialFeatureSelector
++clf = KNeighborsClassifier(n_neighbors=5)
++
++# First try with the cross-validator object itself (should work)
++print("\n--- Testing with cross-validator object ---")
++try:
++    seq1 = SequentialFeatureSelector(clf, n_features_to_select=5, scoring='accuracy', cv=cv)
++    seq1.fit(X, y, groups=groups)
++    print("Success with cross-validator object!")
++except Exception as e:
++    print("Error with cross-validator object:", e)
++
++# Then try with the splits iterator (should fail)
++print("\n--- Testing with splits iterator ---")
++try:
++    # Create new splits iterator
++    splits2 = cv.split(X, y, groups=groups)
++    seq2 = SequentialFeatureSelector(clf, n_features_to_select=5, scoring='accuracy', cv=splits2)
++    seq2.fit(X, y)
++    print("Success with splits iterator!")
++except Exception as e:
++    print("Error with splits iterator:", e)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..1c1d77750
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,19 @@
++from sklearn.datasets import make_classification
++from sklearn.feature_selection import SequentialFeatureSelector
++from sklearn.neighbors import KNeighborsClassifier
++from sklearn.model_selection import LeaveOneGroupOut
++
++import numpy as np
++
++X, y = make_classification()
++
++groups = np.zeros_like(y, dtype=int)
++groups[y.size//2:] = 1
++
++cv = LeaveOneGroupOut()
++splits = cv.split(X, y, groups=groups)
++
++clf = KNeighborsClassifier(n_neighbors=5)
++
++seq = SequentialFeatureSelector(clf, n_features_to_select=5, scoring='accuracy', cv=splits)
++seq.fit(X, y)
+\ No newline at end of file
+diff --git a/sklearn/feature_selection/_sequential.py b/sklearn/feature_selection/_sequential.py
+index e983c55de..ae5e08b00 100644
+--- a/sklearn/feature_selection/_sequential.py
++++ b/sklearn/feature_selection/_sequential.py
+@@ -205,6 +205,11 @@ class SequentialFeatureSelector(SelectorMixin, MetaEstimatorMixin, BaseEstimator
+             Returns the instance itself.
+         """
+         self._validate_params()
++        # After validation, update self.cv with the validated CV object
++        # to handle the case where an iterator was passed
++        from sklearn.model_selection._split import check_cv
++        from sklearn.base import is_classifier
++        self.cv = check_cv(self.cv, y, classifier=is_classifier(self.estimator))
+ 
+         # FIXME: to be removed in 1.3
+         if self.n_features_to_select in ("warn", None):
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..9f9fe7a15
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,56 @@
++from sklearn.datasets import make_classification
++from sklearn.feature_selection import SequentialFeatureSelector
++from sklearn.neighbors import KNeighborsClassifier
++from sklearn.model_selection import LeaveOneGroupOut, KFold
++import numpy as np
++
++X, y = make_classification()
++
++# Test 1: Integer CV (should work as before)
++print("--- Testing with integer CV ---")
++try:
++    clf = KNeighborsClassifier(n_neighbors=5)
++    seq = SequentialFeatureSelector(clf, n_features_to_select=5, scoring='accuracy', cv=5)
++    seq.fit(X, y)
++    print("Success with integer CV!")
++except Exception as e:
++    print("Error with integer CV:", e)
++
++# Test 2: CV object (should work as before)
++print("\n--- Testing with CV object ---")
++try:
++    clf = KNeighborsClassifier(n_neighbors=5)
++    cv_obj = KFold(5)
++    seq = SequentialFeatureSelector(clf, n_features_to_select=5, scoring='accuracy', cv=cv_obj)
++    seq.fit(X, y)
++    print("Success with CV object!")
++except Exception as e:
++    print("Error with CV object:", e)
++
++# Test 3: Iterator from CV.split (the original issue)
++print("\n--- Testing with iterator from CV.split ---")
++try:
++    clf = KNeighborsClassifier(n_neighbors=5)
++    cv = LeaveOneGroupOut()
++    groups = np.zeros_like(y, dtype=int)
++    groups[y.size//2:] = 1
++    splits = cv.split(X, y, groups=groups)
++    seq = SequentialFeatureSelector(clf, n_features_to_select=5, scoring='accuracy', cv=splits)
++    seq.fit(X, y)
++    print("Success with iterator from CV.split!")
++except Exception as e:
++    print("Error with iterator from CV.split:", e)
++
++# Test 4: List of splits (should also work)
++print("\n--- Testing with list of splits ---")
++try:
++    clf = KNeighborsClassifier(n_neighbors=5)
++    cv = LeaveOneGroupOut()
++    groups = np.zeros_like(y, dtype=int)
++    groups[y.size//2:] = 1
++    splits = list(cv.split(X, y, groups=groups))
++    seq = SequentialFeatureSelector(clf, n_features_to_select=5, scoring='accuracy', cv=splits)
++    seq.fit(X, y)
++    print("Success with list of splits!")
++except Exception as e:
++    print("Error with list of splits:", e)
+\ No newline at end of file
+diff --git a/test_iterator.py b/test_iterator.py
+new file mode 100644
+index 000000000..3fcd16b98
+--- /dev/null
++++ b/test_iterator.py
+@@ -0,0 +1,30 @@
++from sklearn.model_selection import LeaveOneGroupOut
++from sklearn.model_selection._split import check_cv
++import numpy as np
++
++# Create some test data
++X = np.random.randn(100, 10)
++y = np.random.randint(0, 2, 100)
++groups = np.zeros_like(y, dtype=int)
++groups[y.size//2:] = 1
++
++# Create splits iterator
++cv = LeaveOneGroupOut()
++splits = cv.split(X, y, groups=groups)
++
++print("Type of splits:", type(splits))
++
++# Check if it's an iterator
++print("Has __next__ method:", hasattr(splits, '__next__'))
++
++# Try to wrap it with check_cv
++wrapped_cv = check_cv(splits, y)
++
++print("Type after check_cv:", type(wrapped_cv))
++
++# Try to get splits from wrapped cv
++try:
++    splits_from_wrapped = list(wrapped_cv.split(X, y, groups))
++    print("Number of splits from wrapped:", len(splits_from_wrapped))
++except Exception as e:
++    print("Error:", e)
+\ No newline at end of file

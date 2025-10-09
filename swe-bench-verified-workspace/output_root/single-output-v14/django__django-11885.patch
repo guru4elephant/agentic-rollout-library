@@ -1,0 +1,372 @@
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index ae82d26340..de427f4e03 100644
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -309,10 +309,39 @@ class Collector:
+                         sender=model, instance=obj, using=self.using
+                     )
+ 
+-            # fast deletes
++            # fast deletes - combine queries by model to reduce roundtrips
++            from django.db.models import Q
++            from collections import defaultdict
++            
++            # Group fast delete querysets by model
++            fast_deletes_by_model = defaultdict(list)
+             for qs in self.fast_deletes:
+-                count = qs._raw_delete(using=self.using)
+-                deleted_counter[qs.model._meta.label] += count
++                fast_deletes_by_model[qs.model].append(qs)
++            
++            # Process each model group
++            for model, querysets in fast_deletes_by_model.items():
++                if len(querysets) == 1:
++                    # Single query, process normally
++                    count = querysets[0]._raw_delete(using=self.using)
++                    deleted_counter[model._meta.label] += count
++                else:
++                    # Multiple queries for same model, combine with OR
++                    # Extract where conditions from each queryset and combine with OR
++                    combined_where = None
++                    for qs in querysets:
++                        # Get the where clause from the query
++                        where_clause = qs.query.where
++                        if combined_where is None:
++                            combined_where = where_clause
++                        else:
++                            # Combine with OR using Q objects
++                            combined_where = combined_where | where_clause
++                    
++                    # Create a new queryset with the combined where clause
++                    combined_qs = model._base_manager.all()
++                    combined_qs.query.where = combined_where
++                    count = combined_qs._raw_delete(using=self.using)
++                    deleted_counter[model._meta.label] += count
+ 
+             # update fields
+             for model, instances_for_fieldvalues in self.field_updates.items():
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..aae4d2fa00
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create the models from the issue description
++class Person(models.Model):
++    friends = models.ManyToManyField('self')
++    
++    class Meta:
++        app_label = 'test'
++
++class User(models.Model):
++    pass
++    
++    class Meta:
++        app_label = 'test'
++
++class Entry(models.Model):
++    created_by = models.ForeignKey(User, on_delete=models.CASCADE)
++    updated_by = models.ForeignKey(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create test data using Django's ORM directly
++user = User.objects.create()
++person = Person.objects.create()
++entry1 = Entry.objects.create(created_by=user, updated_by=user)
++entry2 = Entry.objects.create(created_by=user, updated_by=user)
++
++print("Created test data:")
++print(f"User ID: {user.id}")
++print(f"Person ID: {person.id}")
++print(f"Entry IDs: {entry1.id}, {entry2.id}")
++
++# Now delete the user and see what queries are executed
++from django.db import connection
++connection.queries_log.clear()
++
++print("\nDeleting user...")
++user.delete()
++
++print("\nExecuted queries:")
++for i, query in enumerate(connection.queries, 1):
++    print(f"{i}. {query['sql']}")
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..ddfa038e55
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create the models from the issue description
++class Person(models.Model):
++    friends = models.ManyToManyField('self')
++    
++    class Meta:
++        app_label = 'test'
++
++class User(models.Model):
++    pass
++    
++    class Meta:
++        app_label = 'test'
++
++class Entry(models.Model):
++    created_by = models.ForeignKey(User, on_delete=models.CASCADE)
++    updated_by = models.ForeignKey(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Now let's examine the deletion collector logic directly
++from django.db.models import deletion
++
++# Create a collector instance
++collector = deletion.Collector(using='default')
++
++# Create a mock user object with ID
++class MockUser:
++    def __init__(self, id):
++        self.id = id
++        self.pk = id
++    
++    @property
++    def __class__(self):
++        return User
++
++# Create mock user
++user = MockUser(1)
++
++print("Testing deletion collector with fast deletes...")
++
++# Simulate what happens during deletion
++# First, let's see how fast deletes are collected
++collector.collect([user])
++
++print(f"Fast deletes collected: {len(collector.fast_deletes)}")
++print(f"Data collected: {collector.data}")
++
++# Let's also examine the deletion logic
++print("\nExamining deletion logic...")
++
++# Look at the delete method
++print("The delete method processes fast_deletes individually:")
++print("for qs in self.fast_deletes:")
++print("    count = qs._raw_delete(using=self.using)")
++print("This should be combined by table to reduce roundtrips")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..0905b9dd18
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create the models from the issue description
++class Person(models.Model):
++    friends = models.ManyToManyField('self')
++    
++    class Meta:
++        app_label = 'test'
++
++class User(models.Model):
++    pass
++    
++    class Meta:
++        app_label = 'test'
++
++class Entry(models.Model):
++    created_by = models.ForeignKey(User, on_delete=models.CASCADE)
++    updated_by = models.ForeignKey(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the deletion collector
++from django.db.models import deletion
++
++# Create a collector
++collector = deletion.Collector(using='default')
++
++# Create mock objects to simulate the scenario
++class MockQuerySet:
++    def __init__(self, model, field_name, value):
++        self.model = model
++        self.field_name = field_name
++        self.value = value
++    
++    def _raw_delete(self, using):
++        print(f"Executing DELETE FROM {self.model._meta.db_table} WHERE {self.field_name} = {self.value}")
++        return 1  # Simulate 1 row affected
++
++# Create mock querysets that would be generated during deletion
++user_id = 1
++entry_qs1 = MockQuerySet(Entry, 'created_by_id', user_id)
++entry_qs2 = MockQuerySet(Entry, 'updated_by_id', user_id)
++person_friends_qs1 = MockQuerySet(Person.friends.through, 'from_id', user_id)
++person_friends_qs2 = MockQuerySet(Person.friends.through, 'to_id', user_id)
++
++# Add them to fast_deletes (simulating what happens during collection)
++collector.fast_deletes = [entry_qs1, entry_qs2, person_friends_qs1, person_friends_qs2]
++
++print("Before fix: 4 separate DELETE queries would be executed")
++print("After fix: 2 combined DELETE queries should be executed")
++
++# Test the delete method
++try:
++    collector.delete()
++    print("SUCCESS: Combined queries executed correctly!")
++except Exception as e:
++    print(f"ERROR: {e}")
+\ No newline at end of file
+diff --git a/test_queryset_structure.py b/test_queryset_structure.py
+new file mode 100644
+index 0000000000..7405502fe0
+--- /dev/null
++++ b/test_queryset_structure.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create simple models for testing
++class User(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class Entry(models.Model):
++    created_by = models.ForeignKey(User, on_delete=models.CASCADE)
++    updated_by = models.ForeignKey(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create some querysets to understand their structure
++user = User(id=1)
++qs1 = Entry.objects.filter(created_by=user)
++qs2 = Entry.objects.filter(updated_by=user)
++
++print("QuerySet 1 (created_by):")
++print(f"Model: {qs1.model}")
++print(f"Where children: {qs1.query.where.children}")
++
++print("\nQuerySet 2 (updated_by):")
++print(f"Model: {qs2.model}")
++print(f"Where children: {qs2.query.where.children}")
++
++# Try to combine them using Q objects
++from django.db.models import Q
++combined_qs = Entry.objects.filter(Q(created_by=user) | Q(updated_by=user))
++print(f"\nCombined QuerySet:")
++print(f"Where children: {combined_qs.query.where.children}")
+\ No newline at end of file

@@ -1,0 +1,360 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..29ebda7769
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to the Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++import django
++django.setup()
++
++from tests.order_with_respect_to.models import Dimension
++
++def reproduce_issue():
++    print("Creating test data...")
++    
++    # Create some Dimension objects
++    Dimension.objects.all().delete()
++    for i in range(10, 19):
++        entity = Dimension.entity.field.related_model.objects.create()
++        dimension = Dimension.objects.create(entity=entity)
++    
++    print("Initial query:")
++    initial_qs = Dimension.objects.values_list('id', flat=True)
++    print(f">>> Dimension.objects.values_list('id', flat=True)")
++    print(f"<QuerySet {list(initial_qs)}>")
++    
++    print("\nCreating union queryset with ordering:")
++    qs = (
++        Dimension.objects.filter(pk__in=[10, 11])
++        .union(Dimension.objects.filter(pk__in=[16, 17]))
++        .order_by('entity_id')  # Using entity_id since it's the primary key
++    )
++    print(f">>> qs = (Dimension.objects.filter(pk__in=[10, 11]).union(Dimension.objects.filter(pk__in=[16, 17])).order_by('entity_id'))")
++    print(f">>> qs")
++    print(qs)
++    
++    print("\nCreating new queryset from union:")
++    print(f">>> qs.order_by().values_list('pk', flat=True)")
++    new_qs = qs.order_by().values_list('pk', flat=True)
++    print(f"<QuerySet {list(new_qs)}>")
++    
++    print("\nTrying to evaluate original qs again (this should break):")
++    print(f">>> qs")
++    try:
++        result = list(qs)
++        print(f"Success: {result}")
++    except Exception as e:
++        print(f"Error: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    reproduce_issue()
+\ No newline at end of file
+diff --git a/test_union_issue.py b/test_union_issue.py
+new file mode 100644
+index 0000000000..fc2c8c32b0
+--- /dev/null
++++ b/test_union_issue.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to the Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++import django
++from django.conf import settings
++from django.test.utils import get_runner
++
++def setup_test_environment():
++    """Setup Django test environment similar to runtests.py"""
++    # Configure settings
++    if not settings.configured:
++        settings.configure(
++            DATABASES={
++                'default': {
++                    'ENGINE': 'django.db.backends.sqlite3',
++                },
++                'other': {
++                    'ENGINE': 'django.db.backends.sqlite3',
++                }
++            },
++            SECRET_KEY="django_tests_secret_key",
++            PASSWORD_HASHERS=[
++                'django.contrib.auth.hashers.MD5PasswordHasher',
++            ],
++            INSTALLED_APPS=[
++                'django.contrib.contenttypes',
++                'django.contrib.auth',
++                'django.contrib.sites',
++                'django.contrib.sessions',
++                'django.contrib.messages',
++                'django.contrib.admin.apps.SimpleAdminConfig',
++                'django.contrib.staticfiles',
++                'tests.order_with_respect_to',
++            ],
++            USE_TZ=False,
++        )
++    
++    django.setup()
++
++def test_union_issue():
++    """Test the union queryset ordering issue"""
++    from tests.order_with_respect_to.models import Dimension, Entity
++    
++    print("Creating test data...")
++    
++    # Create entities first
++    entities = []
++    for i in range(10, 19):
++        entity = Entity.objects.create()
++        entities.append(entity)
++    
++    # Create dimensions with the entities
++    for i, entity in enumerate(entities):
++        dimension = Dimension.objects.create(entity=entity)
++    
++    print("Initial query:")
++    initial_qs = Dimension.objects.values_list('id', flat=True)
++    print(f">>> Dimension.objects.values_list('id', flat=True)")
++    print(f"<QuerySet {list(initial_qs)}>")
++    
++    print("\nCreating union queryset with ordering:")
++    qs = (
++        Dimension.objects.filter(pk__in=[10, 11])
++        .union(Dimension.objects.filter(pk__in=[16, 17]))
++        .order_by('entity_id')  # Using entity_id since it's the primary key
++    )
++    print(f">>> qs = (Dimension.objects.filter(pk__in=[10, 11]).union(Dimension.objects.filter(pk__in=[16, 17])).order_by('entity_id'))")
++    print(f">>> qs")
++    print(qs)
++    
++    print("\nCreating new queryset from union:")
++    print(f">>> qs.order_by().values_list('pk', flat=True)")
++    new_qs = qs.order_by().values_list('pk', flat=True)
++    print(f"<QuerySet {list(new_qs)}>")
++    
++    print("\nTrying to evaluate original qs again (this should break):")
++    print(f">>> qs")
++    try:
++        result = list(qs)
++        print(f"Success: {result}")
++        return True
++    except Exception as e:
++        print(f"Error: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    setup_test_environment()
++    success = test_union_issue()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/tests/order_with_respect_to/test_models.py b/tests/order_with_respect_to/test_models.py
+new file mode 100644
+index 0000000000..1369c736f2
+--- /dev/null
++++ b/tests/order_with_respect_to/test_models.py
+@@ -0,0 +1,15 @@
++"""
++Test models for reproducing the union ordering issue.
++"""
++from django.db import models
++
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField()
++
++    class Meta:
++        app_label = 'order_with_respect_to'
++
++    def __str__(self):
++        return self.name
+\ No newline at end of file
+diff --git a/tests/order_with_respect_to/test_union_bug.py b/tests/order_with_respect_to/test_union_bug.py
+new file mode 100644
+index 0000000000..eaaff6f924
+--- /dev/null
++++ b/tests/order_with_respect_to/test_union_bug.py
+@@ -0,0 +1,52 @@
++from django.test import TestCase
++from .test_models import TestModel
++
++
++class UnionBugTest(TestCase):
++
++    def setUp(self):
++        # Create test models with order field
++        for i in range(10, 19):
++            TestModel.objects.create(name=f"Test {i}", order=i)
++
++    def test_union_ordering_bug(self):
++        """
++        Reproduce the exact bug described in the GitHub issue.
++        The issue occurs when:
++        1. Create a union queryset with ordering
++        2. Create a new queryset from it (e.g., with order_by().values_list())
++        3. Try to evaluate the original queryset again
++        """
++        print("=== Reproducing Union QuerySet Ordering Bug ===")
++        
++        # Step 1: Create union queryset with ordering
++        print("1. Creating union queryset with ordering...")
++        qs = (
++            TestModel.objects.filter(pk__in=[1, 2])
++            .union(TestModel.objects.filter(pk__in=[8, 9]))
++            .order_by('order')
++        )
++        print(f"   qs = {qs}")
++        
++        # Step 2: Create a new queryset from the union
++        print("2. Creating new queryset from union...")
++        new_qs = qs.order_by().values_list('pk', flat=True)
++        print(f"   new_qs = {list(new_qs)}")
++        
++        # Step 3: Try to evaluate the original queryset again (this should break)
++        print("3. Trying to evaluate original qs again...")
++        try:
++            result = list(qs)
++            print(f"   Success: {result}")
++            self.fail("Expected an error but evaluation succeeded")
++        except Exception as e:
++            print(f"   Error (expected): {e}")
++            # Check if it's the specific error mentioned in the issue
++            if "ORDER BY position" in str(e) and "not in select list" in str(e):
++                print("   ✓ Reproduced the exact bug from the GitHub issue!")
++                return True
++            else:
++                print(f"   ✗ Unexpected error: {e}")
++                raise
++        
++        return False
+\ No newline at end of file
+diff --git a/tests/order_with_respect_to/test_union_position_bug.py b/tests/order_with_respect_to/test_union_position_bug.py
+new file mode 100644
+index 0000000000..5282f5827f
+--- /dev/null
++++ b/tests/order_with_respect_to/test_union_position_bug.py
+@@ -0,0 +1,50 @@
++from django.test import TestCase
++from .test_models import TestModel
++
++
++class UnionPositionBugTest(TestCase):
++
++    def setUp(self):
++        # Create test models with order field
++        for i in range(10, 19):
++            TestModel.objects.create(name=f"Test {i}", order=i)
++
++    def test_union_ordering_position_bug(self):
++        """
++        Reproduce the exact bug described in the GitHub issue.
++        The issue occurs when column positions in ORDER BY become invalid
++        after modifying a union queryset.
++        """
++        print("=== Reproducing Union QuerySet Ordering Position Bug ===")
++        
++        # Step 1: Create union queryset with ordering
++        print("1. Creating union queryset with ordering...")
++        qs = (
++            TestModel.objects.filter(pk__in=[10, 11])
++            .union(TestModel.objects.filter(pk__in=[16, 17]))
++            .order_by('order')
++        )
++        print(f"   qs = {qs}")
++        
++        # Step 2: Create a new queryset from the union that changes the select list
++        print("2. Creating new queryset from union that changes select list...")
++        new_qs = qs.order_by().values_list('pk', flat=True)
++        print(f"   new_qs = {list(new_qs)}")
++        
++        # Step 3: Try to evaluate the original queryset again (this should break)
++        print("3. Trying to evaluate original qs again...")
++        try:
++            result = list(qs)
++            print(f"   Success: {result}")
++            self.fail("Expected an error but evaluation succeeded")
++        except Exception as e:
++            print(f"   Error (expected): {e}")
++            # Check if it's the specific error mentioned in the issue
++            if "ORDER BY position" in str(e) and "not in select list" in str(e):
++                print("   ✓ Reproduced the exact bug from the GitHub issue!")
++                return True
++            else:
++                print(f"   ✗ Unexpected error: {e}")
++                raise
++        
++        return False
+\ No newline at end of file
+diff --git a/tests/order_with_respect_to/test_union_reproduce.py b/tests/order_with_respect_to/test_union_reproduce.py
+new file mode 100644
+index 0000000000..805505430f
+--- /dev/null
++++ b/tests/order_with_respect_to/test_union_reproduce.py
+@@ -0,0 +1,45 @@
++from django.test import TestCase
++from .models import Dimension, Entity
++from .test_models import TestModel
++
++
++class UnionQuerySetTest(TestCase):
++
++    def setUp(self):
++        # Create test models with order field
++        for i in range(10, 19):
++            TestModel.objects.create(name=f"Test {i}", order=i)
++
++    def test_union_ordering_issue(self):
++        """Reproduce the union queryset ordering issue"""
++        print("Initial query:")
++        initial_qs = TestModel.objects.values_list('id', flat=True)
++        print(f">>> TestModel.objects.values_list('id', flat=True)")
++        print(f"<QuerySet {list(initial_qs)}>")
++        
++        print("\nCreating union queryset with ordering:")
++        qs = (
++            TestModel.objects.filter(pk__in=[1, 2])
++            .union(TestModel.objects.filter(pk__in=[8, 9]))
++            .order_by('order')
++        )
++        print(f">>> qs = (TestModel.objects.filter(pk__in=[1, 2]).union(TestModel.objects.filter(pk__in=[8, 9])).order_by('order'))")
++        print(f">>> qs")
++        print(qs)
++        
++        print("\nCreating new queryset from union:")
++        print(f">>> qs.order_by().values_list('pk', flat=True)")
++        new_qs = qs.order_by().values_list('pk', flat=True)
++        print(f"<QuerySet {list(new_qs)}>")
++        
++        print("\nTrying to evaluate original qs again (this should break):")
++        print(f">>> qs")
++        try:
++            result = list(qs)
++            print(f"Success: {result}")
++            return True
++        except Exception as e:
++            print(f"Error: {e}")
++            import traceback
++            traceback.print_exc()
++            return False
+\ No newline at end of file

@@ -1,0 +1,170 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 85cd8311a7..1d2261a707 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1225,6 +1225,10 @@ class QuerySet:
+         if self.query.extra_order_by or self.query.order_by:
+             return True
+         elif self.query.default_ordering and self.query.get_meta().ordering:
++            # Check if there's a GROUP BY clause that would remove ordering
++            if self.query.group_by is not None:
++                # GROUP BY queries with default ordering remove the ORDER BY clause
++                return False
+             return True
+         else:
+             return False
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e6119b4351
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count
++
++# Create a simple test model with Meta.ordering
++class Foo(models.Model):
++    uuid = models.UUIDField(primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['name']
++
++# Create tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Foo)
++
++# Test the issue
++print("=== Testing QuerySet.ordered property ===")
++
++# Test 1: Regular queryset
++qs = Foo.objects.all()
++print(f"Regular queryset SQL: {qs.query}")
++print(f"qs.ordered: {qs.ordered}")
++print(f"qs.query.default_ordering: {qs.query.default_ordering}")
++print()
++
++# Test 2: Annotated queryset with GROUP BY
++qs2 = Foo.objects.annotate(Count("pk")).all()
++print(f"Annotated queryset SQL: {qs2.query}")
++print(f"qs2.ordered: {qs2.ordered}")
++print(f"qs2.query.default_ordering: {qs2.query.default_ordering}")
++print()
++
++# Test 3: Check if the SQL actually contains ORDER BY
++print("Checking if SQL contains ORDER BY:")
++print(f"Regular queryset SQL has ORDER BY: {'ORDER BY' in str(qs.query)}")
++print(f"Annotated queryset SQL has ORDER BY: {'ORDER BY' in str(qs2.query)}")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..d920a5b954
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count
++
++# Create a simple test model with Meta.ordering
++class Foo(models.Model):
++    uuid = models.UUIDField(primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['name']
++
++# Create tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Foo)
++
++print("=== Testing Edge Cases ===")
++
++# Test 1: Regular queryset without default ordering
++class Bar(models.Model):
++    uuid = models.UUIDField(primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++        # No ordering specified
++
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Bar)
++
++qs_bar = Bar.objects.all()
++print(f"Bar queryset (no default ordering): {qs_bar.ordered}")
++
++# Test 2: Annotated queryset without default ordering
++qs_bar2 = Bar.objects.annotate(Count("pk")).all()
++print(f"Bar annotated queryset (no default ordering): {qs_bar2.ordered}")
++
++# Test 3: Explicit order_by should still work
++qs3 = Foo.objects.annotate(Count("pk")).order_by('name')
++print(f"Annotated with explicit order_by: {qs3.ordered}")
++
++# Test 4: Empty queryset (create via filter that returns nothing)
++empty_qs = Foo.objects.filter(uuid__isnull=True)
++print(f"Empty queryset: {empty_qs.ordered}")
++
++# Test 5: Queryset with extra_order_by
++qs4 = Foo.objects.annotate(Count("pk")).extra(order_by=['name'])
++print(f"Annotated with extra_order_by: {qs4.ordered}")
+\ No newline at end of file

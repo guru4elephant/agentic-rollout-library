@@ -1,0 +1,351 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..8f5d73fbba
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,61 @@
++import os
++import django
++from django.conf import settings
++from django.utils.numberformat import format as nformat
++from decimal import Decimal
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        USE_L10N=False,
++        USE_THOUSAND_SEPARATOR=False,
++    )
++
++print("Comprehensive test of numberformat fix:")
++
++# Test cases from the GitHub issue
++print("\n1. Original issue test cases:")
++result1 = nformat(Decimal('1e-199'), '.', decimal_pos=2)
++print(f"nformat(Decimal('1e-199'), '.', decimal_pos=2) = '{result1}' (expected: '0.00')")
++
++result2 = nformat(Decimal('1e-200'), '.', decimal_pos=2)
++print(f"nformat(Decimal('1e-200'), '.', decimal_pos=2) = '{result2}' (expected: '0.00')")
++
++# Test edge cases with different decimal_pos values
++print("\n2. Different decimal_pos values:")
++for decimal_pos in [0, 1, 2, 3, 4, 5]:
++    result = nformat(Decimal('1e-200'), '.', decimal_pos=decimal_pos)
++    print(f"decimal_pos={decimal_pos}: '{result}'")
++
++# Test numbers that should still use scientific notation (very large numbers)
++print("\n3. Large numbers that should still use scientific notation:")
++large_numbers = [Decimal('1e200'), Decimal('1e201')]
++for num in large_numbers:
++    result = nformat(num, '.', decimal_pos=2)
++    print(f"nformat({num}, '.', decimal_pos=2) = '{result}'")
++
++# Test numbers that are just above the threshold
++print("\n4. Numbers just above the threshold:")
++threshold_numbers = [Decimal('1e-5'), Decimal('1e-6')]
++for num in threshold_numbers:
++    result = nformat(num, '.', decimal_pos=2)
++    print(f"nformat({num}, '.', decimal_pos=2) = '{result}'")
++
++# Test without decimal_pos (should use scientific notation for very small numbers)
++print("\n5. Without decimal_pos (should use scientific notation):")
++result = nformat(Decimal('1e-200'), '.')
++print(f"nformat(Decimal('1e-200'), '.') = '{result}'")
++
++# Test normal numbers
++print("\n6. Normal numbers:")
++normal_numbers = [Decimal('123.456'), Decimal('0.001'), Decimal('0.0001')]
++for num in normal_numbers:
++    result = nformat(num, '.', decimal_pos=2)
++    print(f"nformat({num}, '.', decimal_pos=2) = '{result}'")
++
++# Test negative numbers
++print("\n7. Negative numbers:")
++negative_numbers = [Decimal('-1e-200'), Decimal('-0.001')]
++for num in negative_numbers:
++    result = nformat(num, '.', decimal_pos=2)
++    print(f"nformat({num}, '.', decimal_pos=2) = '{result}'")
+\ No newline at end of file
+diff --git a/debug_issue.py b/debug_issue.py
+new file mode 100644
+index 0000000000..d419a528b9
+--- /dev/null
++++ b/debug_issue.py
+@@ -0,0 +1,35 @@
++import os
++import django
++from django.conf import settings
++from django.utils.numberformat import format as nformat
++from decimal import Decimal
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        USE_L10N=False,
++        USE_THOUSAND_SEPARATOR=False,
++    )
++
++# Debug the issue
++print("Debugging the number format issue:")
++number = Decimal('1e-200')
++print(f"Number: {number}")
++
++# Check what as_tuple() returns
++_, digits, exponent = number.as_tuple()
++print(f"Digits: {digits}, Exponent: {exponent}")
++print(f"abs(exponent) + len(digits) = {abs(exponent) + len(digits)}")
++
++# Check what happens with different decimal_pos values
++print(f"\nTesting different decimal_pos values:")
++for decimal_pos in [2, 3, 4, 5]:
++    result = nformat(number, '.', decimal_pos=decimal_pos)
++    print(f"decimal_pos={decimal_pos}: {result}")
++
++# Test boundary cases
++print(f"\nTesting boundary cases:")
++test_numbers = [Decimal('1e-199'), Decimal('1e-200'), Decimal('1e-201'), Decimal('1e-5')]
++for num in test_numbers:
++    result = nformat(num, '.', decimal_pos=2)
++    print(f"nformat({num}, '.', decimal_pos=2) = '{result}'")
+\ No newline at end of file
+diff --git a/django/utils/numberformat.py b/django/utils/numberformat.py
+index 88b35fc435..a44168bab1 100644
+--- a/django/utils/numberformat.py
++++ b/django/utils/numberformat.py
+@@ -26,26 +26,43 @@ def format(number, decimal_sep, decimal_pos=None, grouping=0, thousand_sep='',
+         return mark_safe(number)
+     # sign
+     sign = ''
++    # Handle sign for negative numbers, but only if they don't round to zero
++    if isinstance(number, Decimal) and number < Decimal('0'):
++        # Check if the number will round to zero when decimal_pos is specified
++        if decimal_pos is not None and abs(number) < Decimal('1e-{}'.format(decimal_pos)):
++            # Number rounds to zero, so don't set negative sign
++            number = abs(number)
++        else:
++            sign = '-'
++            number = abs(number)
++    
+     if isinstance(number, Decimal):
+         # Format values with more than 200 digits (an arbitrary cutoff) using
+         # scientific notation to avoid high memory usage in {:f}'.format().
+         _, digits, exponent = number.as_tuple()
+         if abs(exponent) + len(digits) > 200:
+-            number = '{:e}'.format(number)
+-            coefficient, exponent = number.split('e')
+-            # Format the coefficient.
+-            coefficient = format(
+-                coefficient, decimal_sep, decimal_pos, grouping,
+-                thousand_sep, force_grouping, use_l10n,
+-            )
+-            return '{}e{}'.format(coefficient, exponent)
++            # If decimal_pos is specified and the number is smaller than what
++            # can be represented with that many decimal places, return zeros
++            if decimal_pos is not None and number < Decimal('1e-{}'.format(decimal_pos)):
++                # The number is smaller than 10^-decimal_pos, so it rounds to zero
++                str_number = '0'
++                if decimal_pos > 0:
++                    str_number += '.'
++                    str_number += '0' * decimal_pos
++            else:
++                # Use scientific notation for very large numbers
++                number = '{:e}'.format(number)
++                coefficient, exponent = number.split('e')
++                # Format the coefficient.
++                coefficient = format(
++                    coefficient, decimal_sep, decimal_pos, grouping,
++                    thousand_sep, force_grouping, use_l10n,
++                )
++                return '{}e{}'.format(coefficient, exponent)
+         else:
+             str_number = '{:f}'.format(number)
+     else:
+         str_number = str(number)
+-    if str_number[0] == '-':
+-        sign = '-'
+-        str_number = str_number[1:]
+     # decimal part
+     if '.' in str_number:
+         int_part, dec_part = str_number.split('.')
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..cc78e27341
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,23 @@
++import os
++import django
++from django.conf import settings
++from django.utils.numberformat import format as nformat
++from decimal import Decimal
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        USE_L10N=False,
++        USE_THOUSAND_SEPARATOR=False,
++    )
++
++# Test cases from the GitHub issue
++print("Testing issue reproduction:")
++result1 = nformat(Decimal('1e-199'), '.', decimal_pos=2)
++print(f"nformat(Decimal('1e-199'), '.', decimal_pos=2) = '{result1}'")
++
++result2 = nformat(Decimal('1e-200'), '.', decimal_pos=2)
++print(f"nformat(Decimal('1e-200'), '.', decimal_pos=2) = '{result2}'")
++
++# Expected behavior: both should return '0.00'
++print("\nExpected behavior: both should return '0.00'")
+\ No newline at end of file
+diff --git a/run_key_tests.py b/run_key_tests.py
+new file mode 100644
+index 0000000000..3128ae8c05
+--- /dev/null
++++ b/run_key_tests.py
+@@ -0,0 +1,52 @@
++import os
++import django
++from django.conf import settings
++from django.utils.numberformat import format as nformat
++from decimal import Decimal
++
++# Configure Django settings for testing
++if not settings.configured:
++    settings.configure(
++        SECRET_KEY='test-secret-key',
++        DEBUG=True,
++        USE_L10N=False,
++        USE_THOUSAND_SEPARATOR=False,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        }
++    )
++
++print("Running key numberformat tests...")
++
++# Test cases from the existing test suite that are relevant to our changes
++test_cases = [
++    # From test_decimal_numbers
++    (Decimal('9e-19'), '.', 2, '0.00'),
++    (Decimal('.00000000000099'), '.', 0, '0'),
++    (Decimal('1e-7'), '.', 8, '0.00000010'),
++    (Decimal('1e-8'), '.', 8, '0.00000001'),
++    (Decimal('1e-9'), '.', 8, '0.00000000'),
++    (Decimal('1e-10'), '.', 8, '0.00000000'),
++    (Decimal('1e-11'), '.', 8, '0.00000000'),
++    
++    # Our new test cases
++    (Decimal('1e-199'), '.', 2, '0.00'),
++    (Decimal('1e-200'), '.', 2, '0.00'),
++    (Decimal('-1e-200'), '.', 2, '0.00'),
++    (Decimal('1e-201'), '.', 2, '0.00'),
++    
++    # Test that large numbers still use scientific notation
++    (Decimal('9e200'), '.', None, '9e+200'),
++    (Decimal('9e201'), '.', None, '9e+201'),
++    (Decimal('9e200'), '.', 3, '9.000e+200'),
++]
++
++for i, (number, decimal_sep, decimal_pos, expected) in enumerate(test_cases):
++    result = nformat(number, decimal_sep, decimal_pos)
++    status = "PASS" if result == expected else "FAIL"
++    print(f"Test {i+1}: {status} - nformat({number}, '{decimal_sep}', {decimal_pos}) = '{result}' (expected: '{expected}')")
++
++print("\nAll key tests completed!")
+\ No newline at end of file
+diff --git a/run_numberformat_tests.py b/run_numberformat_tests.py
+new file mode 100644
+index 0000000000..f31c7be8cb
+--- /dev/null
++++ b/run_numberformat_tests.py
+@@ -0,0 +1,44 @@
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings for testing
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_L10N=False,
++        USE_THOUSAND_SEPARATOR=False,
++    )
++
++# Import the format function
++from django.utils.numberformat import format
++from decimal import Decimal
++
++# Run the tests manually
++print("Running numberformat tests...")
++
++# Test the format function
++test_cases = [
++    # Basic tests
++    (123, '.', None, 0, '', False, None, '123'),
++    (123.456, '.', 2, 0, '', False, None, '123.45'),
++    (123.456, ',', 2, 0, '', False, None, '123,45'),
++    
++    # Test the original issue cases
++    (Decimal('1e-199'), '.', 2, 0, '', False, None, '0.00'),
++    (Decimal('1e-200'), '.', 2, 0, '', False, None, '0.00'),
++    
++    # Test negative numbers
++    (Decimal('-1e-200'), '.', 2, 0, '', False, None, '0.00'),
++    (Decimal('-0.001'), '.', 2, 0, '', False, None, '0.00'),
++    
++    # Test without decimal_pos
++    (Decimal('1e-200'), '.', None, 0, '', False, None, '1e-200'),
++]
++
++for i, (number, decimal_sep, decimal_pos, grouping, thousand_sep, force_grouping, use_l10n, expected) in enumerate(test_cases):
++    result = format(number, decimal_sep, decimal_pos, grouping, thousand_sep, force_grouping, use_l10n)
++    status = "PASS" if result == expected else "FAIL"
++    print(f"Test {i+1}: {status} - Expected: '{expected}', Got: '{result}'")
++
++print("\nAll tests completed!")
+\ No newline at end of file
+diff --git a/test_decimal_pos_zero.py b/test_decimal_pos_zero.py
+new file mode 100644
+index 0000000000..528eb81e42
+--- /dev/null
++++ b/test_decimal_pos_zero.py
+@@ -0,0 +1,24 @@
++import os
++import django
++from django.conf import settings
++from django.utils.numberformat import format as nformat
++from decimal import Decimal
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        USE_L10N=False,
++        USE_THOUSAND_SEPARATOR=False,
++    )
++
++print("Testing decimal_pos=0 specifically:")
++result = nformat(Decimal('1e-200'), '.', decimal_pos=0)
++print(f"nformat(Decimal('1e-200'), '.', decimal_pos=0) = '{result}'")
++
++# Also test with a normal number
++result2 = nformat(Decimal('0.001'), '.', decimal_pos=0)
++print(f"nformat(Decimal('0.001'), '.', decimal_pos=0) = '{result2}'")
++
++# Test negative number
++result3 = nformat(Decimal('-1e-200'), '.', decimal_pos=0)
++print(f"nformat(Decimal('-1e-200'), '.', decimal_pos=0) = '{result3}'")
+\ No newline at end of file
+diff --git a/test_settings.py b/test_settings.py
+new file mode 100644
+index 0000000000..1429f1a926
+--- /dev/null
++++ b/test_settings.py
+@@ -0,0 +1,4 @@
++SECRET_KEY = 'test-secret-key'
++DEBUG = True
++USE_L10N = False
++USE_THOUSAND_SEPARATOR = False
+\ No newline at end of file

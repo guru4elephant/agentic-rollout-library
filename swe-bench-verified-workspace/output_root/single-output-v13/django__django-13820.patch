@@ -1,0 +1,229 @@
+diff --git a/proper_test.py b/proper_test.py
+new file mode 100644
+index 0000000000..f02f274f5a
+--- /dev/null
++++ b/proper_test.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++"""
++Proper test to demonstrate the issue and fix for migration loader.
++"""
++
++# Test case 1: Regular package without __file__ (should be ACCEPTED)
++class RegularPackageNoFile:
++    __name__ = 'regular.package'
++    __path__ = ['/regular/path']  # Regular list
++    
++    def __init__(self):
++        # No __file__ - simulating frozen environment
++        pass
++
++# Test case 2: Namespace package (should be REJECTED)
++class NamespacePackage:
++    __name__ = 'namespace.package'
++    
++    def __init__(self):
++        # Namespace packages have special __path__ (not a regular list)
++        # and no __file__
++        from importlib._bootstrap_external import _NamespacePath
++        self.__path__ = _NamespacePath('namespace.package', ['/ns/path1', '/ns/path2'])
++
++# Test case 3: Regular package with __file__ (should be ACCEPTED)
++class RegularPackageWithFile:
++    __name__ = 'regular.withfile'
++    __path__ = ['/regular/path']
++    __file__ = '/regular/path/__init__.py'
++
++def test_check(module, description):
++    print(f"\n=== {description} ===")
++    print(f"Has __file__: {hasattr(module, '__file__')}")
++    print(f"Has __path__: {hasattr(module, '__path__')}")
++    if hasattr(module, '__path__'):
++        print(f"__path__ type: {type(module.__path__)}")
++        print(f"__path__ is list: {isinstance(module.__path__, list)}")
++    
++    # Current Django check
++    current_result = getattr(module, '__file__', None) is None
++    print(f"Current check result: {current_result} (would {'REJECT' if current_result else 'ACCEPT'})")
++    
++    # Proposed check
++    proposed_result = (getattr(module, '__file__', None) is None and 
++                      not isinstance(getattr(module, '__path__', None), list))
++    print(f"Proposed check result: {proposed_result} (would {'REJECT' if proposed_result else 'ACCEPT'})")
++    
++    return current_result, proposed_result
++
++# Test all cases
++test1_current, test1_proposed = test_check(RegularPackageNoFile(), "Regular package without __file__ (frozen env)")
++test2_current, test2_proposed = test_check(NamespacePackage(), "Namespace package")
++test3_current, test3_proposed = test_check(RegularPackageWithFile(), "Regular package with __file__")
++
++print("\n=== SUMMARY ===")
++print("Regular package without __file__ (frozen env):")
++print(f"  Current: {'REJECTED' if test1_current else 'ACCEPTED'} - ISSUE: Should be ACCEPTED")
++print(f"  Proposed: {'REJECTED' if test1_proposed else 'ACCEPTED'} - CORRECT")
++
++print("\nNamespace package:")
++print(f"  Current: {'REJECTED' if test2_current else 'ACCEPTED'} - CORRECT")
++print(f"  Proposed: {'REJECTED' if test2_proposed else 'ACCEPTED'} - CORRECT")
++
++print("\nRegular package with __file__:")
++print(f"  Current: {'REJECTED' if test3_current else 'ACCEPTED'} - CORRECT")
++print(f"  Proposed: {'REJECTED' if test3_proposed else 'ACCEPTED'} - CORRECT")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..be633dcee4
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with migration loader rejecting non-namespace packages
++that don't have __file__ attribute set.
++"""
++
++import sys
++import os
++from importlib import import_module
++from django.conf import settings
++from django.apps import apps
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++    )
++
++# Initialize Django
++import django
++django.setup()
++
++from django.db.migrations.loader import MigrationLoader
++
++def test_migration_loader():
++    """Test the migration loader behavior with modules without __file__"""
++    
++    # Create a simple module without __file__ to simulate frozen environment
++    class FakeModule:
++        """A module-like object without __file__ attribute"""
++        __name__ = 'test_app.migrations'
++        __path__ = ['/fake/path']  # Regular list, not a namespace path
++        
++        def __init__(self):
++            # Intentionally don't set __file__
++            pass
++    
++    # Create a fake app config
++    class FakeAppConfig:
++        label = 'test_app'
++        name = 'test_app'
++    
++    # Mock apps.get_app_config to return our fake app
++    original_get_app_config = apps.get_app_config
++    def mock_get_app_config(app_label):
++        if app_label == 'test_app':
++            return FakeAppConfig()
++        return original_get_app_config(app_label)
++    
++    apps.get_app_config = mock_get_app_config
++    
++    # Mock apps.get_app_configs to return our fake app
++    original_get_app_configs = apps.get_app_configs
++    apps.get_app_configs = lambda: [FakeAppConfig()]
++    
++    # Mock import_module to return our fake module
++    import builtins
++    original_import_module = builtins.__import__
++    def mock_import_module(name, *args, **kwargs):
++        if name == 'test_app.migrations':
++            return FakeModule()
++        return original_import_module(name, *args, **kwargs)
++    
++    builtins.__import__ = mock_import_module
++    
++    # Create MigrationLoader instance
++    from django.db import connections
++    connection = connections['default']
++    
++    loader = MigrationLoader(connection, load=False)
++    
++    try:
++        loader.load_disk()
++        print("SUCCESS: Migration loader accepted module without __file__ but with regular __path__")
++        print(f"Migrated apps: {loader.migrated_apps}")
++        print(f"Unmigrated apps: {loader.unmigrated_apps}")
++    except Exception as e:
++        print(f"ERROR: {e}")
++    
++    # Restore original functions
++    apps.get_app_config = original_get_app_config
++    apps.get_app_configs = original_get_app_configs
++    builtins.__import__ = original_import_module
++
++if __name__ == '__main__':
++    test_migration_loader()
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..32e2f0d3dc
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++"""
++Simple script to reproduce the issue with migration loader rejecting modules
++that don't have __file__ attribute but are not namespace packages.
++"""
++
++# Create a module-like object without __file__ but with regular __path__
++class TestModule:
++    __name__ = 'test.migrations'
++    __path__ = ['/fake/path']  # Regular list, not a namespace path
++    
++    def __init__(self):
++        # Intentionally don't set __file__ to simulate frozen environment
++        pass
++
++# Test the current check logic
++module = TestModule()
++
++print("Testing current Django migration loader logic:")
++print(f"Module has __file__: {hasattr(module, '__file__')}")
++print(f"Module has __path__: {hasattr(module, '__path__')}")
++print(f"Module __path__ type: {type(getattr(module, '__path__', None))}")
++
++# Current Django check (line 93 in loader.py)
++current_check = getattr(module, '__file__', None) is None
++print(f"Current check (getattr(module, '__file__', None) is None): {current_check}")
++
++# Proposed improved check
++proposed_check = (getattr(module, '__file__', None) is None and 
++                 isinstance(getattr(module, '__path__', None), list))
++print(f"Proposed check (getattr(module, '__file__', None) is None and isinstance(getattr(module, '__path__', None), list)): {proposed_check}")
++
++print("\nInterpretation:")
++if current_check:
++    print("Current Django would REJECT this module (treat as namespace package)")
++else:
++    print("Current Django would ACCEPT this module")
++
++if proposed_check:
++    print("Proposed fix would REJECT this module (treat as namespace package)")
++else:
++    print("Proposed fix would ACCEPT this module (not a namespace package)")
++
++print("\nThe issue: Current Django incorrectly rejects non-namespace packages")
++print("that don't have __file__ (like frozen environments), but should only")
++print("reject actual namespace packages (which have non-list __path__).")
+\ No newline at end of file

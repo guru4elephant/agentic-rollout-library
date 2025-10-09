@@ -1,0 +1,312 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..8722d1412
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with Literal annotations in nitpick mode.
++"""
++import tempfile
++import os
++import shutil
++from pathlib import Path
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++def test_literal_nitpick_issue():
++    # Create a temporary directory for our test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = Path(tmpdir) / "source"
++        outdir = Path(tmpdir) / "build"
++        doctreedir = Path(tmpdir) / "doctrees"
++        
++        # Create source directory
++        srcdir.mkdir()
++        
++        # Create conf.py
++        conf_content = '''
++extensions = ['sphinx.ext.autodoc']
++nitpicky = True
++'''
++        (srcdir / "conf.py").write_text(conf_content)
++        
++        # Create index.rst
++        index_content = '''
++Test Documentation
++==================
++
++.. autofunction:: test_module.foo
++'''
++        (srcdir / "index.rst").write_text(index_content)
++        
++        # Create test_module.py
++        module_content = '''
++import typing
++
++@typing.overload
++def foo(x: "typing.Literal[True]") -> int: ...
++@typing.overload
++def foo(x: "typing.Literal[False]") -> str: ...
++def foo(x: bool):
++    """a func"""
++    return 1 if x else "foo"
++'''
++        (srcdir / "test_module.py").write_text(module_content)
++        
++        # Add the source directory to Python path
++        import sys
++        sys.path.insert(0, str(srcdir))
++        
++        # Build with Sphinx
++        with docutils_namespace():
++            app = Sphinx(
++                srcdir=str(srcdir),
++                confdir=str(srcdir),
++                outdir=str(outdir),
++                doctreedir=str(doctreedir),
++                buildername='html',
++                warningiserror=False,
++                verbosity=2
++            )
++            app.build()
++            
++        # Check if warnings were generated
++        print("Build completed. Checking for nitpick warnings...")
++        
++        # Check the output for warnings about Literal values
++        warnings_file = outdir / ".buildinfo"
++        if warnings_file.exists():
++            print(f"Build info exists at: {warnings_file}")
++
++if __name__ == "__main__":
++    test_literal_nitpick_issue()
+\ No newline at end of file
+diff --git a/setup.py b/setup.py
+index 4a1d5aeed..3faa58e79 100644
+--- a/setup.py
++++ b/setup.py
+@@ -15,22 +15,22 @@ if sys.version_info < (3, 6):
+     sys.exit(1)
+ 
+ install_requires = [
+-    'sphinxcontrib-applehelp',
+-    'sphinxcontrib-devhelp',
++    'sphinxcontrib-applehelp<=1.0.7',
++    'sphinxcontrib-devhelp<=1.0.5',
+     'sphinxcontrib-jsmath',
+-    'sphinxcontrib-htmlhelp>=2.0.0',
+-    'sphinxcontrib-serializinghtml>=1.1.5',
+-    'sphinxcontrib-qthelp',
+-    'Jinja2>=2.3',
++    'sphinxcontrib-htmlhelp>=2.0.0,<=2.0.4',
++    'sphinxcontrib-serializinghtml>=1.1.5,<=1.1.9',
++    'sphinxcontrib-qthelp<=1.0.6',
++    'Jinja2<3.0',
+     'Pygments>=2.0',
+     'docutils>=0.14,<0.18',
+     'snowballstemmer>=1.1',
+     'babel>=1.3',
+-    'alabaster>=0.7,<0.8',
++    'alabaster>=0.7,<0.7.12',
+     'imagesize',
+     'requests>=2.5.0',
+     'setuptools',
+-    'packaging',
++    'packaging', 'markupsafe<=2.0.1',
+ ]
+ 
+ extras_require = {
+diff --git a/sphinx/domains/python.py b/sphinx/domains/python.py
+index 9875a9f4b..4cca38067 100644
+--- a/sphinx/domains/python.py
++++ b/sphinx/domains/python.py
+@@ -109,13 +109,13 @@ def type_to_xref(text: str, env: BuildEnvironment = None) -> addnodes.pending_xr
+ 
+ def _parse_annotation(annotation: str, env: BuildEnvironment = None) -> List[Node]:
+     """Parse type annotation."""
+-    def unparse(node: ast.AST) -> List[Node]:
++    def unparse(node: ast.AST, in_literal: bool = False) -> List[Node]:
+         if isinstance(node, ast.Attribute):
+-            return [nodes.Text("%s.%s" % (unparse(node.value)[0], node.attr))]
++            return [nodes.Text("%s.%s" % (unparse(node.value, in_literal)[0], node.attr))]
+         elif isinstance(node, ast.BinOp):
+-            result: List[Node] = unparse(node.left)
+-            result.extend(unparse(node.op))
+-            result.extend(unparse(node.right))
++            result: List[Node] = unparse(node.left, in_literal)
++            result.extend(unparse(node.op, in_literal))
++            result.extend(unparse(node.right, in_literal))
+             return result
+         elif isinstance(node, ast.BitOr):
+             return [nodes.Text(' '), addnodes.desc_sig_punctuation('', '|'), nodes.Text(' ')]
+@@ -123,11 +123,16 @@ def _parse_annotation(annotation: str, env: BuildEnvironment = None) -> List[Nod
+             if node.value is Ellipsis:
+                 return [addnodes.desc_sig_punctuation('', "...")]
+             else:
+-                return [nodes.Text(node.value)]
++                # If we're inside a Literal annotation, keep literal values as text
++                # to avoid nitpick warnings for non-class references
++                if in_literal:
++                    return [nodes.literal('', repr(node.value))]
++                else:
++                    return [nodes.Text(node.value)]
+         elif isinstance(node, ast.Expr):
+-            return unparse(node.value)
++            return unparse(node.value, in_literal)
+         elif isinstance(node, ast.Index):
+-            return unparse(node.value)
++            return unparse(node.value, in_literal)
+         elif isinstance(node, ast.List):
+             result = [addnodes.desc_sig_punctuation('', '[')]
+             if node.elts:
+@@ -135,26 +140,33 @@ def _parse_annotation(annotation: str, env: BuildEnvironment = None) -> List[Nod
+                 # last element of result if the for-loop was run at least
+                 # once
+                 for elem in node.elts:
+-                    result.extend(unparse(elem))
++                    result.extend(unparse(elem, in_literal))
+                     result.append(addnodes.desc_sig_punctuation('', ', '))
+                 result.pop()
+             result.append(addnodes.desc_sig_punctuation('', ']'))
+             return result
+         elif isinstance(node, ast.Module):
+-            return sum((unparse(e) for e in node.body), [])
++            return sum((unparse(e, in_literal) for e in node.body), [])
+         elif isinstance(node, ast.Name):
++            # Check if this is a Literal annotation
++            if node.id == 'Literal':
++                in_literal = True
+             return [nodes.Text(node.id)]
+         elif isinstance(node, ast.Subscript):
+-            result = unparse(node.value)
++            result = unparse(node.value, in_literal)
+             result.append(addnodes.desc_sig_punctuation('', '['))
+-            result.extend(unparse(node.slice))
++            # Parse the slice within the context of the subscript
++            if isinstance(node.value, ast.Name) and node.value.id == 'Literal':
++                result.extend(unparse(node.slice, True))
++            else:
++                result.extend(unparse(node.slice, in_literal))
+             result.append(addnodes.desc_sig_punctuation('', ']'))
+             return result
+         elif isinstance(node, ast.Tuple):
+             if node.elts:
+                 result = []
+                 for elem in node.elts:
+-                    result.extend(unparse(elem))
++                    result.extend(unparse(elem, in_literal))
+                     result.append(addnodes.desc_sig_punctuation('', ', '))
+                 result.pop()
+             else:
+@@ -167,7 +179,11 @@ def _parse_annotation(annotation: str, env: BuildEnvironment = None) -> List[Nod
+                 if isinstance(node, ast.Ellipsis):
+                     return [addnodes.desc_sig_punctuation('', "...")]
+                 elif isinstance(node, ast.NameConstant):
+-                    return [nodes.Text(node.value)]
++                    # If we're inside a Literal annotation, keep literal values as text
++                    if in_literal:
++                        return [nodes.literal('', repr(node.value))]
++                    else:
++                        return [nodes.Text(node.value)]
+ 
+             raise SyntaxError  # unsupported syntax
+ 
+@@ -178,6 +194,8 @@ def _parse_annotation(annotation: str, env: BuildEnvironment = None) -> List[Nod
+     try:
+         tree = ast_parse(annotation)
+         result = unparse(tree)
++        
++        # Convert text nodes to cross-references, but skip literal nodes
+         for i, node in enumerate(result):
+             if isinstance(node, nodes.Text) and node.strip():
+                 result[i] = type_to_xref(str(node), env)
+diff --git a/test_ast.py b/test_ast.py
+new file mode 100644
+index 000000000..c90e40e37
+--- /dev/null
++++ b/test_ast.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++import ast
++from sphinx.pycode.ast import parse
++
++def test_literal_ast():
++    annotation = "Literal[True]"
++    tree = parse(annotation)
++    print("AST tree:")
++    print(ast.dump(tree, indent=2))
++    
++    # Test the unparse function logic
++    def unparse(node):
++        if isinstance(node, ast.Attribute):
++            return [f"{unparse(node.value)[0]}.{node.attr}"]
++        elif isinstance(node, ast.BinOp):
++            result = unparse(node.left)
++            result.extend(unparse(node.op))
++            result.extend(unparse(node.right))
++            return result
++        elif isinstance(node, ast.BitOr):
++            return [' | ']
++        elif isinstance(node, ast.Constant):
++            if node.value is Ellipsis:
++                return ["..."]
++            else:
++                return [str(node.value)]
++        elif isinstance(node, ast.Expr):
++            return unparse(node.value)
++        elif isinstance(node, ast.Index):
++            return unparse(node.value)
++        elif isinstance(node, ast.List):
++            result = ['[']
++            if node.elts:
++                for elem in node.elts:
++                    result.extend(unparse(elem))
++                    result.append(', ')
++                result.pop()
++            result.append(']')
++            return result
++        elif isinstance(node, ast.Module):
++            return sum((unparse(e) for e in node.body), [])
++        elif isinstance(node, ast.Name):
++            return [node.id]
++        elif isinstance(node, ast.Subscript):
++            result = unparse(node.value)
++            result.append('[')
++            result.extend(unparse(node.slice))
++            result.append(']')
++            return result
++        elif isinstance(node, ast.Tuple):
++            if node.elts:
++                result = []
++                for elem in node.elts:
++                    result.extend(unparse(elem))
++                    result.append(', ')
++                result.pop()
++            else:
++                result = ['(', ')']
++            return result
++        else:
++            raise SyntaxError(f"Unsupported node type: {type(node)}")
++    
++    result = unparse(tree)
++    print("Unparse result:")
++    print(result)
++
++if __name__ == "__main__":
++    test_literal_ast()
+\ No newline at end of file
+diff --git a/tox.ini b/tox.ini
+index b6a67fd85..483f2df92 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -28,7 +28,7 @@ setenv =
+     PYTHONWARNINGS = all,ignore::ImportWarning:importlib._bootstrap_external,ignore::DeprecationWarning:site,ignore::DeprecationWarning:distutils,ignore::DeprecationWarning:pip._vendor.packaging.version
+     PYTEST_ADDOPTS = {env:PYTEST_ADDOPTS:} --color yes
+ commands=
+-    python -X dev -m pytest --durations 25 {posargs}
++    python -X dev -m pytest -rA --durations 25 {posargs}
+ 
+ [testenv:flake8]
+ basepython = python3

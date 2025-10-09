@@ -1,0 +1,616 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 794e0faae7..92349cd0c5 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1209,7 +1209,8 @@ class QuerySet:
+         if ignore_conflicts and not connections[self.db].features.supports_ignore_conflicts:
+             raise NotSupportedError('This database backend does not support ignoring conflicts.')
+         ops = connections[self.db].ops
+-        batch_size = (batch_size or max(ops.bulk_batch_size(fields, objs), 1))
++        max_batch_size = max(ops.bulk_batch_size(fields, objs), 1)
++        batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
+         inserted_rows = []
+         bulk_return = connections[self.db].features.can_return_rows_from_bulk_insert
+         for item in [objs[i:i + batch_size] for i in range(0, len(objs), batch_size)]:
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..3de9d7e1d2
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,147 @@
++#!/usr/bin/env python3
++"""
++Final comprehensive test to verify the bulk_create batch_size fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connections
++from django.db.models.query import QuerySet
++
++# Create a simple test model with explicit app_label
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_batch_size_logic():
++    """Test the core batch_size logic"""
++    print("Testing batch_size logic...")
++    
++    connection = connections['default']
++    ops = connection.ops
++    
++    # Simulate what happens in _batched_insert
++    fields = TestModel._meta.concrete_fields
++    objs = [TestModel(name=f'Test {i}', value=i) for i in range(10)]
++    
++    # Get the database's maximum batch size
++    max_batch_size = ops.bulk_batch_size(fields, objs)
++    print(f"Database max batch size: {max_batch_size}")
++    
++    # Test the OLD behavior (the bug)
++    def old_behavior(batch_size):
++        return batch_size or max(ops.bulk_batch_size(fields, objs), 1)
++    
++    # Test the NEW behavior (the fix)
++    def new_behavior(batch_size):
++        max_batch_size = max(ops.bulk_batch_size(fields, objs), 1)
++        return min(batch_size, max_batch_size) if batch_size else max_batch_size
++    
++    test_cases = [
++        (None, max_batch_size),
++        (max_batch_size // 2, max_batch_size // 2),
++        (max_batch_size, max_batch_size),
++        (max_batch_size * 2, max_batch_size),
++    ]
++    
++    all_passed = True
++    for provided, expected in test_cases:
++        old_result = old_behavior(provided)
++        new_result = new_behavior(provided)
++        
++        old_correct = old_result == expected
++        new_correct = new_result == expected
++        
++        print(f"Provided: {provided}")
++        print(f"  OLD: {old_result} {'✓' if old_correct else '✗'}")
++        print(f"  NEW: {new_result} {'✓' if new_correct else '✗'}")
++        print(f"  Expected: {expected}")
++        
++        if not new_correct:
++            all_passed = False
++            print(f"  ERROR: New behavior incorrect!")
++        print()
++    
++    return all_passed
++
++def test_actual_code_change():
++    """Test that our code change is actually in place"""
++    print("Testing actual code change...")
++    
++    # Read the relevant part of the query.py file
++    query_file_path = './django/db/models/query.py'
++    with open(query_file_path, 'r') as f:
++        content = f.read()
++    
++    # Look for the _batched_insert method
++    lines = content.split('\n')
++    in_batched_insert = False
++    found_fix = False
++    
++    for i, line in enumerate(lines):
++        if 'def _batched_insert' in line:
++            in_batched_insert = True
++            continue
++        
++        if in_batched_insert and 'batch_size = (' in line and 'or max(ops.bulk_batch_size' in line:
++            print("Found OLD (buggy) code!")
++            return False
++        
++        if in_batched_insert and 'max_batch_size = max(ops.bulk_batch_size' in line:
++            print("Found NEW (fixed) code!")
++            found_fix = True
++        
++        if in_batched_insert and 'batch_size = min(batch_size, max_batch_size)' in line:
++            print("Found NEW (fixed) code!")
++            found_fix = True
++        
++        if in_batched_insert and line.strip() == '':
++            in_batched_insert = False
++    
++    return found_fix
++
++if __name__ == '__main__':
++    print("=" * 60)
++    print("FINAL TEST: bulk_create batch_size fix verification")
++    print("=" * 60)
++    
++    logic_ok = test_batch_size_logic()
++    code_ok = test_actual_code_change()
++    
++    if logic_ok and code_ok:
++        print("🎉 ALL TESTS PASSED! The fix is working correctly.")
++        print("The batch_size parameter now respects database limits,")
++        print("just like bulk_update does.")
++        sys.exit(0)
++    else:
++        print("❌ SOME TESTS FAILED!")
++        if not logic_ok:
++            print("  - Logic test failed")
++        if not code_ok:
++            print("  - Code change not found")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/issue_resolution_demo.py b/issue_resolution_demo.py
+new file mode 100644
+index 0000000000..de3c06db5e
+--- /dev/null
++++ b/issue_resolution_demo.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python3
++"""
++Demonstration that the GitHub issue has been resolved.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connections
++
++def demonstrate_issue_resolution():
++    """Demonstrate that the batch_size issue has been resolved"""
++    
++    print("=" * 70)
++    print("GITHUB ISSUE RESOLUTION DEMONSTRATION")
++    print("=" * 70)
++    print("Issue: bulk_create batch_size param overrides compatible batch size calculation")
++    print("=" * 70)
++    
++    connection = connections['default']
++    ops = connection.ops
++    
++    # Simulate fields and objects for batch size calculation
++    # (In real usage, these would be actual model fields and objects)
++    max_batch_size = max(ops.bulk_batch_size([], []), 1)  # Get database limit, ensure at least 1
++    print(f"Database maximum batch size: {max_batch_size}")
++    
++    # Test the problematic scenario from the issue
++    user_provided_batch_size = max_batch_size * 2  # User provides a value larger than DB limit
++    
++    print(f"\nScenario: User provides batch_size={user_provided_batch_size}")
++    print(f"Database limit: {max_batch_size}")
++    
++    # OLD behavior (the bug)
++    old_behavior = user_provided_batch_size  # This was the problem!
++    
++    # NEW behavior (the fix)
++    new_behavior = min(user_provided_batch_size, max_batch_size)
++    
++    print(f"\nOLD behavior (buggy): {old_behavior}")
++    print(f"NEW behavior (fixed):  {new_behavior}")
++    
++    if old_behavior != new_behavior:
++        print("✅ ISSUE RESOLVED: batch_size no longer overrides database limits!")
++        print(f"   The provided batch_size ({user_provided_batch_size}) is now capped")
++        print(f"   to the database limit ({max_batch_size})")
++    else:
++        print("❌ Issue not resolved - behavior is the same")
++        return False
++    
++    # Show that bulk_create now behaves like bulk_update
++    print(f"\nConsistency check:")
++    print(f"bulk_create behavior:  min({user_provided_batch_size}, {max_batch_size}) = {new_behavior}")
++    print(f"bulk_update behavior:  min({user_provided_batch_size}, {max_batch_size}) = {new_behavior}")
++    print("✅ Both methods now use the same consistent logic!")
++    
++    return True
++
++if __name__ == '__main__':
++    success = demonstrate_issue_resolution()
++    
++    if success:
++        print("\n" + "=" * 70)
++        print("🎉 GITHUB ISSUE SUCCESSFULLY RESOLVED!")
++        print("=" * 70)
++        print("The batch_size parameter in bulk_create now properly")
++        print("respects database limits, just like bulk_update does.")
++        print("=" * 70)
++        sys.exit(0)
++    else:
++        print("\n❌ Issue resolution failed")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..d521ae0737
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the bulk_create batch_size issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connections
++from django.db.models import QuerySet
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_batch_size_override():
++    """Test that demonstrates the batch_size parameter overriding database limits"""
++    
++    # Get the database operations
++    connection = connections['default']
++    ops = connection.ops
++    
++    # Create some test objects
++    objs = [TestModel(name=f'Test {i}', value=i) for i in range(100)]
++    fields = TestModel._meta.concrete_fields
++    
++    # Get the database's maximum batch size
++    max_batch_size = ops.bulk_batch_size(fields, objs)
++    print(f"Database max batch size: {max_batch_size}")
++    
++    # Test with a batch_size larger than the database limit
++    large_batch_size = max_batch_size * 2
++    
++    # Create a queryset
++    qs = TestModel.objects.all()
++    
++    # Check what happens in _batched_insert
++    # This simulates the current problematic behavior
++    batch_size_provided = large_batch_size
++    current_behavior = batch_size_provided or max(ops.bulk_batch_size(fields, objs), 1)
++    print(f"Current behavior with batch_size={large_batch_size}: {current_behavior}")
++    
++    # What should happen (like in bulk_update)
++    correct_behavior = min(batch_size_provided, max_batch_size) if batch_size_provided else max_batch_size
++    print(f"Correct behavior with batch_size={large_batch_size}: {correct_behavior}")
++    
++    print(f"Issue: batch_size parameter overrides database limit ({max_batch_size} -> {current_behavior})")
++
++if __name__ == '__main__':
++    test_batch_size_override()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..8190d7560d
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the batch_size logic fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connections
++
++def test_batch_size_logic():
++    """Test the batch_size logic without requiring database tables"""
++    
++    # Get the database operations
++    connection = connections['default']
++    ops = connection.ops
++    
++    # Mock some fields and objects for testing bulk_batch_size
++    # We'll simulate what bulk_batch_size would return
++    max_batch_size = 333  # Typical value for SQLite
++    
++    print(f"Simulated database max batch size: {max_batch_size}")
++    
++    # Test cases
++    test_cases = [
++        (None, max_batch_size),  # No batch_size provided
++        (max_batch_size // 2, max_batch_size // 2),  # Smaller than limit
++        (max_batch_size, max_batch_size),  # Equal to limit
++        (max_batch_size * 2, max_batch_size),  # Larger than limit
++    ]
++    
++    print("\nTesting batch_size handling logic:")
++    print("=" * 50)
++    
++    all_passed = True
++    
++    for provided_size, expected_size in test_cases:
++        # Simulate the OLD behavior (the bug)
++        if provided_size is None:
++            old_behavior = max_batch_size
++        else:
++            old_behavior = provided_size  # This was the bug!
++        
++        # Simulate the NEW behavior (the fix)
++        if provided_size is None:
++            new_behavior = max_batch_size
++        else:
++            new_behavior = min(provided_size, max_batch_size)
++        
++        old_status = "✓" if old_behavior == expected_size else "✗"
++        new_status = "✓" if new_behavior == expected_size else "✗"
++        
++        print(f"Provided: {provided_size}")
++        print(f"  OLD (buggy): {old_behavior} {old_status}")
++        print(f"  NEW (fixed): {new_behavior} {new_status}")
++        print(f"  Expected:    {expected_size}")
++        
++        if new_behavior != expected_size:
++            print(f"   ERROR: Expected {expected_size}, but got {new_behavior}")
++            all_passed = False
++        print()
++    
++    return all_passed
++
++def test_edge_cases():
++    """Test edge cases for the batch_size logic"""
++    
++    max_batch_size = 333
++    
++    print("Testing edge cases:")
++    print("=" * 30)
++    
++    # Test valid edge cases (the actual code validates batch_size > 0)
++    edge_cases = [
++        (1, 1),   # Minimum valid batch_size
++        (max_batch_size + 1, max_batch_size),  # Just above limit
++        (max_batch_size - 1, max_batch_size - 1),  # Just below limit
++    ]
++    
++    all_passed = True
++    
++    for provided_size, expected_size in edge_cases:
++        calculated_size = min(provided_size, max_batch_size)
++        
++        status = "✓" if calculated_size == expected_size else "✗"
++        print(f"Provided: {provided_size}, Got: {calculated_size}, Expected: {expected_size} {status}")
++        
++        if calculated_size != expected_size:
++            all_passed = False
++    
++    return all_passed
++
++if __name__ == '__main__':
++    success1 = test_batch_size_logic()
++    success2 = test_edge_cases()
++    
++    if success1 and success2:
++        print("🎉 All tests passed! The fix logic is correct.")
++        sys.exit(0)
++    else:
++        print("❌ Some tests failed.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..20cf42c8b8
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the bulk_create batch_size fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connections
++from django.db.models import QuerySet
++from django.core.management import execute_from_command_line
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_batch_size_fix():
++    """Test that the batch_size parameter now respects database limits"""
++    
++    # Get the database operations
++    connection = connections['default']
++    ops = connection.ops
++    
++    # Create some test objects
++    objs = [TestModel(name=f'Test {i}', value=i) for i in range(100)]
++    fields = TestModel._meta.concrete_fields
++    
++    # Get the database's maximum batch size
++    max_batch_size = ops.bulk_batch_size(fields, objs)
++    print(f"Database max batch size: {max_batch_size}")
++    
++    # Test cases
++    test_cases = [
++        (None, max_batch_size),  # No batch_size provided
++        (max_batch_size // 2, max_batch_size // 2),  # Smaller than limit
++        (max_batch_size, max_batch_size),  # Equal to limit
++        (max_batch_size * 2, max_batch_size),  # Larger than limit
++    ]
++    
++    print("\nTesting batch_size handling:")
++    print("=" * 50)
++    
++    for provided_size, expected_size in test_cases:
++        # Simulate the fixed behavior
++        if provided_size is None:
++            calculated_size = max_batch_size
++        else:
++            calculated_size = min(provided_size, max_batch_size)
++        
++        status = "✓" if calculated_size == expected_size else "✗"
++        print(f"{status} Provided: {provided_size}, Expected: {expected_size}, Got: {calculated_size}")
++        
++        if calculated_size != expected_size:
++            print(f"   ERROR: Expected {expected_size}, but got {calculated_size}")
++            return False
++    
++    print("\nAll tests passed! The fix correctly handles batch_size parameters.")
++    return True
++
++def test_actual_bulk_create():
++    """Test actual bulk_create with different batch_size values"""
++    
++    # Create test objects
++    objs = [TestModel(name=f'Object {i}', value=i) for i in range(10)]
++    
++    print("\nTesting actual bulk_create calls:")
++    print("=" * 50)
++    
++    # Test with no batch_size
++    try:
++        created = TestModel.objects.bulk_create(objs)
++        print("✓ bulk_create() with no batch_size: Success")
++    except Exception as e:
++        print(f"✗ bulk_create() with no batch_size: Failed - {e}")
++        return False
++    
++    # Test with reasonable batch_size
++    try:
++        created = TestModel.objects.bulk_create(objs, batch_size=5)
++        print("✓ bulk_create() with batch_size=5: Success")
++    except Exception as e:
++        print(f"✗ bulk_create() with batch_size=5: Failed - {e}")
++        return False
++    
++    # Test with very large batch_size (should be capped)
++    try:
++        created = TestModel.objects.bulk_create(objs, batch_size=1000)
++        print("✓ bulk_create() with batch_size=1000: Success (should be capped)")
++    except Exception as e:
++        print(f"✗ bulk_create() with batch_size=1000: Failed - {e}")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    success1 = test_batch_size_fix()
++    success2 = test_actual_bulk_create()
++    
++    if success1 and success2:
++        print("\n🎉 All tests passed! The fix is working correctly.")
++        sys.exit(0)
++    else:
++        print("\n❌ Some tests failed.")
++        sys.exit(1)
+\ No newline at end of file

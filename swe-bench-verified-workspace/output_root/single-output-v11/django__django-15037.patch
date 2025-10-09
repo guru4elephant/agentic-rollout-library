@@ -1,0 +1,149 @@
+diff --git a/django/core/management/commands/inspectdb.py b/django/core/management/commands/inspectdb.py
+index f9b4bfb477..d6bd5598e7 100644
+--- a/django/core/management/commands/inspectdb.py
++++ b/django/core/management/commands/inspectdb.py
+@@ -124,10 +124,19 @@ class Command(BaseCommand):
+                             "self" if relations[column_name][1] == table_name
+                             else table2model(relations[column_name][1])
+                         )
+-                        if rel_to in known_models:
+-                            field_type = '%s(%s' % (rel_type, rel_to)
++                        # Check if the foreign key references a specific column (not the primary key)
++                        referenced_column = relations[column_name][0]
++                        if referenced_column != 'id' and referenced_column is not None:
++                            # Add the referenced column as a parameter
++                            if rel_to in known_models:
++                                field_type = '%s(%s, %r' % (rel_type, rel_to, referenced_column)
++                            else:
++                                field_type = "%s('%s', %r" % (rel_type, rel_to, referenced_column)
+                         else:
+-                            field_type = "%s('%s'" % (rel_type, rel_to)
++                            if rel_to in known_models:
++                                field_type = '%s(%s' % (rel_type, rel_to)
++                            else:
++                                field_type = "%s('%s'" % (rel_type, rel_to)
+                     else:
+                         # Calling `get_field_type` to get the field type string and any
+                         # additional parameters and notes.
+diff --git a/django/db/backends/sqlite3/introspection.py b/django/db/backends/sqlite3/introspection.py
+index ce097dbd72..6ff2510db5 100644
+--- a/django/db/backends/sqlite3/introspection.py
++++ b/django/db/backends/sqlite3/introspection.py
+@@ -145,10 +145,14 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
+                 continue
+             table, column = [s.strip('"') for s in m.groups()]
+ 
+-            if field_desc.startswith("FOREIGN KEY"):
++            if "FOREIGN KEY" in field_desc:
+                 # Find name of the target FK field
+-                m = re.match(r'FOREIGN KEY\s*\(([^\)]*)\).*', field_desc, re.I)
+-                field_name = m[1].strip('"')
++                m = re.search(r'FOREIGN KEY\s*\(([^\)]*)\)', field_desc, re.I)
++                if m:
++                    field_name = m[1].strip('"')
++                else:
++                    # Fallback: use the first word as field name
++                    field_name = field_desc.split()[0].strip('"')
+             else:
+                 field_name = field_desc.split()[0].strip('"')
+ 
+diff --git a/test_postgresql_fk.py b/test_postgresql_fk.py
+new file mode 100644
+index 0000000000..ac172d3275
+--- /dev/null
++++ b/test_postgresql_fk.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python
++"""
++Test script to verify the foreign key fix using PostgreSQL introspection.
++"""
++
++import os
++import sys
++import tempfile
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Set up minimal Django configuration
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.postgresql',
++                'NAME': 'test_db',
++                'USER': 'postgres',
++                'PASSWORD': 'postgres',
++                'HOST': 'localhost',
++                'PORT': '5432',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++import django
++django.setup()
++
++from django.db import connections
++from django.db.backends.postgresql.introspection import DatabaseIntrospection
++
++def test_postgresql_introspection():
++    """Test PostgreSQL introspection to see if it returns the correct foreign key info"""
++    
++    try:
++        connection = connections['default']
++        with connection.cursor() as cursor:
++            introspection = DatabaseIntrospection(connection)
++            
++            # Create test tables
++            cursor.execute("""
++                CREATE TABLE IF NOT EXISTS foo (
++                    id serial primary key,
++                    other_id int UNIQUE
++                )
++            """)
++            
++            cursor.execute("""
++                CREATE TABLE IF NOT EXISTS bar (
++                    id serial primary key,
++                    other_id int,
++                    constraint myconst FOREIGN KEY(other_id) REFERENCES foo(other_id)
++                )
++            """)
++            
++            # Get relations for bar table
++            relations = introspection.get_relations(cursor, 'bar')
++            print("Relations for bar table:", relations)
++            
++            # Check if the relation includes the referenced column name
++            if 'other_id' in relations:
++                referenced_column, referenced_table = relations['other_id']
++                print(f"Foreign key 'other_id' references: {referenced_table}.{referenced_column}")
++                
++                if referenced_column == 'other_id':
++                    print("✅ PostgreSQL introspection correctly returns referenced column name")
++                    return True
++                else:
++                    print("❌ PostgreSQL introspection does not return correct referenced column name")
++                    return False
++            else:
++                print("❌ No foreign key relations found")
++                return False
++                
++    except Exception as e:
++        print(f"Error: {e}")
++        return False
++
++if __name__ == '__main__':
++    print("Testing PostgreSQL introspection for foreign key references...")
++    result = test_postgresql_introspection()
++    
++    if result:
++        print("\nPostgreSQL introspection works correctly!")
++    else:
++        print("\nPostgreSQL introspection has issues!")
+\ No newline at end of file

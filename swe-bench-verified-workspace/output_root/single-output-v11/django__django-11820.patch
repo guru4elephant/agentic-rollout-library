@@ -1,0 +1,178 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 3ce711f3f1..d83f6d67e9 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -1706,7 +1706,11 @@ class Model(metaclass=ModelBase):
+         for field in related_fields:
+             _cls = cls
+             fld = None
+-            for part in field.split(LOOKUP_SEP):
++            parts = field.split(LOOKUP_SEP)
++            for i, part in enumerate(parts):
++                # Skip pk check for the last part of related field lookup
++                if i == len(parts) - 1 and part == 'pk':
++                    continue
+                 try:
+                     fld = _cls._meta.get_field(part)
+                     if fld.is_relation:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..0f259ccdd0
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,50 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++import django
++from django.conf import settings
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core.checks import run_checks
++
++# Create a simple test model with ordering containing related field's pk
++class TestModel(models.Model):
++    related_field = models.ForeignKey('auth.User', on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ['related_field__pk']  # This should NOT raise E015 error
++
++# Run checks directly on the model class
++errors = TestModel.check()
++for error in errors:
++    if 'E015' in str(error):
++        print(f"ERROR: {error}")
++        print("Issue reproduced!")
++        sys.exit(1)
++
++print("No E015 error found - issue might be fixed or not reproduced")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..b757bad7ba
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++import django
++from django.conf import settings
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Test case 1: related_field__pk (should work)
++class TestModel1(models.Model):
++    related_field = models.ForeignKey('auth.User', on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app1'
++        ordering = ['related_field__pk']
++
++# Test case 2: related_field__id (should work)
++class TestModel2(models.Model):
++    related_field = models.ForeignKey('auth.User', on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app2'
++        ordering = ['related_field__id']
++
++# Test case 3: invalid related field (should still raise E015)
++class TestModel3(models.Model):
++    related_field = models.ForeignKey('auth.User', on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app3'
++        ordering = ['related_field__nonexistent']
++
++# Test case 4: multiple level related field with pk (should work)
++class Level2(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app4'
++
++class Level1(models.Model):
++    level2 = models.ForeignKey(Level2, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app4'
++
++class TestModel4(models.Model):
++    level1 = models.ForeignKey(Level1, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app4'
++        ordering = ['level1__level2__pk']
++
++# Run checks on all test models
++test_models = [TestModel1, TestModel2, TestModel3, TestModel4]
++
++for i, model in enumerate(test_models, 1):
++    errors = model.check()
++    e015_errors = [error for error in errors if 'E015' in str(error)]
++    
++    if i == 3:
++        # Test case 3 should have E015 error
++        if e015_errors:
++            print(f"✓ Test case {i}: E015 correctly raised for invalid field")
++        else:
++            print(f"✗ Test case {i}: E015 should be raised for invalid field")
++    else:
++        # Other test cases should not have E015 errors
++        if e015_errors:
++            print(f"✗ Test case {i}: E015 incorrectly raised: {e015_errors}")
++        else:
++            print(f"✓ Test case {i}: No E015 error (correct)")
++
++print("\nAll tests completed!")
+\ No newline at end of file

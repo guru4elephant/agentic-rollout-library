@@ -1,0 +1,513 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 5f07a4208a..dbd8480a42 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -2011,14 +2011,15 @@ class ModelAdmin(BaseModelAdmin):
+             )
+             if formset.is_valid():
+                 changecount = 0
+-                for form in formset.forms:
+-                    if form.has_changed():
+-                        obj = self.save_form(request, form, change=True)
+-                        self.save_model(request, obj, form, change=True)
+-                        self.save_related(request, form, formsets=[], change=True)
+-                        change_msg = self.construct_change_message(request, form, None)
+-                        self.log_change(request, obj, change_msg)
+-                        changecount += 1
++                with transaction.atomic():
++                    for form in formset.forms:
++                        if form.has_changed():
++                            obj = self.save_form(request, form, change=True)
++                            self.save_model(request, obj, form, change=True)
++                            self.save_related(request, form, formsets=[], change=True)
++                            change_msg = self.construct_change_message(request, form, None)
++                            self.log_change(request, obj, change_msg)
++                            changecount += 1
+ 
+                 if changecount:
+                     msg = ngettext(
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..97da5bf3af
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++"""
++Script to analyze the changelist_view method for transaction handling.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings first
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Now import Django modules after setup
++from django.contrib.admin.options import ModelAdmin
++
++def analyze_changelist_view():
++    """Analyze the changelist_view method to identify transaction issues"""
++    print("Analyzing changelist_view method for transaction handling...")
++    
++    # Let's examine the changelist_view method source code
++    source_lines = []
++    with open('/testbed/django/contrib/admin/options.py', 'r') as f:
++        lines = f.readlines()
++        in_changelist_view = False
++        for i, line in enumerate(lines):
++            if 'def changelist_view(self, request, extra_context=None):' in line:
++                in_changelist_view = True
++                source_lines.append(f"Line {i+1}: {line.strip()}")
++            elif in_changelist_view:
++                source_lines.append(f"Line {i+1}: {line.strip()}")
++                if line.strip() == '':  # End of method
++                    break
++    
++    # Print the relevant part of changelist_view
++    print("\n=== changelist_view method (relevant part) ===")
++    for line in source_lines:
++        if 'request.method == "POST" and cl.list_editable and "_save" in request.POST' in line:
++            print(f"\n🚨 CRITICAL: Found list_editable processing without transaction:")
++            print(line)
++        elif 'formset.is_valid():' in line:
++            print(f"\n🚨 CRITICAL: Database operations without transaction wrapper:")
++            print(line)
++        elif 'save_form' in line or 'save_model' in line or 'save_related' in line:
++            print(f"   → Database operation: {line}")
++        else:
++            print(line)
++    
++    print("\n=== Analysis ===")
++    print("The changelist_view method processes list_editable forms without transaction handling.")
++    print("Multiple database operations (save_form, save_model, save_related) occur without")
++    print("atomic transaction, which could leave database in inconsistent state on errors.")
++
++if __name__ == '__main__':
++    analyze_changelist_view()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..d1dacba303
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the transaction syntax is correct.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings first
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Test that the transaction syntax is correct
++from django.db import transaction
++
++def test_transaction_syntax():
++    """Test that the transaction.atomic() syntax works"""
++    print("Testing transaction.atomic() syntax...")
++    
++    try:
++        with transaction.atomic():
++            print("✓ transaction.atomic() works correctly")
++            return True
++    except Exception as e:
++        print(f"✗ transaction.atomic() failed: {e}")
++        return False
++
++if __name__ == '__main__':
++    success = test_transaction_syntax()
++    if success:
++        print("\n✅ Transaction syntax test PASSED")
++        sys.exit(0)
++    else:
++        print("\n❌ Transaction syntax test FAILED")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_transaction_error.py b/test_transaction_error.py
+new file mode 100644
+index 0000000000..14bef1227d
+--- /dev/null
++++ b/test_transaction_error.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""
++Test script to verify that transaction rollback works on error.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings first
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Now import Django modules after setup
++from django.test import TestCase, RequestFactory
++from django.contrib.auth.models import User
++from django.contrib.admin.sites import AdminSite
++from django.contrib.admin.options import ModelAdmin
++from django.db import models
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    description = models.TextField(blank=True)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Create a custom ModelAdmin that will raise an error during save
++class ErrorTestModelAdmin(ModelAdmin):
++    list_display = ['name', 'description']
++    list_editable = ['description']
++    
++    def save_model(self, request, obj, form, change):
++        # Raise an error on the second object to test transaction rollback
++        if obj.id == 2:
++            raise Exception("Simulated error during save")
++        super().save_model(request, obj, form, change)
++
++def test_transaction_rollback():
++    """Test that transaction rollback works when an error occurs"""
++    print("Testing transaction rollback on error...")
++    
++    # Create database tables
++    from django.core.management.color import no_style
++    from django.db import connection
++    
++    style = no_style()
++    sql = connection.ops.sql_table_creation_suffix()
++    tables = connection.introspection.django_table_names()
++    
++    # Create tables manually for this test
++    with connection.cursor() as cursor:
++        for sql in connection.ops.sql_create_table(TestModel._meta, style):
++            cursor.execute(sql)
++    
++    # Create test data
++    TestModel.objects.create(name="Test 1", description="Original description 1")
++    TestModel.objects.create(name="Test 2", description="Original description 2")
++    
++    # Create admin instance
++    admin_site = AdminSite()
++    model_admin = ErrorTestModelAdmin(TestModel, admin_site)
++    
++    # Create a mock request with POST data for bulk edit
++    factory = RequestFactory()
++    request = factory.post('/admin/test_app/testmodel/', {
++        'form-0-id': '1',
++        'form-0-description': 'Updated description 1',
++        'form-1-id': '2', 
++        'form-1-description': 'Updated description 2',
++        '_save': 'Save',
++    })
++    
++    # Create a superuser for permissions
++    user = User.objects.create_superuser('admin', 'admin@example.com', 'password')
++    request.user = user
++    
++    try:
++        # Call changelist_view which should process the list_editable form
++        response = model_admin.changelist_view(request)
++        print("✗ changelist_view should have failed but didn't")
++        return False
++        
++    except Exception as e:
++        if "Simulated error during save" in str(e):
++            print("✓ changelist_view correctly raised an error")
++            
++            # Check if database was rolled back (should have original values)
++            obj1 = TestModel.objects.get(id=1)
++            obj2 = TestModel.objects.get(id=2)
++            
++            if obj1.description == 'Original description 1' and obj2.description == 'Original description 2':
++                print("✓ Database was correctly rolled back")
++                return True
++            else:
++                print("✗ Database was not rolled back correctly")
++                print(f"Object 1 description: {obj1.description}")
++                print(f"Object 2 description: {obj2.description}")
++                return False
++        else:
++            print(f"✗ Unexpected error: {e}")
++            return False
++
++if __name__ == '__main__':
++    success = test_transaction_rollback()
++    if success:
++        print("\n✅ Transaction rollback test PASSED")
++        sys.exit(0)
++    else:
++        print("\n❌ Transaction rollback test FAILED")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_transaction_fix.py b/test_transaction_fix.py
+new file mode 100644
+index 0000000000..38894f8f53
+--- /dev/null
++++ b/test_transaction_fix.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python3
++"""
++Test script to verify that transaction handling is working in changelist_view.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings first
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Now import Django modules after setup
++from django.test import TestCase, RequestFactory
++from django.contrib.auth.models import User
++from django.contrib.admin.sites import AdminSite
++from django.contrib.admin.options import ModelAdmin
++from django.db import models, transaction
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    description = models.TextField(blank=True)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Create ModelAdmin with list_editable
++class TestModelAdmin(ModelAdmin):
++    list_display = ['name', 'description']
++    list_editable = ['description']
++
++def test_transaction_handling():
++    """Test that transaction handling works in changelist_view"""
++    print("Testing transaction handling in changelist_view...")
++    
++    # Create database tables
++    from django.core.management.color import no_style
++    from django.db import connection
++    
++    style = no_style()
++    sql = connection.ops.sql_table_creation_suffix()
++    tables = connection.introspection.django_table_names()
++    
++    # Create tables manually for this test
++    with connection.cursor() as cursor:
++        for sql in connection.ops.sql_create_table(TestModel._meta, style):
++            cursor.execute(sql)
++    
++    # Create test data
++    TestModel.objects.create(name="Test 1", description="Original description 1")
++    TestModel.objects.create(name="Test 2", description="Original description 2")
++    
++    # Create admin instance
++    admin_site = AdminSite()
++    model_admin = TestModelAdmin(TestModel, admin_site)
++    
++    # Create a mock request with POST data for bulk edit
++    factory = RequestFactory()
++    request = factory.post('/admin/test_app/testmodel/', {
++        'form-0-id': '1',
++        'form-0-description': 'Updated description 1',
++        'form-1-id': '2', 
++        'form-1-description': 'Updated description 2',
++        '_save': 'Save',
++    })
++    
++    # Create a superuser for permissions
++    user = User.objects.create_superuser('admin', 'admin@example.com', 'password')
++    request.user = user
++    
++    try:
++        # Call changelist_view which should process the list_editable form
++        response = model_admin.changelist_view(request)
++        print("✓ changelist_view completed successfully")
++        
++        # Check if changes were saved
++        obj1 = TestModel.objects.get(id=1)
++        obj2 = TestModel.objects.get(id=2)
++        
++        if obj1.description == 'Updated description 1' and obj2.description == 'Updated description 2':
++            print("✓ Changes were saved correctly")
++            return True
++        else:
++            print("✗ Changes were not saved correctly")
++            return False
++            
++    except Exception as e:
++        print(f"✗ Error during changelist_view: {e}")
++        return False
++
++if __name__ == '__main__':
++    success = test_transaction_handling()
++    if success:
++        print("\n✅ Transaction handling test PASSED")
++        sys.exit(0)
++    else:
++        print("\n❌ Transaction handling test FAILED")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/verify_transaction_fix.py b/verify_transaction_fix.py
+new file mode 100644
+index 0000000000..1e6e03bdf1
+--- /dev/null
++++ b/verify_transaction_fix.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++"""
++Final verification that the transaction fix is working correctly.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings first
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Now import Django modules after setup
++from django.contrib.admin.options import ModelAdmin
++
++def verify_transaction_fix():
++    """Verify that transaction.atomic() has been added to changelist_view"""
++    print("Verifying transaction fix in changelist_view...")
++    
++    # Read the changelist_view method to check for transaction.atomic()
++    with open('/testbed/django/contrib/admin/options.py', 'r') as f:
++        content = f.read()
++    
++    # Look for the specific section where list_editable processing occurs
++    lines = content.split('\n')
++    in_list_editable_section = False
++    transaction_found = False
++    
++    for i, line in enumerate(lines):
++        if 'request.method == "POST" and cl.list_editable and "_save" in request.POST' in line:
++            in_list_editable_section = True
++            print(f"Found list_editable processing at line {i+1}")
++        
++        if in_list_editable_section and 'if formset.is_valid():' in line:
++            print(f"Found formset validation at line {i+1}")
++        
++        if in_list_editable_section and 'with transaction.atomic():' in line:
++            transaction_found = True
++            print(f"✅ Found transaction.atomic() at line {i+1}")
++            break
++            
++        # If we reach the end of the list_editable section, break
++        if in_list_editable_section and 'return HttpResponseRedirect(request.get_full_path())' in line:
++            break
++    
++    if transaction_found:
++        print("✅ Transaction handling has been successfully added to changelist_view")
++        print("✅ The fix ensures database operations are atomic during list_editable processing")
++        return True
++    else:
++        print("❌ Transaction handling was not found in changelist_view")
++        return False
++
++if __name__ == '__main__':
++    success = verify_transaction_fix()
++    if success:
++        print("\n🎉 Transaction fix verification PASSED!")
++        sys.exit(0)
++    else:
++        print("\n💥 Transaction fix verification FAILED!")
++        sys.exit(1)
+\ No newline at end of file

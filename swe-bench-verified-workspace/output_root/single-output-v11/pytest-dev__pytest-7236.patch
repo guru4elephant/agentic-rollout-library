@@ -1,0 +1,304 @@
+diff --git a/debug_order.py b/debug_order.py
+new file mode 100644
+index 000000000..e5ac57bde
+--- /dev/null
++++ b/debug_order.py
+@@ -0,0 +1,25 @@
++import unittest
++import pytest
++
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        print("setUp called")
++    @unittest.skip("hello")
++    def test_one(self):
++        print("test_one called")
++    def tearDown(self):
++        print("tearDown called")
++
++# Let's create a simple plugin to debug the execution order
++class DebugPlugin:
++    def pytest_runtest_setup(self, item):
++        print(f"pytest_runtest_setup: {item.name}, skipped: {item._store.get('skipped_by_mark_key', 'not set')}")
++    
++    def pytest_runtest_call(self, item):
++        print(f"pytest_runtest_call: {item.name}, skipped: {item._store.get('skipped_by_mark_key', 'not set')}")
++    
++    def pytest_runtest_teardown(self, item, nextitem):
++        print(f"pytest_runtest_teardown: {item.name}, skipped: {item._store.get('skipped_by_mark_key', 'not set')}")
++
++if __name__ == "__main__":
++    pytest.main([__file__, "-v", "-s"], plugins=[DebugPlugin()])
+\ No newline at end of file
+diff --git a/debug_skip.py b/debug_skip.py
+new file mode 100644
+index 000000000..2a440bbfc
+--- /dev/null
++++ b/debug_skip.py
+@@ -0,0 +1,16 @@
++import unittest
++
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        print("setUp called")
++    @unittest.skip("hello")
++    def test_one(self):
++        print("test_one called")
++    def tearDown(self):
++        print("tearDown called")
++
++if __name__ == "__main__":
++    test = MyTestCase("test_one")
++    print("Has __unittest_skip__:", hasattr(test, "__unittest_skip__"))
++    if hasattr(test, "__unittest_skip__"):
++        print("Skip reason:", getattr(test, "__unittest_skip_why__", "None"))
+\ No newline at end of file
+diff --git a/debug_unittest.py b/debug_unittest.py
+new file mode 100644
+index 000000000..06403377c
+--- /dev/null
++++ b/debug_unittest.py
+@@ -0,0 +1,21 @@
++import unittest
++import sys
++
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        print("setUp called")
++    @unittest.skip("hello")
++    def test_one(self):
++        print("test_one called")
++    def tearDown(self):
++        print("tearDown called")
++
++# Let's see what happens when we run the test directly with unittest
++if __name__ == "__main__":
++    suite = unittest.TestLoader().loadTestsFromTestCase(MyTestCase)
++    result = unittest.TestResult()
++    suite.run(result)
++    print("Tests run:", result.testsRun)
++    print("Skipped:", len(result.skipped))
++    print("Errors:", len(result.errors))
++    print("Failures:", len(result.failures))
+\ No newline at end of file
+diff --git a/debug_unittest_skip.py b/debug_unittest_skip.py
+new file mode 100644
+index 000000000..28b0d8c50
+--- /dev/null
++++ b/debug_unittest_skip.py
+@@ -0,0 +1,15 @@
++import unittest
++
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        print(f"setUp called, __unittest_skip__: {getattr(self, '__unittest_skip__', 'not set')}")
++    @unittest.skip("hello")
++    def test_one(self):
++        print(f"test_one called, __unittest_skip__: {getattr(self, '__unittest_skip__', 'not set')}")
++    def tearDown(self):
++        print(f"tearDown called, __unittest_skip__: {getattr(self, '__unittest_skip__', 'not set')}")
++
++# Let's see what happens when we run the test with pytest
++if __name__ == "__main__":
++    import pytest
++    pytest.main([__file__, "-v", "-s"])
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..eabaa9a04
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,10 @@
++import unittest
++
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        xxx
++    @unittest.skip("hello")
++    def test_one(self):
++        pass
++    def tearDown(self):
++        xxx
+\ No newline at end of file
+diff --git a/src/_pytest/unittest.py b/src/_pytest/unittest.py
+index 773f545af..70e9c60b8 100644
+--- a/src/_pytest/unittest.py
++++ b/src/_pytest/unittest.py
+@@ -221,8 +221,11 @@ class TestCaseFunction(Function):
+             # TestCase instance interacts with the results object, so better to only do it
+             # when absolutely needed
+             if self.config.getoption("usepdb"):
+-                self._explicit_tearDown = self._testcase.tearDown
+-                setattr(self._testcase, "tearDown", lambda *args: None)
++                # Don't replace tearDown for skipped tests
++                if not (self._store.get(skipped_by_mark_key, False) or 
++                        getattr(self.obj, "__unittest_skip__", False)):
++                    self._explicit_tearDown = self._testcase.tearDown
++                    setattr(self._testcase, "tearDown", lambda *args: None)
+ 
+             # we need to update the actual bound method with self.obj, because
+             # wrap_pytest_function_for_tracing replaces self.obj by a wrapper
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 000000000..c4c1dace2
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,80 @@
++import unittest
++import pytest
++
++def test_unittest_skip_with_pdb():
++    """Test that unittest skipped tests don't execute teardown with --pdb"""
++    class MyTestCase(unittest.TestCase):
++        def setUp(self):
++            self.setup_called = True
++        @unittest.skip("test skip")
++        def test_skipped(self):
++            pass
++        def tearDown(self):
++            # This should not be called for skipped tests
++            assert False, "tearDown should not be called for skipped tests"
++
++    # Run with --pdb
++    import subprocess
++    import sys
++    result = subprocess.run([
++        sys.executable, "-m", "pytest", __file__, "--pdb", "-v",
++        "-k", "test_skipped"
++    ], capture_output=True, text=True, timeout=30)
++    
++    # Should be skipped, not error
++    assert "SKIPPED" in result.stdout
++    assert "ERROR" not in result.stdout
++    assert "tearDown should not be called" not in result.stdout
++
++def test_unittest_normal_with_pdb():
++    """Test that normal unittest tests still work with --pdb"""
++    class MyTestCase(unittest.TestCase):
++        def setUp(self):
++            self.setup_called = True
++        def test_normal(self):
++            self.assertTrue(True)
++        def tearDown(self):
++            self.teardown_called = True
++
++    # Run with --pdb
++    import subprocess
++    import sys
++    result = subprocess.run([
++        sys.executable, "-m", "pytest", __file__, "--pdb", "-v",
++        "-k", "test_normal"
++    ], capture_output=True, text=True, timeout=30)
++    
++    # Should pass
++    assert "PASSED" in result.stdout
++    assert "ERROR" not in result.stdout
++
++def test_pytest_skip_with_pdb():
++    """Test that pytest skipped tests don't execute teardown with --pdb"""
++    class MyTestCase(unittest.TestCase):
++        def setUp(self):
++            self.setup_called = True
++        @pytest.mark.skip(reason="test skip")
++        def test_skipped(self):
++            pass
++        def tearDown(self):
++            # This should not be called for skipped tests
++            assert False, "tearDown should not be called for skipped tests"
++
++    # Run with --pdb
++    import subprocess
++    import sys
++    result = subprocess.run([
++        sys.executable, "-m", "pytest", __file__, "--pdb", "-v",
++        "-k", "test_skipped"
++    ], capture_output=True, text=True, timeout=30)
++    
++    # Should be skipped, not error
++    assert "SKIPPED" in result.stdout
++    assert "ERROR" not in result.stdout
++    assert "tearDown should not be called" not in result.stdout
++
++if __name__ == "__main__":
++    test_unittest_skip_with_pdb()
++    test_unittest_normal_with_pdb()
++    test_pytest_skip_with_pdb()
++    print("All tests passed!")
+\ No newline at end of file
+diff --git a/test_final.py b/test_final.py
+new file mode 100644
+index 000000000..479346d66
+--- /dev/null
++++ b/test_final.py
+@@ -0,0 +1,27 @@
++import unittest
++
++class TestUnittestSkipWithPDB(unittest.TestCase):
++    def setUp(self):
++        self.setup_called = True
++    
++    @unittest.skip("test skip")
++    def test_skipped(self):
++        pass
++    
++    def tearDown(self):
++        # This should not be called for skipped tests
++        assert False, "tearDown should not be called for skipped tests"
++
++class TestUnittestNormalWithPDB(unittest.TestCase):
++    def setUp(self):
++        self.setup_called = True
++    
++    def test_normal(self):
++        self.assertTrue(True)
++    
++    def tearDown(self):
++        self.teardown_called = True
++
++if __name__ == "__main__":
++    import pytest
++    pytest.main([__file__, "--pdb", "-v"])
+\ No newline at end of file
+diff --git a/test_normal.py b/test_normal.py
+new file mode 100644
+index 000000000..69ebca74f
+--- /dev/null
++++ b/test_normal.py
+@@ -0,0 +1,14 @@
++import unittest
++
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        print("setUp called")
++    def test_one(self):
++        print("test_one called")
++        self.assertTrue(True)
++    def tearDown(self):
++        print("tearDown called")
++
++if __name__ == "__main__":
++    import pytest
++    pytest.main([__file__, "--pdb", "-v", "-s"])
+\ No newline at end of file
+diff --git a/test_pytest_skip.py b/test_pytest_skip.py
+new file mode 100644
+index 000000000..577bb36ee
+--- /dev/null
++++ b/test_pytest_skip.py
+@@ -0,0 +1,15 @@
++import unittest
++import pytest
++
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        xxx
++    @pytest.mark.skip(reason="hello")
++    def test_one(self):
++        pass
++    def tearDown(self):
++        xxx
++
++if __name__ == "__main__":
++    import pytest
++    pytest.main([__file__, "--pdb", "-v"])
+\ No newline at end of file

@@ -1,0 +1,99 @@
+diff --git a/django/db/backends/base/schema.py b/django/db/backends/base/schema.py
+index 61f88401ab..1f521cfc5c 100644
+--- a/django/db/backends/base/schema.py
++++ b/django/db/backends/base/schema.py
+@@ -393,7 +393,7 @@ class BaseDatabaseSchemaEditor:
+         news = {tuple(fields) for fields in new_index_together}
+         # Deleted indexes
+         for fields in olds.difference(news):
+-            self._delete_composed_index(model, fields, {'index': True}, self.sql_delete_index)
++            self._delete_composed_index(model, fields, {'index': True, 'unique': False}, self.sql_delete_index)
+         # Created indexes
+         for field_names in news.difference(olds):
+             fields = [model._meta.get_field(field) for field in field_names]
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..c792de1eb9
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++import os
++import sys
++import tempfile
++import shutil
++from django.conf import settings
++from django.db import models
++from django.core.management import execute_from_command_line
++
++# Configure minimal Django settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    SECRET_KEY='test-secret-key',
++)
++
++# Create a simple test model class without using Django's model system directly
++class TestModel:
++    class _meta:
++        db_table = 'test_model'
++        constraints = []
++        indexes = []
++        
++        @staticmethod
++        def get_field(field_name):
++            class Field:
++                def __init__(self, name):
++                    self.column = name
++            return Field(field_name)
++
++if __name__ == '__main__':
++    # Set up Django apps registry
++    import django
++    django.setup()
++    
++    from django.db import connection
++    
++    # Create a simple test table first
++    with connection.cursor() as cursor:
++        cursor.execute("CREATE TABLE test_model (id INTEGER PRIMARY KEY, field1 VARCHAR(100), field2 VARCHAR(100))")
++        cursor.execute("CREATE UNIQUE INDEX test_model_field1_field2_uniq ON test_model (field1, field2)")
++        cursor.execute("CREATE INDEX test_model_field1_field2_idx ON test_model (field1, field2)")
++    
++    # Now test the alter_index_together method which should use the fixed _delete_composed_index
++    with connection.schema_editor() as schema_editor:
++        try:
++            # Simulate removing index_together when both unique_together and index_together exist
++            schema_editor.alter_index_together(
++                TestModel, 
++                [('field1', 'field2')], 
++                []
++            )
++            print("SUCCESS: alter_index_together completed without error")
++            
++            # Verify the index was actually removed
++            with connection.cursor() as cursor:
++                constraints = connection.introspection.get_constraints(cursor, 'test_model')
++                remaining_indexes = [name for name, info in constraints.items() 
++                                   if info['index'] and not info['unique'] and info['columns'] == ['field1', 'field2']]
++                if remaining_indexes:
++                    print(f"ERROR: Indexes still exist: {remaining_indexes}")
++                else:
++                    print("SUCCESS: Index was properly removed")
++                    
++        except ValueError as e:
++            print(f"ERROR: {e}")
++            if "Found wrong number (2) of constraints" in str(e):
++                print("This is the bug we're trying to fix!")
++            else:
++                raise e
+\ No newline at end of file

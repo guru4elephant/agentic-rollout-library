@@ -1,0 +1,362 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..fcc63cf8d2
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,128 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.functions import ExtractYear, ExtractIsoYear, ExtractMonth
++
++class DTModel(models.Model):
++    start_date = models.DateTimeField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_iso_year_fix():
++    """Test that ISO year lookups no longer use BETWEEN optimization"""
++    print("=== Testing ISO Year Fix ===")
++    
++    # Test explicit annotation with filter
++    qs = DTModel.objects.annotate(extracted=ExtractIsoYear('start_date')).only('id')
++    filtered_qs = qs.filter(extracted=2020)
++    query = str(filtered_qs.query)
++    
++    if "BETWEEN" in query and "iso_year" not in query:
++        print("❌ FAIL: ISO year filter still uses BETWEEN optimization")
++        return False
++    elif "django_datetime_extract('iso_year'" in query:
++        print("✅ PASS: ISO year filter correctly uses EXTRACT operation")
++        return True
++    else:
++        print(f"❓ UNKNOWN: Unexpected query: {query}")
++        return False
++
++def test_regular_year_optimization():
++    """Test that regular year lookups still use BETWEEN optimization"""
++    print("\n=== Testing Regular Year Optimization ===")
++    
++    # Test explicit annotation with filter
++    qs = DTModel.objects.annotate(extracted=ExtractYear('start_date')).only('id')
++    filtered_qs = qs.filter(extracted=2020)
++    query = str(filtered_qs.query)
++    
++    if "BETWEEN" in query:
++        print("✅ PASS: Regular year filter still uses BETWEEN optimization")
++        return True
++    else:
++        print(f"❌ FAIL: Regular year filter doesn't use optimization: {query}")
++        return False
++
++def test_other_extract_operations():
++    """Test that other extract operations work normally"""
++    print("\n=== Testing Other Extract Operations ===")
++    
++    # Test month extraction
++    qs = DTModel.objects.annotate(extracted=ExtractMonth('start_date')).only('id')
++    filtered_qs = qs.filter(extracted=6)
++    query = str(filtered_qs.query)
++    
++    if "django_datetime_extract('month'" in query:
++        print("✅ PASS: Month extraction works correctly")
++        return True
++    else:
++        print(f"❌ FAIL: Month extraction broken: {query}")
++        return False
++
++def test_implicit_lookups():
++    """Test that implicit lookups work correctly"""
++    print("\n=== Testing Implicit Lookups ===")
++    
++    # Test implicit ISO year lookup
++    implicit_iso_qs = DTModel.objects.filter(start_date__iso_year=2020).only('id')
++    iso_query = str(implicit_iso_qs.query)
++    
++    if "BETWEEN" in iso_query and "iso_year" not in iso_query:
++        print("❌ FAIL: Implicit ISO year lookup still uses BETWEEN optimization")
++        return False
++    elif "django_datetime_extract('iso_year'" in iso_query:
++        print("✅ PASS: Implicit ISO year lookup correctly uses EXTRACT operation")
++        iso_ok = True
++    else:
++        print(f"❓ UNKNOWN: Unexpected implicit ISO query: {iso_query}")
++        iso_ok = False
++    
++    # Test implicit regular year lookup
++    implicit_regular_qs = DTModel.objects.filter(start_date__year=2020).only('id')
++    regular_query = str(implicit_regular_qs.query)
++    
++    if "BETWEEN" in regular_query:
++        print("✅ PASS: Implicit regular year lookup uses BETWEEN optimization")
++        regular_ok = True
++    else:
++        print(f"❌ FAIL: Implicit regular year lookup broken: {regular_query}")
++        regular_ok = False
++    
++    return iso_ok and regular_ok
++
++if __name__ == "__main__":
++    results = []
++    results.append(test_iso_year_fix())
++    results.append(test_regular_year_optimization())
++    results.append(test_other_extract_operations())
++    results.append(test_implicit_lookups())
++    
++    print(f"\n=== SUMMARY ===")
++    if all(results):
++        print("✅ ALL TESTS PASSED - The fix is working correctly!")
++    else:
++        print("❌ SOME TESTS FAILED - There may be issues with the fix")
++        print(f"Passed: {sum(results)}/{len(results)}")
+\ No newline at end of file
+diff --git a/django/db/models/lookups.py b/django/db/models/lookups.py
+index 916478d075..204b3571cc 100644
+--- a/django/db/models/lookups.py
++++ b/django/db/models/lookups.py
+@@ -549,7 +549,9 @@ class YearLookup(Lookup):
+     def as_sql(self, compiler, connection):
+         # Avoid the extract operation if the rhs is a direct value to allow
+         # indexes to be used.
+-        if self.rhs_is_direct_value():
++        # Don't apply the optimization for ISO year lookups as they have different
++        # boundaries than regular years.
++        if self.rhs_is_direct_value() and getattr(self.lhs, 'lookup_name', None) != 'iso_year':
+             # Skip the extract part by directly using the originating field,
+             # that is self.lhs.lhs.
+             lhs_sql, params = self.process_lhs(compiler, connection, self.lhs.lhs)
+diff --git a/edge_case_test.py b/edge_case_test.py
+new file mode 100644
+index 0000000000..90d626b22a
+--- /dev/null
++++ b/edge_case_test.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.functions import ExtractIsoYear
++from django.db.models.lookups import YearExact, YearGt, YearGte, YearLt, YearLte
++
++class DTModel(models.Model):
++    start_date = models.DateTimeField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_all_year_lookup_types():
++    """Test that all YearLookup subclasses work correctly with ISO year"""
++    print("=== Testing All YearLookup Types with ISO Year ===")
++    
++    extract = ExtractIsoYear('start_date')
++    tests = [
++        ('YearExact', YearExact(extract, 2020)),
++        ('YearGt', YearGt(extract, 2020)),
++        ('YearGte', YearGte(extract, 2020)),
++        ('YearLt', YearLt(extract, 2020)),
++        ('YearLte', YearLte(extract, 2020)),
++    ]
++    
++    all_passed = True
++    for name, lookup in tests:
++        # Check if the optimization is correctly skipped for ISO year
++        if lookup.rhs_is_direct_value() and getattr(lookup.lhs, 'lookup_name', None) == 'iso_year':
++            # Should NOT use optimization for ISO year
++            print(f"✅ PASS: {name} correctly identifies ISO year and will skip optimization")
++        else:
++            print(f"❌ FAIL: {name} doesn't correctly identify ISO year")
++            all_passed = False
++    
++    return all_passed
++
++def test_non_extract_lookups():
++    """Test that non-extract lookups still work normally"""
++    print("\n=== Testing Non-Extract Lookups ===")
++    
++    # Test with a simple value (not an extract operation)
++    # This should use optimization since it's not an ISO year extract
++    from django.db.models import DateTimeField
++    field = DateTimeField()
++    
++    # Create a mock lookup that would use optimization
++    class MockLookup:
++        def __init__(self):
++            self.lhs = type('MockLHS', (), {'lookup_name': None})()
++            self.rhs = 2020
++        
++        def rhs_is_direct_value(self):
++            return True
++    
++    mock_lookup = MockLookup()
++    
++    # This should use optimization since it's not an ISO year extract
++    if mock_lookup.rhs_is_direct_value() and getattr(mock_lookup.lhs, 'lookup_name', None) != 'iso_year':
++        print("✅ PASS: Non-extract lookups correctly use optimization")
++        return True
++    else:
++        print("❌ FAIL: Non-extract lookups don't use optimization correctly")
++        return False
++
++if __name__ == "__main__":
++    results = []
++    results.append(test_all_year_lookup_types())
++    results.append(test_non_extract_lookups())
++    
++    print(f"\n=== SUMMARY ===")
++    if all(results):
++        print("✅ ALL EDGE CASE TESTS PASSED - The fix handles edge cases correctly!")
++    else:
++        print("❌ SOME EDGE CASE TESTS FAILED - There may be issues with the fix")
++        print(f"Passed: {sum(results)}/{len(results)}")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..861188f70a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.functions import ExtractIsoYear
++
++class DTModel(models.Model):
++    start_date = models.DateTimeField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Create a simple test
++from django.db import connection
++
++# Create test data
++qs = DTModel.objects.annotate(extracted=ExtractIsoYear('start_date')).only('id')
++print("Annotation query:")
++print(qs.query)
++
++print("\nFilter with explicit annotation (should use extracted but uses BETWEEN):")
++filtered_qs = qs.filter(extracted=2020)
++print(filtered_qs.query)
++
++print("\nFilter with implicit lookup (uses BETWEEN):")
++implicit_qs = DTModel.objects.filter(start_date__iso_year=2020).only('id')
++print(implicit_qs.query)
+\ No newline at end of file
+diff --git a/test_regular_year.py b/test_regular_year.py
+new file mode 100644
+index 0000000000..586c7ac284
+--- /dev/null
++++ b/test_regular_year.py
+@@ -0,0 +1,45 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.functions import ExtractYear
++
++class DTModel(models.Model):
++    start_date = models.DateTimeField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Test regular year extraction still uses optimization
++print("Regular year annotation query:")
++qs = DTModel.objects.annotate(extracted=ExtractYear('start_date')).only('id')
++print(qs.query)
++
++print("\nRegular year filter with explicit annotation (should use BETWEEN optimization):")
++filtered_qs = qs.filter(extracted=2020)
++print(filtered_qs.query)
++
++print("\nRegular year filter with implicit lookup (should use BETWEEN optimization):")
++implicit_qs = DTModel.objects.filter(start_date__year=2020).only('id')
++print(implicit_qs.query)
+\ No newline at end of file

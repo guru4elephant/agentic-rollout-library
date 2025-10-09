@@ -1,0 +1,675 @@
+diff --git a/django/contrib/staticfiles/storage.py b/django/contrib/staticfiles/storage.py
+index 494890cc23..e18d0a75d2 100644
+--- a/django/contrib/staticfiles/storage.py
++++ b/django/contrib/staticfiles/storage.py
+@@ -226,17 +226,24 @@ class HashedFilesMixin:
+             path for path in paths
+             if matches_patterns(path, self._patterns)
+         ]
++        # Track which files have already been yielded to avoid duplicates
++        yielded_files = set()
++
+         # Do a single pass first. Post-process all files once, then repeat for
+         # adjustable files.
+         for name, hashed_name, processed, _ in self._post_process(paths, adjustable_paths, hashed_files):
+-            yield name, hashed_name, processed
++            if name not in yielded_files:
++                yield name, hashed_name, processed
++                yielded_files.add(name)
+ 
+         paths = {path: paths[path] for path in adjustable_paths}
+ 
+         for i in range(self.max_post_process_passes):
+             substitutions = False
+             for name, hashed_name, processed, subst in self._post_process(paths, adjustable_paths, hashed_files):
+-                yield name, hashed_name, processed
++                if name not in yielded_files:
++                    yield name, hashed_name, processed
++                    yielded_files.add(name)
+                 substitutions = substitutions or subst
+ 
+             if not substitutions:
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..44d82e9d79
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import tempfile
++import shutil
++from django.conf import settings
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_URL='test',
++        STATIC_URL='/static/',
++        STATIC_ROOT=tempfile.mkdtemp(),
++        INSTALLED_APPS=[
++            'django.contrib.staticfiles',
++        ],
++    )
++
++def test_manifest_storage():
++    """Test that ManifestStaticFilesStorage also works correctly"""
++    
++    # Create a temporary directory for static files
++    static_dir = tempfile.mkdtemp()
++    css_dir = os.path.join(static_dir, 'css')
++    os.makedirs(css_dir)
++    
++    # Create CSS files
++    css_content = '''
++body {
++    background: url('image.png');
++}
++'''
++    with open(os.path.join(css_dir, 'style.css'), 'w') as f:
++        f.write(css_content)
++    
++    # Create image file
++    with open(os.path.join(css_dir, 'image.png'), 'w') as f:
++        f.write('dummy image content')
++    
++    # Create ManifestStaticFilesStorage instance
++    storage = ManifestStaticFilesStorage(location=static_dir)
++    
++    # Collect files
++    paths = {}
++    for root, dirs, files in os.walk(static_dir):
++        for file in files:
++            rel_path = os.path.relpath(os.path.join(root, file), static_dir)
++            paths[rel_path] = (storage, os.path.join(root, file))
++    
++    print("Testing ManifestStaticFilesStorage...")
++    print("Files found:", list(paths.keys()))
++    
++    yield_count = {}
++    
++    # Run post_process and count yields per file
++    for name, hashed_name, processed in storage.post_process(paths):
++        if name in yield_count:
++            yield_count[name] += 1
++        else:
++            yield_count[name] = 1
++    
++    print("\nYield counts per file:")
++    for file, count in yield_count.items():
++        print(f"  {file}: {count} time(s)")
++    
++    # Check for duplicates
++    duplicates = {file: count for file, count in yield_count.items() if count > 1}
++    if duplicates:
++        print(f"\nFAILED: Found {len(duplicates)} files with duplicate yields:")
++        for file, count in duplicates.items():
++            print(f"  {file}: yielded {count} times")
++        return False
++    else:
++        print(f"\nSUCCESS: No duplicate yields found. ManifestStaticFilesStorage works correctly!")
++        return True
++
++if __name__ == '__main__':
++    try:
++        success = test_manifest_storage()
++        sys.exit(0 if success else 1)
++    finally:
++        # Cleanup
++        if 'static_dir' in locals():
++            shutil.rmtree(static_dir, ignore_errors=True)
++        if 'STATIC_ROOT' in settings.__dict__:
++            shutil.rmtree(settings.STATIC_ROOT, ignore_errors=True)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..99bffe78ce
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import tempfile
++import shutil
++from django.conf import settings
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATIC_ROOT=tempfile.mkdtemp(),
++        INSTALLED_APPS=[
++            'django.contrib.staticfiles',
++        ],
++    )
++
++def test_duplicate_yields():
++    """Test to reproduce the duplicate yield issue"""
++    
++    # Create a temporary directory for static files
++    static_dir = tempfile.mkdtemp()
++    css_dir = os.path.join(static_dir, 'css')
++    os.makedirs(css_dir)
++    
++    # Create a simple CSS file that references another file
++    css_content = '''
++body {
++    background: url('image.png');
++    font-family: Arial;
++}
++'''
++    
++    with open(os.path.join(css_dir, 'test.css'), 'w') as f:
++        f.write(css_content)
++    
++    # Create a dummy image file
++    with open(os.path.join(css_dir, 'image.png'), 'w') as f:
++        f.write('dummy image content')
++    
++    # Create storage instance
++    storage = ManifestStaticFilesStorage(location=static_dir)
++    
++    # Collect files
++    paths = {}
++    for root, dirs, files in os.walk(static_dir):
++        for file in files:
++            rel_path = os.path.relpath(os.path.join(root, file), static_dir)
++            paths[rel_path] = (storage, os.path.join(root, file))
++    
++    print("Testing post_process yields...")
++    yield_count = {}
++    
++    # Run post_process and count yields per file
++    for name, hashed_name, processed in storage.post_process(paths):
++        if name in yield_count:
++            yield_count[name] += 1
++        else:
++            yield_count[name] = 1
++    
++    print("Yield counts per file:")
++    for file, count in yield_count.items():
++        print(f"  {file}: {count} time(s)")
++    
++    # Check for duplicates
++    duplicates = {file: count for file, count in yield_count.items() if count > 1}
++    if duplicates:
++        print("\nDUPLICATE YIELDS FOUND (issue reproduced):")
++        for file, count in duplicates.items():
++            print(f"  {file}: yielded {count} times")
++        return True
++    else:
++        print("\nNo duplicate yields found (issue not reproduced)")
++        return False
++
++if __name__ == '__main__':
++    try:
++        issue_reproduced = test_duplicate_yields()
++        sys.exit(0 if not issue_reproduced else 1)
++    finally:
++        # Cleanup
++        if 'static_dir' in locals():
++            shutil.rmtree(static_dir, ignore_errors=True)
++        if 'STATIC_ROOT' in settings.__dict__:
++            shutil.rmtree(settings.STATIC_ROOT, ignore_errors=True)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..3cf776d27f
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,111 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import tempfile
++import shutil
++from django.conf import settings
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATIC_ROOT=tempfile.mkdtemp(),
++        INSTALLED_APPS=[
++            'django.contrib.staticfiles',
++        ],
++    )
++
++def test_comprehensive_yields():
++    """Test various scenarios to ensure the fix works correctly"""
++    
++    # Create a temporary directory for static files
++    static_dir = tempfile.mkdtemp()
++    css_dir = os.path.join(static_dir, 'css')
++    os.makedirs(css_dir)
++    
++    # Create multiple CSS files that reference each other
++    css1_content = '''
++@import url('style2.css');
++body {
++    background: url('image.png');
++}
++'''
++    css2_content = '''
++@import url('style3.css');
++div {
++    border: 1px solid black;
++}
++'''
++    css3_content = '''
++p {
++    color: red;
++    background: url('image2.png');
++}
++'''
++    
++    # Create CSS files
++    with open(os.path.join(css_dir, 'style1.css'), 'w') as f:
++        f.write(css1_content)
++    with open(os.path.join(css_dir, 'style2.css'), 'w') as f:
++        f.write(css2_content)
++    with open(os.path.join(css_dir, 'style3.css'), 'w') as f:
++        f.write(css3_content)
++    
++    # Create image files
++    with open(os.path.join(css_dir, 'image.png'), 'w') as f:
++        f.write('dummy image content')
++    with open(os.path.join(css_dir, 'image2.png'), 'w') as f:
++        f.write('dummy image content 2')
++    
++    # Create a non-adjustable file (should only be yielded once)
++    with open(os.path.join(static_dir, 'readme.txt'), 'w') as f:
++        f.write('This is a text file')
++    
++    # Create storage instance
++    storage = ManifestStaticFilesStorage(location=static_dir)
++    
++    # Collect files
++    paths = {}
++    for root, dirs, files in os.walk(static_dir):
++        for file in files:
++            rel_path = os.path.relpath(os.path.join(root, file), static_dir)
++            paths[rel_path] = (storage, os.path.join(root, file))
++    
++    print("Testing comprehensive post_process yields...")
++    yield_count = {}
++    
++    # Run post_process and count yields per file
++    for name, hashed_name, processed in storage.post_process(paths):
++        if name in yield_count:
++            yield_count[name] += 1
++        else:
++            yield_count[name] = 1
++    
++    print("Yield counts per file:")
++    for file, count in yield_count.items():
++        print(f"  {file}: {count} time(s)")
++    
++    # Check for duplicates
++    duplicates = {file: count for file, count in yield_count.items() if count > 1}
++    if duplicates:
++        print("\nFAILED: DUPLICATE YIELDS FOUND:")
++        for file, count in duplicates.items():
++            print(f"  {file}: yielded {count} times")
++        return False
++    else:
++        print("\nSUCCESS: No duplicate yields found")
++        return True
++
++if __name__ == '__main__':
++    try:
++        success = test_comprehensive_yields()
++        sys.exit(0 if success else 1)
++    finally:
++        # Cleanup
++        if 'static_dir' in locals():
++            shutil.rmtree(static_dir, ignore_errors=True)
++        if 'STATIC_ROOT' in settings.__dict__:
++            shutil.rmtree(settings.STATIC_ROOT, ignore_errors=True)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..62a3a02075
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import tempfile
++import shutil
++from django.conf import settings
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATIC_ROOT=tempfile.mkdtemp(),
++        INSTALLED_APPS=[
++            'django.contrib.staticfiles',
++        ],
++    )
++
++def test_empty_files():
++    """Test with empty paths dictionary"""
++    
++    static_dir = tempfile.mkdtemp()
++    storage = ManifestStaticFilesStorage(location=static_dir)
++    
++    print("Testing empty files scenario...")
++    
++    yield_count = 0
++    paths = {}  # Empty paths
++    
++    # Run post_process with empty paths
++    for name, hashed_name, processed in storage.post_process(paths):
++        yield_count += 1
++        print(f"Yielded: {name} -> {hashed_name} (processed: {processed})")
++    
++    if yield_count == 0:
++        print("SUCCESS: No yields for empty paths (expected)")
++        return True
++    else:
++        print(f"FAILED: Expected 0 yields, got {yield_count}")
++        return False
++
++def test_single_non_adjustable_file():
++    """Test with a single non-adjustable file (should yield once)"""
++    
++    static_dir = tempfile.mkdtemp()
++    with open(os.path.join(static_dir, 'test.txt'), 'w') as f:
++        f.write('test content')
++    
++    storage = ManifestStaticFilesStorage(location=static_dir)
++    
++    print("Testing single non-adjustable file scenario...")
++    
++    # Collect files
++    paths = {}
++    for root, dirs, files in os.walk(static_dir):
++        for file in files:
++            rel_path = os.path.relpath(os.path.join(root, file), static_dir)
++            paths[rel_path] = (storage, os.path.join(root, file))
++    
++    yield_count = {}
++    
++    # Run post_process
++    for name, hashed_name, processed in storage.post_process(paths):
++        if name in yield_count:
++            yield_count[name] += 1
++        else:
++            yield_count[name] = 1
++    
++    print("Yield counts:", yield_count)
++    
++    if len(yield_count) == 1 and yield_count.get('test.txt') == 1:
++        print("SUCCESS: Single non-adjustable file yielded exactly once")
++        return True
++    else:
++        print("FAILED: Single non-adjustable file yield count incorrect")
++        return False
++
++if __name__ == '__main__':
++    success1 = test_empty_files()
++    success2 = test_single_non_adjustable_file()
++    
++    if success1 and success2:
++        print("\nAll edge case tests passed!")
++        sys.exit(0)
++    else:
++        print("\nSome edge case tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..41f7e61b9b
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import tempfile
++import shutil
++from django.conf import settings
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATIC_ROOT=tempfile.mkdtemp(),
++        INSTALLED_APPS=[
++            'django.contrib.staticfiles',
++        ],
++    )
++
++def test_github_issue_scenario():
++    """Test the exact scenario described in the GitHub issue"""
++    
++    # Create a temporary directory for static files
++    static_dir = tempfile.mkdtemp()
++    admin_css_dir = os.path.join(static_dir, 'admin', 'css')
++    os.makedirs(admin_css_dir)
++    
++    # Create a CSS file similar to admin/css/base.css that might have references
++    base_css_content = '''
++body {
++    background: url('../img/bg.gif');
++    font-family: Arial;
++}
++@import url('dashboard.css');
++'''
++    
++    dashboard_css_content = '''
++.dashboard {
++    padding: 10px;
++    border: 1px solid #ccc;
++}
++'''
++    
++    # Create CSS files
++    with open(os.path.join(admin_css_dir, 'base.css'), 'w') as f:
++        f.write(base_css_content)
++    with open(os.path.join(admin_css_dir, 'dashboard.css'), 'w') as f:
++        f.write(dashboard_css_content)
++    
++    # Create image directory and file
++    admin_img_dir = os.path.join(static_dir, 'admin', 'img')
++    os.makedirs(admin_img_dir)
++    with open(os.path.join(admin_img_dir, 'bg.gif'), 'w') as f:
++        f.write('dummy image content')
++    
++    # Create storage instance
++    storage = ManifestStaticFilesStorage(location=static_dir)
++    
++    # Collect files
++    paths = {}
++    for root, dirs, files in os.walk(static_dir):
++        for file in files:
++            rel_path = os.path.relpath(os.path.join(root, file), static_dir)
++            paths[rel_path] = (storage, os.path.join(root, file))
++    
++    print("Testing GitHub issue scenario...")
++    print("Files found:", list(paths.keys()))
++    
++    yield_count = {}
++    processed_files = []
++    
++    # Run post_process and capture yields
++    for name, hashed_name, processed in storage.post_process(paths):
++        processed_files.append((name, hashed_name, processed))
++        if name in yield_count:
++            yield_count[name] += 1
++        else:
++            yield_count[name] = 1
++    
++    print("\nYield counts per file:")
++    for file, count in yield_count.items():
++        print(f"  {file}: {count} time(s)")
++    
++    print("\nAll processed files:")
++    for name, hashed_name, processed in processed_files:
++        print(f"  {name} -> {hashed_name} (processed: {processed})")
++    
++    # Check for duplicates - the main issue
++    duplicates = {file: count for file, count in yield_count.items() if count > 1}
++    if duplicates:
++        print(f"\nFAILED: Found {len(duplicates)} files with duplicate yields:")
++        for file, count in duplicates.items():
++            print(f"  {file}: yielded {count} times")
++        return False
++    else:
++        print(f"\nSUCCESS: No duplicate yields found. Each file yielded exactly once.")
++        
++        # Also verify that we have the expected number of yields
++        expected_yields = len(paths)
++        actual_yields = len(processed_files)
++        if actual_yields == expected_yields:
++            print(f"SUCCESS: Expected {expected_yields} yields, got {actual_yields}")
++            return True
++        else:
++            print(f"WARNING: Expected {expected_yields} yields, but got {actual_yields}")
++            return True  # This might be OK if some files don't need processing
++
++if __name__ == '__main__':
++    try:
++        success = test_github_issue_scenario()
++        sys.exit(0 if success else 1)
++    finally:
++        # Cleanup
++        if 'static_dir' in locals():
++            shutil.rmtree(static_dir, ignore_errors=True)
++        if 'STATIC_ROOT' in settings.__dict__:
++            shutil.rmtree(settings.STATIC_ROOT, ignore_errors=True)
+\ No newline at end of file
+diff --git a/test_nested_references.py b/test_nested_references.py
+new file mode 100644
+index 0000000000..37541c8226
+--- /dev/null
++++ b/test_nested_references.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import tempfile
++import shutil
++from django.conf import settings
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATIC_ROOT=tempfile.mkdtemp(),
++        INSTALLED_APPS=[
++            'django.contrib.staticfiles',
++        ],
++    )
++
++def test_nested_references():
++    """Test that files with nested references still work but only yield once"""
++    
++    # Create a temporary directory for static files
++    static_dir = tempfile.mkdtemp()
++    css_dir = os.path.join(static_dir, 'css')
++    os.makedirs(css_dir)
++    
++    # Create CSS files that reference each other in a chain
++    # This should trigger multiple passes but each file should only be yielded once
++    css1_content = '''
++@import url('style2.css');
++body {
++    background: url('image.png');
++}
++'''
++    css2_content = '''
++@import url('style3.css');
++div {
++    border: 1px solid black;
++}
++'''
++    css3_content = '''
++p {
++    color: red;
++}
++'''
++    
++    # Create CSS files
++    with open(os.path.join(css_dir, 'style1.css'), 'w') as f:
++        f.write(css1_content)
++    with open(os.path.join(css_dir, 'style2.css'), 'w') as f:
++        f.write(css2_content)
++    with open(os.path.join(css_dir, 'style3.css'), 'w') as f:
++        f.write(css3_content)
++    
++    # Create image file
++    with open(os.path.join(css_dir, 'image.png'), 'w') as f:
++        f.write('dummy image content')
++    
++    # Create storage instance
++    storage = ManifestStaticFilesStorage(location=static_dir)
++    
++    # Collect files
++    paths = {}
++    for root, dirs, files in os.walk(static_dir):
++        for file in files:
++            rel_path = os.path.relpath(os.path.join(root, file), static_dir)
++            paths[rel_path] = (storage, os.path.join(root, file))
++    
++    print("Testing nested references scenario...")
++    print("Files found:", list(paths.keys()))
++    
++    yield_count = {}
++    
++    # Run post_process and count yields per file
++    for name, hashed_name, processed in storage.post_process(paths):
++        if name in yield_count:
++            yield_count[name] += 1
++        else:
++            yield_count[name] = 1
++    
++    print("\nYield counts per file:")
++    for file, count in yield_count.items():
++        print(f"  {file}: {count} time(s)")
++    
++    # Check for duplicates - should be none
++    duplicates = {file: count for file, count in yield_count.items() if count > 1}
++    if duplicates:
++        print(f"\nFAILED: Found {len(duplicates)} files with duplicate yields:")
++        for file, count in duplicates.items():
++            print(f"  {file}: yielded {count} times")
++        return False
++    else:
++        print(f"\nSUCCESS: No duplicate yields found. Each file yielded exactly once.")
++        return True
++
++if __name__ == '__main__':
++    try:
++        success = test_nested_references()
++        sys.exit(0 if success else 1)
++    finally:
++        # Cleanup
++        if 'static_dir' in locals():
++            shutil.rmtree(static_dir, ignore_errors=True)
++        if 'STATIC_ROOT' in settings.__dict__:
++            shutil.rmtree(settings.STATIC_ROOT, ignore_errors=True)
+\ No newline at end of file

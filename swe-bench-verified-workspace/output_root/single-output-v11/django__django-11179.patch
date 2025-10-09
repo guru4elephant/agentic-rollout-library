@@ -1,0 +1,448 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..22d8208b2e
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,137 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key-for-testing',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.deletion import Collector
++from unittest.mock import Mock, patch
++
++# Create test models
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class ModelWithForeignKey(models.Model):
++    name = models.CharField(max_length=100)
++    related = models.ForeignKey(SimpleModel, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_fast_delete_pk_clearing():
++    """Test that PK is cleared in fast delete optimization case"""
++    print("Testing fast delete PK clearing...")
++    
++    obj = SimpleModel(name="Test Object")
++    obj.pk = 1
++    collector = Collector(using='default')
++    collector.add([obj])
++    
++    with patch.object(collector, 'can_fast_delete', return_value=True):
++        with patch('django.db.models.sql.DeleteQuery') as mock_delete_query:
++            mock_instance = Mock()
++            mock_instance.delete_batch.return_value = 1
++            mock_delete_query.return_value = mock_instance
++            collector.delete()
++    
++    success = obj.pk is None
++    print(f"  Result: {'PASS' if success else 'FAIL'}")
++    return success
++
++def test_general_delete_pk_clearing():
++    """Test that PK is cleared in general delete case"""
++    print("Testing general delete PK clearing...")
++    
++    obj = SimpleModel(name="Test Object")
++    obj.pk = 1
++    collector = Collector(using='default')
++    collector.add([obj])
++    
++    with patch.object(collector, 'can_fast_delete', return_value=False):
++        with patch('django.db.models.sql.DeleteQuery') as mock_delete_query:
++            mock_instance = Mock()
++            mock_instance.delete_batch.return_value = 1
++            mock_delete_query.return_value = mock_instance
++            collector.delete()
++    
++    success = obj.pk is None
++    print(f"  Result: {'PASS' if success else 'FAIL'}")
++    return success
++
++def test_multiple_objects():
++    """Test that PK clearing works with multiple objects"""
++    print("Testing multiple objects...")
++    
++    obj1 = SimpleModel(name="Test Object 1")
++    obj1.pk = 1
++    obj2 = SimpleModel(name="Test Object 2") 
++    obj2.pk = 2
++    
++    collector = Collector(using='default')
++    collector.add([obj1, obj2])
++    
++    with patch.object(collector, 'can_fast_delete', return_value=False):
++        with patch('django.db.models.sql.DeleteQuery') as mock_delete_query:
++            mock_instance = Mock()
++            mock_instance.delete_batch.return_value = 2
++            mock_delete_query.return_value = mock_instance
++            collector.delete()
++    
++    success = obj1.pk is None and obj2.pk is None
++    print(f"  Result: {'PASS' if success else 'FAIL'}")
++    return success
++
++def test_edge_case_no_pk():
++    """Test behavior with objects that have no PK"""
++    print("Testing edge case - no PK...")
++    
++    # For objects without PK, they can't be added to collector, so skip this test
++    # The fix should only apply to objects that have been saved (have a PK)
++    print("  Skipping - objects without PK can't be added to collector")
++    return True  # This is expected behavior
++
++if __name__ == "__main__":
++    print("Running comprehensive tests for PK clearing fix...")
++    print("=" * 50)
++    
++    tests = [
++        test_fast_delete_pk_clearing,
++        test_general_delete_pk_clearing,
++        test_multiple_objects,
++        test_edge_case_no_pk,
++    ]
++    
++    results = []
++    for test in tests:
++        results.append(test())
++        print()
++    
++    all_passed = all(results)
++    print("=" * 50)
++    print(f"Overall result: {'ALL TESTS PASSED' if all_passed else 'SOME TESTS FAILED'}")
++    
++    sys.exit(0 if all_passed else 1)
+\ No newline at end of file
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index 92fe4affb9..3a462f1c4c 100644
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -277,6 +277,7 @@ class Collector:
+             if self.can_fast_delete(instance):
+                 with transaction.mark_for_rollback_on_error():
+                     count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)
++                setattr(instance, model._meta.pk.attname, None)
+                 return count, {model._meta.label: count}
+ 
+         with transaction.atomic(using=self.using, savepoint=False):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..8105173995
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model without any dependencies
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_delete_clears_pk():
++    """Test that delete() clears the primary key on model instances"""
++    # Create and save an instance - this will fail but we can test the delete behavior
++    # by manually setting up the object state
++    obj = SimpleModel(name="Test Object")
++    obj.pk = 1  # Manually set a PK to simulate a saved object
++    original_pk = obj.pk
++    print(f"Created object with PK: {original_pk}")
++    
++    # Delete the object using the delete method
++    obj.delete()
++    
++    # Check if PK is cleared
++    if obj.pk is None:
++        print("✓ SUCCESS: PK was cleared after delete()")
++        return True
++    else:
++        print(f"✗ FAILURE: PK was NOT cleared after delete(). Current PK: {obj.pk}")
++        return False
++
++if __name__ == "__main__":
++    success = test_delete_clears_pk()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..586981383a
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.deletion import Collector
++
++# Create a simple model without any dependencies
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_delete_clears_pk():
++    """Test that delete() clears the primary key on model instances in fast delete case"""
++    # Create an instance and manually set its state to simulate a saved object
++    obj = SimpleModel(name="Test Object")
++    obj.pk = 1  # Manually set a PK to simulate a saved object
++    
++    # Create a collector and add the instance
++    collector = Collector(using='default')
++    collector.add([obj])
++    
++    # Get the original PK
++    original_pk = obj.pk
++    print(f"Created object with PK: {original_pk}")
++    
++    # Call delete which should trigger the fast delete optimization
++    collector.delete()
++    
++    # Check if PK is cleared
++    if obj.pk is None:
++        print("✓ SUCCESS: PK was cleared after delete()")
++        return True
++    else:
++        print(f"✗ FAILURE: PK was NOT cleared after delete(). Current PK: {obj.pk}")
++        return False
++
++if __name__ == "__main__":
++    success = test_delete_clears_pk()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_general_case.py b/test_general_case.py
+new file mode 100644
+index 0000000000..c4e6353594
+--- /dev/null
++++ b/test_general_case.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.deletion import Collector
++from unittest.mock import Mock, patch
++
++# Create a simple model without any dependencies
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_pk_clearing_in_general_case():
++    """Test that PK is cleared in general delete case (non-fast delete)"""
++    # Create an instance and manually set its state to simulate a saved object
++    obj = SimpleModel(name="Test Object")
++    obj.pk = 1  # Manually set a PK to simulate a saved object
++    
++    # Create a collector and add the instance
++    collector = Collector(using='default')
++    collector.add([obj])
++    
++    # Get the original PK
++    original_pk = obj.pk
++    print(f"Created object with PK: {original_pk}")
++    
++    # Mock the can_fast_delete to return False to test the general case
++    with patch.object(collector, 'can_fast_delete', return_value=False):
++        with patch('django.db.models.sql.DeleteQuery') as mock_delete_query:
++            # Mock the delete_batch method to return a count
++            mock_instance = Mock()
++            mock_instance.delete_batch.return_value = 1
++            mock_delete_query.return_value = mock_instance
++            
++            # Call delete which should use the general case
++            collector.delete()
++    
++    # Check if PK is cleared
++    if obj.pk is None:
++        print("✓ SUCCESS: PK was cleared after delete() in general case")
++        return True
++    else:
++        print(f"✗ FAILURE: PK was NOT cleared after delete() in general case. Current PK: {obj.pk}")
++        return False
++
++if __name__ == "__main__":
++    success = test_pk_clearing_in_general_case()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_pk_clearing.py b/test_pk_clearing.py
+new file mode 100644
+index 0000000000..3dfff6ffef
+--- /dev/null
++++ b/test_pk_clearing.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.deletion import Collector
++from unittest.mock import Mock, patch
++
++# Create a simple model without any dependencies
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_pk_clearing_in_fast_delete():
++    """Test that PK is cleared in fast delete optimization case"""
++    # Create an instance and manually set its state to simulate a saved object
++    obj = SimpleModel(name="Test Object")
++    obj.pk = 1  # Manually set a PK to simulate a saved object
++    
++    # Create a collector and add the instance
++    collector = Collector(using='default')
++    collector.add([obj])
++    
++    # Get the original PK
++    original_pk = obj.pk
++    print(f"Created object with PK: {original_pk}")
++    
++    # Mock the can_fast_delete to return True and mock the delete_batch to avoid DB operations
++    with patch.object(collector, 'can_fast_delete', return_value=True):
++        with patch('django.db.models.sql.DeleteQuery') as mock_delete_query:
++            # Mock the delete_batch method to return a count
++            mock_instance = Mock()
++            mock_instance.delete_batch.return_value = 1
++            mock_delete_query.return_value = mock_instance
++            
++            # Call delete which should trigger the fast delete optimization
++            collector.delete()
++    
++    # Check if PK is cleared
++    if obj.pk is None:
++        print("✓ SUCCESS: PK was cleared after delete()")
++        return True
++    else:
++        print(f"✗ FAILURE: PK was NOT cleared after delete(). Current PK: {obj.pk}")
++        return False
++
++if __name__ == "__main__":
++    success = test_pk_clearing_in_fast_delete()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

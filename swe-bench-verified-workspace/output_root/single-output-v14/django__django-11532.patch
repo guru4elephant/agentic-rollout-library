@@ -1,0 +1,188 @@
+diff --git a/django/core/mail/utils.py b/django/core/mail/utils.py
+index d18dfe4667..5afaf879e7 100644
+--- a/django/core/mail/utils.py
++++ b/django/core/mail/utils.py
+@@ -3,6 +3,7 @@ Email message and email sending related helper functions.
+ """
+ 
+ import socket
++import encodings.idna
+ 
+ 
+ # Cache the hostname, but do it lazily: socket.getfqdn() can take a couple of
+@@ -13,7 +14,15 @@ class CachedDnsName:
+ 
+     def get_fqdn(self):
+         if not hasattr(self, '_fqdn'):
+-            self._fqdn = socket.getfqdn()
++            fqdn = socket.getfqdn()
++            # Convert non-ASCII domain names to punycode to avoid encoding issues
++            try:
++                # Try to encode as ASCII to check if it contains non-ASCII characters
++                fqdn.encode('ascii')
++            except UnicodeEncodeError:
++                # Contains non-ASCII characters, convert to punycode
++                fqdn = encodings.idna.ToASCII(fqdn).decode('ascii')
++            self._fqdn = fqdn
+         return self._fqdn
+ 
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..cb4d185d6d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the non-ASCII domain email encoding issue.
++"""
++
++import sys
++import os
++
++# Add the django directory to the path
++sys.path.insert(0, './django')
++sys.path.insert(0, '.')
++
++# Configure minimal Django settings
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        EMAIL_USE_LOCALTIME=False,
++        USE_TZ=True,
++        SECRET_KEY='test-key-for-reproduction'
++    )
++
++# Import the specific modules we need
++from unittest.mock import patch
++from email.header import Header
++
++def test_unicode_dns_issue():
++    """Test the issue with non-ASCII domain names and non-unicode encoding"""
++    
++    print("Testing Unicode DNS issue with non-ASCII domain...")
++    
++    # Test the complete email message flow with our fix
++    try:
++        # Import the email modules
++        from django.core.mail.message import EmailMessage
++        from django.core.mail.utils import DNS_NAME
++        
++        # Mock the DNS_NAME to use a non-ASCII domain
++        import socket
++        from unittest.mock import patch
++        
++        with patch.object(socket, 'getfqdn', return_value='漢字'):
++            # Clear any cached value
++            if hasattr(DNS_NAME, '_fqdn'):
++                delattr(DNS_NAME, '_fqdn')
++            
++            # Create email with non-unicode encoding
++            email = EmailMessage('subject', 'body content', 'from@example.com', ['to@example.com'])
++            email.encoding = 'iso-8859-1'
++            
++            # This should now work without UnicodeEncodeError
++            message = email.message()
++            
++            # Check if Message-ID contains punycode
++            message_id = message['Message-ID']
++            print(f"Message-ID: {message_id}")
++            
++            if 'xn--p8s937b' in message_id:
++                print("SUCCESS: Message-ID contains punycode encoding")
++                return True
++            else:
++                print("FAILURE: Message-ID does not contain punycode encoding")
++                return False
++                
++    except UnicodeEncodeError as e:
++        print(f"ERROR: UnicodeEncodeError occurred: {e}")
++        return False
++    except Exception as e:
++        print(f"ERROR: Unexpected error: {e}")
++        return False
++
++if __name__ == "__main__":
++    success = test_unicode_dns_issue()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..167e94830a
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for non-ASCII domain names.
++"""
++
++import sys
++import os
++
++# Add the django directory to the path
++sys.path.insert(0, './django')
++sys.path.insert(0, '.')
++
++from unittest.mock import patch
++import socket
++from django.core.mail.utils import DNS_NAME
++
++def test_dns_name_punycode():
++    """Test that DNS_NAME returns punycode for non-ASCII domains"""
++    
++    print("Testing DNS_NAME with non-ASCII domain...")
++    
++    # Mock socket.getfqdn to return a non-ASCII domain
++    with patch.object(socket, 'getfqdn', return_value='漢字'):
++        # Clear any cached value
++        if hasattr(DNS_NAME, '_fqdn'):
++            delattr(DNS_NAME, '_fqdn')
++            
++        # Get the DNS name
++        dns_name = str(DNS_NAME)
++        print(f"DNS_NAME result: {dns_name}")
++        
++        # Check if it contains punycode
++        if 'xn--' in dns_name:
++            print("SUCCESS: DNS_NAME returned punycode encoded domain")
++            return True
++        else:
++            print("FAILURE: DNS_NAME did not return punycode encoded domain")
++            return False
++
++def test_dns_name_ascii():
++    """Test that DNS_NAME returns normal ASCII domains unchanged"""
++    
++    print("Testing DNS_NAME with ASCII domain...")
++    
++    # Mock socket.getfqdn to return an ASCII domain
++    with patch.object(socket, 'getfqdn', return_value='example.com'):
++        # Clear any cached value
++        if hasattr(DNS_NAME, '_fqdn'):
++            delattr(DNS_NAME, '_fqdn')
++            
++        # Get the DNS name
++        dns_name = str(DNS_NAME)
++        print(f"DNS_NAME result: {dns_name}")
++        
++        # Check if it's unchanged
++        if dns_name == 'example.com':
++            print("SUCCESS: DNS_NAME returned ASCII domain unchanged")
++            return True
++        else:
++            print("FAILURE: DNS_NAME modified ASCII domain")
++            return False
++
++if __name__ == "__main__":
++    success1 = test_dns_name_punycode()
++    success2 = test_dns_name_ascii()
++    
++    if success1 and success2:
++        print("\nAll tests passed!")
++        sys.exit(0)
++    else:
++        print("\nSome tests failed!")
++        sys.exit(1)
+\ No newline at end of file

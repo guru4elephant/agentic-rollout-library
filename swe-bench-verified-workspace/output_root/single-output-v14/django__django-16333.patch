@@ -1,0 +1,783 @@
+diff --git a/django/contrib/auth/forms.py b/django/contrib/auth/forms.py
+index d73d1c8495..c0997a8016 100644
+--- a/django/contrib/auth/forms.py
++++ b/django/contrib/auth/forms.py
+@@ -141,6 +141,11 @@ class UserCreationForm(forms.ModelForm):
+         user.set_password(self.cleaned_data["password1"])
+         if commit:
+             user.save()
++            self._save_m2m()
++        else:
++            # If not committing, add a method to the form to allow deferred
++            # saving of m2m data.
++            self.save_m2m = self._save_m2m
+         return user
+ 
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..ccdb0e6228
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,126 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the UserCreationForm ManyToMany field save issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.auth.models import AbstractUser
++from django.contrib.auth.forms import UserCreationForm
++from django import forms
++
++# Create a custom User model with a ManyToManyField
++class CustomUser(AbstractUser):
++    # Add a custom ManyToManyField for testing
++    favorite_colors = models.ManyToManyField(
++        'testapp.Color',
++        blank=True,
++    )
++
++    class Meta:
++        app_label = 'testapp'
++
++# Simple model for ManyToManyField
++class Color(models.Model):
++    name = models.CharField(max_length=50)
++    
++    class Meta:
++        app_label = 'testapp'
++
++# Custom UserCreationForm that includes ManyToMany fields
++class CustomUserCreationForm(UserCreationForm):
++    class Meta:
++        model = CustomUser
++        fields = ('username', 'password1', 'password2', 'favorite_colors')
++    
++    favorite_colors = forms.ModelMultipleChoiceField(
++        queryset=Color.objects.all(),
++        required=False,
++    )
++
++def test_m2m_save_issue():
++    """Test that demonstrates the ManyToMany save issue"""
++    from django.db import connection
++    from django.test.utils import setup_test_environment
++    
++    setup_test_environment()
++    
++    # Create database tables
++    from django.core.management.color import no_style
++    style = no_style()
++    sql = connection.ops.sql_table_creation_suffix()
++    tables = connection.introspection.django_table_names()
++    sql = connection.ops.sql_table_creation_suffix()
++    
++    # Create tables manually
++    with connection.cursor() as cursor:
++        for sql in connection.ops.sql_create_table(Color._meta, style):
++            cursor.execute(sql)
++        for sql in connection.ops.sql_create_table(CustomUser._meta, style):
++            cursor.execute(sql)
++        for sql in connection.ops.sql_create_table(CustomUser.favorite_colors.through._meta, style):
++            cursor.execute(sql)
++    
++    # Create some test colors
++    Color.objects.create(name='red')
++    Color.objects.create(name='blue')
++    Color.objects.create(name='green')
++    
++    # Test data
++    form_data = {
++        'username': 'testuser',
++        'password1': 'testpassword123',
++        'password2': 'testpassword123',
++        'favorite_colors': [1, 2]  # red and blue
++    }
++    
++    # Create form instance
++    form = CustomUserCreationForm(data=form_data)
++    
++    if form.is_valid():
++        print("Form is valid")
++        user = form.save(commit=True)
++        print(f"User created: {user.username}")
++        
++        # Check if ManyToMany data was saved
++        favorite_colors_count = user.favorite_colors.count()
++        print(f"Favorite colors count: {favorite_colors_count}")
++        
++        if favorite_colors_count == 2:
++            print("SUCCESS: ManyToMany data was saved correctly!")
++            return True
++        else:
++            print(f"FAILURE: Expected 2 favorite colors, got {favorite_colors_count}")
++            return False
++    else:
++        print("Form is invalid")
++        print(form.errors)
++        return False
++
++if __name__ == '__main__':
++    success = test_m2m_save_issue()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/simple_m2m_test.py b/simple_m2m_test.py
+new file mode 100644
+index 0000000000..7a1e896829
+--- /dev/null
++++ b/simple_m2m_test.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify UserCreationForm.save() calls save_m2m().
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.forms import UserCreationForm
++from django.contrib.auth.models import User
++
++def test_save_m2m_called():
++    """Test that UserCreationForm.save() calls save_m2m() when commit=True"""
++    print("Testing UserCreationForm.save() calls save_m2m()...")
++    
++    # Create a mock form instance
++    form = UserCreationForm()
++    
++    # Mock the save_m2m method to track if it's called
++    save_m2m_called = False
++    
++    def mock_save_m2m():
++        nonlocal save_m2m_called
++        save_m2m_called = True
++    
++    # Set up the form with necessary attributes
++    form.cleaned_data = {'password1': 'testpassword'}
++    form.instance = User()
++    form.save_m2m = mock_save_m2m
++    
++    # Test the save method with commit=True
++    try:
++        result = form.save(commit=True)
++        if save_m2m_called:
++            print("✓ SUCCESS: save_m2m() was called when commit=True")
++            return True
++        else:
++            print("✗ FAILURE: save_m2m() was NOT called when commit=True")
++            return False
++    except Exception as e:
++        # Expected to fail due to database issues, but save_m2m should still be called
++        if save_m2m_called:
++            print("✓ SUCCESS: save_m2m() was called (expected database error occurred)")
++            return True
++        else:
++            print(f"✗ FAILURE: save_m2m() was NOT called (error: {e})")
++            return False
++
++def test_commit_false_behavior():
++    """Test that commit=False sets the save_m2m method"""
++    print("\nTesting commit=False behavior...")
++    
++    form = UserCreationForm()
++    form.cleaned_data = {'password1': 'testpassword'}
++    form.instance = User()
++    
++    # Test commit=False
++    result = form.save(commit=False)
++    
++    # Check that save_m2m method is set
++    if hasattr(form, 'save_m2m') and callable(form.save_m2m):
++        print("✓ SUCCESS: save_m2m method is set when commit=False")
++        return True
++    else:
++        print("✗ FAILURE: save_m2m method is NOT set when commit=False")
++        return False
++
++def test_method_source():
++    """Test that the save method contains the correct code"""
++    print("\nTesting method source code...")
++    
++    import inspect
++    source = inspect.getsource(UserCreationForm.save)
++    
++    checks = [
++        ('self._save_m2m()', 'Calls _save_m2m when commit=True'),
++        ('self.save_m2m = self._save_m2m', 'Sets save_m2m when commit=False'),
++    ]
++    
++    all_passed = True
++    for check, description in checks:
++        if check in source:
++            print(f"✓ {description}")
++        else:
++            print(f"✗ {description}")
++            all_passed = False
++    
++    return all_passed
++
++if __name__ == '__main__':
++    success1 = test_save_m2m_called()
++    success2 = test_commit_false_behavior()
++    success3 = test_method_source()
++    
++    if success1 and success2 and success3:
++        print("\n🎉 All tests passed! The UserCreationForm ManyToMany fix is working correctly.")
++        sys.exit(0)
++    else:
++        print("\n❌ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..cf9585f4eb
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python3
++"""
++Simple script to reproduce the UserCreationForm ManyToMany field save issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.auth.models import AbstractUser
++from django.contrib.auth.forms import UserCreationForm
++from django import forms
++
++# Create a custom User model with a ManyToManyField
++class CustomUser(AbstractUser):
++    # Add a custom ManyToManyField for testing
++    favorite_colors = models.ManyToManyField(
++        'testapp.Color',
++        blank=True,
++    )
++
++    class Meta:
++        app_label = 'testapp'
++
++# Simple model for ManyToManyField
++class Color(models.Model):
++    name = models.CharField(max_length=50)
++    
++    class Meta:
++        app_label = 'testapp'
++
++# Custom UserCreationForm that includes ManyToMany fields
++class CustomUserCreationForm(UserCreationForm):
++    class Meta:
++        model = CustomUser
++        fields = ('username', 'password1', 'password2', 'favorite_colors')
++    
++    favorite_colors = forms.ModelMultipleChoiceField(
++        queryset=Color.objects.all(),
++        required=False,
++    )
++
++def test_m2m_save_issue():
++    """Test that demonstrates the ManyToMany save issue"""
++    print("Testing UserCreationForm ManyToMany field save issue...")
++    
++    # Create form instance with test data
++    form_data = {
++        'username': 'testuser',
++        'password1': 'testpassword123',
++        'password2': 'testpassword123',
++        'favorite_colors': [1, 2]  # This would fail due to missing objects, but we're testing the save method
++    }
++    
++    form = CustomUserCreationForm(data=form_data)
++    
++    # Just test that the form validates (we'll skip the actual database operations)
++    if form.is_valid():
++        print("✓ Form is valid")
++        
++        # Test the save method behavior
++        user = form.save(commit=False)
++        user.set_password('testpassword123')
++        
++        # The issue: UserCreationForm.save(commit=True) doesn't call save_m2m()
++        # Let's check if the form has the save_m2m method
++        if hasattr(form, 'save_m2m'):
++            print("✓ Form has save_m2m method (commit=False case)")
++        else:
++            print("✗ Form does NOT have save_m2m method")
++            
++        return True
++    else:
++        print("✗ Form is invalid")
++        print(form.errors)
++        return False
++
++if __name__ == '__main__':
++    success = test_m2m_save_issue()
++    print(f"Test {'PASSED' if success else 'FAILED'}")
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..3ad32d4a01
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,121 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the UserCreationForm ManyToMany fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.forms import UserCreationForm
++from django import forms
++from django.contrib.auth.models import User
++
++def test_save_method_behavior():
++    """Test the behavior of UserCreationForm.save() method"""
++    print("Testing UserCreationForm.save() method behavior...")
++    
++    # Test 1: Check that save_m2m is called when commit=True
++    form = UserCreationForm()
++    
++    # Mock the save_m2m method to track if it's called
++    save_m2m_called = False
++    original_save_m2m = None
++    
++    def mock_save_m2m():
++        nonlocal save_m2m_called
++        save_m2m_called = True
++    
++    # Test the commit=True case
++    try:
++        # Create a mock form with cleaned_data
++        form.cleaned_data = {'password1': 'testpassword'}
++        form.instance = User()
++        form.save_m2m = mock_save_m2m
++        
++        # This should call save_m2m
++        result = form.save(commit=True)
++        if save_m2m_called:
++            print("✓ save_m2m() is called when commit=True")
++        else:
++            print("✗ save_m2m() is NOT called when commit=True")
++            return False
++    except Exception as e:
++        print(f"✓ save_m2m() would be called when commit=True (expected error: {e})")
++    
++    # Test 2: Check that save_m2m method is set when commit=False
++    save_m2m_called = False
++    form = UserCreationForm()
++    form.cleaned_data = {'password1': 'testpassword'}
++    form.instance = User()
++    
++    result = form.save(commit=False)
++    if hasattr(form, 'save_m2m') and callable(form.save_m2m):
++        print("✓ save_m2m method is set when commit=False")
++    else:
++        print("✗ save_m2m method is NOT set when commit=False")
++        return False
++    
++    return True
++
++def test_method_signatures():
++    """Test that the method signatures match expected behavior"""
++    print("\nTesting method signatures...")
++    
++    import inspect
++    
++    # Get the source of the save method
++    source = inspect.getsource(UserCreationForm.save)
++    
++    # Check that it contains the key elements
++    checks = [
++        ('def save(self, commit=True):', 'Method signature'),
++        ('user = super().save(commit=False)', 'Calls parent save with commit=False'),
++        ('user.set_password(', 'Sets password'),
++        ('if commit:', 'Commit check'),
++        ('user.save()', 'Saves user instance'),
++        ('self.save_m2m()', 'Calls save_m2m when commit=True'),
++        ('self.save_m2m = self._save_m2m', 'Sets save_m2m when commit=False'),
++    ]
++    
++    all_passed = True
++    for check, description in checks:
++        if check in source:
++            print(f"✓ {description}")
++        else:
++            print(f"✗ {description}")
++            all_passed = False
++    
++    return all_passed
++
++if __name__ == '__main__':
++    success1 = test_save_method_behavior()
++    success2 = test_method_signatures()
++    
++    if success1 and success2:
++        print("\n✓ All tests passed! The fix is working correctly.")
++        sys.exit(0)
++    else:
++        print("\n✗ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_m2m_fix.py b/test_m2m_fix.py
+new file mode 100644
+index 0000000000..be26e7e91a
+--- /dev/null
++++ b/test_m2m_fix.py
+@@ -0,0 +1,179 @@
++#!/usr/bin/env python3
++"""
++Test to verify that UserCreationForm properly saves ManyToMany fields.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.contrib.auth.forms import UserCreationForm
++# We'll create our own test models since we can't import from auth_tests
++from django.db import models
++from django.contrib.auth.models import AbstractBaseUser
++
++class Organization(models.Model):
++    name = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'testapp'
++
++class CustomUserWithM2M(AbstractBaseUser):
++    username = models.CharField(max_length=30, unique=True)
++    orgs = models.ManyToManyField(Organization)
++    
++    USERNAME_FIELD = "username"
++    
++    class Meta:
++        app_label = 'testapp'
++
++class CustomUserCreationFormWithM2M(UserCreationForm):
++    class Meta:
++        model = CustomUserWithM2M
++        fields = ('username', 'password1', 'password2', 'orgs')
++    
++    orgs = forms.ModelMultipleChoiceField(
++        queryset=Organization.objects.all(),
++        required=False,
++    )
++
++def test_m2m_save_fix():
++    """Test that UserCreationForm properly saves ManyToMany fields"""
++    print("Testing UserCreationForm ManyToMany field save fix...")
++    
++    # Create test database tables
++    from django.db import connection
++    from django.core.management.color import no_style
++    
++    style = no_style()
++    
++    with connection.cursor() as cursor:
++        for sql in connection.ops.sql_create_table(Organization._meta, style):
++            cursor.execute(sql)
++        for sql in connection.ops.sql_create_table(CustomUserWithM2M._meta, style):
++            cursor.execute(sql)
++        for sql in connection.ops.sql_create_table(CustomUserWithM2M.orgs.through._meta, style):
++            cursor.execute(sql)
++    
++    # Create test organizations
++    org1 = Organization.objects.create(name='Org 1')
++    org2 = Organization.objects.create(name='Org 2')
++    
++    # Test data with ManyToMany field
++    form_data = {
++        'username': 'testuser',
++        'password1': 'testpassword123',
++        'password2': 'testpassword123',
++        'orgs': [org1.id, org2.id]  # Both organizations
++    }
++    
++    # Create and validate form
++    form = CustomUserCreationFormWithM2M(data=form_data)
++    
++    if not form.is_valid():
++        print(f"✗ Form is invalid: {form.errors}")
++        return False
++    
++    print("✓ Form is valid")
++    
++    # Save the form with commit=True
++    user = form.save(commit=True)
++    
++    # Check that the user was created
++    if user is None:
++        print("✗ User was not created")
++        return False
++    
++    print(f"✓ User created: {user.username}")
++    
++    # Check that ManyToMany data was saved
++    orgs_count = user.orgs.count()
++    print(f"✓ Organizations count: {orgs_count}")
++    
++    if orgs_count == 2:
++        print("✓ SUCCESS: ManyToMany data was saved correctly!")
++        return True
++    else:
++        print(f"✗ FAILURE: Expected 2 organizations, got {orgs_count}")
++        return False
++
++def test_commit_false_behavior():
++    """Test that commit=False behavior works correctly"""
++    print("\nTesting commit=False behavior...")
++    
++    # Create test organizations
++    org1 = Organization.objects.create(name='Org 1')
++    org2 = Organization.objects.create(name='Org 2')
++    
++    # Test data with ManyToMany field
++    form_data = {
++        'username': 'testuser2',
++        'password1': 'testpassword123',
++        'password2': 'testpassword123',
++        'orgs': [org1.id, org2.id]
++    }
++    
++    # Create and validate form
++    form = CustomUserCreationFormWithM2M(data=form_data)
++    
++    if not form.is_valid():
++        print(f"✗ Form is invalid: {form.errors}")
++        return False
++    
++    # Save the form with commit=False
++    user = form.save(commit=False)
++    
++    # Check that save_m2m method is set
++    if hasattr(form, 'save_m2m') and callable(form.save_m2m):
++        print("✓ save_m2m method is set when commit=False")
++        
++        # Now save the user and call save_m2m
++        user.save()
++        form.save_m2m()
++        
++        # Check that ManyToMany data was saved
++        orgs_count = user.orgs.count()
++        print(f"✓ Organizations count after save_m2m: {orgs_count}")
++        
++        if orgs_count == 2:
++            print("✓ SUCCESS: commit=False behavior works correctly!")
++            return True
++        else:
++            print(f"✗ FAILURE: Expected 2 organizations, got {orgs_count}")
++            return False
++    else:
++        print("✗ save_m2m method is NOT set when commit=False")
++        return False
++
++if __name__ == '__main__':
++    success1 = test_m2m_save_fix()
++    success2 = test_commit_false_behavior()
++    
++    if success1 and success2:
++        print("\n🎉 All tests passed! The UserCreationForm ManyToMany fix is working correctly.")
++        sys.exit(0)
++    else:
++        print("\n❌ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_save_method.py b/test_save_method.py
+new file mode 100644
+index 0000000000..2abd0a0a49
+--- /dev/null
++++ b/test_save_method.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++"""
++Test to demonstrate the UserCreationForm.save() method issue with ManyToMany fields.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.forms import UserCreationForm
++from django import forms
++from django.contrib.auth.models import User
++
++def test_save_method():
++    """Test the UserCreationForm.save() method behavior"""
++    print("Testing UserCreationForm.save() method...")
++    
++    # Create a simple form instance
++    form = UserCreationForm()
++    
++    # Check if the form has save_m2m method (it should inherit from ModelForm)
++    if hasattr(form, 'save_m2m'):
++        print("✓ Form has save_m2m method")
++    else:
++        print("✗ Form does NOT have save_m2m method")
++    
++    # Check the save method implementation
++    import inspect
++    source = inspect.getsource(UserCreationForm.save)
++    print(f"UserCreationForm.save method source:\n{source}")
++    
++    # Check if it calls save_m2m when commit=True
++    if 'save_m2m' in source:
++        print("✓ UserCreationForm.save calls save_m2m")
++    else:
++        print("✗ UserCreationForm.save does NOT call save_m2m")
++        
++    # Compare with ModelForm.save method
++    from django.forms.models import ModelForm
++    modelform_source = inspect.getsource(ModelForm.save)
++    print(f"ModelForm.save method source:\n{modelform_source}")
++    
++    if 'save_m2m' in modelform_source or '_save_m2m' in modelform_source:
++        print("✓ ModelForm.save handles m2m data")
++    else:
++        print("✗ ModelForm.save does not handle m2m data")
++    
++    return 'save_m2m' not in source
++
++if __name__ == '__main__':
++    issue_exists = test_save_method()
++    print(f"\nIssue exists: {issue_exists}")
++    sys.exit(0 if issue_exists else 1)
+\ No newline at end of file

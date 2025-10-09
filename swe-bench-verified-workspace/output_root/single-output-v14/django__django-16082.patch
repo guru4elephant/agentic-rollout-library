@@ -1,0 +1,386 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 5e3c7cab82..29005da2eb 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -527,12 +527,15 @@ _connector_combinations = [
+             (fields.DecimalField, fields.IntegerField, fields.DecimalField),
+             (fields.IntegerField, fields.FloatField, fields.FloatField),
+             (fields.FloatField, fields.IntegerField, fields.FloatField),
++            (fields.DecimalField, fields.FloatField, fields.FloatField),
++            (fields.FloatField, fields.DecimalField, fields.FloatField),
+         ]
+         for connector in (
+             Combinable.ADD,
+             Combinable.SUB,
+             Combinable.MUL,
+             Combinable.DIV,
++            Combinable.MOD,
+         )
+     },
+     # Bitwise operators.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..bc5530d186
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.expressions import F, Value
++from decimal import Decimal
++
++# Create a simple test model
++class TestModel(models.Model):
++    decimal_field = models.DecimalField(max_digits=10, decimal_places=2)
++    integer_field = models.IntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++def test_mod_operator_output_field():
++    """Test that MOD operator resolves output_field correctly with mixed types"""
++    print("Testing MOD operator with mixed numeric types...")
++    
++    # Create expressions with different types using Value to specify types
++    decimal_expr = Value(Decimal('10.5'), output_field=models.DecimalField())
++    integer_expr = Value(5, output_field=models.IntegerField())
++    
++    # Test MOD operation between Decimal and Integer
++    mod_expr = decimal_expr % integer_expr
++    
++    # Resolve the expressions to get output_field
++    from django.db.models.sql.query import Query
++    query = Query(TestModel)
++    
++    resolved_decimal = decimal_expr.resolve_expression(query)
++    resolved_integer = integer_expr.resolve_expression(query) 
++    resolved_mod = mod_expr.resolve_expression(query)
++    
++    print(f"Decimal expression output_field: {resolved_decimal.output_field.get_internal_type()}")
++    print(f"Integer expression output_field: {resolved_integer.output_field.get_internal_type()}")
++    print(f"MOD expression output_field: {resolved_mod.output_field.get_internal_type()}")
++    
++    # The issue: MOD should resolve to DecimalField like other arithmetic operations
++    # but currently it doesn't handle mixed types properly
++    expected_type = 'DecimalField'
++    actual_type = resolved_mod.output_field.get_internal_type()
++    
++    print(f"Expected output field type: {expected_type}")
++    print(f"Actual output field type: {actual_type}")
++    
++    if actual_type == expected_type:
++        print("✓ MOD operator correctly resolves output_field for mixed types")
++        return True
++    else:
++        print("✗ MOD operator does NOT resolve output_field correctly for mixed types")
++        return False
++
++def test_other_operators_for_comparison():
++    """Test that other arithmetic operators work correctly for comparison"""
++    print("\nTesting other arithmetic operators for comparison...")
++    
++    decimal_expr = Value(Decimal('10.5'), output_field=models.DecimalField())
++    integer_expr = Value(5, output_field=models.IntegerField())
++    
++    from django.db.models.sql.query import Query
++    query = Query(TestModel)
++    
++    operators = [
++        ('+', decimal_expr + integer_expr),
++        ('-', decimal_expr - integer_expr), 
++        ('*', decimal_expr * integer_expr),
++        ('/', decimal_expr / integer_expr),
++    ]
++    
++    for op_symbol, expr in operators:
++        resolved_expr = expr.resolve_expression(query)
++        actual_type = resolved_expr.output_field.get_internal_type()
++        print(f"{op_symbol} operator output_field: {actual_type}")
++        if actual_type != 'DecimalField':
++            print(f"✗ {op_symbol} operator also has issue!")
++
++if __name__ == '__main__':
++    success = test_mod_operator_output_field()
++    test_other_operators_for_comparison()
++    
++    if not success:
++        print("\nIssue reproduced: MOD operator doesn't resolve output_field correctly!")
++        sys.exit(1)
++    else:
++        print("\nNo issue found.")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..5e49d4615a
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,143 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.expressions import F, Value, Combinable
++from decimal import Decimal
++
++def test_all_operators():
++    """Test all arithmetic operators to ensure they work correctly"""
++    print("Testing all arithmetic operators with mixed numeric types...")
++    
++    from django.db.models.sql.query import Query
++    query = Query(None)  # Simple query without model
++    
++    # Test data
++    decimal_val = Decimal('10.5')
++    integer_val = 5
++    float_val = 3.5
++    
++    decimal_expr = Value(decimal_val, output_field=models.DecimalField())
++    integer_expr = Value(integer_val, output_field=models.IntegerField())
++    float_expr = Value(float_val, output_field=models.FloatField())
++    
++    # Test all operators
++    operators = [
++        ('+', Combinable.ADD),
++        ('-', Combinable.SUB),
++        ('*', Combinable.MUL),
++        ('/', Combinable.DIV),
++        ('%', Combinable.MOD),
++    ]
++    
++    all_passed = True
++    
++    for op_symbol, op_func in operators:
++        try:
++            # Test Decimal % Integer
++            if op_symbol == '%':
++                # Use the mod operator directly
++                expr1 = decimal_expr % integer_expr
++            else:
++                # Use the combine method for other operators
++                expr1 = decimal_expr._combine(integer_expr, op_func, False)
++            
++            resolved1 = expr1.resolve_expression(query)
++            result_type1 = resolved1.output_field.get_internal_type()
++            
++            print(f"Decimal {op_symbol} Integer: {result_type1}")
++            
++            # Test Integer % Decimal
++            if op_symbol == '%':
++                expr2 = integer_expr % decimal_expr
++            else:
++                expr2 = integer_expr._combine(decimal_expr, op_func, False)
++            
++            resolved2 = expr2.resolve_expression(query)
++            result_type2 = resolved2.output_field.get_internal_type()
++            
++            print(f"Integer {op_symbol} Decimal: {result_type2}")
++            
++            # For arithmetic operators, both should be DecimalField
++            if result_type1 != 'DecimalField' or result_type2 != 'DecimalField':
++                print(f"✗ {op_symbol} operator failed type resolution")
++                all_passed = False
++                
++        except Exception as e:
++            print(f"✗ {op_symbol} operator error: {e}")
++            all_passed = False
++    
++    return all_passed
++
++def test_mod_specific():
++    """Test MOD operator specifically"""
++    print("\nTesting MOD operator specifically...")
++    
++    from django.db.models.sql.query import Query
++    query = Query(None)
++    
++    # Test cases that should work
++    test_cases = [
++        (Decimal('10.5'), models.DecimalField, 3, models.IntegerField, 'DecimalField'),
++        (10, models.IntegerField, Decimal('3.5'), models.DecimalField, 'DecimalField'),
++        (Decimal('10.5'), models.DecimalField, 3.5, models.FloatField, 'FloatField'),
++        (10.5, models.FloatField, Decimal('3.5'), models.DecimalField, 'FloatField'),
++        (10, models.IntegerField, 3.5, models.FloatField, 'FloatField'),
++        (10.5, models.FloatField, 3, models.IntegerField, 'FloatField'),
++    ]
++    
++    all_passed = True
++    
++    for lhs_val, lhs_field, rhs_val, rhs_field, expected_type in test_cases:
++        try:
++            lhs_expr = Value(lhs_val, output_field=lhs_field)
++            rhs_expr = Value(rhs_val, output_field=rhs_field)
++            mod_expr = lhs_expr % rhs_expr
++            resolved = mod_expr.resolve_expression(query)
++            actual_type = resolved.output_field.get_internal_type()
++            
++            if actual_type == expected_type:
++                print(f"✓ {lhs_field.__name__} % {rhs_field.__name__}: {actual_type}")
++            else:
++                print(f"✗ {lhs_field.__name__} % {rhs_field.__name__}: expected {expected_type}, got {actual_type}")
++                all_passed = False
++                
++        except Exception as e:
++            print(f"✗ {lhs_field.__name__} % {rhs_field.__name__}: Error - {e}")
++            all_passed = False
++    
++    return all_passed
++
++if __name__ == '__main__':
++    success1 = test_all_operators()
++    success2 = test_mod_specific()
++    
++    if success1 and success2:
++        print("\nAll tests passed! The fix is working correctly.")
++        sys.exit(0)
++    else:
++        print("\nSome tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..f45c8536e4
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.expressions import F, Value
++from decimal import Decimal
++
++# Create a simple test model
++class TestModel(models.Model):
++    decimal_field = models.DecimalField(max_digits=10, decimal_places=2)
++    integer_field = models.IntegerField()
++    float_field = models.FloatField()
++
++    class Meta:
++        app_label = 'test'
++
++def test_mod_operator_edge_cases():
++    """Test MOD operator with various edge cases"""
++    print("Testing MOD operator edge cases...")
++    
++    from django.db.models.sql.query import Query
++    query = Query(TestModel)
++    
++    # Test cases - use field instances instead of classes
++    test_cases = [
++        # (description, lhs_value, lhs_field, rhs_value, rhs_field, expected_type)
++        ("Decimal % Integer", Decimal('10.5'), models.DecimalField(), 3, models.IntegerField(), 'DecimalField'),
++        ("Integer % Decimal", 10, models.IntegerField(), Decimal('3.5'), models.DecimalField(), 'DecimalField'),
++        ("Decimal % Float", Decimal('10.5'), models.DecimalField(), 3.5, models.FloatField(), 'FloatField'),
++        ("Float % Decimal", 10.5, models.FloatField(), Decimal('3.5'), models.DecimalField(), 'FloatField'),
++        ("Integer % Float", 10, models.IntegerField(), 3.5, models.FloatField(), 'FloatField'),
++        ("Float % Integer", 10.5, models.FloatField(), 3, models.IntegerField(), 'FloatField'),
++        ("Decimal % Decimal", Decimal('10.5'), models.DecimalField(), Decimal('3.5'), models.DecimalField(), 'DecimalField'),
++        ("Integer % Integer", 10, models.IntegerField(), 3, models.IntegerField(), 'IntegerField'),
++        ("Float % Float", 10.5, models.FloatField(), 3.5, models.FloatField(), 'FloatField'),
++    ]
++    
++    all_passed = True
++    
++    for desc, lhs_val, lhs_field, rhs_val, rhs_field, expected_type in test_cases:
++        try:
++            lhs_expr = Value(lhs_val, output_field=lhs_field)
++            rhs_expr = Value(rhs_val, output_field=rhs_field)
++            mod_expr = lhs_expr % rhs_expr
++            resolved_mod = mod_expr.resolve_expression(query)
++            
++            actual_type = resolved_mod.output_field.get_internal_type()
++            
++            if actual_type == expected_type:
++                print(f"✓ {desc}: {actual_type}")
++            else:
++                print(f"✗ {desc}: expected {expected_type}, got {actual_type}")
++                all_passed = False
++                
++        except Exception as e:
++            print(f"✗ {desc}: Error - {e}")
++            all_passed = False
++    
++    return all_passed
++
++if __name__ == '__main__':
++    success = test_mod_operator_edge_cases()
++    
++    if success:
++        print("\nAll edge cases passed!")
++        sys.exit(0)
++    else:
++        print("\nSome edge cases failed!")
++        sys.exit(1)
+\ No newline at end of file

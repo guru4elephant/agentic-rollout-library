@@ -1,0 +1,286 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..96e886d2
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++"""
++Script to reproduce the UnicodeDecodeError issue with unicode method names
++"""
++
++import requests
++import sys
++
++def test_unicode_method():
++    print("Testing unicode method names...")
++    
++    # This should work fine (string method)
++    print("Testing with string method 'POST':")
++    try:
++        files = {u'file': open(u'/usr/bin/diff', u'rb')}
++        response = requests.request(method='POST', url=u'http://httpbin.org/post', files=files)
++        print("SUCCESS: String method worked")
++        print("Status code:", response.status_code)
++    except Exception as e:
++        print("ERROR with string method:", str(e))
++        print("Type:", type(e))
++    
++    print("\nTesting with unicode method u'POST':")
++    # This should fail with UnicodeDecodeError
++    try:
++        files = {u'file': open(u'/usr/bin/diff', u'rb')}
++        response = requests.request(method=u'POST', url=u'http://httpbin.org/post', files=files)
++        print("SUCCESS: Unicode method worked")
++        print("Status code:", response.status_code)
++    except UnicodeDecodeError as e:
++        print("UnicodeDecodeError with unicode method:", str(e))
++        print("Type:", type(e))
++    except Exception as e:
++        print("Other error with unicode method:", str(e))
++        print("Type:", type(e))
++
++if __name__ == "__main__":
++    test_unicode_method()
+\ No newline at end of file
+diff --git a/requests/models.py b/requests/models.py
+index f82f56a3..d87ad106 100644
+--- a/requests/models.py
++++ b/requests/models.py
+@@ -307,7 +307,7 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+         """Prepares the given HTTP method."""
+         self.method = method
+         if self.method is not None:
+-            self.method = self.method.upper()
++            self.method = to_native_string(self.method).upper()
+ 
+     def prepare_url(self, url, params):
+         """Prepares the given HTTP URL."""
+diff --git a/requests/packages/urllib3/request.py b/requests/packages/urllib3/request.py
+index 66a9a0e6..28c11a21 100644
+--- a/requests/packages/urllib3/request.py
++++ b/requests/packages/urllib3/request.py
+@@ -67,6 +67,11 @@ class RequestMethods(object):
+         :meth:`request_encode_url`, :meth:`request_encode_body`,
+         or even the lowest level :meth:`urlopen`.
+         """
++        # Handle unicode method names in Python 2
++        if hasattr(method, 'encode'):
++            method = method.encode('ascii')
++        if hasattr(method, 'decode'):
++            method = method.decode('ascii')
+         method = method.upper()
+ 
+         if method in self._encode_url_methods:
+diff --git a/requests/sessions.py b/requests/sessions.py
+index cc72f65d..f5f7b39a 100644
+--- a/requests/sessions.py
++++ b/requests/sessions.py
+@@ -16,7 +16,7 @@ from .compat import cookielib, OrderedDict, urljoin, urlparse, urlunparse
+ from .cookies import cookiejar_from_dict, extract_cookies_to_jar, RequestsCookieJar
+ from .models import Request, PreparedRequest
+ from .hooks import default_hooks, dispatch_hook
+-from .utils import to_key_val_list, default_headers
++from .utils import to_key_val_list, default_headers, to_native_string
+ from .exceptions import TooManyRedirects, InvalidSchema
+ from .structures import CaseInsensitiveDict
+ 
+@@ -254,7 +254,7 @@ class Session(SessionRedirectMixin):
+ 
+         p = PreparedRequest()
+         p.prepare(
+-            method=request.method.upper(),
++            method=to_native_string(request.method).upper(),
+             url=request.url,
+             files=request.files,
+             data=request.data,
+@@ -311,7 +311,7 @@ class Session(SessionRedirectMixin):
+         """
+         # Create the Request.
+         req = Request(
+-            method = method.upper(),
++            method = to_native_string(method).upper(),
+             url = url,
+             headers = headers,
+             files = files,
+diff --git a/test_comprehensive_fix.py b/test_comprehensive_fix.py
+new file mode 100644
+index 00000000..545c97f0
+--- /dev/null
++++ b/test_comprehensive_fix.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++"""
++Comprehensive test to verify the unicode method name fix works at all levels
++"""
++
++import sys
++import os
++
++# Add the current directory to Python path so we can import requests
++sys.path.insert(0, '/testbed')
++
++from requests.models import Request, PreparedRequest
++from requests.sessions import Session
++from requests.packages.urllib3.request import RequestMethods
++
++def test_requests_level():
++    print("=== Testing Requests Level ===")
++    
++    # Test 1: Request class with unicode method
++    print("Test 1: Request class with unicode method")
++    try:
++        req = Request(method=u'POST', url=u'http://httpbin.org/post')
++        prepared = req.prepare()
++        print("SUCCESS: Request with unicode method prepared successfully")
++        print("Method type:", type(prepared.method))
++        print("Method value:", repr(prepared.method))
++        assert isinstance(prepared.method, str), "Method should be a string, not unicode"
++    except Exception as e:
++        print("ERROR with Request:", str(e))
++        print("Type:", type(e))
++        return False
++    
++    # Test 2: Session class with unicode method
++    print("\nTest 2: Session class with unicode method")
++    try:
++        session = Session()
++        req = session.prepare_request(Request(method=u'POST', url=u'http://httpbin.org/post'))
++        print("SUCCESS: Session with unicode method prepared successfully")
++        print("Method type:", type(req.method))
++        print("Method value:", repr(req.method))
++        assert isinstance(req.method, str), "Method should be a string, not unicode"
++    except Exception as e:
++        print("ERROR with Session:", str(e))
++        print("Type:", type(e))
++        return False
++    
++    return True
++
++def test_urllib3_level():
++    print("\n=== Testing urllib3 Level ===")
++    
++    # Create a mock RequestMethods instance
++    class MockRequestMethods(RequestMethods):
++        def urlopen(self, method, url, body=None, headers=None, **kw):
++            # Just return the method to test the conversion
++            return method
++    
++    # Test urllib3 request method with unicode
++    print("Test: urllib3 request method with unicode method")
++    try:
++        rm = MockRequestMethods()
++        result = rm.request(u'POST', 'http://httpbin.org/post')
++        print("SUCCESS: urllib3 request with unicode method processed successfully")
++        print("Method type:", type(result))
++        print("Method value:", repr(result))
++        assert isinstance(result, str), "Method should be a string, not unicode"
++        assert result == 'POST', "Method should be 'POST'"
++    except Exception as e:
++        print("ERROR with urllib3:", str(e))
++        print("Type:", type(e))
++        return False
++    
++    return True
++
++def test_comparison():
++    print("\n=== Testing Comparison ===")
++    
++    # Compare unicode vs string methods at requests level
++    req_unicode = Request(method=u'POST', url=u'http://httpbin.org/post')
++    req_string = Request(method='POST', url=u'http://httpbin.org/post')
++    
++    prep_unicode = req_unicode.prepare()
++    prep_string = req_string.prepare()
++    
++    print("Unicode method result type:", type(prep_unicode.method))
++    print("String method result type:", type(prep_string.method))
++    print("Methods are equal:", prep_unicode.method == prep_string.method)
++    print("Unicode method value:", repr(prep_unicode.method))
++    print("String method value:", repr(prep_string.method))
++    
++    assert prep_unicode.method == prep_string.method, "Unicode and string methods should produce same result"
++    assert isinstance(prep_unicode.method, type(prep_string.method)), "Both should be same type"
++    
++    return True
++
++if __name__ == "__main__":
++    success = True
++    success &= test_requests_level()
++    success &= test_urllib3_level()
++    success &= test_comparison()
++    
++    if success:
++        print("\n=== ALL TESTS PASSED ===")
++        print("The unicode method name fix is working correctly!")
++    else:
++        print("\n=== SOME TESTS FAILED ===")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_method_conversion.py b/test_method_conversion.py
+new file mode 100644
+index 00000000..35613dba
+--- /dev/null
++++ b/test_method_conversion.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++"""
++Test script to verify that unicode method names are properly converted to native strings
++"""
++
++import sys
++import os
++
++# Add the current directory to Python path so we can import requests
++sys.path.insert(0, '/testbed')
++
++from requests.models import Request, PreparedRequest
++from requests.sessions import Session
++
++def test_unicode_method_conversion():
++    print("Testing unicode method conversion...")
++    
++    # Test 1: Request class with unicode method
++    print("Test 1: Request class with unicode method")
++    try:
++        req = Request(method=u'POST', url=u'http://httpbin.org/post')
++        prepared = req.prepare()
++        print("SUCCESS: Request with unicode method prepared successfully")
++        print("Method type:", type(prepared.method))
++        print("Method value:", repr(prepared.method))
++    except Exception as e:
++        print("ERROR with Request:", str(e))
++        print("Type:", type(e))
++    
++    # Test 2: Session class with unicode method
++    print("\nTest 2: Session class with unicode method")
++    try:
++        session = Session()
++        req = session.prepare_request(Request(method=u'POST', url=u'http://httpbin.org/post'))
++        print("SUCCESS: Session with unicode method prepared successfully")
++        print("Method type:", type(req.method))
++        print("Method value:", repr(req.method))
++    except Exception as e:
++        print("ERROR with Session:", str(e))
++        print("Type:", type(e))
++    
++    # Test 3: Compare unicode vs string methods
++    print("\nTest 3: Compare unicode vs string methods")
++    req_unicode = Request(method=u'POST', url=u'http://httpbin.org/post')
++    req_string = Request(method='POST', url=u'http://httpbin.org/post')
++    
++    prep_unicode = req_unicode.prepare()
++    prep_string = req_string.prepare()
++    
++    print("Unicode method result type:", type(prep_unicode.method))
++    print("String method result type:", type(prep_string.method))
++    print("Methods are equal:", prep_unicode.method == prep_string.method)
++    print("Unicode method value:", repr(prep_unicode.method))
++    print("String method value:", repr(prep_string.method))
++
++if __name__ == "__main__":
++    test_unicode_method_conversion()
+\ No newline at end of file

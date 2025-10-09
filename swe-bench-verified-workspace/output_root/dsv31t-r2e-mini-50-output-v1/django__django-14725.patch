@@ -1,0 +1,152 @@
+diff --git a/django/forms/formsets.py b/django/forms/formsets.py
+index 75b0646512..c23ad1a196 100644
+--- a/django/forms/formsets.py
++++ b/django/forms/formsets.py
+@@ -478,7 +478,7 @@ class BaseFormSet(RenderableFormMixin):
+ def formset_factory(form, formset=BaseFormSet, extra=1, can_order=False,
+                     can_delete=False, max_num=None, validate_max=False,
+                     min_num=None, validate_min=False, absolute_max=None,
+-                    can_delete_extra=True, renderer=None):
++                    can_delete_extra=True, renderer=None, can_add=True):
+     """Return a FormSet for the given form class."""
+     if min_num is None:
+         min_num = DEFAULT_MIN_NUM
+@@ -505,6 +505,7 @@ def formset_factory(form, formset=BaseFormSet, extra=1, can_order=False,
+         'validate_min': validate_min,
+         'validate_max': validate_max,
+         'renderer': renderer or get_default_renderer(),
++        'can_add': can_add,
+     }
+     return type(form.__name__ + 'FormSet', (formset,), attrs)
+ 
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 7effb202e3..4e5cddde8c 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -875,7 +875,8 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
+                          widgets=None, validate_max=False, localized_fields=None,
+                          labels=None, help_texts=None, error_messages=None,
+                          min_num=None, validate_min=False, field_classes=None,
+-                         absolute_max=None, can_delete_extra=True, renderer=None):
++                         absolute_max=None, can_delete_extra=True, renderer=None,
++                         can_add=True):
+     """Return a FormSet class for the given Django model class."""
+     meta = getattr(form, 'Meta', None)
+     if (getattr(meta, 'fields', fields) is None and
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..588aef117d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the issue: Provide a way for model formsets to disallow new object creation
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.db import models, connection
++from django.forms import modelformset_factory
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    description = models.TextField(blank=True)
++
++    class Meta:
++        app_label = 'test'
++
++# Create a form for the model
++class TestForm(forms.ModelForm):
++    class Meta:
++        model = TestModel
++        fields = ['name', 'description']
++
++def test_current_behavior():
++    """Test the current behavior of model formsets"""
++    print("=== Testing current behavior ===")
++    
++    # Create database tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Create some initial objects
++    obj1 = TestModel.objects.create(name="Object 1", description="First object")
++    obj2 = TestModel.objects.create(name="Object 2", description="Second object")
++    
++    # Create a formset with extra=0 (what users try to use for "edit only")
++    TestFormSet = modelformset_factory(TestModel, form=TestForm, extra=0)
++    
++    # Simulate POST data with additional forms (what users can do with JavaScript)
++    post_data = {
++        'form-TOTAL_FORMS': '3',  # More forms than initial objects
++        'form-INITIAL_FORMS': '2',
++        'form-MIN_NUM_FORMS': '0',
++        'form-MAX_NUM_FORMS': '1000',
++        
++        # Existing objects
++        'form-0-id': str(obj1.id),
++        'form-0-name': 'Updated Object 1',
++        'form-0-description': 'Updated first object',
++        
++        'form-1-id': str(obj2.id),
++        'form-1-name': 'Updated Object 2',
++        'form-1-description': 'Updated second object',
++        
++        # New object (should not be allowed in "edit only" mode)
++        'form-2-name': 'New Object',
++        'form-2-description': 'New object created via POST',
++    }
++    
++    formset = TestFormSet(post_data, queryset=TestModel.objects.all())
++    
++    print(f"Formset is valid: {formset.is_valid()}")
++    print(f"Total forms: {formset.total_form_count()}")
++    print(f"Initial forms: {formset.initial_form_count()}")
++    print(f"Extra forms: {len(formset.extra_forms)}")
++    
++    if formset.is_valid():
++        print("Formset validation passed - this allows new object creation!")
++        instances = formset.save()
++        print(f"Saved {len(instances)} instances")
++        for i, instance in enumerate(instances):
++            print(f"Instance {i}: {instance.name} (ID: {instance.id})")
++    else:
++        print("Formset validation failed")
++        print("Errors:", formset.errors)
++    
++    # Clean up
++    TestModel.objects.all().delete()
++    
++    # Drop database tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.delete_model(TestModel)
++
++if __name__ == '__main__':
++    test_current_behavior()
+\ No newline at end of file

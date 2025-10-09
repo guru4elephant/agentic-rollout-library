@@ -1,0 +1,659 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index d9c9b0db04..c888854841 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -34,6 +34,25 @@ MAX_GET_RESULTS = 21
+ REPR_OUTPUT_SIZE = 20
+ 
+ 
++def _is_field_unique(model, field_name):
++    """
++    Check if a field is unique either by its unique attribute or by being
++    part of a unique constraint.
++    """
++    field = model._meta.get_field(field_name)
++    
++    # Check if the field itself is unique
++    if field.unique:
++        return True
++    
++    # Check if the field is part of any unique constraints
++    for constraint in model._meta.total_unique_constraints:
++        if field_name in constraint.fields:
++            return True
++    
++    return False
++
++
+ class BaseIterable:
+     def __init__(self, queryset, chunked_fetch=False, chunk_size=GET_ITERATOR_CHUNK_SIZE):
+         self.queryset = queryset
+@@ -689,7 +708,7 @@ class QuerySet:
+         """
+         assert not self.query.is_sliced, \
+             "Cannot use 'limit' or 'offset' with in_bulk"
+-        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:
++        if field_name != 'pk' and not _is_field_unique(self.model, field_name):
+             raise ValueError("in_bulk()'s field_name must be a unique field but %r isn't." % field_name)
+         if id_list is not None:
+             if not id_list:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..987a18076d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++from django.conf import settings
++from django.db import models
++from django.db.models import UniqueConstraint
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++# Create a test model similar to the one in the issue
++class Article(models.Model):
++    slug = models.CharField(max_length=255)
++    
++    class Meta:
++        constraints = [
++            UniqueConstraint(fields=["slug"], name="%(app_label)s_%(class)s_slug_unq")
++        ]
++
++# Initialize Django
++from django import setup
++setup()
++
++# Test the issue without creating database tables
++try:
++    # Just test the validation logic
++    queryset = Article.objects.all()
++    result = queryset.in_bulk(field_name="slug")
++    print("SUCCESS: in_bulk() worked with UniqueConstraint")
++except ValueError as e:
++    print(f"ERROR: {e}")
++except Exception as e:
++    print(f"UNEXPECTED ERROR: {e}")
+\ No newline at end of file
+diff --git a/test_backwards_compatibility.py b/test_backwards_compatibility.py
+new file mode 100644
+index 0000000000..ec020e129c
+--- /dev/null
++++ b/test_backwards_compatibility.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++from django.conf import settings
++from django.db import models
++from django.db.models import UniqueConstraint
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++# Initialize Django
++from django import setup
++setup()
++
++# Create database tables
++from django.db import connection
++connection.ensure_connection()
++with connection.schema_editor() as schema_editor:
++    # Create test models
++    class ArticleWithUniqueField(models.Model):
++        slug = models.CharField(max_length=255, unique=True)
++        
++        class Meta:
++            app_label = 'test'
++    
++    class ArticleWithConstraint(models.Model):
++        slug = models.CharField(max_length=255)
++        
++        class Meta:
++            app_label = 'test'
++            constraints = [
++                UniqueConstraint(fields=["slug"], name="test_article_slug_unq")
++            ]
++    
++    class ArticleWithoutUnique(models.Model):
++        slug = models.CharField(max_length=255)
++        
++        class Meta:
++            app_label = 'test'
++    
++    # Create the tables
++    schema_editor.create_model(ArticleWithUniqueField)
++    schema_editor.create_model(ArticleWithConstraint)
++    schema_editor.create_model(ArticleWithoutUnique)
++
++print("Testing backwards compatibility...")
++
++# Test 1: Field with unique=True should work
++try:
++    article1 = ArticleWithUniqueField.objects.create(slug="unique1")
++    result1 = ArticleWithUniqueField.objects.in_bulk(field_name="slug")
++    print("✓ ArticleWithUniqueField: SUCCESS")
++except Exception as e:
++    print(f"✗ ArticleWithUniqueField: FAILED - {e}")
++
++# Test 2: Field with unique constraint should work
++try:
++    article2 = ArticleWithConstraint.objects.create(slug="constraint1")
++    result2 = ArticleWithConstraint.objects.in_bulk(field_name="slug")
++    print("✓ ArticleWithConstraint: SUCCESS")
++except Exception as e:
++    print(f"✗ ArticleWithConstraint: FAILED - {e}")
++
++# Test 3: Field without any uniqueness should fail
++try:
++    article3 = ArticleWithoutUnique.objects.create(slug="normal1")
++    result3 = ArticleWithoutUnique.objects.in_bulk(field_name="slug")
++    print("✗ ArticleWithoutUnique: SHOULD HAVE FAILED")
++except ValueError as e:
++    if "isn't" in str(e):
++        print("✓ ArticleWithoutUnique: CORRECTLY FAILED")
++    else:
++        print(f"✗ ArticleWithoutUnique: UNEXPECTED ERROR - {e}")
++except Exception as e:
++    print(f"✗ ArticleWithoutUnique: UNEXPECTED ERROR - {e}")
++
++print("\nBackwards compatibility test completed!")
+\ No newline at end of file
+diff --git a/test_django_integration.py b/test_django_integration.py
+new file mode 100644
+index 0000000000..1486a2fd99
+--- /dev/null
++++ b/test_django_integration.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++from django.conf import settings
++from django.db import models
++from django.db.models import UniqueConstraint
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++# Import after configuring settings
++from django import setup
++setup()
++
++# Import our helper function
++from django.db.models.query import _is_field_unique
++
++# Create test models
++class ArticleWithUniqueField(models.Model):
++    slug = models.CharField(max_length=255, unique=True)
++    
++    class Meta:
++        app_label = 'test'
++
++class ArticleWithConstraint(models.Model):
++    slug = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'test'
++        constraints = [
++            UniqueConstraint(fields=["slug"], name="test_article_slug_unq")
++        ]
++
++class ArticleWithoutUnique(models.Model):
++    slug = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'test'
++
++print("Testing _is_field_unique with actual Django models...")
++
++# Test 1: Field with unique=True
++result1 = _is_field_unique(ArticleWithUniqueField, "slug")
++print(f"ArticleWithUniqueField.slug: {result1} (expected: True)")
++
++# Test 2: Field with unique constraint
++result2 = _is_field_unique(ArticleWithConstraint, "slug")
++print(f"ArticleWithConstraint.slug: {result2} (expected: True)")
++
++# Test 3: Field without unique attributes
++result3 = _is_field_unique(ArticleWithoutUnique, "slug")
++print(f"ArticleWithoutUnique.slug: {result3} (expected: False)")
++
++print("\nIntegration test completed!")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..58cfdd9897
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++from django.conf import settings
++from django.db import models
++from django.db.models import UniqueConstraint
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++# Initialize Django
++from django import setup
++setup()
++
++# Import our helper function
++from django.db.models.query import _is_field_unique
++
++# Create test models for edge cases
++class ArticleWithMultipleConstraints(models.Model):
++    slug = models.CharField(max_length=255)
++    title = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'test'
++        constraints = [
++            UniqueConstraint(fields=["slug"], name="test_article_slug_unq"),
++            UniqueConstraint(fields=["title"], name="test_article_title_unq"),
++            UniqueConstraint(fields=["slug", "title"], name="test_article_slug_title_unq"),
++        ]
++
++class ArticleWithConditionalConstraint(models.Model):
++    slug = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'test'
++        constraints = [
++            UniqueConstraint(fields=["slug"], name="test_article_slug_unq", condition=models.Q(slug__isnull=False)),
++        ]
++
++print("Testing edge cases...")
++
++# Test 1: Multiple constraints with different fields
++result1 = _is_field_unique(ArticleWithMultipleConstraints, "slug")
++result2 = _is_field_unique(ArticleWithMultipleConstraints, "title")
++print(f"Multiple constraints - slug: {result1} (expected: True)")
++print(f"Multiple constraints - title: {result2} (expected: True)")
++
++# Test 2: Conditional constraint (should not be considered as total unique constraint)
++result4 = _is_field_unique(ArticleWithConditionalConstraint, "slug")
++print(f"Conditional constraint - slug: {result4} (expected: False)")
++
++print("\nEdge case testing completed!")
+\ No newline at end of file
+diff --git a/test_final.py b/test_final.py
+new file mode 100644
+index 0000000000..d962c2f695
+--- /dev/null
++++ b/test_final.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++from django.conf import settings
++from django.db import models
++from django.db.models import UniqueConstraint
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++# Initialize Django
++from django import setup
++setup()
++
++# Create database tables
++from django.db import connection
++connection.ensure_connection()
++with connection.schema_editor() as schema_editor:
++    # Create test models
++    class ArticleWithConstraint(models.Model):
++        slug = models.CharField(max_length=255)
++        
++        class Meta:
++            app_label = 'test'
++            constraints = [
++                UniqueConstraint(fields=["slug"], name="test_article_slug_unq")
++            ]
++    
++    # Create the table
++    schema_editor.create_model(ArticleWithConstraint)
++
++print("Testing in_bulk with UniqueConstraint...")
++
++# Test the in_bulk method
++try:
++    # Create some test data
++    article1 = ArticleWithConstraint.objects.create(slug="test1")
++    article2 = ArticleWithConstraint.objects.create(slug="test2")
++    
++    # This should now work with our fix
++    result = ArticleWithConstraint.objects.in_bulk(field_name="slug")
++    print("SUCCESS: in_bulk() worked with UniqueConstraint!")
++    print(f"Result: {result}")
++    
++    # Verify the result is correct
++    expected_keys = {"test1", "test2"}
++    actual_keys = set(result.keys())
++    if actual_keys == expected_keys:
++        print("✓ Result contains correct keys")
++    else:
++        print(f"✗ Result keys mismatch. Expected: {expected_keys}, Got: {actual_keys}")
++        
++except ValueError as e:
++    print(f"ERROR: {e}")
++except Exception as e:
++    print(f"UNEXPECTED ERROR: {e}")
++
++print("\nTest completed!")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..344b05ade3
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Import the helper function we just created
++from django.db.models.query import _is_field_unique
++
++# Mock the necessary classes to test our function
++class MockField:
++    def __init__(self, unique=False):
++        self.unique = unique
++
++class MockUniqueConstraint:
++    def __init__(self, fields):
++        self.fields = fields
++        self.condition = None
++
++class MockMeta:
++    def __init__(self, field_unique=False, constraint_fields=None):
++        self.field_unique = field_unique
++        self.constraint_fields = constraint_fields or []
++    
++    def get_field(self, field_name):
++        return MockField(self.field_unique)
++    
++    @property
++    def total_unique_constraints(self):
++        if self.constraint_fields:
++            return [MockUniqueConstraint(self.constraint_fields)]
++        return []
++
++class MockModel:
++    def __init__(self, field_unique=False, constraint_fields=None):
++        self._meta = MockMeta(field_unique, constraint_fields)
++
++# Test cases
++print("Testing _is_field_unique function...")
++
++# Test 1: Field with unique=True
++model1 = MockModel(field_unique=True)
++result1 = _is_field_unique(model1, "slug")
++print(f"Field with unique=True: {result1} (expected: True)")
++
++# Test 2: Field without unique=True and no constraints
++model2 = MockModel(field_unique=False)
++result2 = _is_field_unique(model2, "slug")
++print(f"Field without unique and no constraints: {result2} (expected: False)")
++
++# Test 3: Field without unique=True but with unique constraint
++model3 = MockModel(field_unique=False, constraint_fields=["slug"])
++result3 = _is_field_unique(model3, "slug")
++print(f"Field with unique constraint: {result3} (expected: True)")
++
++# Test 4: Field without unique=True but with constraint on different field
++model4 = MockModel(field_unique=False, constraint_fields=["title"])
++result4 = _is_field_unique(model4, "slug")
++print(f"Field with constraint on different field: {result4} (expected: False)")
++
++print("\nAll tests completed!")
+\ No newline at end of file
+diff --git a/test_in_bulk.py b/test_in_bulk.py
+new file mode 100644
+index 0000000000..68db916432
+--- /dev/null
++++ b/test_in_bulk.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Test the actual in_bulk method with our fix
++from django.db.models.query import QuerySet
++
++# Mock the necessary classes
++class MockField:
++    def __init__(self, unique=False):
++        self.unique = unique
++
++class MockUniqueConstraint:
++    def __init__(self, fields):
++        self.fields = fields
++        self.condition = None
++
++class MockMeta:
++    def __init__(self, field_unique=False, constraint_fields=None):
++        self.field_unique = field_unique
++        self.constraint_fields = constraint_fields or []
++    
++    def get_field(self, field_name):
++        return MockField(self.field_unique)
++    
++    def total_unique_constraints(self):
++        if self.constraint_fields:
++            return [MockUniqueConstraint(self.constraint_fields)]
++        return []
++
++class MockModel:
++    def __init__(self, field_unique=False, constraint_fields=None):
++        self._meta = MockMeta(field_unique, constraint_fields)
++
++class MockQuery:
++    def __init__(self):
++        self.is_sliced = False
++
++# Create a test queryset
++class TestQuerySet(QuerySet):
++    def __init__(self, field_unique=False, constraint_fields=None):
++        self.model = MockModel(field_unique, constraint_fields)
++        self.query = MockQuery()
++        # Initialize required attributes
++        self._deferred_filter = None
++        self._result_cache = None
++
++print("Testing in_bulk method with our fix...")
++
++# Test 1: Field with unique=True should work
++try:
++    qs1 = TestQuerySet(field_unique=True)
++    result1 = qs1.in_bulk(field_name="slug")
++    print("✓ Field with unique=True: SUCCESS")
++except Exception as e:
++    print(f"✗ Field with unique=True: FAILED - {e}")
++
++# Test 2: Field without unique and no constraints should fail
++try:
++    qs2 = TestQuerySet(field_unique=False)
++    result2 = qs2.in_bulk(field_name="slug")
++    print("✗ Field without unique and no constraints: SHOULD HAVE FAILED")
++except ValueError as e:
++    if "isn't" in str(e):
++        print("✓ Field without unique and no constraints: CORRECTLY FAILED")
++    else:
++        print(f"✗ Field without unique and no constraints: UNEXPECTED ERROR - {e}")
++except Exception as e:
++    print(f"✗ Field without unique and no constraints: UNEXPECTED ERROR - {e}")
++
++# Test 3: Field with unique constraint should work
++try:
++    qs3 = TestQuerySet(field_unique=False, constraint_fields=["slug"])
++    result3 = qs3.in_bulk(field_name="slug")
++    print("✓ Field with unique constraint: SUCCESS")
++except Exception as e:
++    print(f"✗ Field with unique constraint: FAILED - {e}")
++
++# Test 4: Field with constraint on different field should fail
++try:
++    qs4 = TestQuerySet(field_unique=False, constraint_fields=["title"])
++    result4 = qs4.in_bulk(field_name="slug")
++    print("✗ Field with constraint on different field: SHOULD HAVE FAILED")
++except ValueError as e:
++    if "isn't" in str(e):
++        print("✓ Field with constraint on different field: CORRECTLY FAILED")
++    else:
++        print(f"✗ Field with constraint on different field: UNEXPECTED ERROR - {e}")
++except Exception as e:
++    print(f"✗ Field with constraint on different field: UNEXPECTED ERROR - {e}")
++
++print("\nAll tests completed!")
+\ No newline at end of file
+diff --git a/test_validation.py b/test_validation.py
+new file mode 100644
+index 0000000000..ca40640052
+--- /dev/null
++++ b/test_validation.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Test the current validation logic
++from django.db.models.query import QuerySet
++
++# Mock the minimal required attributes to test the validation
++class MockModel:
++    class _meta:
++        constraints = []
++        
++        @staticmethod
++        def get_field(field_name):
++            class MockField:
++                def __init__(self, unique):
++                    self.unique = unique
++            return MockField(False)  # Field is not unique by itself
++
++# Create a mock queryset
++class MockQuerySet(QuerySet):
++    def __init__(self):
++        self.model = MockModel()
++        self.query = type('MockQuery', (), {'is_sliced': False})()
++
++# Test the current validation
++queryset = MockQuerySet()
++try:
++    result = queryset.in_bulk(field_name="slug")
++    print("SUCCESS: in_bulk() worked")
++except ValueError as e:
++    print(f"ERROR: {e}")
+\ No newline at end of file

@@ -1,0 +1,629 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index dddf7c679c..ad883dd7ef 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -137,11 +137,17 @@ class CreateModel(ModelOperation):
+                 ),
+             ]
+         elif isinstance(operation, AlterModelOptions) and self.name_lower == operation.name_lower:
++            # Merge options, but also remove any options that are not present in the alter operation
++            # This mimics the behavior of AlterModelOptions.state_forwards()
++            options = {**self.options, **operation.options}
++            for key in operation.ALTER_OPTION_KEYS:
++                if key not in operation.options:
++                    options.pop(key, None)
+             return [
+                 CreateModel(
+                     self.name,
+                     fields=self.fields,
+-                    options={**self.options, **operation.options},
++                    options=options,
+                     bases=self.bases,
+                     managers=self.managers,
+                 ),
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..0885be463d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with squashmigrations not unsetting model options
++when optimizing CreateModel and AlterModelOptions.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++
++def test_option_clearing():
++    """Test that options are properly cleared when squashing AlterModelOptions into CreateModel"""
++    
++    # Create initial model with some options
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[('id', models.AutoField(primary_key=True))],
++        options={
++            'verbose_name': 'Test Model',
++            'ordering': ['id'],
++            'permissions': [('can_view', 'Can view test model')]
++        }
++    )
++    
++    # Create AlterModelOptions that removes some options
++    alter_op = AlterModelOptions(
++        name='TestModel',
++        options={
++            'verbose_name': 'New Test Model',  # Change this
++            'ordering': [],  # Clear this (empty list)
++            # 'permissions' is missing, so it should be removed
++        }
++    )
++    
++    # Reduce the operations (simulate squashing)
++    reduced_ops = create_op.reduce(alter_op, 'test_app')
++    
++    print("Original CreateModel options:", create_op.options)
++    print("AlterModelOptions options:", alter_op.options)
++    print("Reduced CreateModel options:", reduced_ops[0].options)
++    
++    # Check if permissions were properly removed
++    if 'permissions' in reduced_ops[0].options:
++        print("❌ ISSUE: 'permissions' option was not removed!")
++        return False
++    else:
++        print("✅ SUCCESS: 'permissions' option was properly removed")
++    
++    # Check if ordering was properly cleared
++    if reduced_ops[0].options.get('ordering') == []:
++        print("✅ SUCCESS: 'ordering' option was properly cleared")
++    else:
++        print("❌ ISSUE: 'ordering' option was not properly cleared")
++        return False
++    
++    # Check if verbose_name was properly updated
++    if reduced_ops[0].options.get('verbose_name') == 'New Test Model':
++        print("✅ SUCCESS: 'verbose_name' option was properly updated")
++    else:
++        print("❌ ISSUE: 'verbose_name' option was not properly updated")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    success = test_option_clearing()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..cd938068d9
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,165 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to ensure our fix doesn't break existing functionality.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions, RenameModel, DeleteModel
++from django.db import models
++
++def test_comprehensive():
++    """Comprehensive test of various migration operation scenarios"""
++    
++    print("Running comprehensive tests...")
++    
++    # Test 1: Normal AlterModelOptions (not empty)
++    print("\nTest 1: Normal AlterModelOptions with changes")
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[('id', models.AutoField(primary_key=True))],
++        options={
++            'verbose_name': 'Old Name',
++            'ordering': ['id'],
++        }
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel',
++        options={
++            'verbose_name': 'New Name',
++            'ordering': ['-id'],
++        }
++    )
++    
++    reduced_ops = create_op.reduce(alter_op, 'test_app')
++    result_options = reduced_ops[0].options
++    
++    expected = {'verbose_name': 'New Name', 'ordering': ['-id']}
++    if result_options == expected:
++        print("✅ PASS: Normal AlterModelOptions works correctly")
++    else:
++        print(f"❌ FAIL: Expected {expected}, got {result_options}")
++        return False
++    
++    # Test 2: Empty AlterModelOptions (GitHub issue case)
++    print("\nTest 2: Empty AlterModelOptions (GitHub issue)")
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[('id', models.AutoField(primary_key=True))],
++        options={
++            'verbose_name': 'Test Model',
++            'ordering': ['id'],
++            'permissions': [('can_view', 'Can view')],
++        }
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel',
++        options={}
++    )
++    
++    reduced_ops = create_op.reduce(alter_op, 'test_app')
++    result_options = reduced_ops[0].options
++    
++    if result_options == {}:
++        print("✅ PASS: Empty AlterModelOptions clears all options")
++    else:
++        print(f"❌ FAIL: Expected empty options, got {result_options}")
++        return False
++    
++    # Test 3: Non-ALTER_OPTION_KEYS preservation
++    print("\nTest 3: Non-ALTER_OPTION_KEYS preservation")
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[('id', models.AutoField(primary_key=True))],
++        options={
++            'verbose_name': 'Test Model',
++            'custom_option': 'custom_value',
++            'another_custom': 123,
++        }
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel',
++        options={'verbose_name': 'New Name'}
++    )
++    
++    reduced_ops = create_op.reduce(alter_op, 'test_app')
++    result_options = reduced_ops[0].options
++    
++    expected = {'verbose_name': 'New Name', 'custom_option': 'custom_value', 'another_custom': 123}
++    if result_options == expected:
++        print("✅ PASS: Non-ALTER_OPTION_KEYS preserved correctly")
++    else:
++        print(f"❌ FAIL: Expected {expected}, got {result_options}")
++        return False
++    
++    # Test 4: Other operation types should still work
++    print("\nTest 4: Other operation types (RenameModel)")
++    create_op = CreateModel(
++        name='OldModel',
++        fields=[('id', models.AutoField(primary_key=True))],
++        options={'verbose_name': 'Old Model'}
++    )
++    
++    rename_op = RenameModel(
++        old_name='OldModel',
++        new_name='NewModel'
++    )
++    
++    reduced_ops = create_op.reduce(rename_op, 'test_app')
++    if (len(reduced_ops) == 1 and 
++        reduced_ops[0].name == 'NewModel' and 
++        reduced_ops[0].options == {'verbose_name': 'Old Model'}):
++        print("✅ PASS: RenameModel reduction works correctly")
++    else:
++        print("❌ FAIL: RenameModel reduction broken")
++        return False
++    
++    # Test 5: DeleteModel should still work
++    print("\nTest 5: DeleteModel operation")
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[('id', models.AutoField(primary_key=True))],
++        options={'verbose_name': 'Test Model'}
++    )
++    
++    delete_op = DeleteModel(name='TestModel')
++    
++    reduced_ops = create_op.reduce(delete_op, 'test_app')
++    if reduced_ops == []:
++        print("✅ PASS: DeleteModel reduction works correctly")
++    else:
++        print("❌ FAIL: DeleteModel reduction broken")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    success = test_comprehensive()
++    print(f"\nOverall result: {'PASS' if success else 'FAIL'}")
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..07cf8f77b2
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,134 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the CreateModel and AlterModelOptions fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++
++def test_edge_cases():
++    """Test various edge cases for the option clearing fix"""
++    
++    # Test 1: Empty alter options should clear all ALTER_OPTION_KEYS
++    print("Test 1: Empty alter options")
++    create_op = CreateModel(
++        name='TestModel1',
++        fields=[('id', models.AutoField(primary_key=True))],
++        options={
++            'verbose_name': 'Test Model',
++            'ordering': ['id'],
++            'permissions': [('can_view', 'Can view')],
++            'managed': True,
++        }
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel1',
++        options={}  # Empty options should clear everything
++    )
++    
++    reduced_ops = create_op.reduce(alter_op, 'test_app')
++    result_options = reduced_ops[0].options
++    
++    # All ALTER_OPTION_KEYS should be removed
++    alter_option_keys = alter_op.ALTER_OPTION_KEYS
++    remaining_alter_keys = [key for key in alter_option_keys if key in result_options]
++    
++    if remaining_alter_keys:
++        print(f"❌ FAIL: Expected no ALTER_OPTION_KEYS, but found: {remaining_alter_keys}")
++        return False
++    else:
++        print("✅ PASS: All ALTER_OPTION_KEYS properly cleared")
++    
++    # Test 2: Non-ALTER_OPTION_KEYS should be preserved
++    print("\nTest 2: Non-ALTER_OPTION_KEYS preservation")
++    create_op = CreateModel(
++        name='TestModel2',
++        fields=[('id', models.AutoField(primary_key=True))],
++        options={
++            'verbose_name': 'Test Model',
++            'custom_option': 'custom_value',  # This should be preserved
++            'another_custom': 123,
++        }
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel2',
++        options={'verbose_name': 'New Name'}  # Only change verbose_name
++    )
++    
++    reduced_ops = create_op.reduce(alter_op, 'test_app')
++    result_options = reduced_ops[0].options
++    
++    if (result_options.get('custom_option') == 'custom_value' and 
++        result_options.get('another_custom') == 123 and
++        result_options.get('verbose_name') == 'New Name'):
++        print("✅ PASS: Non-ALTER_OPTION_KEYS preserved, ALTER_OPTION_KEYS updated")
++    else:
++        print("❌ FAIL: Non-ALTER_OPTION_KEYS not properly preserved")
++        return False
++    
++    # Test 3: Setting options to None/empty values
++    print("\nTest 3: Setting options to None/empty values")
++    create_op = CreateModel(
++        name='TestModel3',
++        fields=[('id', models.AutoField(primary_key=True))],
++        options={
++            'verbose_name': 'Test Model',
++            'ordering': ['id'],
++            'permissions': [('can_view', 'Can view')],
++        }
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel3',
++        options={
++            'verbose_name': None,  # Set to None
++            'ordering': [],        # Set to empty list
++            'permissions': None,   # Set to None
++        }
++    )
++    
++    reduced_ops = create_op.reduce(alter_op, 'test_app')
++    result_options = reduced_ops[0].options
++    
++    # These should be preserved with their new values (None/empty)
++    if (result_options.get('verbose_name') is None and
++        result_options.get('ordering') == [] and
++        result_options.get('permissions') is None):
++        print("✅ PASS: Options properly set to None/empty values")
++    else:
++        print("❌ FAIL: Options not properly set to None/empty values")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    success = test_edge_cases()
++    print(f"\nOverall result: {'PASS' if success else 'FAIL'}")
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_fix_integration.py b/test_fix_integration.py
+new file mode 100644
+index 0000000000..33f4ef5480
+--- /dev/null
++++ b/test_fix_integration.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++"""
++Test to verify our fix integrates properly with Django's migration system.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++from django.db import models
++
++def test_integration():
++    """Test that our fix works with the actual Django migration operations"""
++    
++    print("Testing integration with Django migration operations...")
++    
++    # Test the basic case that was reported in the issue
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[('id', models.AutoField(primary_key=True))],
++        options={
++            'verbose_name': 'Test Model',
++            'ordering': ['id'],
++            'permissions': [('can_view', 'Can view test model')]
++        }
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel',
++        options={
++            'verbose_name': 'New Test Model',
++            'ordering': [],
++            # 'permissions' is missing, so it should be removed
++        }
++    )
++    
++    # This should now work correctly with our fix
++    reduced_ops = create_op.reduce(alter_op, 'test_app')
++    
++    # Verify the result
++    result_options = reduced_ops[0].options
++    
++    expected_options = {
++        'verbose_name': 'New Test Model',
++        'ordering': [],
++    }
++    
++    # Check that permissions was removed and other options updated
++    if 'permissions' in result_options:
++        print("❌ FAIL: 'permissions' option was not removed")
++        return False
++    
++    if result_options.get('verbose_name') != 'New Test Model':
++        print("❌ FAIL: 'verbose_name' option was not updated")
++        return False
++    
++    if result_options.get('ordering') != []:
++        print("❌ FAIL: 'ordering' option was not cleared")
++        return False
++    
++    print("✅ PASS: Integration test successful")
++    return True
++
++if __name__ == '__main__':
++    success = test_integration()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_github_issue_case.py b/test_github_issue_case.py
+new file mode 100644
+index 0000000000..5ec3bd0eda
+--- /dev/null
++++ b/test_github_issue_case.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python3
++"""
++Test the exact case described in the GitHub issue:
++AlterModelOptions(name="test_model", options={}) should clear all model options
++when squashed into CreateModel.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++from django.db import models
++
++def test_github_issue_case():
++    """Test the exact case from the GitHub issue"""
++    
++    print("Testing GitHub issue case: AlterModelOptions(name='test_model', options={})")
++    
++    # Create initial model with various options
++    create_op = CreateModel(
++        name='test_model',
++        fields=[('id', models.AutoField(primary_key=True))],
++        options={
++            'verbose_name': 'Test Model',
++            'verbose_name_plural': 'Test Models',
++            'ordering': ['id'],
++            'permissions': [('can_view', 'Can view test model')],
++            'default_permissions': ('add', 'change', 'delete', 'view'),
++            'get_latest_by': 'id',
++        }
++    )
++    
++    # This is the exact case from the GitHub issue
++    alter_op = AlterModelOptions(
++        name='test_model',
++        options={}  # Empty options dictionary
++    )
++    
++    # Reduce the operations (simulate squashing)
++    reduced_ops = create_op.reduce(alter_op, 'test_app')
++    
++    print("Original CreateModel options:", create_op.options)
++    print("AlterModelOptions options:", alter_op.options)
++    print("Reduced CreateModel options:", reduced_ops[0].options)
++    
++    # Check that all ALTER_OPTION_KEYS are removed
++    alter_option_keys = alter_op.ALTER_OPTION_KEYS
++    result_options = reduced_ops[0].options
++    
++    remaining_alter_keys = [key for key in alter_option_keys if key in result_options]
++    
++    if remaining_alter_keys:
++        print(f"❌ FAIL: Expected no ALTER_OPTION_KEYS, but found: {remaining_alter_keys}")
++        return False
++    else:
++        print("✅ SUCCESS: All ALTER_OPTION_KEYS properly cleared")
++    
++    # The result should be an empty options dictionary or only contain non-ALTER_OPTION_KEYS
++    # (though in this test we didn't add any non-ALTER_OPTION_KEYS)
++    if result_options:
++        print(f"❌ FAIL: Expected empty options, but got: {result_options}")
++        return False
++    else:
++        print("✅ SUCCESS: Options dictionary is properly empty")
++    
++    return True
++
++if __name__ == '__main__':
++    success = test_github_issue_case()
++    print(f"\nOverall result: {'PASS' if success else 'FAIL'}")
++    sys.exit(0 if success else 1)
+\ No newline at end of file

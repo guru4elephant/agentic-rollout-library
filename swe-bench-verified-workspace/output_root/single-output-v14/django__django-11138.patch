@@ -1,0 +1,365 @@
+diff --git a/django/db/backends/mysql/operations.py b/django/db/backends/mysql/operations.py
+index 50f85e0621..e842a4b18b 100644
+--- a/django/db/backends/mysql/operations.py
++++ b/django/db/backends/mysql/operations.py
+@@ -70,7 +70,10 @@ class DatabaseOperations(BaseDatabaseOperations):
+ 
+     def _convert_field_to_tz(self, field_name, tzname):
+         if settings.USE_TZ:
+-            field_name = "CONVERT_TZ(%s, 'UTC', '%s')" % (field_name, tzname)
++            # Use the database's timezone instead of hardcoded 'UTC'
++            db_timezone = self.connection.timezone_name
++            if db_timezone != tzname:
++                field_name = "CONVERT_TZ(%s, '%s', '%s')" % (field_name, db_timezone, tzname)
+         return field_name
+ 
+     def datetime_cast_date_sql(self, field_name, tzname):
+diff --git a/django/db/backends/oracle/operations.py b/django/db/backends/oracle/operations.py
+index c1afb2ed5e..ceac77d051 100644
+--- a/django/db/backends/oracle/operations.py
++++ b/django/db/backends/oracle/operations.py
+@@ -99,9 +99,12 @@ END;
+             return field_name
+         if not self._tzname_re.match(tzname):
+             raise ValueError("Invalid time zone name: %s" % tzname)
+-        # Convert from UTC to local time, returning TIMESTAMP WITH TIME ZONE
+-        # and cast it back to TIMESTAMP to strip the TIME ZONE details.
+-        return "CAST((FROM_TZ(%s, '0:00') AT TIME ZONE '%s') AS TIMESTAMP)" % (field_name, tzname)
++        # Use the database's timezone instead of hardcoded UTC ('0:00')
++        db_timezone = self.connection.timezone_name
++        if db_timezone == tzname:
++            return field_name
++        # Convert from database timezone to target timezone
++        return "CAST((FROM_TZ(%s, '%s') AT TIME ZONE '%s') AS TIMESTAMP)" % (field_name, db_timezone, tzname)
+ 
+     def datetime_cast_date_sql(self, field_name, tzname):
+         field_name = self._convert_field_to_tz(field_name, tzname)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..b2a1ea0e30
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python
++import os
++import sys
++from django.conf import settings
++from django.db.backends.mysql.operations import DatabaseOperations
++
++# Configure minimal Django settings
++settings.configure(
++    DEBUG=True,
++    USE_TZ=True,
++    TIME_ZONE='Europe/Paris',
++)
++
++def test_mysql_timezone_conversion():
++    """Test that MySQL timezone conversion uses the correct source timezone"""
++    # Create a mock connection object with timezone_name property
++    class MockConnection:
++        def __init__(self, timezone_name):
++            self.timezone_name = timezone_name
++    
++    # Create operations instance with mock connection
++    mock_connection = MockConnection('Europe/Paris')
++    ops = DatabaseOperations(mock_connection)
++    
++    print("Testing MySQL timezone conversion...")
++    print(f"Database timezone_name: {ops.connection.timezone_name}")
++    
++    # Test the _convert_field_to_tz method
++    field_name = "my_datetime_field"
++    tzname = "Europe/Paris"
++    
++    # This should convert from the database timezone (Europe/Paris) to the target timezone (Europe/Paris)
++    # But currently it converts from UTC to Europe/Paris
++    result = ops._convert_field_to_tz(field_name, tzname)
++    print(f"Current conversion result: {result}")
++    
++    # The current implementation produces: CONVERT_TZ(my_datetime_field, 'UTC', 'Europe/Paris')
++    # But it should produce: CONVERT_TZ(my_datetime_field, 'Europe/Paris', 'Europe/Paris')
++    # Or better yet, no conversion when source and target timezones are the same
++    
++    # Check if the result contains 'UTC' as the source timezone
++    if "'UTC'" in result:
++        print("❌ ISSUE CONFIRMED: Using 'UTC' as source timezone instead of database timezone")
++        return False
++    else:
++        print("✅ No issue found")
++        return True
++
++if __name__ == "__main__":
++    success = test_mysql_timezone_conversion()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_basic_functionality.py b/test_basic_functionality.py
+new file mode 100644
+index 0000000000..0d6c0cfacd
+--- /dev/null
++++ b/test_basic_functionality.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python
++import os
++import sys
++from django.conf import settings
++from django.db.backends.mysql.operations import DatabaseOperations
++
++# Configure minimal Django settings
++settings.configure(
++    DEBUG=True,
++    USE_TZ=True,
++    TIME_ZONE='Europe/Paris',
++)
++
++def test_basic_mysql_operations():
++    """Test that basic MySQL operations still work after our changes"""
++    print("Testing basic MySQL operations...")
++    
++    # Create a mock connection object with timezone_name property
++    class MockConnection:
++        def __init__(self, timezone_name):
++            self.timezone_name = timezone_name
++    
++    # Test with different timezone scenarios
++    test_cases = [
++        ('Europe/Paris', 'Europe/Paris'),  # Same timezone
++        ('Europe/Paris', 'UTC'),           # Different timezone
++        ('UTC', 'Europe/Paris'),           # UTC database
++        ('UTC', 'UTC'),                    # Both UTC
++    ]
++    
++    for db_tz, target_tz in test_cases:
++        mock_connection = MockConnection(db_tz)
++        ops = DatabaseOperations(mock_connection)
++        
++        result = ops._convert_field_to_tz("my_datetime_field", target_tz)
++        print(f"Database TZ: {db_tz}, Target TZ: {target_tz}, Result: {result}")
++        
++        # Verify the result makes sense
++        if db_tz == target_tz:
++            assert result == "my_datetime_field", "Should return original field when timezones match"
++        else:
++            assert f"'{db_tz}'" in result and f"'{target_tz}'" in result, "Should convert between timezones"
++    
++    print("✅ All basic MySQL operations tests passed!")
++
++if __name__ == "__main__":
++    try:
++        test_basic_mysql_operations()
++        print("🎉 Basic functionality tests passed!")
++        sys.exit(0)
++    except Exception as e:
++        print(f"❌ Test failed: {e}")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..86ab0724d4
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python
++import os
++import sys
++from django.conf import settings
++from django.db.backends.mysql.operations import DatabaseOperations
++
++# Configure minimal Django settings
++settings.configure(
++    DEBUG=True,
++    USE_TZ=True,
++    TIME_ZONE='Europe/Paris',
++)
++
++def test_mysql_timezone_conversion():
++    """Test MySQL timezone conversion with different scenarios"""
++    print("Testing MySQL timezone conversion...")
++    
++    # Create a mock connection object with timezone_name property
++    class MockConnection:
++        def __init__(self, timezone_name):
++            self.timezone_name = timezone_name
++    
++    # Test case 1: Database timezone same as target timezone (no conversion needed)
++    mock_connection = MockConnection('Europe/Paris')
++    ops = DatabaseOperations(mock_connection)
++    
++    result = ops._convert_field_to_tz("my_datetime_field", "Europe/Paris")
++    print(f"Case 1 - Same timezone: {result}")
++    assert result == "my_datetime_field", "Should return original field when timezones match"
++    
++    # Test case 2: Database timezone different from target timezone (conversion needed)
++    result = ops._convert_field_to_tz("my_datetime_field", "UTC")
++    print(f"Case 2 - Different timezone: {result}")
++    assert "CONVERT_TZ" in result and "'Europe/Paris'" in result and "'UTC'" in result, "Should convert from database to target timezone"
++    
++    # Test case 3: Database with UTC timezone
++    mock_connection_utc = MockConnection('UTC')
++    ops_utc = DatabaseOperations(mock_connection_utc)
++    
++    result = ops_utc._convert_field_to_tz("my_datetime_field", "Europe/Paris")
++    print(f"Case 3 - UTC database: {result}")
++    assert "CONVERT_TZ" in result and "'UTC'" in result and "'Europe/Paris'" in result, "Should convert from UTC to target timezone"
++    
++    print("✅ All MySQL tests passed!")
++
++# Oracle tests removed since cx_Oracle is not installed
++
++if __name__ == "__main__":
++    try:
++        test_mysql_timezone_conversion()
++        print("🎉 MySQL tests passed! The fix is working correctly.")
++        sys.exit(0)
++    except Exception as e:
++        print(f"❌ Test failed: {e}")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..ad32d35b82
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python
++import os
++import sys
++from django.conf import settings
++from django.db.backends.mysql.operations import DatabaseOperations
++
++# Configure minimal Django settings
++settings.configure(
++    DEBUG=True,
++    USE_TZ=True,
++    TIME_ZONE='Europe/Paris',
++)
++
++def test_github_issue_scenario():
++    """Test the specific scenario described in the GitHub issue"""
++    print("Testing GitHub issue scenario...")
++    
++    # Create a mock connection object with timezone_name property
++    class MockConnection:
++        def __init__(self, timezone_name):
++            self.timezone_name = timezone_name
++    
++    # Scenario from the issue: Database has TIME_ZONE set to 'Europe/Paris'
++    # and we're querying with a date lookup that should use the same timezone
++    mock_connection = MockConnection('Europe/Paris')
++    ops = DatabaseOperations(mock_connection)
++    
++    # Test the datetime_cast_date_sql method which is used for __date lookups
++    field_name = "my_datetime_field"
++    tzname = "Europe/Paris"  # This comes from settings.TIME_ZONE
++    
++    # This method calls _convert_field_to_tz internally
++    result = ops.datetime_cast_date_sql(field_name, tzname)
++    print(f"datetime_cast_date_sql result: {result}")
++    
++    # Before our fix: DATE(CONVERT_TZ(my_datetime_field, 'UTC', 'Europe/Paris'))
++    # After our fix: DATE(my_datetime_field)  (no conversion needed)
++    
++    # The fix should eliminate unnecessary conversion when timezones are the same
++    if "CONVERT_TZ" in result:
++        print("❌ ISSUE: Still doing unnecessary timezone conversion")
++        return False
++    else:
++        print("✅ FIXED: No unnecessary timezone conversion")
++        return True
++
++def test_different_timezone_scenario():
++    """Test that conversion still works when timezones are different"""
++    print("Testing different timezone scenario...")
++    
++    class MockConnection:
++        def __init__(self, timezone_name):
++            self.timezone_name = timezone_name
++    
++    # Database has different timezone than target
++    mock_connection = MockConnection('UTC')
++    ops = DatabaseOperations(mock_connection)
++    
++    field_name = "my_datetime_field"
++    tzname = "Europe/Paris"
++    
++    result = ops.datetime_cast_date_sql(field_name, tzname)
++    print(f"Different TZ datetime_cast_date_sql result: {result}")
++    
++    # Should still do conversion when timezones are different
++    if "CONVERT_TZ" in result and "'UTC'" in result and "'Europe/Paris'" in result:
++        print("✅ Conversion works correctly for different timezones")
++        return True
++    else:
++        print("❌ Conversion not working for different timezones")
++        return False
++
++if __name__ == "__main__":
++    try:
++        success1 = test_github_issue_scenario()
++        success2 = test_different_timezone_scenario()
++        
++        if success1 and success2:
++            print("🎉 GitHub issue is fixed! The fix works correctly.")
++            sys.exit(0)
++        else:
++            print("❌ GitHub issue is not fully fixed.")
++            sys.exit(1)
++    except Exception as e:
++        print(f"❌ Test failed: {e}")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_oracle_fix.py b/test_oracle_fix.py
+new file mode 100644
+index 0000000000..32427d3e4a
+--- /dev/null
++++ b/test_oracle_fix.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python
++import os
++import sys
++from django.conf import settings
++
++# Configure minimal Django settings
++settings.configure(
++    DEBUG=True,
++    USE_TZ=True,
++    TIME_ZONE='Europe/Paris',
++)
++
++def test_oracle_timezone_conversion():
++    """Test Oracle timezone conversion with different scenarios"""
++    print("Testing Oracle timezone conversion...")
++    
++    # Create a mock connection object with timezone_name property
++    class MockConnection:
++        def __init__(self, timezone_name):
++            self.timezone_name = timezone_name
++    
++    # Import the Oracle operations class directly (bypassing the cx_Oracle dependency)
++    import sys
++    sys.path.insert(0, '/testbed')
++    from django.db.backends.oracle.operations import DatabaseOperations
++    
++    # Test case 1: Database timezone same as target timezone (no conversion needed)
++    mock_connection = MockConnection('Europe/Paris')
++    ops = DatabaseOperations(mock_connection)
++    
++    result = ops._convert_field_to_tz("my_datetime_field", "Europe/Paris")
++    print(f"Case 1 - Same timezone: {result}")
++    assert result == "my_datetime_field", "Should return original field when timezones match"
++    
++    # Test case 2: Database timezone different from target timezone (conversion needed)
++    result = ops._convert_field_to_tz("my_datetime_field", "UTC")
++    print(f"Case 2 - Different timezone: {result}")
++    assert "FROM_TZ" in result and "'Europe/Paris'" in result and "'UTC'" in result, "Should convert from database to target timezone"
++    
++    print("✅ All Oracle tests passed!")
++
++if __name__ == "__main__":
++    try:
++        test_oracle_timezone_conversion()
++        print("🎉 Oracle fix is working correctly!")
++        sys.exit(0)
++    except Exception as e:
++        print(f"❌ Test failed: {e}")
++        sys.exit(1)
+\ No newline at end of file

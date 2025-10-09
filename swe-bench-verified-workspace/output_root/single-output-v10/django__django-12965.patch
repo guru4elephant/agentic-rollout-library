@@ -1,0 +1,333 @@
+diff --git a/debug_alias.py b/debug_alias.py
+new file mode 100644
+index 0000000000..6d1f6509a8
+--- /dev/null
++++ b/debug_alias.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'testapp'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Get a queryset and examine its query structure
++queryset = TestModel.objects.all()
++print(f"Original query: {queryset.query}")
++
++# Check the alias_refcount and alias_map
++print(f"Alias refcount: {queryset.query.alias_refcount}")
++print(f"Alias map: {queryset.query.alias_map}")
++
++# Now clone the query and change its class to DeleteQuery
++query = queryset.query.clone()
++query.__class__ = models.sql.DeleteQuery
++print(f"After class change - Alias refcount: {query.alias_refcount}")
++print(f"After class change - Alias map: {query.alias_map}")
++
++# Check single_alias property
++from django.db.models.sql.compiler import SQLDeleteCompiler
++compiler = SQLDeleteCompiler(query, connection, using='default')
++print(f"Single alias: {compiler.single_alias}")
++
++# Check what SQL would be generated
++sql, params = compiler.as_sql()
++print(f"Generated SQL: {sql}")
+\ No newline at end of file
+diff --git a/debug_new_query.py b/debug_new_query.py
+new file mode 100644
+index 0000000000..6b1e52fe06
+--- /dev/null
++++ b/debug_new_query.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'testapp'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create a new DeleteQuery instance (like the regular delete operation does)
++from django.db.models import sql
++query = sql.DeleteQuery(TestModel)
++print(f"New DeleteQuery - Alias refcount: {query.alias_refcount}")
++print(f"New DeleteQuery - Alias map: {query.alias_map}")
++
++# Check single_alias property
++from django.db.models.sql.compiler import SQLDeleteCompiler
++compiler = SQLDeleteCompiler(query, connection, using='default')
++print(f"Single alias: {compiler.single_alias}")
++
++# Check what SQL would be generated
++sql_stmt, params = compiler.as_sql()
++print(f"Generated SQL: {sql_stmt}")
+\ No newline at end of file
+diff --git a/debug_query.py b/debug_query.py
+new file mode 100644
+index 0000000000..50c8901e4e
+--- /dev/null
++++ b/debug_query.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'testapp'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Insert some test data
++TestModel.objects.create(name='Test 1')
++TestModel.objects.create(name='Test 2')
++
++# Get a queryset and examine its query structure
++queryset = TestModel.objects.all()
++print(f"Original query: {queryset.query}")
++
++# Check the single_alias property
++from django.db.models.sql.compiler import SQLDeleteCompiler
++compiler = SQLDeleteCompiler(queryset.query, connection, using='default')
++print(f"Single alias: {compiler.single_alias}")
++print(f"Alias refcount: {queryset.query.alias_refcount}")
++print(f"Alias map: {queryset.query.alias_map}")
++
++# Check what SQL would be generated
++sql, params = compiler.as_sql()
++print(f"Generated SQL: {sql}")
++print(f"SQL params: {params}")
++
++# Now test _raw_delete
++print("\nTesting _raw_delete:")
++count = queryset._raw_delete(using='default')
++print(f"Raw delete count: {count}")
+\ No newline at end of file
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 07d6ffd4ca..0ac7365a9f 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -17,6 +17,7 @@ from django.db import (
+     router, transaction,
+ )
+ from django.db.models import AutoField, DateField, DateTimeField, sql
++from django.db.models.sql import datastructures
+ from django.db.models.constants import LOOKUP_SEP
+ from django.db.models.deletion import Collector
+ from django.db.models.expressions import Case, Expression, F, Value, When
+@@ -758,13 +759,18 @@ class QuerySet:
+         Delete objects found from the given queryset in single direct SQL
+         query. No signals are sent and there is no protection for cascades.
+         """
+-        query = self.query.clone()
+-        query.__class__ = sql.DeleteQuery
+-        cursor = query.get_compiler(using).execute_sql(CURSOR)
+-        if cursor:
+-            with cursor:
+-                return cursor.rowcount
+-        return 0
++        # Create a proper DeleteQuery instance and set it up for a simple DELETE FROM table
++        model = self.model
++        query = sql.DeleteQuery(model)
++        
++        # Properly set up the alias_map and alias_refcount for the table
++        table_name = model._meta.db_table
++        query.alias_map[table_name] = sql.datastructures.BaseTable(table_name, table_name)
++        query.alias_refcount[table_name] = 1
++        
++        # Use do_query to execute a simple DELETE FROM table without any WHERE clause
++        count = query.do_query(table_name, query.where_class(), using)
++        return count
+     _raw_delete.alters_data = True
+ 
+     def update(self, **kwargs):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..639d9be316
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'testapp'
++
++# Test the delete behavior
++from django.db import connection
++
++# Create the table
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Insert some test data
++TestModel.objects.create(name='Test 1')
++TestModel.objects.create(name='Test 2')
++
++print("Before delete:")
++print(f"Objects count: {TestModel.objects.count()}")
++
++# Capture the SQL that gets generated
++from django.db import connections
++connection = connections['default']
++
++# Clear any existing queries
++from django.db import connection
++connection.queries_log.clear()
++
++# Perform the delete operation
++TestModel.objects.all().delete()
++
++print("\nAfter delete:")
++print(f"Objects count: {TestModel.objects.count()}")
++
++print("\nSQL queries executed:")
++for i, query in enumerate(connection.queries, 1):
++    print(f"{i}: {query['sql']}")
++
++# Let's also check if fast delete is possible
++from django.db.models.deletion import Collector
++collector = Collector(using='default')
++queryset = TestModel.objects.all()
++print(f"\nCan fast delete: {collector.can_fast_delete(queryset)}")
++print(f"Has signal listeners: {collector._has_signal_listeners(TestModel)}")
++
++# Debug the collect method
++print("\nDebugging collect method:")
++collector.collect(queryset)
++print(f"Fast deletes count: {len(collector.fast_deletes)}")
++print(f"Data count: {len(collector.data)}")
++if collector.fast_deletes:
++    print(f"Fast delete queryset: {collector.fast_deletes[0]}")
++    print(f"Will use _raw_delete: {hasattr(collector.fast_deletes[0], '_raw_delete')}")
++
++# Now let's run the actual delete and see what happens
++print("\nRunning actual delete:")
++connection.queries_log.clear()
++deleted, row_count = collector.delete()
++print(f"Deleted: {deleted}, Row count: {row_count}")
++print("SQL queries executed during delete:")
++for i, query in enumerate(connection.queries, 1):
++    print(f"{i}: {query['sql']}")
+\ No newline at end of file

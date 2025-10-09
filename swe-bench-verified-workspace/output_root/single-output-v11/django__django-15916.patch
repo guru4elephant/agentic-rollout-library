@@ -1,0 +1,398 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..34f157f4dd
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python3
++"""Comprehensive test for formfield_callback behavior."""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.db import models
++
++# Define a simple model
++class MyModel(models.Model):
++    active = models.BooleanField()
++    name = models.CharField(max_length=64, blank=True, null=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Define a formfield_callback function
++def all_required(field, **kwargs):
++    formfield = field.formfield(**kwargs)
++    formfield.required = True
++    return formfield
++
++def make_optional(field, **kwargs):
++    formfield = field.formfield(**kwargs)
++    formfield.required = False
++    return formfield
++
++def test_formfield_callback_behavior():
++    print("Comprehensive testing of formfield_callback behavior...")
++    
++    # Test 1: Original form with formfield_callback in Meta
++    class MyForm(forms.ModelForm):
++        class Meta:
++            model = MyModel
++            formfield_callback = all_required
++            fields = ['active', 'name']
++    
++    print("\n1. Testing original MyForm with formfield_callback in Meta:")
++    form1 = MyForm()
++    print(f"   active field required: {form1.fields['active'].required}")
++    print(f"   name field required: {form1.fields['name'].required}")
++    
++    # Test 2: Factory form without explicit formfield_callback (should inherit)
++    print("\n2. Testing FactoryForm from modelform_factory (should inherit callback):")
++    FactoryForm = forms.modelform_factory(MyModel, form=MyForm)
++    form2 = FactoryForm()
++    print(f"   active field required: {form2.fields['active'].required}")
++    print(f"   name field required: {form2.fields['name'].required}")
++    
++    # Test 3: Factory form with explicit formfield_callback (should override)
++    print("\n3. Testing FactoryForm with explicit formfield_callback (should override):")
++    FactoryFormOverride = forms.modelform_factory(MyModel, form=MyForm, formfield_callback=make_optional)
++    form3 = FactoryFormOverride()
++    print(f"   active field required: {form3.fields['active'].required}")
++    print(f"   name field required: {form3.fields['name'].required}")
++    
++    # Test 4: Form without formfield_callback in Meta
++    class MyFormNoCallback(forms.ModelForm):
++        class Meta:
++            model = MyModel
++            fields = ['active', 'name']
++    
++    print("\n4. Testing form without formfield_callback in Meta:")
++    form4 = MyFormNoCallback()
++    print(f"   active field required: {form4.fields['active'].required}")
++    print(f"   name field required: {form4.fields['name'].required}")
++    
++    # Test 5: Factory form from form without callback (should not have callback)
++    print("\n5. Testing FactoryForm from form without callback:")
++    FactoryFormNoCallback = forms.modelform_factory(MyModel, form=MyFormNoCallback)
++    form5 = FactoryFormNoCallback()
++    print(f"   active field required: {form5.fields['active'].required}")
++    print(f"   name field required: {form5.fields['name'].required}")
++    
++    # Verify results
++    print("\n6. Verification:")
++    
++    # Test 2 should have required=True (inherited from MyForm)
++    test2_pass = form2.fields['active'].required == True and form2.fields['name'].required == True
++    print(f"   Test 2 (inheritance): {'✓ PASS' if test2_pass else '✗ FAIL'}")
++    
++    # Test 3 should have required=False (explicit override)
++    test3_pass = form3.fields['active'].required == False and form3.fields['name'].required == False
++    print(f"   Test 3 (override): {'✓ PASS' if test3_pass else '✗ FAIL'}")
++    
++    # Test 5 should have default behavior (not required for BooleanField, not required for CharField with blank=True)
++    test5_pass = form5.fields['active'].required == False and form5.fields['name'].required == False
++    print(f"   Test 5 (no callback): {'✓ PASS' if test5_pass else '✗ FAIL'}")
++    
++    return test2_pass and test3_pass and test5_pass
++
++if __name__ == '__main__':
++    success = test_formfield_callback_behavior()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 192d9fad94..d3eec6392b 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -245,7 +245,7 @@ def fields_for_model(
+ class ModelFormOptions:
+     def __init__(self, options=None):
+         self.model = getattr(options, "model", None)
+-        self.fields = getattr(options, "fields", None)
++        self.fields =  getattr(options, "fields", None)
+         self.exclude = getattr(options, "exclude", None)
+         self.widgets = getattr(options, "widgets", None)
+         self.localized_fields = getattr(options, "localized_fields", None)
+@@ -253,6 +253,7 @@ class ModelFormOptions:
+         self.help_texts = getattr(options, "help_texts", None)
+         self.error_messages = getattr(options, "error_messages", None)
+         self.field_classes = getattr(options, "field_classes", None)
++        self.formfield_callback = getattr(options, "formfield_callback", None)
+ 
+ 
+ class ModelFormMetaclass(DeclarativeFieldsMetaclass):
+@@ -308,7 +309,7 @@ class ModelFormMetaclass(DeclarativeFieldsMetaclass):
+                 opts.fields,
+                 opts.exclude,
+                 opts.widgets,
+-                formfield_callback,
++                opts.formfield_callback or formfield_callback,
+                 opts.localized_fields,
+                 opts.labels,
+                 opts.help_texts,
+@@ -636,7 +637,12 @@ def modelform_factory(
+     class_name = model.__name__ + "Form"
+ 
+     # Class attributes for the new form class.
+-    form_class_attrs = {"Meta": Meta, "formfield_callback": formfield_callback}
++    # If formfield_callback is None, try to inherit from parent form's Meta
++    final_formfield_callback = formfield_callback
++    if final_formfield_callback is None and hasattr(form, "Meta") and hasattr(form.Meta, "formfield_callback"):
++        final_formfield_callback = form.Meta.formfield_callback
++    
++    form_class_attrs = {"Meta": Meta, "formfield_callback": final_formfield_callback}
+ 
+     if getattr(Meta, "fields", None) is None and getattr(Meta, "exclude", None) is None:
+         raise ImproperlyConfigured(
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..ada66eab34
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++"""Script to reproduce the formfield_callback issue in modelform_factory."""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.db import models
++
++# Define a simple model
++class MyModel(models.Model):
++    active = models.BooleanField()
++    name = models.CharField(max_length=64, blank=True, null=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Define a formfield_callback function
++def all_required(field, **kwargs):
++    formfield = field.formfield(**kwargs)
++    formfield.required = True
++    return formfield
++
++# Define a ModelForm with formfield_callback in Meta
++class MyForm(forms.ModelForm):
++    class Meta:
++        model = MyModel
++        formfield_callback = all_required
++        fields = ['active', 'name']
++
++def test_formfield_callback_behavior():
++    print("Testing formfield_callback behavior in modelform_factory...")
++    
++    # Create factory form
++    FactoryForm = forms.modelform_factory(MyModel, form=MyForm)
++    
++    # Test the original form
++    print("\n1. Testing original MyForm:")
++    form1 = MyForm()
++    print(f"   active field required: {form1.fields['active'].required}")
++    print(f"   name field required: {form1.fields['name'].required}")
++    
++    # Test the factory form
++    print("\n2. Testing FactoryForm from modelform_factory:")
++    form2 = FactoryForm()
++    print(f"   active field required: {form2.fields['active'].required}")
++    print(f"   name field required: {form2.fields['name'].required}")
++    
++    # The bug: FactoryForm should have required fields but doesn't
++    expected_required = True
++    actual_required = form2.fields['active'].required
++    
++    print(f"\n3. Expected result: active field should be required ({expected_required})")
++    print(f"   Actual result: active field required is {actual_required}")
++    
++    if actual_required == expected_required:
++        print("   ✓ PASS: formfield_callback is working correctly")
++        return True
++    else:
++        print("   ✗ FAIL: formfield_callback is NOT working correctly")
++        return False
++
++if __name__ == '__main__':
++    success = test_formfield_callback_behavior()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_final_verification.py b/test_final_verification.py
+new file mode 100644
+index 0000000000..b1b6144f52
+--- /dev/null
++++ b/test_final_verification.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""Final verification test for the formfield_callback fix."""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.db import models
++
++# Define a simple model
++class TestModel(models.Model):
++    active = models.BooleanField()
++    name = models.CharField(max_length=64, blank=True, null=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Define formfield_callback functions
++def make_required(field, **kwargs):
++    formfield = field.formfield(**kwargs)
++    formfield.required = True
++    return formfield
++
++def make_optional(field, **kwargs):
++    formfield = field.formfield(**kwargs)
++    formfield.required = False
++    return formfield
++
++def test_basic_functionality():
++    """Test that basic modelform_factory functionality still works."""
++    print("Testing basic modelform_factory functionality...")
++    
++    # Test 1: Basic factory form without callback
++    Form1 = forms.modelform_factory(TestModel, fields=['active', 'name'])
++    form1 = Form1()
++    print(f"   Basic form - active: {form1.fields['active'].required}, name: {form1.fields['name'].required}")
++    
++    # Test 2: Factory form with explicit callback
++    Form2 = forms.modelform_factory(TestModel, fields=['active', 'name'], formfield_callback=make_required)
++    form2 = Form2()
++    print(f"   With callback - active: {form2.fields['active'].required}, name: {form2.fields['name'].required}")
++    
++    return True
++
++def test_formfield_callback_inheritance():
++    """Test the specific issue from the GitHub issue."""
++    print("\nTesting formfield_callback inheritance...")
++    
++    # Define a form with formfield_callback in Meta
++    class FormWithCallback(forms.ModelForm):
++        class Meta:
++            model = TestModel
++            formfield_callback = make_required
++            fields = ['active', 'name']
++    
++    # Test 1: Original form should use callback from Meta
++    form1 = FormWithCallback()
++    print(f"   Original form - active: {form1.fields['active'].required}, name: {form1.fields['name'].required}")
++    
++    # Test 2: Factory form should inherit callback from parent form's Meta
++    FactoryForm = forms.modelform_factory(TestModel, form=FormWithCallback)
++    form2 = FactoryForm()
++    print(f"   Factory form - active: {form2.fields['active'].required}, name: {form2.fields['name'].required}")
++    
++    # Both should have required=True
++    success = (form1.fields['active'].required == True and form1.fields['name'].required == True and
++               form2.fields['active'].required == True and form2.fields['name'].required == True)
++    
++    print(f"   Inheritance test: {'✓ PASS' if success else '✗ FAIL'}")
++    return success
++
++def test_callback_override():
++    """Test that explicit callback overrides inherited callback."""
++    print("\nTesting callback override behavior...")
++    
++    class FormWithCallback(forms.ModelForm):
++        class Meta:
++            model = TestModel
++            formfield_callback = make_required
++            fields = ['active', 'name']
++    
++    # Factory form with explicit callback should override inherited callback
++    FactoryForm = forms.modelform_factory(TestModel, form=FormWithCallback, formfield_callback=make_optional)
++    form = FactoryForm()
++    print(f"   Override form - active: {form.fields['active'].required}, name: {form.fields['name'].required}")
++    
++    # Should have required=False due to explicit override
++    success = (form.fields['active'].required == False and form.fields['name'].required == False)
++    
++    print(f"   Override test: {'✓ PASS' if success else '✗ FAIL'}")
++    return success
++
++if __name__ == '__main__':
++    print("Final verification of formfield_callback fix")
++    print("=" * 50)
++    
++    test1 = test_basic_functionality()
++    test2 = test_formfield_callback_inheritance()
++    test3 = test_callback_override()
++    
++    print("\n" + "=" * 50)
++    if test1 and test2 and test3:
++        print("✓ ALL TESTS PASSED - The fix is working correctly!")
++        sys.exit(0)
++    else:
++        print("✗ SOME TESTS FAILED - The fix needs more work.")
++        sys.exit(1)
+\ No newline at end of file

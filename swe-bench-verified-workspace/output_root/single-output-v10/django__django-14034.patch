@@ -1,0 +1,293 @@
+diff --git a/django/forms/fields.py b/django/forms/fields.py
+index 65d6a9ec82..2774378896 100644
+--- a/django/forms/fields.py
++++ b/django/forms/fields.py
+@@ -1025,8 +1025,21 @@ class MultiValueField(Field):
+             if not value or not [v for v in value if v not in self.empty_values]:
+                 if self.required:
+                     raise ValidationError(self.error_messages['required'], code='required')
+-                else:
++                elif self.require_all_fields:
++                    # When require_all_fields=True, individual fields have required=False
++                    # so we can return early if the MultiValueField itself is not required
+                     return self.compress([])
++                # When require_all_fields=False, we need to check if any individual field
++                # is required. If all individual fields are optional, we can return early.
++                # If any individual field is required, we need to proceed with validation
++                # to catch the required field validation errors.
++                if not any(field.required for field in self.fields):
++                    return self.compress([])
++                # If there are required fields, we need to proceed with validation
++                # to catch the required field validation errors, even if all values
++                # are empty and the MultiValueField itself is not required.
++                # This addresses the GitHub issue where individual required fields
++                # should be validated even when all values are empty.
+         else:
+             raise ValidationError(self.error_messages['invalid'], code='invalid')
+         for i, field in enumerate(self.fields):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..bedae1a65d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.forms import (
++    Form,
++    CharField,
++    MultiValueField,
++    MultiWidget,
++)
++
++class MF(MultiValueField):
++    widget = MultiWidget
++    def __init__(self):
++        fields = [
++            CharField(required=False),
++            CharField(required=True),
++        ]
++        widget = self.widget(widgets=[
++            f.widget
++            for f in fields
++        ], attrs={})
++        super(MF, self).__init__(
++            fields=fields,
++            widget=widget,
++            require_all_fields=False,
++            required=False,
++        )
++    def compress(self, value):
++        return []
++
++class F(Form):
++    mf = MF()
++
++print("Testing MultiValueField issue...")
++
++# Test case 1: Both subfields empty - should return False but currently returns True
++f1 = F({
++    'mf_0': '',
++    'mf_1': '',
++})
++print(f"Test 1 - Both empty: is_valid() = {f1.is_valid()}")
++print(f"Expected: False, Got: {f1.is_valid()}")
++if f1.is_valid() == False:
++    print("✓ PASS: Form validation correctly returns False")
++else:
++    print("✗ FAIL: Form validation incorrectly returns True")
++
++# Test case 2: First field has value, second empty - should return False
++f2 = F({
++    'mf_0': 'xxx',
++    'mf_1': '',
++})
++print(f"\nTest 2 - First field has value, second empty: is_valid() = {f2.is_valid()}")
++print(f"Expected: False, Got: {f2.is_valid()}")
++if f2.is_valid() == False:
++    print("✓ PASS: Form validation correctly returns False")
++else:
++    print("✗ FAIL: Form validation incorrectly returns True")
++
++# Test case 3: Both fields have values - should return True
++f3 = F({
++    'mf_0': 'xxx',
++    'mf_1': 'yyy',
++})
++print(f"\nTest 3 - Both fields have values: is_valid() = {f3.is_valid()}")
++print(f"Expected: True, Got: {f3.is_valid()}")
++if f3.is_valid() == True:
++    print("✓ PASS: Form validation correctly returns True")
++else:
++    print("✗ FAIL: Form validation incorrectly returns False")
++
++print("\nIssue summary:")
++print("When both subfields are empty, form.is_valid() should return False")
++print("because one of the subfields is required=True, but it currently returns True")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..2b2036b8e8
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,164 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.forms import (
++    Form,
++    CharField,
++    MultiValueField,
++    MultiWidget,
++)
++
++class MF(MultiValueField):
++    widget = MultiWidget
++    def __init__(self):
++        fields = [
++            CharField(required=False),
++            CharField(required=True),
++        ]
++        widget = self.widget(widgets=[
++            f.widget
++            for f in fields
++        ], attrs={})
++        super(MF, self).__init__(
++            fields=fields,
++            widget=widget,
++            require_all_fields=False,
++            required=False,
++        )
++    def compress(self, value):
++        return []
++
++class F(Form):
++    mf = MF()
++
++print("Testing MultiValueField edge cases...")
++
++# Test case 1: Both subfields empty - should return False
++f1 = F({
++    'mf_0': '',
++    'mf_1': '',
++})
++print(f"Test 1 - Both empty: is_valid() = {f1.is_valid()}")
++print(f"Expected: False, Got: {f1.is_valid()}")
++
++# Test case 2: First field has value, second empty - should return False
++f2 = F({
++    'mf_0': 'xxx',
++    'mf_1': '',
++})
++print(f"\nTest 2 - First field has value, second empty: is_valid() = {f2.is_valid()}")
++print(f"Expected: False, Got: {f2.is_valid()}")
++
++# Test case 3: Both fields have values - should return True
++f3 = F({
++    'mf_0': 'xxx',
++    'mf_1': 'yyy',
++})
++print(f"\nTest 3 - Both fields have values: is_valid() = {f3.is_valid()}")
++print(f"Expected: True, Got: {f3.is_valid()}")
++
++# Test case 4: MultiValueField with require_all_fields=True
++class MF_RequireAll(MultiValueField):
++    widget = MultiWidget
++    def __init__(self):
++        fields = [
++            CharField(required=False),
++            CharField(required=True),
++        ]
++        widget = self.widget(widgets=[
++            f.widget
++            for f in fields
++        ], attrs={})
++        super(MF_RequireAll, self).__init__(
++            fields=fields,
++            widget=widget,
++            require_all_fields=True,
++            required=False,
++        )
++    def compress(self, value):
++        return []
++
++class F2(Form):
++    mf = MF_RequireAll()
++
++f4 = F2({
++    'mf_0': '',
++    'mf_1': '',
++})
++print(f"\nTest 4 - require_all_fields=True, both empty: is_valid() = {f4.is_valid()}")
++print(f"Expected: False, Got: {f4.is_valid()}")
++
++f5 = F2({
++    'mf_0': 'xxx',
++    'mf_1': '',
++})
++print(f"\nTest 5 - require_all_fields=True, second empty: is_valid() = {f5.is_valid()}")
++print(f"Expected: False, Got: {f5.is_valid()}")
++
++f6 = F2({
++    'mf_0': 'xxx',
++    'mf_1': 'yyy',
++})
++print(f"\nTest 6 - require_all_fields=True, both have values: is_valid() = {f6.is_valid()}")
++print(f"Expected: True, Got: {f6.is_valid()}")
++
++# Test case 5: MultiValueField with required=True
++class MF_Required(MultiValueField):
++    widget = MultiWidget
++    def __init__(self):
++        fields = [
++            CharField(required=False),
++            CharField(required=True),
++        ]
++        widget = self.widget(widgets=[
++            f.widget
++            for f in fields
++        ], attrs={})
++        super(MF_Required, self).__init__(
++            fields=fields,
++            widget=widget,
++            require_all_fields=False,
++            required=True,
++        )
++    def compress(self, value):
++        return []
++
++class F3(Form):
++    mf = MF_Required()
++
++f7 = F3({
++    'mf_0': '',
++    'mf_1': '',
++})
++print(f"\nTest 7 - MultiValueField required=True, both empty: is_valid() = {f7.is_valid()}")
++print(f"Expected: False, Got: {f7.is_valid()}")
++
++f8 = F3({
++    'mf_0': 'xxx',
++    'mf_1': '',
++})
++print(f"\nTest 8 - MultiValueField required=True, second empty: is_valid() = {f8.is_valid()}")
++print(f"Expected: False, Got: {f8.is_valid()}")
++
++f9 = F3({
++    'mf_0': 'xxx',
++    'mf_1': 'yyy',
++})
++print(f"\nTest 9 - MultiValueField required=True, both have values: is_valid() = {f9.is_valid()}")
++print(f"Expected: True, Got: {f9.is_valid()}")
++
++print("\nAll tests completed!")
+\ No newline at end of file

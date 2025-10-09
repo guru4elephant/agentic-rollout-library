@@ -1,0 +1,520 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..b6fd33f44c
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,176 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, transaction
++
++# Define the models from the issue
++class Product(models.Model):
++    sku = models.CharField(primary_key=True, max_length=50)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Order(models.Model):
++    product = models.ForeignKey(Product, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_original_issue():
++    """Test the original issue case"""
++    print("Testing original issue case")
++    
++    with transaction.atomic():
++        order = Order()
++        order.product = Product()
++        order.product.sku = "foo"
++        order.product.save()
++        order.save()
++        
++        # Check what value was actually stored in product_id
++        order_from_db = Order.objects.get(id=order.id)
++        print(f"Order.product_id value: '{order_from_db.product_id}'")
++        print(f"Expected product_id value: 'foo'")
++        
++        # These assertions should pass but currently fail
++        exists_empty = Order.objects.filter(product_id="").exists()
++        
++        print(f"Order.objects.filter(product_id='').exists(): {exists_empty}")
++        
++        if exists_empty:
++            print("❌ FAIL: Order with empty product_id exists (shouldn't)")
++            return False
++        else:
++            print("✅ PASS: No order with empty product_id")
++            return True
++
++def test_working_case():
++    """Test the case that already works"""
++    print("\nTesting working case")
++    
++    with transaction.atomic():
++        order = Order()
++        order.product = Product(sku="bar")
++        order.product.save()
++        order.save()
++        
++        order_from_db = Order.objects.get(id=order.id)
++        print(f"Order.product_id value: '{order_from_db.product_id}'")
++        print(f"Expected product_id value: 'bar'")
++        
++        if order_from_db.product_id == "bar":
++            print("✅ PASS: product_id is correct")
++            return True
++        else:
++            print("❌ FAIL: product_id is incorrect")
++            return False
++
++def test_normal_foreign_key():
++    """Test normal foreign key behavior with integer primary key"""
++    class Category(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test_app'
++    
++    class Item(models.Model):
++        category = models.ForeignKey(Category, on_delete=models.CASCADE)
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test_app'
++    
++    print("\nTesting normal foreign key behavior")
++    
++    with transaction.atomic():
++        item = Item(name="test_item")
++        item.category = Category()
++        item.category.name = "test_category"
++        item.category.save()
++        item.save()
++        
++        item_from_db = Item.objects.get(id=item.id)
++        print(f"Item.category_id value: '{item_from_db.category_id}'")
++        print(f"Expected category_id value: '{item.category.id}'")
++        
++        if item_from_db.category_id == item.category.id:
++            print("✅ PASS: category_id is correct")
++            return True
++        else:
++            print("❌ FAIL: category_id is incorrect")
++            return False
++
++def test_null_assignment():
++    """Test assigning None to foreign key"""
++    print("\nTesting None assignment")
++    
++    try:
++        with transaction.atomic():
++            order = Order()
++            order.product = None
++            order.save()
++        
++        print("❌ FAIL: Should have raised validation error")
++        return False
++    except Exception as e:
++        print(f"✅ PASS: Validation error raised as expected: {type(e).__name__}")
++        return True
++
++if __name__ == "__main__":
++    # Create database tables using Django's schema creation
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Product)
++        schema_editor.create_model(Order)
++        # Create tables for the additional test models
++        from django.db import models
++        class Category(models.Model):
++            name = models.CharField(max_length=100)
++            class Meta:
++                app_label = 'test_app'
++        
++        class Item(models.Model):
++            category = models.ForeignKey(Category, on_delete=models.CASCADE)
++            name = models.CharField(max_length=100)
++            class Meta:
++                app_label = 'test_app'
++        
++        schema_editor.create_model(Category)
++        schema_editor.create_model(Item)
++    
++    # Run tests
++    results = []
++    results.append(test_original_issue())
++    results.append(test_working_case())
++    results.append(test_normal_foreign_key())
++    results.append(test_null_assignment())
++    
++    print(f"\nOverall result: {sum(results)}/{len(results)} tests passed")
++    
++    if all(results):
++        print("🎉 All tests passed!")
++    else:
++        print("❌ Some tests failed!")
+\ No newline at end of file
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 2428218696..5fcf622fc0 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -933,7 +933,13 @@ class Model(metaclass=ModelBase):
+                         "%s() prohibited to prevent data loss due to unsaved "
+                         "related object '%s'." % (operation_name, field.name)
+                     )
+-                elif getattr(self, field.attname) is None:
++                elif getattr(self, field.attname) is None or (
++                    # Handle the case where foreign key was set to empty string
++                    # but related object now has a primary key
++                    isinstance(getattr(self, field.attname), str) and 
++                    not getattr(self, field.attname) and 
++                    obj.pk is not None
++                ):
+                     # Use pk from related object if it has been saved after
+                     # an assignment.
+                     setattr(self, field.attname, obj.pk)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..ec2273a83f
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, transaction
++
++# Define the models from the issue
++class Product(models.Model):
++    sku = models.CharField(primary_key=True, max_length=50)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Order(models.Model):
++    product = models.ForeignKey(Product, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_case_1():
++    """Test case that fails according to the issue"""
++    print("Testing case 1: Assign empty instance, then set primary key")
++    
++    with transaction.atomic():
++        order = Order()
++        order.product = Product()
++        order.product.sku = "foo"
++        order.product.save()
++        order.save()
++        
++        # Check what value was actually stored in product_id
++        order_from_db = Order.objects.get(id=order.id)
++        print(f"Order.product_id value: '{order_from_db.product_id}'")
++        print(f"Expected product_id value: 'foo'")
++        
++        # These assertions should pass but currently fail
++        exists_empty = Order.objects.filter(product_id="").exists()
++        
++        print(f"Order.objects.filter(product_id='').exists(): {exists_empty}")
++        
++        if exists_empty:
++            print("❌ FAIL: Order with empty product_id exists (shouldn't)")
++        else:
++            print("✅ PASS: No order with empty product_id")
++
++def test_case_2():
++    """Test case that works according to the issue"""
++    print("\nTesting case 2: Assign instance with primary key already set")
++    
++    with transaction.atomic():
++        order = Order()
++        order.product = Product(sku="bar")
++        order.product.save()
++        order.save()
++        
++        exists_correct = Order.objects.filter(product=order.product).exists()
++        
++        print(f"Order.objects.filter(product=order.product).exists(): {exists_correct}")
++        
++        if exists_correct:
++            print("✅ PASS: Order with correct product exists")
++        else:
++            print("❌ FAIL: Order with correct product doesn't exist")
++
++if __name__ == "__main__":
++    # Create database tables using Django's schema creation
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Product)
++        schema_editor.create_model(Order)
++    
++    # Run tests
++    test_case_1()
++    test_case_2()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..2aba34f9f9
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, transaction
++
++# Define the models
++class Product(models.Model):
++    sku = models.CharField(primary_key=True, max_length=50)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Order(models.Model):
++    product = models.ForeignKey(Product, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_edge_case_1():
++    """Test with None assignment"""
++    print("Testing edge case 1: Assign None to foreign key")
++    
++    try:
++        with transaction.atomic():
++            order = Order()
++            order.product = None
++            order.save()
++        
++        print("❌ FAIL: Should have raised validation error")
++    except Exception as e:
++        print(f"✅ PASS: Validation error raised as expected: {type(e).__name__}")
++
++def test_edge_case_2():
++    """Test with existing object"""
++    print("\nTesting edge case 2: Assign existing object")
++    
++    with transaction.atomic():
++        # Create a product first
++        product = Product(sku="existing")
++        product.save()
++        
++        order = Order()
++        order.product = product
++        order.save()
++        
++        order_from_db = Order.objects.get(id=order.id)
++        print(f"Order.product_id value: '{order_from_db.product_id}'")
++        print(f"Expected product_id value: 'existing'")
++        
++        if order_from_db.product_id == "existing":
++            print("✅ PASS: product_id is correct")
++        else:
++            print("❌ FAIL: product_id is incorrect")
++
++def test_edge_case_3():
++    """Test with object that has non-empty primary key at assignment"""
++    print("\nTesting edge case 3: Assign object with non-empty primary key")
++    
++    with transaction.atomic():
++        order = Order()
++        order.product = Product(sku="pre_set")
++        order.product.save()
++        order.save()
++        
++        order_from_db = Order.objects.get(id=order.id)
++        print(f"Order.product_id value: '{order_from_db.product_id}'")
++        print(f"Expected product_id value: 'pre_set'")
++        
++        if order_from_db.product_id == "pre_set":
++            print("✅ PASS: product_id is correct")
++        else:
++            print("❌ FAIL: product_id is incorrect")
++
++def test_edge_case_4():
++    """Test with object that has empty string primary key (should fail validation)"""
++    print("\nTesting edge case 4: Assign object with empty string primary key")
++    
++    try:
++        with transaction.atomic():
++            order = Order()
++            order.product = Product(sku="")  # Empty string primary key
++            order.product.save()
++            order.save()
++        
++        print("❌ FAIL: Should have raised validation error")
++    except Exception as e:
++        print(f"✅ PASS: Validation error raised as expected: {e}")
++
++if __name__ == "__main__":
++    # Create database tables using Django's schema creation
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Product)
++        schema_editor.create_model(Order)
++    
++    # Run tests
++    test_edge_case_1()
++    test_edge_case_2()
++    test_edge_case_3()
++    test_edge_case_4()
+\ No newline at end of file
+diff --git a/test_numeric_pk.py b/test_numeric_pk.py
+new file mode 100644
+index 0000000000..46d9f64528
+--- /dev/null
++++ b/test_numeric_pk.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, transaction
++
++# Test with numeric primary key
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Book(models.Model):
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    title = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_numeric_pk():
++    """Test with numeric primary key"""
++    print("Testing numeric primary key case")
++    
++    with transaction.atomic():
++        book = Book(title="Test Book")
++        book.author = Author()  # Author without PK
++        book.author.name = "Test Author"
++        book.author.save()  # This should generate a numeric PK
++        book.save()
++        
++        book_from_db = Book.objects.get(id=book.id)
++        print(f"Book.author_id value: '{book_from_db.author_id}'")
++        print(f"Expected author_id value: '{book.author.id}'")
++        
++        if book_from_db.author_id == book.author.id:
++            print("✅ PASS: author_id is correct")
++            return True
++        else:
++            print("❌ FAIL: author_id is incorrect")
++            return False
++
++if __name__ == "__main__":
++    # Create database tables using Django's schema creation
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Author)
++        schema_editor.create_model(Book)
++    
++    # Run test
++    result = test_numeric_pk()
++    
++    if result:
++        print("🎉 Test passed!")
++    else:
++        print("❌ Test failed!")
+\ No newline at end of file

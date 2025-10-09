@@ -1,0 +1,387 @@
+diff --git a/django/views/debug.py b/django/views/debug.py
+index 7a89f7bd15..a09a4c2f92 100644
+--- a/django/views/debug.py
++++ b/django/views/debug.py
+@@ -397,9 +397,12 @@ class ExceptionReporter:
+     def get_traceback_frames(self):
+         def explicit_or_implicit_cause(exc_value):
+             explicit = getattr(exc_value, '__cause__', None)
+-            suppress_context = getattr(exc_value, '__suppress_context__', None)
+-            implicit = getattr(exc_value, '__context__', None)
+-            return explicit or (None if suppress_context else implicit)
++            if explicit is not None:
++                return explicit
++            suppress_context = getattr(exc_value, '__suppress_context__', False)
++            if suppress_context:
++                return None
++            return getattr(exc_value, '__context__', None)
+ 
+         # Get the exception and all its causes
+         exceptions = []
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..2eb110fb08
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        DEFAULT_CHARSET='utf-8',
++    )
++    django.setup()
++
++from django.views.debug import ExceptionReporter
++from django.http import HttpRequest
++
++# Test the exact scenario from the GitHub issue
++class TestView:
++    def get(self, request, *args, **kwargs):
++        try:
++            raise RuntimeError('my error')
++        except Exception as exc:
++            raise ValueError('my new error') from None
++
++# Create a test request
++request = HttpRequest()
++request.method = 'GET'
++
++# Create the exception
++try:
++    view = TestView()
++    view.get(request)
++except Exception as e:
++    import sys
++    tb = sys.exc_info()[2]
++    # Create exception reporter
++    reporter = ExceptionReporter(request, is_email=False, exc_type=type(e), exc_value=e, tb=tb)
++    
++    # Get traceback frames
++    frames = reporter.get_traceback_frames()
++    
++    print("Number of frames:", len(frames))
++    
++    # Check if RuntimeError appears in any frame (which it shouldn't with 'from None')
++    runtime_error_found = False
++    for frame in frames:
++        if 'exc_cause' in frame and frame['exc_cause']:
++            if frame['exc_cause'].__class__.__name__ == 'RuntimeError':
++                runtime_error_found = True
++                print(f"Found RuntimeError in frame: {frame['exc_cause']}")
++                break
++    
++    print("RuntimeError found in traceback:", runtime_error_found)
++    
++    if runtime_error_found:
++        print("FAILURE: Bug still exists - RuntimeError appears in traceback when using 'from None'")
++        exit(1)
++    else:
++        print("SUCCESS: Bug fixed - RuntimeError correctly suppressed from traceback")
++        exit(0)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..d17ff611aa
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        DEFAULT_CHARSET='utf-8',
++    )
++    django.setup()
++
++from django.views.debug import ExceptionReporter
++from django.http import HttpRequest
++
++class TestView:
++    def get(self, request, *args, **kwargs):
++        try:
++            raise RuntimeError('my error')
++        except Exception as exc:
++            new_exc = ValueError('my new error')
++            raise new_exc from None
++
++class TestView2:
++    def get(self, request, *args, **kwargs):
++        try:
++            raise RuntimeError('my error')
++        except Exception as exc:
++            # Test without 'from None' - should show RuntimeError in traceback
++            raise ValueError('my new error')
++
++class TestView3:
++    def get(self, request, *args, **kwargs):
++        try:
++            raise RuntimeError('my error')
++        except Exception as exc:
++            # Test the exact scenario from the issue
++            # This should NOT show RuntimeError in traceback
++            raise ValueError('my new error') from None
++
++# Create a test request
++request = HttpRequest()
++request.method = 'GET'
++
++def test_view(view_class, description):
++    print(f"\n=== Testing {description} ===")
++    try:
++        view = view_class()
++        view.get(request)
++    except Exception as e:
++        import sys
++        tb = sys.exc_info()[2]
++        # Create exception reporter
++        reporter = ExceptionReporter(request, is_email=False, exc_type=type(e), exc_value=e, tb=tb)
++        
++        # Get traceback frames
++        frames = reporter.get_traceback_frames()
++        
++        print("Number of frames:", len(frames))
++        
++        # Check if RuntimeError appears in any frame
++        runtime_error_found = False
++        for frame in frames:
++            if 'exc_cause' in frame and frame['exc_cause']:
++                if frame['exc_cause'].__class__.__name__ == 'RuntimeError':
++                    runtime_error_found = True
++                    print(f"Found RuntimeError in frame: {frame['exc_cause']}")
++                    break
++        
++        print("RuntimeError found in traceback:", runtime_error_found)
++        return runtime_error_found
++
++# Test all scenarios
++test1 = test_view(TestView, "'from None' - should suppress RuntimeError")
++test2 = test_view(TestView2, "regular raise - should show RuntimeError")
++test3 = test_view(TestView3, "explicit __suppress_context__ - should suppress RuntimeError")
++
++print(f"\n=== Results ===")
++print(f"Test 1 (from None): RuntimeError found = {test1} (should be False)")
++print(f"Test 2 (regular): RuntimeError found = {test2} (should be True)") 
++print(f"Test 3 (explicit suppress): RuntimeError found = {test3} (should be False)")
++
++if test1 == False and test2 == True and test3 == False:
++    print("All tests passed! Current implementation is working correctly.")
++else:
++    print("Some tests failed. There may be an issue with the implementation.")
+\ No newline at end of file
+diff --git a/run_debug_tests.py b/run_debug_tests.py
+new file mode 100644
+index 0000000000..ba901b9111
+--- /dev/null
++++ b/run_debug_tests.py
+@@ -0,0 +1,33 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings for testing
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        DEFAULT_CHARSET='utf-8',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        TEST_RUNNER='django.test.runner.DiscoverRunner',
++    )
++    django.setup()
++
++# Run the specific debug tests
++from django.test.utils import get_runner
++
++TestRunner = get_runner(settings)
++test_runner = TestRunner(verbosity=2)
++failures = test_runner.run_tests(['tests.view_tests.tests.test_debug'])
++
++if failures:
++    print(f"\nTests failed: {failures}")
++    exit(1)
++else:
++    print("\nAll debug tests passed!")
++    exit(0)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..ca10e8dc09
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        DEFAULT_CHARSET='utf-8',
++    )
++    django.setup()
++
++from django.views.debug import ExceptionReporter
++from django.http import HttpRequest
++
++# Edge case 1: Exception with __cause__ set but no __suppress_context__
++class TestView1:
++    def get(self, request, *args, **kwargs):
++        try:
++            raise RuntimeError('my error')
++        except Exception as exc:
++            new_exc = ValueError('my new error')
++            new_exc.__cause__ = exc
++            raise new_exc
++
++# Edge case 2: Exception with __suppress_context__ set to True but no __cause__
++class TestView2:
++    def get(self, request, *args, **kwargs):
++        try:
++            raise RuntimeError('my error')
++        except Exception as exc:
++            new_exc = ValueError('my new error')
++            new_exc.__suppress_context__ = True
++            raise new_exc
++
++# Edge case 3: Exception with __suppress_context__ set to False
++class TestView3:
++    def get(self, request, *args, **kwargs):
++        try:
++            raise RuntimeError('my error')
++        except Exception as exc:
++            new_exc = ValueError('my new error')
++            new_exc.__suppress_context__ = False
++            raise new_exc
++
++def test_view(view_class, description, should_show_runtime_error):
++    print(f"\n=== Testing {description} ===")
++    try:
++        view = view_class()
++        view.get(request)
++    except Exception as e:
++        import sys
++        tb = sys.exc_info()[2]
++        reporter = ExceptionReporter(request, is_email=False, exc_type=type(e), exc_value=e, tb=tb)
++        frames = reporter.get_traceback_frames()
++        
++        runtime_error_found = False
++        for frame in frames:
++            if 'exc_cause' in frame and frame['exc_cause']:
++                if frame['exc_cause'].__class__.__name__ == 'RuntimeError':
++                    runtime_error_found = True
++                    break
++        
++        print(f"RuntimeError found: {runtime_error_found} (expected: {should_show_runtime_error})")
++        return runtime_error_found == should_show_runtime_error
++
++# Create a test request
++request = HttpRequest()
++request.method = 'GET'
++
++# Test edge cases
++test1_pass = test_view(TestView1, "explicit cause, no suppress_context", True)
++test2_pass = test_view(TestView2, "no cause, suppress_context=True", False)
++test3_pass = test_view(TestView3, "no cause, suppress_context=False", True)
++
++print(f"\n=== Results ===")
++print(f"Test 1 (explicit cause): {'PASS' if test1_pass else 'FAIL'}")
++print(f"Test 2 (suppress_context=True): {'PASS' if test2_pass else 'FAIL'}")
++print(f"Test 3 (suppress_context=False): {'PASS' if test3_pass else 'FAIL'}")
++
++if test1_pass and test2_pass and test3_pass:
++    print("All edge case tests passed!")
++else:
++    print("Some edge case tests failed!")
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..59b8c2227d
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        DEFAULT_CHARSET='utf-8',
++    )
++    django.setup()
++
++from django.views.debug import ExceptionReporter
++from django.http import HttpRequest
++
++class TestView:
++    def get(self, request, *args, **kwargs):
++        try:
++            raise RuntimeError('my error')
++        except Exception as exc:
++            raise ValueError('my new error') from None
++
++# Create a test request
++request = HttpRequest()
++request.method = 'GET'
++
++# Create the exception
++try:
++    view = TestView()
++    view.get(request)
++except Exception as e:
++    import sys
++    tb = sys.exc_info()[2]
++    # Create exception reporter
++    reporter = ExceptionReporter(request, is_email=False, exc_type=type(e), exc_value=e, tb=tb)
++    
++    # Get traceback frames
++    frames = reporter.get_traceback_frames()
++    
++    print("Number of frames:", len(frames))
++    
++    # Check if RuntimeError appears in any frame (which it shouldn't with 'from None')
++    runtime_error_found = False
++    for frame in frames:
++        if 'exc_cause' in frame and frame['exc_cause']:
++            if frame['exc_cause'].__class__.__name__ == 'RuntimeError':
++                runtime_error_found = True
++                print(f"Found RuntimeError in frame: {frame['exc_cause']}")
++                break
++    
++    print("RuntimeError found in traceback:", runtime_error_found)
++    
++    if runtime_error_found:
++        print("BUG: RuntimeError should not appear in traceback when using 'from None'")
++        exit(1)
++    else:
++        print("OK: RuntimeError correctly suppressed from traceback")
++        exit(0)
+\ No newline at end of file

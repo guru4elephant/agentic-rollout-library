@@ -1,0 +1,420 @@
+diff --git a/debug_imports.py b/debug_imports.py
+new file mode 100644
+index 0000000000..14245d713b
+--- /dev/null
++++ b/debug_imports.py
+@@ -0,0 +1,42 @@
++#!/usr/bin/env python3
++import os
++import sys
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++from django.conf import settings
++settings.configure(
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    SECRET_KEY='test-secret-key',
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++)
++
++from django.db import models
++from django.db.migrations.serializer import TypeSerializer
++from django.db.migrations.writer import MigrationWriter
++
++# Test the TypeSerializer with models.Model
++serializer = TypeSerializer(models.Model)
++result, imports = serializer.serialize()
++print('Result:', result)
++print('Imports:', imports)
++
++# Test the import handling logic
++test_imports = set()
++test_imports.update(imports)
++print('Test imports before handling:', test_imports)
++
++# Simulate the import handling logic from MigrationWriter
++if "from django.db import models" in test_imports:
++    test_imports.discard("from django.db import models")
++    test_imports.add("from django.db import migrations, models")
++else:
++    test_imports.add("from django.db import migrations")
++
++print('Test imports after handling:', test_imports)
+\ No newline at end of file
+diff --git a/django/db/migrations/serializer.py b/django/db/migrations/serializer.py
+index e19c881cda..072a2efc14 100644
+--- a/django/db/migrations/serializer.py
++++ b/django/db/migrations/serializer.py
+@@ -273,7 +273,7 @@ class TupleSerializer(BaseSequenceSerializer):
+ class TypeSerializer(BaseSerializer):
+     def serialize(self):
+         special_cases = [
+-            (models.Model, "models.Model", []),
++            (models.Model, "models.Model", ["from django.db import models"]),
+             (type(None), 'type(None)', []),
+         ]
+         for case, string, imports in special_cases:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..657acc7970
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++import os
++import sys
++import tempfile
++import shutil
++from django.conf import settings
++from django.core.management import execute_from_command_line
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a minimal settings module
++test_settings = '''
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++SECRET_KEY = 'test-secret-key'
++INSTALLED_APPS = ['test_app']
++'''
++
++# Create the test app directory structure
++test_app_dir = os.path.join(os.getcwd(), 'test_app')
++os.makedirs(test_app_dir, exist_ok=True)
++
++# Create __init__.py for the app
++with open(os.path.join(test_app_dir, '__init__.py'), 'w') as f:
++    f.write('')
++
++# Create models.py with the problematic content
++models_content = '''
++from django.db import models
++
++class MyField(models.TextField):
++    pass
++
++class MyBaseModel(models.Model):
++    class Meta:
++        abstract = True
++
++class MyMixin:
++    pass
++
++class MyModel(MyMixin, MyBaseModel):
++    name = MyField(primary_key=True)
++'''
++
++with open(os.path.join(test_app_dir, 'models.py'), 'w') as f:
++    f.write(models_content)
++
++# Create the test settings file
++with open('test_settings.py', 'w') as f:
++    f.write(test_settings)
++
++# Set up Django
++from django import setup
++setup()
++
++# Run makemigrations
++from django.core.management import execute_from_command_line
++try:
++    execute_from_command_line(['manage.py', 'makemigrations', 'test_app'])
++    print("Migration generated successfully")
++    
++    # Check the migration file content
++    migrations_dir = os.path.join(test_app_dir, 'migrations')
++    if os.path.exists(migrations_dir):
++        migration_files = [f for f in os.listdir(migrations_dir) if f.endswith('.py') and f != '__init__.py']
++        if migration_files:
++            migration_file = os.path.join(migrations_dir, migration_files[0])
++            with open(migration_file, 'r') as f:
++                content = f.read()
++                print("Migration content:")
++                print(content)
++                
++                # Try to import the migration to see if it has the error
++                try:
++                    # Create a temporary module to test import
++                    import importlib.util
++                    spec = importlib.util.spec_from_file_location("test_migration", migration_file)
++                    migration_module = importlib.util.module_from_spec(spec)
++                    spec.loader.exec_module(migration_module)
++                    print("Migration imported successfully - no NameError!")
++                except NameError as e:
++                    print(f"NameError found: {e}")
++                    sys.exit(1)
++                except Exception as e:
++                    print(f"Other error during import: {e}")
++        else:
++            print("No migration files found")
++    else:
++        print("No migrations directory found")
++        
++except Exception as e:
++    print(f"Error running makemigrations: {e}")
++    sys.exit(1)
++
++# Cleanup
++shutil.rmtree(test_app_dir, ignore_errors=True)
++if os.path.exists('test_settings.py'):
++    os.remove('test_settings.py')
++
++print("Test completed")
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..62e7aca4c8
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,27 @@
++#!/usr/bin/env python3
++import os
++import sys
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++from django.conf import settings
++settings.configure(
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    SECRET_KEY='test-secret-key',
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++)
++
++from django.db import models
++from django.db.migrations.serializer import TypeSerializer
++
++# Test the TypeSerializer with models.Model
++serializer = TypeSerializer(models.Model)
++result, imports = serializer.serialize()
++print('Result:', result)
++print('Imports:', imports)
+\ No newline at end of file
+diff --git a/test_migration_generation.py b/test_migration_generation.py
+new file mode 100644
+index 0000000000..e4941999d2
+--- /dev/null
++++ b/test_migration_generation.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++import os
++import tempfile
++import shutil
++from django.conf import settings
++from django.core.management import execute_from_command_line
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a minimal settings module
++test_settings = '''
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++SECRET_KEY = 'test-secret-key'
++INSTALLED_APPS = ['test_app']
++'''
++
++# Create the test app directory structure
++test_app_dir = os.path.join(os.getcwd(), 'test_app')
++os.makedirs(test_app_dir, exist_ok=True)
++
++# Create __init__.py for the app
++with open(os.path.join(test_app_dir, '__init__.py'), 'w') as f:
++    f.write('')
++
++# Create models.py with the problematic content
++models_content = '''
++from django.db import models
++
++class MyField(models.TextField):
++    pass
++
++class MyBaseModel(models.Model):
++    class Meta:
++        abstract = True
++
++class MyMixin:
++    pass
++
++class MyModel(MyMixin, MyBaseModel):
++    name = MyField(primary_key=True)
++'''
++
++with open(os.path.join(test_app_dir, 'models.py'), 'w') as f:
++    f.write(models_content)
++
++# Create the test settings file
++with open('test_settings.py', 'w') as f:
++    f.write(test_settings)
++
++# Set up Django
++from django import setup
++setup()
++
++# Run makemigrations
++try:
++    execute_from_command_line(['manage.py', 'makemigrations', 'test_app'])
++    print("Migration generated successfully")
++    
++    # Check the migration file content
++    migrations_dir = os.path.join(test_app_dir, 'migrations')
++    if os.path.exists(migrations_dir):
++        migration_files = [f for f in os.listdir(migrations_dir) if f.endswith('.py') and f != '__init__.py']
++        if migration_files:
++            migration_file = os.path.join(migrations_dir, migration_files[0])
++            with open(migration_file, 'r') as f:
++                content = f.read()
++                print("Migration content:")
++                print(content)
++        else:
++            print("No migration files found")
++    else:
++        print("No migrations directory found")
++        
++except Exception as e:
++    print(f"Error running makemigrations: {e}")
++
++# Cleanup
++shutil.rmtree(test_app_dir, ignore_errors=True)
++if os.path.exists('test_settings.py'):
++    os.remove('test_settings.py')
++
++print("Test completed")
+\ No newline at end of file
+diff --git a/test_migration_import.py b/test_migration_import.py
+new file mode 100644
+index 0000000000..74c7f8f508
+--- /dev/null
++++ b/test_migration_import.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python3
++import os
++import sys
++import importlib.util
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a minimal settings module
++test_settings = '''
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++SECRET_KEY = 'test-secret-key'
++INSTALLED_APPS = ['test_app']
++'''
++
++# Create the test app directory structure
++test_app_dir = os.path.join(os.getcwd(), 'test_app')
++os.makedirs(test_app_dir, exist_ok=True)
++
++# Create __init__.py for the app
++with open(os.path.join(test_app_dir, '__init__.py'), 'w') as f:
++    f.write('')
++
++# Create models.py with the problematic content
++models_content = '''
++from django.db import models
++
++class MyField(models.TextField):
++    pass
++
++class MyBaseModel(models.Model):
++    class Meta:
++        abstract = True
++
++class MyMixin:
++    pass
++
++class MyModel(MyMixin, MyBaseModel):
++    name = MyField(primary_key=True)
++'''
++
++with open(os.path.join(test_app_dir, 'models.py'), 'w') as f:
++    f.write(models_content)
++
++# Create the test settings file
++with open('test_settings.py', 'w') as f:
++    f.write(test_settings)
++
++# Set up Django
++from django import setup
++setup()
++
++# Run makemigrations
++from django.core.management import execute_from_command_line
++try:
++    execute_from_command_line(['manage.py', 'makemigrations', 'test_app'])
++    print("Migration generated successfully")
++    
++    # Check the migration file content
++    migrations_dir = os.path.join(test_app_dir, 'migrations')
++    if os.path.exists(migrations_dir):
++        migration_files = [f for f in os.listdir(migrations_dir) if f.endswith('.py') and f != '__init__.py']
++        if migration_files:
++            migration_file = os.path.join(migrations_dir, migration_files[0])
++            with open(migration_file, 'r') as f:
++                content = f.read()
++                print("Migration content:")
++                print(content)
++                
++            # Test importing the migration
++            try:
++                # Create a temporary module to test import
++                spec = importlib.util.spec_from_file_location("test_migration", migration_file)
++                migration_module = importlib.util.module_from_spec(spec)
++                spec.loader.exec_module(migration_module)
++                print("✓ Migration imported successfully - no NameError!")
++                
++                # Test that the Migration class can be instantiated
++                migration_instance = migration_module.Migration('test_migration', 'test_app')
++                print("✓ Migration class instantiated successfully")
++                
++            except NameError as e:
++                print(f"✗ NameError found: {e}")
++                sys.exit(1)
++            except Exception as e:
++                print(f"✗ Other error during import: {e}")
++                sys.exit(1)
++        else:
++            print("No migration files found")
++            sys.exit(1)
++    else:
++        print("No migrations directory found")
++        sys.exit(1)
++        
++except Exception as e:
++    print(f"Error running makemigrations: {e}")
++    sys.exit(1)
++
++# Cleanup
++import shutil
++shutil.rmtree(test_app_dir, ignore_errors=True)
++if os.path.exists('test_settings.py'):
++    os.remove('test_settings.py')
++
++print("✓ All tests passed!")
+\ No newline at end of file

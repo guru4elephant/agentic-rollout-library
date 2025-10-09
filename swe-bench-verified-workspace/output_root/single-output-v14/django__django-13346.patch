@@ -1,0 +1,333 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..cbf0756a26
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python3
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model with JSONField
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    data = models.JSONField(default=dict)
++    
++    class Meta:
++        app_label = 'test'
++
++def create_test_data():
++    # Create test data with various scenarios
++    TestModel.objects.bulk_create([
++        TestModel(name='test1', data={'key': 0}),
++        TestModel(name='test2', data={'key': 1}),
++        TestModel(name='test3', data={'key': 0}),
++        TestModel(name='test4', data={'key': 2}),
++        TestModel(name='test5', data={'key': 3}),
++        TestModel(name='test6', data={'key': 'string'}),
++        TestModel(name='test7', data={'key': None}),
++        TestModel(name='test8', data={'other': 'value'}),
++    ])
++
++def test_comprehensive():
++    from django.db import connection
++    
++    # Create table
++    table_name = 'test_testmodel'
++    sql = f"""
++    CREATE TABLE {table_name} (
++        id INTEGER PRIMARY KEY AUTOINCREMENT,
++        name VARCHAR(100) NOT NULL,
++        data TEXT NOT NULL
++    )
++    """
++    with connection.cursor() as cursor:
++        cursor.execute(sql)
++    
++    # Create test data
++    create_test_data()
++    
++    print("Comprehensive test of __in lookup on key transform...")
++    
++    # Test 1: Single value in list
++    first_filter = {'data__key__in': [0]}
++    first_items = TestModel.objects.filter(**first_filter)
++    second_filter = {'data__key': 0}
++    second_items = TestModel.objects.filter(**second_filter)
++    print(f"Single value [0]: __in={len(first_items)}, direct={len(second_items)}, equal={len(first_items) == len(second_items)}")
++    
++    # Test 2: Multiple values in list
++    first_filter = {'data__key__in': [0, 1]}
++    first_items = TestModel.objects.filter(**first_filter)
++    second_filter = {'data__key__in': [1, 0]}  # Same values, different order
++    second_items = TestModel.objects.filter(**second_filter)
++    print(f"Multiple values [0,1]: {len(first_items)} results, should be same regardless of order: {len(first_items) == len(second_items)}")
++    
++    # Test 3: String values
++    first_filter = {'data__key__in': ['string']}
++    first_items = TestModel.objects.filter(**first_filter)
++    second_filter = {'data__key': 'string'}
++    second_items = TestModel.objects.filter(**second_filter)
++    print(f"String value ['string']: __in={len(first_items)}, direct={len(second_items)}, equal={len(first_items) == len(second_items)}")
++    
++    # Test 4: Empty list should return empty result
++    try:
++        first_filter = {'data__key__in': []}
++        first_items = TestModel.objects.filter(**first_filter)
++        print(f"Empty list []: {len(first_items)} results (should be 0)")
++    except Exception as e:
++        print(f"Empty list []: Exception {e}")
++    
++    # Test 5: Non-existent value
++    first_filter = {'data__key__in': [999]}
++    first_items = TestModel.objects.filter(**first_filter)
++    print(f"Non-existent value [999]: {len(first_items)} results (should be 0)")
++    
++    # Test 6: Mixed types
++    first_filter = {'data__key__in': [0, 'string']}
++    first_items = TestModel.objects.filter(**first_filter)
++    print(f"Mixed types [0, 'string']: {len(first_items)} results")
++
++if __name__ == '__main__':
++    test_comprehensive()
+\ No newline at end of file
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fafc1beee8..84087b6841 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -479,6 +479,34 @@ class KeyTransformGte(KeyTransformNumericLookupMixin, lookups.GreaterThanOrEqual
+     pass
+ 
+ 
++class KeyTransformIn(lookups.In):
++    def process_rhs(self, compiler, connection):
++        if isinstance(self.rhs, KeyTransform):
++            return super(lookups.In, self).process_rhs(compiler, connection)
++        
++        rhs, rhs_params = super().process_rhs(compiler, connection)
++        
++        # Handle different database backends
++        if connection.vendor == 'oracle':
++            func = []
++            for value in rhs_params:
++                function = 'JSON_QUERY' if isinstance(value, (list, dict)) else 'JSON_VALUE'
++                func.append("%s('%s', '$.value')" % (
++                    function,
++                    json.dumps({'value': value}),
++                ))
++            rhs = rhs % tuple(func)
++            rhs_params = []
++        elif connection.vendor == 'sqlite':
++            func = ["JSON_EXTRACT(%s, '$')" if value != 'null' else '%s' for value in rhs_params]
++            rhs = rhs % tuple(func)
++        elif connection.vendor == 'mysql':
++            func = ["JSON_EXTRACT(%s, '$')"] * len(rhs_params)
++            rhs = rhs % tuple(func)
++        
++        return rhs, rhs_params
++
++
+ KeyTransform.register_lookup(KeyTransformExact)
+ KeyTransform.register_lookup(KeyTransformIExact)
+ KeyTransform.register_lookup(KeyTransformIsNull)
+@@ -494,6 +522,7 @@ KeyTransform.register_lookup(KeyTransformLt)
+ KeyTransform.register_lookup(KeyTransformLte)
+ KeyTransform.register_lookup(KeyTransformGt)
+ KeyTransform.register_lookup(KeyTransformGte)
++KeyTransform.register_lookup(KeyTransformIn)
+ 
+ 
+ class KeyTransformFactory:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..202a352964
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model with JSONField
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    data = models.JSONField(default=dict)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create test data
++def create_test_data():
++    # Create some test data with numeric keys
++    TestModel.objects.bulk_create([
++        TestModel(name='test1', data={'key': 0}),
++        TestModel(name='test2', data={'key': 1}),
++        TestModel(name='test3', data={'key': 0}),
++        TestModel(name='test4', data={'key': 2}),
++    ])
++
++# Test the issue
++def test_in_lookup():
++    # Create test data
++    create_test_data()
++    
++    print("Testing __in lookup on key transform...")
++    
++    # Test 1: __in lookup
++    first_filter = {'data__key__in': [0]}
++    first_items = TestModel.objects.filter(**first_filter)
++    print(f"First filter (__in): {len(first_items)} results")
++    
++    # Test 2: Direct equality lookup
++    second_filter = {'data__key': 0}
++    second_items = TestModel.objects.filter(**second_filter)
++    print(f"Second filter (direct): {len(second_items)} results")
++    
++    # They should be the same
++    print(f"Results should be equal: {len(first_items) == len(second_items)}")
++
++if __name__ == '__main__':
++    from django.db import connection
++    
++    # Simple table creation using raw SQL
++    table_name = 'test_testmodel'
++    sql = f"""
++    CREATE TABLE {table_name} (
++        id INTEGER PRIMARY KEY AUTOINCREMENT,
++        name VARCHAR(100) NOT NULL,
++        data TEXT NOT NULL
++    )
++    """
++    with connection.cursor() as cursor:
++        cursor.execute(sql)
++    
++    test_in_lookup()
+\ No newline at end of file
+diff --git a/test_multiple_databases.py b/test_multiple_databases.py
+new file mode 100644
+index 0000000000..6ff0469bc7
+--- /dev/null
++++ b/test_multiple_databases.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++import os
++import django
++from django.conf import settings
++
++def test_with_database(engine_name):
++    print(f"\nTesting with {engine_name}...")
++    
++    # Configure Django settings for this database
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': engine_name,
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++    
++    django.setup()
++    
++    from django.db import models, connection
++
++    # Create a simple model with JSONField
++    class TestModel(models.Model):
++        name = models.CharField(max_length=100)
++        data = models.JSONField(default=dict)
++        
++        class Meta:
++            app_label = 'test'
++
++    # Create table
++    table_name = 'test_testmodel'
++    sql = f"""
++    CREATE TABLE {table_name} (
++        id INTEGER PRIMARY KEY AUTOINCREMENT,
++        name VARCHAR(100) NOT NULL,
++        data TEXT NOT NULL
++    )
++    """
++    with connection.cursor() as cursor:
++        cursor.execute(sql)
++
++    # Create test data
++    TestModel.objects.bulk_create([
++        TestModel(name='test1', data={'key': 0}),
++        TestModel(name='test2', data={'key': 1}),
++        TestModel(name='test3', data={'key': 0}),
++        TestModel(name='test4', data={'key': 2}),
++    ])
++
++    # Test the issue
++    first_filter = {'data__key__in': [0]}
++    first_items = TestModel.objects.filter(**first_filter)
++    
++    second_filter = {'data__key': 0}
++    second_items = TestModel.objects.filter(**second_filter)
++    
++    print(f"__in lookup: {len(first_items)} results")
++    print(f"Direct lookup: {len(second_items)} results")
++    print(f"Results equal: {len(first_items) == len(second_items)}")
++    
++    # Clean up
++    django.setup()
++
++if __name__ == '__main__':
++    # Test with different database backends
++    test_with_database('django.db.backends.sqlite3')
++    
++    # Note: MySQL and Oracle would require actual database connections
++    # For now, we'll test the logic with SQLite and assume the fix works
++    # for other databases based on the vendor-specific handling in our code
++    
++    print("\nNote: MySQL and Oracle tests would require actual database connections.")
++    print("The fix includes vendor-specific handling for Oracle, MySQL, and SQLite.")
+\ No newline at end of file

@@ -1,0 +1,255 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index ce18098fd2..7a008c9e9f 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1124,7 +1124,8 @@ class Query(BaseExpression):
+ 
+     def check_filterable(self, expression):
+         """Raise an error if expression cannot be used in a WHERE clause."""
+-        if not getattr(expression, 'filterable', True):
++        # Only check filterable attribute on actual expression objects
++        if isinstance(expression, BaseExpression) and not getattr(expression, 'filterable', True):
+             raise NotSupportedError(
+                 expression.__class__.__name__ + ' is disallowed in the filter '
+                 'clause.'
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..3c95595991
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.utils import timezone
++
++# Create the models from the issue
++class ProductMetaDataType(models.Model):
++    label = models.CharField(max_length=255, unique=True, blank=False, null=False)
++    filterable = models.BooleanField(default=False, verbose_name="filterable")
++    
++    class Meta:
++        app_label = "adminpricing"
++        verbose_name = "product meta data type"
++        verbose_name_plural = "product meta data types"
++    
++    def __str__(self):
++        return self.label
++
++class Product(models.Model):
++    name = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = "adminpricing"
++
++class ProductMetaData(models.Model):
++    id = models.BigAutoField(primary_key=True)
++    product = models.ForeignKey(
++        Product, null=False, blank=False, on_delete=models.CASCADE
++    )
++    value = models.TextField(null=False, blank=False)
++    marketplace = models.CharField(max_length=100)  # Simplified for reproduction
++    date_created = models.DateTimeField(null=True, default=timezone.now)
++    metadata_type = models.ForeignKey(
++        ProductMetaDataType, null=False, blank=False, on_delete=models.CASCADE
++    )
++    
++    class Meta:
++        app_label = "adminpricing"
++        verbose_name = "product meta data"
++        verbose_name_plural = "product meta datas"
++
++def test_reproduction():
++    """Reproduce the issue described in the GitHub issue"""
++    print("Creating database tables...")
++    from django.db import connection
++    
++    # Create tables using the schema editor
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(ProductMetaDataType)
++        schema_editor.create_model(Product)
++        schema_editor.create_model(ProductMetaData)
++    
++    print("Creating test data...")
++    
++    # Create a metadata type with filterable=False
++    brand_metadata = ProductMetaDataType.objects.create(
++        label="Brand",
++        filterable=False
++    )
++    
++    # Create a product
++    product = Product.objects.create(name="Test Product")
++    
++    # Create metadata
++    ProductMetaData.objects.create(
++        product=product,
++        value="Dark Vador",
++        marketplace="Test Marketplace",
++        metadata_type=brand_metadata
++    )
++    
++    print("Attempting to filter with metadata_type that has filterable field...")
++    
++    try:
++        # This should trigger the error
++        result = ProductMetaData.objects.filter(
++            value="Dark Vador", 
++            metadata_type=brand_metadata
++        )
++        print("SUCCESS: Filter worked without error")
++        print(f"Found {result.count()} results")
++    except Exception as e:
++        print(f"ERROR: {e}")
++        print("This reproduces the issue described in the GitHub issue")
++        return False
++    
++    return True
++
++if __name__ == "__main__":
++    test_reproduction()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..d733470a86
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,113 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.utils import timezone
++from django.db.models.expressions import F
++
++# Create test models
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    filterable = models.BooleanField(default=False)
++    
++    class Meta:
++        app_label = "testapp"
++
++class RelatedModel(models.Model):
++    test_field = models.ForeignKey(TestModel, on_delete=models.CASCADE)
++    value = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = "testapp"
++
++def test_edge_cases():
++    """Test various edge cases to ensure the fix doesn't break anything"""
++    from django.db import connection
++    
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++        schema_editor.create_model(RelatedModel)
++    
++    print("Testing edge cases...")
++    
++    # Test 1: Normal filtering with model instance that has filterable field
++    test_obj = TestModel.objects.create(name="Test Object", filterable=False)
++    RelatedModel.objects.create(test_field=test_obj, value="test value")
++    
++    try:
++        result = RelatedModel.objects.filter(test_field=test_obj)
++        print("✓ Test 1 PASSED: Filtering with model instance that has filterable field")
++        print(f"  Found {result.count()} results")
++    except Exception as e:
++        print(f"✗ Test 1 FAILED: {e}")
++    
++    # Test 2: Filtering with F expression (should still work)
++    try:
++        result = RelatedModel.objects.filter(test_field=F('test_field'))
++        print("✓ Test 2 PASSED: Filtering with F expression")
++    except Exception as e:
++        print(f"✗ Test 2 FAILED: {e}")
++    
++    # Test 3: Create an expression with filterable=False and test it
++    from django.db.models.expressions import BaseExpression
++    
++    class NonFilterableExpression(BaseExpression):
++        filterable = False
++        
++        def as_sql(self, compiler, connection):
++            return "'test'", []
++    
++    non_filterable_expr = NonFilterableExpression()
++    
++    try:
++        result = RelatedModel.objects.filter(value=non_filterable_expr)
++        print("✗ Test 3 FAILED: Should have raised error for non-filterable expression")
++    except Exception as e:
++        if "disallowed in the filter clause" in str(e):
++            print("✓ Test 3 PASSED: Non-filterable expression correctly rejected")
++        else:
++            print(f"✗ Test 3 FAILED: Unexpected error: {e}")
++    
++    # Test 4: Create an expression with filterable=True and test it
++    class FilterableExpression(BaseExpression):
++        filterable = True
++        
++        def as_sql(self, compiler, connection):
++            return "'test'", []
++    
++    filterable_expr = FilterableExpression()
++    
++    try:
++        result = RelatedModel.objects.filter(value=filterable_expr)
++        print("✓ Test 4 PASSED: Filterable expression accepted")
++    except Exception as e:
++        print(f"✗ Test 4 FAILED: {e}")
++    
++    print("All edge case tests completed.")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file

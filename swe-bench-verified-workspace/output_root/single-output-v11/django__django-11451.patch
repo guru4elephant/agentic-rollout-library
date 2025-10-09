@@ -1,0 +1,189 @@
+diff --git a/django/contrib/auth/backends.py b/django/contrib/auth/backends.py
+index f4b1722757..a3765ae0f1 100644
+--- a/django/contrib/auth/backends.py
++++ b/django/contrib/auth/backends.py
+@@ -39,6 +39,8 @@ class ModelBackend(BaseBackend):
+     def authenticate(self, request, username=None, password=None, **kwargs):
+         if username is None:
+             username = kwargs.get(UserModel.USERNAME_FIELD)
++        if username is None or password is None:
++            return
+         try:
+             user = UserModel._default_manager.get_by_natural_key(username)
+         except UserModel.DoesNotExist:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..9f45e1c022
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where ModelBackend.authenticate() makes a database query when username is None.
++"""
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++from django.db import connection
++
++def test_authenticate_with_none_username():
++    """Test that authenticate() doesn't make DB queries when username is None"""
++    backend = ModelBackend()
++    
++    # Reset query count
++    connection.queries_log.clear()
++    
++    # Call authenticate with username=None and password=None
++    # This should NOT make any database queries
++    try:
++        result = backend.authenticate(None, username=None, password=None)
++    except Exception as e:
++        # We expect an exception due to missing table, but we want to check if a query was attempted
++        queries = connection.queries_log
++        print(f"Number of queries attempted: {len(queries)}")
++        
++        if queries:
++            print("Queries attempted:")
++            for i, query in enumerate(queries, 1):
++                print(f"  {i}. {query['sql']}")
++            
++            # This confirms the issue - a query was attempted when it shouldn't be
++            print("✗ Issue confirmed: Database query was attempted when username is None")
++            return False
++        else:
++            print("✓ No queries attempted")
++            return True
++    
++    # Should return None and make no queries
++    queries = connection.queries_log
++    print(f"Number of queries executed: {len(queries)}")
++    
++    if queries:
++        print("Queries executed:")
++        for i, query in enumerate(queries, 1):
++            print(f"  {i}. {query['sql']}")
++        print("✗ Issue confirmed: Database query was executed when username is None")
++        return False
++    
++    print("✓ Test passed: No queries made when username and password are None")
++    return True
++
++if __name__ == '__main__':
++    test_authenticate_with_none_username()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..fee539dcb3
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the ModelBackend.authenticate() fix
++"""
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++from django.db import connection
++
++def test_edge_cases():
++    """Test various edge cases for the authenticate() method"""
++    backend = ModelBackend()
++    
++    # Test 1: username=None, password=None
++    print("Test 1: username=None, password=None")
++    connection.queries_log.clear()
++    result = backend.authenticate(None, username=None, password=None)
++    queries = connection.queries_log
++    assert result is None and len(queries) == 0, "Should return None and make no queries"
++    print("✓ Passed")
++    
++    # Test 2: username=None, password="some_password"
++    print("Test 2: username=None, password='some_password'")
++    connection.queries_log.clear()
++    result = backend.authenticate(None, username=None, password="some_password")
++    queries = connection.queries_log
++    assert result is None and len(queries) == 0, "Should return None and make no queries"
++    print("✓ Passed")
++    
++    # Test 3: username="some_user", password=None
++    print("Test 3: username='some_user', password=None")
++    connection.queries_log.clear()
++    result = backend.authenticate(None, username="some_user", password=None)
++    queries = connection.queries_log
++    assert result is None and len(queries) == 0, "Should return None and make no queries"
++    print("✓ Passed")
++    
++    # Test 4: username="", password="some_password" (empty string)
++    print("Test 4: username='', password='some_password'")
++    connection.queries_log.clear()
++    try:
++        result = backend.authenticate(None, username="", password="some_password")
++    except Exception:
++        pass  # Expected due to missing table
++    queries = connection.queries_log
++    # This should attempt a query since username is not None
++    assert len(queries) > 0, "Should attempt a query for empty string username"
++    print("✓ Passed")
++    
++    # Test 5: username="some_user", password="" (empty string)
++    print("Test 5: username='some_user', password=''")
++    connection.queries_log.clear()
++    try:
++        result = backend.authenticate(None, username="some_user", password="")
++    except Exception:
++        pass  # Expected due to missing table
++    queries = connection.queries_log
++    # This should attempt a query since password is not None
++    assert len(queries) > 0, "Should attempt a query for empty string password"
++    print("✓ Passed")
++    
++    print("All edge case tests passed!")
++
++if __name__ == '__main__':
++    test_edge_cases()
+\ No newline at end of file

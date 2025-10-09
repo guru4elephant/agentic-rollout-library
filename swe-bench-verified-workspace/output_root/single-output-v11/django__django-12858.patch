@@ -1,0 +1,589 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 6c9e9d3707..124db6eed0 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -1747,7 +1747,7 @@ class Model(metaclass=ModelBase):
+                     else:
+                         _cls = None
+                 except (FieldDoesNotExist, AttributeError):
+-                    if fld is None or fld.get_transform(part) is None:
++                    if fld is None or (fld.get_transform(part) is None and fld.get_lookup(part) is None):
+                         errors.append(
+                             checks.Error(
+                                 "'ordering' refers to the nonexistent field, "
+diff --git a/ordering_test.py b/ordering_test.py
+new file mode 100644
+index 0000000000..52fac10190
+--- /dev/null
++++ b/ordering_test.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++# Test the ordering validation logic
++from django.db.models import Field, Lookup
++from django.db.models.fields.related import ForeignKey
++
++# Simulate the validation logic from _check_ordering method
++def validate_ordering_part(field, part):
++    """
++    Simulate the validation logic from line 1750 in base.py
++    """
++    transform_result = field.get_transform(part)
++    lookup_result = field.get_lookup(part)
++    
++    # Old logic (before fix): only checked get_transform
++    old_valid = transform_result is not None
++    
++    # New logic (after fix): checks both get_transform and get_lookup
++    new_valid = transform_result is not None or lookup_result is not None
++    
++    return old_valid, new_valid
++
++# Test with different field types and parts
++print("Testing validation logic:")
++
++# Test 1: CharField with isnull lookup
++char_field = Field()
++part = 'isnull'
++old_valid, new_valid = validate_ordering_part(char_field, part)
++print(f"CharField 'isnull': old_valid={old_valid}, new_valid={new_valid}")
++
++# Test 2: CharField with nonexistent lookup  
++part = 'nonexistent'
++old_valid, new_valid = validate_ordering_part(char_field, part)
++print(f"CharField 'nonexistent': old_valid={old_valid}, new_valid={new_valid}")
++
++# Test 3: ForeignKey with isnull lookup
++from django.db import models
++fk_field = ForeignKey('self', models.CASCADE, null=True)
++part = 'isnull'
++old_valid, new_valid = validate_ordering_part(fk_field, part)
++print(f"ForeignKey 'isnull': old_valid={old_valid}, new_valid={new_valid}")
++
++# Test 4: ForeignKey with exact lookup (should be valid both ways)
++part = 'exact'
++old_valid, new_valid = validate_ordering_part(fk_field, part)
++print(f"ForeignKey 'exact': old_valid={old_valid}, new_valid={new_valid}")
++
++print("\nSummary:")
++print("- Before fix: 'isnull' would fail validation (get_transform returns None)")
++print("- After fix: 'isnull' passes validation (get_lookup returns valid lookup)")
++print("- 'nonexistent' should fail validation in both cases")
++print("- 'exact' should pass validation in both cases")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..11f6dd16b7
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++from django.conf import settings
++from django.apps import apps
++
++# Configure minimal Django settings with a custom app
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'app',
++        ],
++        USE_TZ=True,
++    )
++
++import django
++django.setup()
++
++from django.core.checks import run_checks
++from django.db import models
++
++# Create a simple app module to register our models
++import types
++app_module = types.ModuleType('app')
++app_module.__file__ = __file__
++sys.modules['app'] = app_module
++
++# Define the models based on the issue description
++class Product(models.Model):
++    parent = models.ForeignKey('self', models.CASCADE, null=True)
++    
++    class Meta:
++        app_label = 'app'
++
++class Supply(models.Model):
++    product = models.ForeignKey(Product, models.CASCADE)
++    
++    class Meta:
++        app_label = 'app'
++
++class Stock(models.Model):
++    supply = models.ForeignKey(Supply, models.CASCADE)
++    
++    class Meta:
++        app_label = 'app'
++        ordering = ['supply__product__parent__isnull']
++
++# Register the models with the app
++from django.apps import AppConfig
++
++class AppConfig(AppConfig):
++    name = 'app'
++    verbose_name = 'Test App'
++
++app_config = AppConfig('app', 'app')
++app_config.models_module = app_module
++
++# Manually register the app config
++from django.apps.registry import Apps
++apps = Apps(['app'])
++apps.app_configs['app'] = app_config
++apps.all_models['app'] = {
++    'product': Product,
++    'supply': Supply,
++    'stock': Stock,
++}
++
++# Run the checks specifically on our Stock model
++try:
++    errors = Stock.check()
++    print("Model checks completed")
++    print("Errors:", errors)
++except Exception as e:
++    print("Error during model checks:", e)
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..65e0f36b97
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,41 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++# Test the specific logic that was fixed
++from django.db.models import Field
++
++# Create a field instance
++field = Field()
++
++# Test the logic that was fixed
++part = 'isnull'
++
++# Before fix: only checked get_transform
++transform_result = field.get_transform(part)
++print(f"get_transform('isnull'): {transform_result}")
++
++# After fix: also checks get_lookup  
++lookup_result = field.get_lookup(part)
++print(f"get_lookup('isnull'): {lookup_result}")
++
++# Test the new condition
++if transform_result is None and lookup_result is None:
++    print("FAIL: Both transform and lookup are None (invalid)")
++else:
++    print("SUCCESS: Either transform or lookup is valid")
++
++# Test with non-existent lookup
++part = 'nonexistent'
++transform_result = field.get_transform(part)
++lookup_result = field.get_lookup(part)
++print(f"\nFor 'nonexistent':")
++print(f"get_transform('nonexistent'): {transform_result}")
++print(f"get_lookup('nonexistent'): {lookup_result}")
++
++if transform_result is None and lookup_result is None:
++    print("SUCCESS: Both transform and lookup are None (invalid)")
++else:
++    print("FAIL: Either transform or lookup is valid (should be invalid)")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..419f6231e1
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,100 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings first
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++import django
++django.setup()
++
++# Test edge cases for our fix
++from django.db import models
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    created = models.DateTimeField(auto_now_add=True)
++    
++    class Meta:
++        app_label = 'test'
++
++print("Testing edge cases...")
++
++# Test case 1: Multiple valid lookups
++class TestModel1(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['name__isnull', 'name__exact', 'name__contains']
++
++try:
++    errors = TestModel1._check_ordering()
++    print(f"Multiple valid lookups: {len(errors)} errors (should be 0)")
++except Exception as e:
++    print(f"Error: {e}")
++
++# Test case 2: Mixed valid and invalid
++class TestModel2(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['name__isnull', 'name__nonexistent']
++
++try:
++    errors = TestModel2._check_ordering()
++    print(f"Mixed valid/invalid: {len(errors)} errors (should be 1)")
++except Exception as e:
++    print(f"Error: {e}")
++
++# Test case 3: Valid transform + valid lookup
++class TestModel3(models.Model):
++    created = models.DateTimeField(auto_now_add=True)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['created__year', 'created__isnull']
++
++try:
++    errors = TestModel3._check_ordering()
++    print(f"Transform + lookup: {len(errors)} errors (should be 0)")
++except Exception as e:
++    print(f"Error: {e}")
++
++# Test case 4: Complex related field with lookups
++class RelatedModel(models.Model):
++    value = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class TestModel4(models.Model):
++    related = models.ForeignKey(RelatedModel, models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['related__value__isnull', 'related__value__exact']
++
++try:
++    errors = TestModel4._check_ordering()
++    print(f"Complex related lookups: {len(errors)} errors (should be 0)")
++except Exception as e:
++    print(f"Error: {e}")
++
++print("Edge case testing completed.")
+\ No newline at end of file
+diff --git a/test_existing_functionality.py b/test_existing_functionality.py
+new file mode 100644
+index 0000000000..c762166458
+--- /dev/null
++++ b/test_existing_functionality.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings first
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++import django
++django.setup()
++
++# Test that our fix doesn't break existing functionality
++from django.db import models
++
++# Test case 1: Non-existent field should still fail
++class TestModel1(models.Model):
++    class Meta:
++        app_label = 'test'
++        ordering = ['nonexistent_field']
++
++# Test case 2: Non-existent lookup should still fail  
++class TestModel2(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['name__nonexistent_lookup']
++
++# Test case 3: Valid lookup should now pass
++class TestModel3(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['name__isnull']
++
++# Test case 4: Valid transform should still pass
++class TestModel4(models.Model):
++    created = models.DateTimeField(auto_now_add=True)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['created__year']  # year is a valid transform for DateTimeField
++
++print("Testing that existing functionality is preserved...")
++
++# These should all still work as expected
++try:
++    errors1 = TestModel1._check_ordering()
++    print(f"Non-existent field errors: {len(errors1)} (should be 1)")
++    
++    errors2 = TestModel2._check_ordering()  
++    print(f"Non-existent lookup errors: {len(errors2)} (should be 1)")
++    
++    errors3 = TestModel3._check_ordering()
++    print(f"Valid lookup errors: {len(errors3)} (should be 0)")
++    
++    errors4 = TestModel4._check_ordering()
++    print(f"Valid transform errors: {len(errors4)} (should be 0)")
++    
++    print("SUCCESS: Existing functionality preserved")
++except Exception as e:
++    print(f"ERROR: {e}")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..3087458070
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,45 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++# Test the fix for the E015 issue
++from django.db import models
++
++# Create a simple test case
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['name__isnull']  # This should not raise E015 error
++
++# Test the check_ordering method directly
++try:
++    errors = TestModel._check_ordering()
++    print("Ordering check errors:", errors)
++    if errors:
++        print("FAIL: E015 error still present")
++    else:
++        print("SUCCESS: E015 error fixed")
++except Exception as e:
++    print("Error during ordering check:", e)
++
++# Test with a non-existent lookup to ensure validation still works
++class TestModel2(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++        ordering = ['name__nonexistent']  # This should raise E015 error
++
++try:
++    errors = TestModel2._check_ordering()
++    print("Ordering check errors for nonexistent lookup:", errors)
++    if errors and any('E015' in str(error) for error in errors):
++        print("SUCCESS: E015 error correctly raised for nonexistent lookup")
++    else:
++        print("FAIL: E015 error not raised for nonexistent lookup")
++except Exception as e:
++    print("Error during ordering check:", e)
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..08dfe4acee
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings first
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++import django
++django.setup()
++
++# Test the exact scenario from the GitHub issue
++from django.db import models
++
++# Define the models exactly as described in the issue
++class Product(models.Model):
++    parent = models.ForeignKey('self', models.CASCADE, null=True)
++    
++    class Meta:
++        app_label = 'app'
++
++class Supply(models.Model):
++    product = models.ForeignKey(Product, models.CASCADE)
++    
++    class Meta:
++        app_label = 'app'
++
++class Stock(models.Model):
++    supply = models.ForeignKey(Supply, models.CASCADE)
++    
++    class Meta:
++        app_label = 'app'
++        ordering = ['supply__product__parent__isnull']  # This was causing E015
++
++print("Testing the exact GitHub issue scenario...")
++
++# Test the ordering validation
++try:
++    errors = Stock._check_ordering()
++    print(f"Number of errors: {len(errors)}")
++    
++    if len(errors) == 0:
++        print("SUCCESS: No E015 error raised for 'supply__product__parent__isnull'")
++        print("The issue has been fixed!")
++    else:
++        print("FAIL: E015 error still present")
++        for error in errors:
++            print(f"Error: {error}")
++            
++except Exception as e:
++    print(f"Error during test: {e}")
++
++# Also test the reverse ordering mentioned in the issue
++class StockReverse(models.Model):
++    supply = models.ForeignKey(Supply, models.CASCADE)
++    
++    class Meta:
++        app_label = 'app'
++        ordering = ['-supply__product__parent__isnull']  # Reverse ordering
++
++print("\nTesting reverse ordering...")
++try:
++    errors = StockReverse._check_ordering()
++    print(f"Number of errors: {len(errors)}")
++    
++    if len(errors) == 0:
++        print("SUCCESS: No E015 error raised for reverse ordering")
++    else:
++        print("FAIL: E015 error for reverse ordering")
++        for error in errors:
++            print(f"Error: {error}")
++            
++except Exception as e:
++    print(f"Error during test: {e}")
+\ No newline at end of file
+diff --git a/test_reproduce.py b/test_reproduce.py
+new file mode 100644
+index 0000000000..d8bcc59069
+--- /dev/null
++++ b/test_reproduce.py
+@@ -0,0 +1,26 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++# Test the specific issue: check if isnull is a valid transform
++from django.db import models
++
++# Create a simple field to test transforms
++field = models.ForeignKey('self', models.CASCADE, null=True)
++
++# Check if isnull is a valid transform
++isnull_transform = field.get_transform('isnull')
++print(f"isnull transform: {isnull_transform}")
++
++# Check what happens when we try to get a non-existent transform
++nonexistent_transform = field.get_transform('nonexistent')
++print(f"nonexistent transform: {nonexistent_transform}")
++
++# Check if the field has the isnull lookup
++from django.db.models.lookups import IsNull
++print(f"Field lookups: {field.get_lookups()}")
++
++# Check specifically for isnull lookup
++print(f"Has isnull lookup: {'isnull' in field.get_lookups()}")
+\ No newline at end of file

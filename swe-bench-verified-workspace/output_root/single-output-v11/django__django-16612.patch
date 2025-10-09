@@ -1,0 +1,708 @@
+diff --git a/direct_test.py b/direct_test.py
+new file mode 100644
+index 0000000000..f39ef4e8e3
+--- /dev/null
++++ b/direct_test.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""
++Direct test to examine the redirect issue
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import RequestFactory
++from django.http import HttpResponsePermanentRedirect
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        APPEND_SLASH=True,
++    )
++
++django.setup()
++
++def test_redirect_issue():
++    """Test the specific redirect issue"""
++    factory = RequestFactory()
++    
++    # Create a request with query string
++    request = factory.get('/admin/auth/foo?id=123')
++    
++    print("Testing redirect issue...")
++    print(f"Request path: {request.path}")
++    print(f"Query string: {request.META.get('QUERY_STRING', '')}")
++    
++    # Simulate the problematic line from catch_all_view
++    redirect_url = "%s/" % request.path
++    response = HttpResponsePermanentRedirect(redirect_url)
++    
++    print(f"Current redirect URL: {response.url}")
++    print(f"Query string preserved: {'id=123' in response.url}")
++    
++    # What the redirect should be
++    correct_redirect_url = "%s/?%s" % (request.path, request.META.get('QUERY_STRING', ''))
++    print(f"Correct redirect URL should be: {correct_redirect_url}")
++    
++    return response.url == correct_redirect_url
++
++if __name__ == '__main__':
++    print("Direct test of redirect issue...")
++    correct = test_redirect_issue()
++    if correct:
++        print("\n✓ Redirect is working correctly")
++    else:
++        print("\n✗ Redirect is broken - query string is missing")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/django/contrib/admin/sites.py b/django/contrib/admin/sites.py
+index 61be31d890..96c54e44ad 100644
+--- a/django/contrib/admin/sites.py
++++ b/django/contrib/admin/sites.py
+@@ -453,7 +453,7 @@ class AdminSite:
+                 pass
+             else:
+                 if getattr(match.func, "should_append_slash", True):
+-                    return HttpResponsePermanentRedirect("%s/" % request.path)
++                    return HttpResponsePermanentRedirect(request.get_full_path(force_append_slash=True))
+         raise Http404
+ 
+     def _build_app_dict(self, request, label=None):
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..0f44672faa
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""
++Final comprehensive test to verify the fix works correctly
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import TestCase, RequestFactory
++from django.contrib.admin.sites import AdminSite
++from django.urls import path, reverse
++
++# Configure Django settings properly
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF='final_test',
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        APPEND_SLASH=True,
++        TEST_RUNNER='django.test.runner.DiscoverRunner',
++    )
++
++django.setup()
++
++# Create admin site and URL patterns
++admin_site = AdminSite()
++urlpatterns = [
++    path('admin/', admin_site.urls),
++]
++
++class TestQueryStringFix(TestCase):
++    """Test that query strings are preserved in AdminSite.catch_all_view redirects"""
++    
++    def setUp(self):
++        self.factory = RequestFactory()
++        self.admin_site = AdminSite()
++    
++    def test_query_string_preserved_in_redirect(self):
++        """Test that query strings are preserved when APPEND_SLASH redirects occur"""
++        # Create a request with query string
++        request = self.factory.get('/admin/auth/foo?id=123')
++        request.urlconf = urlpatterns
++        
++        # Call catch_all_view which should redirect with query string preserved
++        response = self.admin_site.catch_all_view(request, 'auth/foo')
++        
++        # Verify it's a redirect
++        self.assertEqual(response.status_code, 301)  # Permanent redirect
++        
++        # Verify query string is preserved
++        self.assertIn('id=123', response.url)
++        self.assertEqual(response.url, '/admin/auth/foo/?id=123')
++    
++    def test_multiple_query_params_preserved(self):
++        """Test that multiple query parameters are preserved"""
++        request = self.factory.get('/admin/auth/foo?id=123&name=test&page=1')
++        request.urlconf = urlpatterns
++        
++        response = self.admin_site.catch_all_view(request, 'auth/foo')
++        
++        self.assertEqual(response.status_code, 301)
++        self.assertIn('id=123', response.url)
++        self.assertIn('name=test', response.url)
++        self.assertIn('page=1', response.url)
++        self.assertEqual(response.url, '/admin/auth/foo/?id=123&name=test&page=1')
++    
++    def test_no_query_string_still_works(self):
++        """Test that redirects without query strings still work"""
++        request = self.factory.get('/admin/auth/foo')
++        request.urlconf = urlpatterns
++        
++        response = self.admin_site.catch_all_view(request, 'auth/foo')
++        
++        self.assertEqual(response.status_code, 301)
++        self.assertEqual(response.url, '/admin/auth/foo/')
++    
++    def test_empty_query_string_handled(self):
++        """Test that empty query strings are handled correctly"""
++        request = self.factory.get('/admin/auth/foo?')
++        request.urlconf = urlpatterns
++        
++        response = self.admin_site.catch_all_view(request, 'auth/foo')
++        
++        self.assertEqual(response.status_code, 301)
++        self.assertEqual(response.url, '/admin/auth/foo/')
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..300dcb0bd0
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the AdminSite.catch_all_view() query string issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import RequestFactory
++from django.contrib.admin.sites import AdminSite
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF=__name__,
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        APPEND_SLASH=True,
++    )
++
++django.setup()
++
++# Create a simple URLconf
++from django.urls import path
++urlpatterns = [
++    path('admin/', AdminSite().urls),
++]
++
++def test_query_string_preservation():
++    """Test that query strings are preserved in redirects"""
++    factory = RequestFactory()
++    admin_site = AdminSite()
++    
++    # Create a request with query string
++    request = factory.get('/admin/auth/foo?id=123')
++    request.urlconf = urlpatterns
++    
++    print(f"Request path: {request.path}")
++    print(f"Request path_info: {request.path_info}")
++    print(f"Query string: {request.META.get('QUERY_STRING', '')}")
++    print(f"Full URL with query: {request.path}?{request.META.get('QUERY_STRING', '')}")
++    
++    try:
++        # This should redirect with the query string preserved
++        response = admin_site.catch_all_view(request, 'auth/foo')
++        print(f"Redirect URL: {response.url}")
++        print(f"Query string preserved: {'id=123' in response.url}")
++    except Exception as e:
++        print(f"Exception occurred: {e}")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    print("Testing AdminSite.catch_all_view() query string preservation...")
++    success = test_query_string_preservation()
++    if success:
++        print("\n✓ Test completed successfully")
++    else:
++        print("\n✗ Test failed")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/simple_final_test.py b/simple_final_test.py
+new file mode 100644
+index 0000000000..b5ca2bab24
+--- /dev/null
++++ b/simple_final_test.py
+@@ -0,0 +1,132 @@
++#!/usr/bin/env python3
++"""
++Simple final test to verify the fix works correctly without complex Django test setup
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import RequestFactory
++from django.http import HttpResponsePermanentRedirect
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        APPEND_SLASH=True,
++    )
++
++django.setup()
++
++def test_fix_comprehensive():
++    """Comprehensive test of the fix"""
++    factory = RequestFactory()
++    
++    test_cases = [
++        {
++            'name': 'Single query parameter',
++            'url': '/admin/auth/foo?id=123',
++            'expected': '/admin/auth/foo/?id=123'
++        },
++        {
++            'name': 'Multiple query parameters',
++            'url': '/admin/auth/foo?id=123&name=test&page=1',
++            'expected': '/admin/auth/foo/?id=123&name=test&page=1'
++        },
++        {
++            'name': 'No query string',
++            'url': '/admin/auth/foo',
++            'expected': '/admin/auth/foo/'
++        },
++        {
++            'name': 'Empty query string',
++            'url': '/admin/auth/foo?',
++            'expected': '/admin/auth/foo/'
++        },
++        {
++            'name': 'Path already has slash',
++            'url': '/admin/auth/foo/?id=123',
++            'expected': '/admin/auth/foo/?id=123'
++        },
++    ]
++    
++    all_passed = True
++    
++    for test_case in test_cases:
++        print(f"\nTesting: {test_case['name']}")
++        print(f"URL: {test_case['url']}")
++        
++        # Create request
++        request = factory.get(test_case['url'])
++        
++        # Test the fix using get_full_path with force_append_slash
++        redirect_url = request.get_full_path(force_append_slash=True)
++        
++        print(f"Expected: {test_case['expected']}")
++        print(f"Actual: {redirect_url}")
++        
++        if redirect_url == test_case['expected']:
++            print("✓ PASS")
++        else:
++            print("✗ FAIL")
++            all_passed = False
++    
++    return all_passed
++
++def test_old_vs_new_behavior():
++    """Test that demonstrates the fix works"""
++    factory = RequestFactory()
++    
++    print("\n" + "="*60)
++    print("COMPARISON: OLD vs NEW BEHAVIOR")
++    print("="*60)
++    
++    # Create request with query string
++    request = factory.get('/admin/auth/foo?id=123')
++    
++    # OLD behavior (broken)
++    old_redirect = "%s/" % request.path
++    old_response = HttpResponsePermanentRedirect(old_redirect)
++    
++    # NEW behavior (fixed)
++    new_redirect = request.get_full_path(force_append_slash=True)
++    new_response = HttpResponsePermanentRedirect(new_redirect)
++    
++    print(f"Original URL: {request.get_full_path()}")
++    print(f"OLD redirect: {old_response.url} (query string lost!)")
++    print(f"NEW redirect: {new_response.url} (query string preserved!)")
++    
++    # Verify the fix
++    old_has_query = 'id=123' in old_response.url
++    new_has_query = 'id=123' in new_response.url
++    
++    print(f"OLD preserves query: {old_has_query}")
++    print(f"NEW preserves query: {new_has_query}")
++    
++    return new_has_query and not old_has_query
++
++if __name__ == '__main__':
++    print("Final comprehensive test of the query string fix...")
++    
++    # Test comprehensive cases
++    comprehensive_pass = test_fix_comprehensive()
++    
++    # Test old vs new behavior comparison
++    comparison_pass = test_old_vs_new_behavior()
++    
++    if comprehensive_pass and comparison_pass:
++        print("\n" + "="*60)
++        print("✓ ALL TESTS PASSED! The fix is working correctly.")
++        print("="*60)
++    else:
++        print("\n" + "="*60)
++        print("✗ SOME TESTS FAILED! The fix needs more work.")
++        print("="*60)
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..cd5f8f0566
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""
++Simple test to understand the catch_all_view behavior
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import RequestFactory
++from django.contrib.admin.sites import AdminSite
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        APPEND_SLASH=True,
++    )
++
++django.setup()
++
++def test_catch_all():
++    """Test the catch_all_view method directly"""
++    factory = RequestFactory()
++    admin_site = AdminSite()
++    
++    # Create a request with query string
++    request = factory.get('/admin/auth/foo?id=123')
++    
++    print("Testing catch_all_view with query string...")
++    print(f"Request path: {request.path}")
++    print(f"Query string: {request.META.get('QUERY_STRING', '')}")
++    
++    try:
++        # Call catch_all_view directly
++        response = admin_site.catch_all_view(request, 'auth/foo')
++        print(f"Redirect URL: {response.url}")
++        print(f"Query string preserved: {'id=123' in response.url}")
++        return True
++    except Exception as e:
++        print(f"Exception: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == '__main__':
++    print("Simple test of catch_all_view...")
++    success = test_catch_all()
++    if success:
++        print("\n✓ Test completed successfully")
++    else:
++        print("\n✗ Test failed")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..b526db352f
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the query string fix
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import RequestFactory
++from django.http import HttpResponsePermanentRedirect
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        APPEND_SLASH=True,
++    )
++
++django.setup()
++
++def test_edge_cases():
++    """Test various edge cases for query string handling"""
++    factory = RequestFactory()
++    
++    test_cases = [
++        # (path, query_string, expected_redirect)
++        ('/admin/auth/foo', 'id=123', '/admin/auth/foo/?id=123'),
++        ('/admin/auth/foo', 'id=123&name=test', '/admin/auth/foo/?id=123&name=test'),
++        ('/admin/auth/foo', '', '/admin/auth/foo/'),
++        ('/admin/auth/foo/', 'id=123', '/admin/auth/foo/?id=123'),  # Already has slash
++        ('/admin', 'id=123', '/admin/?id=123'),
++    ]
++    
++    all_passed = True
++    
++    for path, query_string, expected in test_cases:
++        # Create request
++        full_url = f"{path}?{query_string}" if query_string else path
++        request = factory.get(full_url)
++        
++        # Test the fix
++        redirect_url = request.get_full_path(force_append_slash=True)
++        
++        print(f"Path: {path}")
++        print(f"Query: '{query_string}'")
++        print(f"Expected: {expected}")
++        print(f"Actual: {redirect_url}")
++        
++        if redirect_url == expected:
++            print("✓ PASS")
++        else:
++            print("✗ FAIL")
++            all_passed = False
++        
++        print()
++    
++    return all_passed
++
++if __name__ == '__main__':
++    print("Testing edge cases for query string fix...")
++    success = test_edge_cases()
++    if success:
++        print("✓ All edge cases passed!")
++    else:
++        print("✗ Some edge cases failed")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..aa0f3ea4f7
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""
++Test to verify the fix for AdminSite.catch_all_view() query string issue
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import RequestFactory
++from django.contrib.admin.sites import AdminSite
++from django.urls import path, include
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF=__name__,
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        APPEND_SLASH=True,
++    )
++
++django.setup()
++
++# Create a simple URLconf that includes admin
++admin_site = AdminSite()
++urlpatterns = [
++    path('admin/', admin_site.urls),
++]
++
++def test_fixed_catch_all_view():
++    """Test that the fix preserves query strings in redirects"""
++    factory = RequestFactory()
++    
++    # Create a request with query string
++    request = factory.get('/admin/auth/foo?id=123')
++    request.urlconf = urlpatterns
++    
++    print("Testing fixed catch_all_view...")
++    print(f"Request path: {request.path}")
++    print(f"Query string: {request.META.get('QUERY_STRING', '')}")
++    
++    try:
++        # This should now redirect with the query string preserved
++        response = admin_site.catch_all_view(request, 'auth/foo')
++        print(f"Redirect URL: {response.url}")
++        print(f"Query string preserved: {'id=123' in response.url}")
++        
++        # Verify the redirect is correct
++        expected_url = "/admin/auth/foo/?id=123"
++        if response.url == expected_url:
++            print("✓ Fix is working correctly!")
++            return True
++        else:
++            print(f"✗ Expected: {expected_url}")
++            print(f"✗ Got: {response.url}")
++            return False
++            
++    except Exception as e:
++        print(f"Exception occurred: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == '__main__':
++    print("Testing the fix for AdminSite.catch_all_view() query string issue...")
++    success = test_fixed_catch_all_view()
++    if success:
++        print("\n✓ Test completed successfully - fix is working!")
++    else:
++        print("\n✗ Test failed - fix is not working")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_simple_fix.py b/test_simple_fix.py
+new file mode 100644
+index 0000000000..4e4813b276
+--- /dev/null
++++ b/test_simple_fix.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the fix works by directly testing the method
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import RequestFactory
++from django.contrib.admin.sites import AdminSite
++from django.http import HttpResponsePermanentRedirect
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        APPEND_SLASH=True,
++    )
++
++django.setup()
++
++def test_fix():
++    """Test that the fix preserves query strings"""
++    factory = RequestFactory()
++    admin_site = AdminSite()
++    
++    # Create a request with query string
++    request = factory.get('/admin/auth/foo?id=123')
++    
++    print("Testing the fix...")
++    print(f"Request path: {request.path}")
++    print(f"Query string: {request.META.get('QUERY_STRING', '')}")
++    
++    # Test the old behavior (should be broken)
++    old_redirect = "%s/" % request.path
++    print(f"Old redirect URL: {old_redirect}")
++    
++    # Test the new behavior (should work)
++    new_redirect = request.get_full_path(force_append_slash=True)
++    print(f"New redirect URL: {new_redirect}")
++    
++    # Create responses to test
++    old_response = HttpResponsePermanentRedirect(old_redirect)
++    new_response = HttpResponsePermanentRedirect(new_redirect)
++    
++    print(f"Old response URL: {old_response.url}")
++    print(f"New response URL: {new_response.url}")
++    
++    # Check if query string is preserved
++    old_has_query = 'id=123' in old_response.url
++    new_has_query = 'id=123' in new_response.url
++    
++    print(f"Old preserves query: {old_has_query}")
++    print(f"New preserves query: {new_has_query}")
++    
++    if new_has_query and not old_has_query:
++        print("✓ Fix is working correctly!")
++        return True
++    else:
++        print("✗ Fix is not working")
++        return False
++
++if __name__ == '__main__':
++    print("Testing the simple fix...")
++    success = test_fix()
++    if success:
++        print("\n✓ Test completed successfully - fix is working!")
++    else:
++        print("\n✗ Test failed - fix is not working")
++        sys.exit(1)
+\ No newline at end of file

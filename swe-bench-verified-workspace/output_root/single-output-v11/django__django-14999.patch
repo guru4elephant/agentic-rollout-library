@@ -1,0 +1,1483 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index 982816be3a..7cd3e254c2 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -320,6 +320,12 @@ class RenameModel(ModelOperation):
+         new_model = to_state.apps.get_model(app_label, self.new_name)
+         if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+             old_model = from_state.apps.get_model(app_label, self.old_name)
++            
++            # If the old model has db_table defined, this operation should be a noop
++            default_db_table = "%s_%s" % (old_model._meta.app_label, old_model._meta.model_name)
++            if old_model._meta.db_table != default_db_table:
++                return
++            
+             # Move the main table
+             schema_editor.alter_db_table(
+                 new_model,
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..85d680e0da
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations import operations
++from django.db.migrations.state import ProjectState, ModelState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++    django.setup()
++
++def test_final():
++    """Final test of RenameModel with db_table"""
++    print("=== Final RenameModel Test ===")
++    
++    # Test case 1: Model with custom db_table
++    print("\n1. Testing model with custom db_table...")
++    project_state = ProjectState()
++    model_state = ModelState(
++        'test_app',
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {'db_table': 'custom_table_name'},
++        (models.Model,),
++        []
++    )
++    project_state.add_model(model_state)
++    
++    rename_operation = operations.RenameModel(
++        old_name='TestModel',
++        new_name='RenamedModel',
++    )
++    
++    class MockSchemaEditor:
++        def __init__(self):
++            self.calls = []
++        
++        def alter_db_table(self, *args, **kwargs):
++            self.calls.append(('alter_db_table', args, kwargs))
++        
++        def alter_field(self, *args, **kwargs):
++            self.calls.append(('alter_field', args, kwargs))
++        
++        @property
++        def connection(self):
++            return type('MockConnection', (), {'alias': 'default'})()
++    
++    schema_editor = MockSchemaEditor()
++    rename_operation.allow_migrate_model = lambda alias, model: True
++    
++    # Create to_state with renamed model
++    to_state = ProjectState()
++    renamed_model_state = ModelState(
++        'test_app',
++        'RenamedModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {'db_table': 'custom_table_name'},
++        (models.Model,),
++        []
++    )
++    to_state.add_model(renamed_model_state)
++    
++    # Test forwards
++    schema_editor.calls = []
++    rename_operation.database_forwards('test_app', schema_editor, project_state, to_state)
++    test1_operations = len(schema_editor.calls)
++    print(f"   Forwards operations: {test1_operations} (expected: 0)")
++    
++    # Test case 2: Model without custom db_table
++    print("\n2. Testing model without custom db_table...")
++    project_state_default = ProjectState()
++    model_state_default = ModelState(
++        'test_app',
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {},  # No db_table
++        (models.Model,),
++        []
++    )
++    project_state_default.add_model(model_state_default)
++    
++    to_state_default = ProjectState()
++    renamed_model_state_default = ModelState(
++        'test_app',
++        'RenamedModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {},  # No db_table
++        (models.Model,),
++        []
++    )
++    to_state_default.add_model(renamed_model_state_default)
++    
++    # Create a new operation instance for this test
++    rename_operation2 = operations.RenameModel(
++        old_name='TestModel',
++        new_name='RenamedModel',
++    )
++    rename_operation2.allow_migrate_model = lambda alias, model: True
++    
++    schema_editor.calls = []
++    rename_operation2.database_forwards('test_app', schema_editor, project_state_default, to_state_default)
++    test2_operations = len(schema_editor.calls)
++    print(f"   Forwards operations: {test2_operations} (expected: >0)")
++    
++    # Summary
++    print("\n=== Test Summary ===")
++    test1_pass = (test1_operations == 0)  # First test should have 0 calls
++    test2_pass = (test2_operations > 0)   # Second test should have >0 calls
++    
++    if test1_pass and test2_pass:
++        print("✓ SUCCESS: All tests passed!")
++        print("  - Models with custom db_table: No operations (noop)")
++        print("  - Models without custom db_table: Operations performed")
++        return True
++    else:
++        print("✗ FAILURE: Some tests failed!")
++        print(f"  - Test 1 (custom db_table): {test1_operations} operations (expected: 0)")
++        print(f"  - Test 2 (default db_table): {test2_operations} operations (expected: >0)")
++        return False
++
++if __name__ == '__main__':
++    success = test_final()
++    
++    if success:
++        print("\n🎉 Fix is working correctly!")
++    else:
++        print("\n❌ Fix needs more work!")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..6f658aa181
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations import operations
++from django.db.migrations.state import ProjectState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++    django.setup()
++
++def test_rename_model_with_db_table():
++    print("Testing RenameModel with db_table defined...")
++    
++    # Create a project state with a model that has db_table defined
++    project_state = ProjectState()
++    
++    # Create a model state with db_table defined
++    from django.db.migrations.state import ModelState
++    model_state = ModelState(
++        'test_app',
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {'db_table': 'custom_table_name'},
++        (models.Model,),
++        []
++    )
++    
++    # Add the model to the project state
++    project_state.add_model(model_state)
++    
++    # Create a RenameModel operation
++    rename_operation = operations.RenameModel(
++        old_name='TestModel',
++        new_name='RenamedModel',
++    )
++    
++    print(f"Old model name: {rename_operation.old_name}")
++    print(f"New model name: {rename_operation.new_name}")
++    
++    # Check if the old model has db_table defined
++    old_model_key = ('test_app', 'testmodel')
++    if old_model_key in project_state.models:
++        old_model = project_state.models[old_model_key]
++        db_table = old_model.options.get('db_table')
++        print(f"Old model db_table: {db_table}")
++        
++        # The issue: RenameModel should be a noop if db_table is defined
++        if db_table:
++            print("RenameModel should be a noop since db_table is defined")
++        else:
++            print("RenameModel should perform operations since db_table is not defined")
++    else:
++        print("Old model not found in project state")
++    
++    print("Test completed.")
++
++if __name__ == '__main__':
++    test_rename_model_with_db_table()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..bb7326695f
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations import operations
++from django.db.migrations.state import ProjectState, ModelState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++    django.setup()
++
++def test_db_table_check():
++    """Test the logic for detecting custom db_table"""
++    print("Testing db_table detection logic...")
++    
++    # Create a model state with custom db_table
++    model_with_custom_table = ModelState(
++        'test_app',
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {'db_table': 'custom_table_name'},
++        (models.Model,),
++        []
++    )
++    
++    # Create a model state without custom db_table
++    model_with_default_table = ModelState(
++        'test_app', 
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {},  # No db_table defined
++        (models.Model,),
++        []
++    )
++    
++    # Test the logic used in the fix
++    default_db_table_custom = "%s_%s" % (model_with_custom_table.app_label, model_with_custom_table.name.lower())
++    default_db_table_default = "%s_%s" % (model_with_default_table.app_label, model_with_default_table.name.lower())
++    
++    custom_table = model_with_custom_table.options.get('db_table', '')
++    # For default table, we need to check if db_table is not specified (None or empty)
++    default_table_specified = 'db_table' in model_with_default_table.options
++    default_table_value = model_with_default_table.options.get('db_table', '')
++    
++    print(f"Custom model db_table: {custom_table}")
++    print(f"Default model has db_table specified: {default_table_specified}")
++    print(f"Default model db_table value: '{default_table_value}'")
++    print(f"Calculated default for custom: {default_db_table_custom}")
++    print(f"Calculated default for default: {default_db_table_default}")
++    
++    # Test the condition from our fix
++    should_be_noop_custom = custom_table != default_db_table_custom
++    # For default table, if db_table is not specified, it's not a custom table
++    should_be_noop_default = default_table_specified and default_table_value != default_db_table_default
++    
++    print(f"Should be noop (custom db_table): {should_be_noop_custom}")
++    print(f"Should be noop (default db_table): {should_be_noop_default}")
++    
++    if should_be_noop_custom and not should_be_noop_default:
++        print("✓ SUCCESS: Logic correctly identifies custom db_table")
++    else:
++        print("✗ FAILURE: Logic does not correctly identify custom db_table")
++
++if __name__ == '__main__':
++    test_db_table_check()
+\ No newline at end of file
+diff --git a/test_backwards_fix.py b/test_backwards_fix.py
+new file mode 100644
+index 0000000000..9cdad91bfd
+--- /dev/null
++++ b/test_backwards_fix.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations import operations
++from django.db.migrations.state import ProjectState, ModelState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++    django.setup()
++
++def test_rename_model_backwards_with_db_table():
++    """Test that RenameModel database_backwards is a noop when db_table is defined"""
++    print("Testing RenameModel database_backwards with db_table defined...")
++    
++    # Create a project state with a model that has db_table defined
++    project_state = ProjectState()
++    
++    # Create a model state with db_table defined
++    model_state = ModelState(
++        'test_app',
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {'db_table': 'custom_table_name'},
++        (models.Model,),
++        []
++    )
++    
++    # Add the model to the project state
++    project_state.add_model(model_state)
++    
++    # Create a RenameModel operation
++    rename_operation = operations.RenameModel(
++        old_name='TestModel',
++        new_name='RenamedModel',
++    )
++    
++    # Mock schema editor to track calls
++    class MockSchemaEditor:
++        def __init__(self):
++            self.calls = []
++        
++        def alter_db_table(self, *args, **kwargs):
++            self.calls.append(('alter_db_table', args, kwargs))
++        
++        def alter_field(self, *args, **kwargs):
++            self.calls.append(('alter_field', args, kwargs))
++        
++        @property
++        def connection(self):
++            return type('MockConnection', (), {'alias': 'default'})()
++    
++    schema_editor = MockSchemaEditor()
++    
++    # Mock allow_migrate_model
++    rename_operation.allow_migrate_model = lambda alias, model: True
++    
++    # Test database_backwards
++    print("Testing database_backwards...")
++    try:
++        # Create a mock to_state with the renamed model
++        to_state = ProjectState()
++        renamed_model_state = ModelState(
++            '1 test_app',
++            'RenamedModel',
++            [
++                ('id', models.AutoField(primary_key=True)),
++                ('name', models.CharField(max_length=100)),
++            ],
++            {'db_table': 'custom_table_name'},
++            (models.Model,),
++            []
++        )
++        to_state.add_model(renamed_model_state)
++        
++        rename_operation.database_backwards('test_app', schema_editor, project_state, to_state)
++        
++        print(f"Number of database operations called: {len(schema_editor.calls)}")
++        if len(schema_editor.calls) == 0:
++            print("✓ SUCCESS: No database operations called (noop behavior working)")
++            return True
++        else:
++            print("✗ FAILURE: Database operations were called:")
++            for call in schema_editor.calls:
++                print(f"  - {call[0]}")
++            return False
++            
++    except Exception as e:
++        print(f"✗ ERROR: {e}")
++        return False
++
++if __name__ == '__main__':
++    success = test_rename_model_backwards_with_db_table()
++    
++    if success:
++        print("\n✓ Backwards test passed!")
++    else:
++        print("\n✗ Backwards test failed!")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..65ea72ecfc
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,152 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations import operations
++from django.db.migrations.state import ProjectState, ModelState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++    django.setup()
++
++def test_comprehensive():
++    """Comprehensive test of RenameModel with db_table"""
++    print("=== Comprehensive RenameModel Test ===")
++    
++    # Test case 1: Model with custom db_table
++    print("\n1. Testing model with custom db_table...")
++    project_state = ProjectState()
++    model_state = ModelState(
++        'test_app',
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {'db_table': 'custom_table_name'},
++        (models.Model,),
++        []
++    )
++    project_state.add_model(model_state)
++    
++    rename_operation = operations.RenameModel(
++        old_name='TestModel',
++        new_name='RenamedModel',
++    )
++    
++    class MockSchemaEditor:
++        def __init__(self):
++            self.calls = []
++        
++        def alter_db_table(self, *args, **kwargs):
++            self.calls.append(('alter_db_table', args, kwargs))
++        
++        def alter_field(self, *args, **kwargs):
++            self.calls.append(('alter_field', args, kwargs))
++        
++        @property
++        def connection(self):
++            return type('MockConnection', (), {'alias': 'default'})()
++    
++    schema_editor = MockSchemaEditor()
++    rename_operation.allow_migrate_model = lambda alias, model: True
++    
++    # Create to_state with renamed model
++    to_state = ProjectState()
++    renamed_model_state = ModelState(
++        'test_app',
++        'RenamedModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {'db_table': 'custom_table_name'},
++        (models.Model,),
++        []
++    )
++    to_state.add_model(renamed_model_state)
++    
++    # Test forwards
++    schema_editor.calls = []
++    rename_operation.database_forwards('test_app', schema_editor, project_state, to_state)
++    print(f"   Forwards operations: {len(schema_editor.calls)} (expected: 0)")
++    
++    # Test case 2: Model without custom db_table
++    print("\n2. Testing model without custom db_table...")
++    project_state_default = ProjectState()
++    model_state_default = ModelState(
++        'test_app',
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {},  # No db_table
++        (models.Model,),
++        []
++    )
++    project_state_default.add_model(model_state_default)
++    
++    to_state_default = ProjectState()
++    renamed_model_state_default = ModelState(
++        'test_app',
++        'RenamedModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {},  # No db_table
++        (models.Model,),
++        []
++    )
++    to_state_default.add_model(renamed_model_state_default)
++    
++    # Create a new operation instance for this test
++    rename_operation2 = operations.RenameModel(
++        old_name='TestModel',
++        new_name='RenamedModel',
++    )
++    rename_operation2.allow_migrate_model = lambda alias, model: True
++    
++    schema_editor.calls = []
++    rename_operation2.database_forwards('test_app', schema_editor, project_state_default, to_state_default)
++    print(f"   Forwards operations: {len(schema_editor.calls)} (expected: >0)")
++    
++    # Summary
++    print("\n=== Test Summary ===")
++    test1_pass = (len(schema_editor.calls) == 0)  # First test should have 0 calls
++    test2_pass = (len(schema_editor.calls) > 0)   # Second test should have >0 calls
++    
++    if test1_pass and test2_pass:
++        print("✓ SUCCESS: All tests passed!")
++        print("  - Models with custom db_table: No operations (noop)")
++        print("  - Models without custom db_table: Operations performed")
++        return True
++    else:
++        print("✗ FAILURE: Some tests failed!")
++        return False
++
++if __name__ == '__main__':
++    success = test_comprehensive()
++    
++    if success:
++        print("\n🎉 Fix is working correctly!")
++    else:
++        print("\n❌ Fix needs more work!")
+\ No newline at end of file
+diff --git a/test_db_table_logic.py b/test_db_table_logic.py
+new file mode 100644
+index 0000000000..57053ab23e
+--- /dev/null
++++ b/test_db_table_logic.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations import operations
++from django.db.migrations.state import ProjectState, ModelState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++    django.setup()
++
++def test_db_table_logic():
++    """Test the db_table logic used in the RenameModel fix"""
++    print("Testing db_table logic in RenameModel...")
++    
++    # Create a model state with custom db_table
++    model_with_custom_table = ModelState(
++        'test_app',
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {'db_table': 'custom_table_name'},
++        (models.Model,),
++        []
++    )
++    
++    # Create a model state without custom db_table
++    model_with_default_table = ModelState(
++        'test_app', 
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {},  # No db_table defined
++        (models.Model,),
++        []
++    )
++    
++    # Test the logic that would be used in database_forwards
++    def should_be_noop(model_state):
++        """Replicate the logic from our fix"""
++        default_db_table = "%s_%s" % (model_state.app_label, model_state.name.lower())
++        actual_db_table = model_state.options.get('db_table', '')
++        
++        # If db_table is not specified in options, it's not a custom table
++        if 'db_table' not in model_state.options:
++            return False
++        
++        # If db_table is specified but matches the default, it's not a custom table
++        if actual_db_table == default_db_table:
++            return False
++            
++        # If db_table is specified and doesn't match default, it's a custom table
++        return True
++    
++    # Test both cases
++    custom_result = should_be_noop(model_with_custom_table)
++    default_result = should_be_noop(model_with_default_table)
++    
++    print(f"Model with custom db_table should be noop: {custom_result}")
++    print(f"Model with default db_table should be noop: {default_result}")
++    
++    if custom_result and not default_result:
++        print("✓ SUCCESS: Logic correctly identifies when to be a noop")
++    else:
++        print("✗ FAILURE: Logic does not correctly identify when to be a noop")
++
++if __name__ == '__main__':
++    test_db_table_logic()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..5bc624daff
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,162 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations import operations
++from django.db.migrations.state import ProjectState, ModelState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++    django.setup()
++
++def test_rename_model_noop_with_db_table():
++    """Test that RenameModel is a noop when db_table is defined"""
++    print("Testing RenameModel noop behavior with db_table defined...")
++    
++    # Create a project state with a model that has db_table defined
++    project_state = ProjectState()
++    
++    # Create a model state with db_table defined
++    model_state = ModelState(
++        'test_app',
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {'db_table': 'custom_table_name'},
++        (models.Model,),
++        []
++    )
++    
++    # Add the model to the project state
++    project_state.add_model(model_state)
++    
++    # Create a RenameModel operation
++    rename_operation = operations.RenameModel(
++        old_name='TestModel',
++        new_name='RenamedModel',
++    )
++    
++    # Mock schema editor to track if any operations are called
++    class MockSchemaEditor:
++        def __init__(self):
++            self.operations_called = []
++        
++        def alter_db_table(self, *args, **kwargs):
++            self.operations_called.append(('alter_db_table', args, kwargs))
++        
++        def alter_field(self, *args, **kwargs):
++            self.operations_called.append(('alter_field', args, kwargs))
++    
++    schema_editor = MockSchemaEditor()
++    
++    # Mock the allow_migrate_model method
++    rename_operation.allow_migrate_model = lambda alias, model: True
++    
++    # Test database_forwards
++    print("Testing database_forwards...")
++    try:
++        rename_operation.database_forwards('test_app', schema_editor, project_state, project_state)
++        print(f"Operations called: {len(schema_editor.operations_called)}")
++        if len(schema_editor.operations_called) == 0:
++            print("✓ SUCCESS: No operations called (noop behavior working)")
++        else:
++            print("✗ FAILURE: Operations were called")
++            for op in schema_editor.operations_called:
++                print(f"  - {op[0]}")
++    except Exception as e:
++        print(f"✗ ERROR: {e}")
++    
++    # Test database_backwards
++    print("\nTesting database_backwards...")
++    schema_editor.operations_called = []  # Reset
++    try:
++        rename_operation.database_backwards('test_app', schema_editor, project_state, project_state)
++        print(f"Operations called: {len(schema_editor.operations_called)}")
++        if len(schema_editor.operations_called) == 0:
++            print("✓ SUCCESS: No operations called (noop behavior working)")
++        else:
++            print("✗ FAILURE: Operations were called")
++            for op in schema_editor.operations_called:
++                print(f"  - {op[0]}")
++    except Exception as e:
++        print(f"✗ ERROR: {e}")
++
++def test_rename_model_normal_without_db_table():
++    """Test that RenameModel works normally when db_table is not defined"""
++    print("\nTesting RenameModel normal behavior without db_table defined...")
++    
++    # Create a project state with a model that doesn't have db_table defined
++    project_state = ProjectState()
++    
++    # Create a model state without db_table defined
++    model_state = ModelState(
++        'test_app',
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {},  # No db_table defined
++        (models.Model,),
++        []
++    )
++    
++    # Add the model to the project state
++    project_state.add_model(model_state)
++    
++    # Create a RenameModel operation
++    rename_operation = operations.RenameModel(
++        old_name='TestModel',
++        new_name='RenamedModel',
++    )
++    
++    # Mock schema editor to track if any operations are called
++    class MockSchemaEditor:
++        def __init__(self):
++            self.operations_called = []
++        
++        def alter_db_table(self, *args, **kwargs):
++            self.operations_called.append(('alter_db_table', args, kwargs))
++        
++        def alter_field(self, *args, **kwargs):
++            self.operations_called.append(('alter_field', args, kwargs))
++    
++    schema_editor = MockSchemaEditor()
++    
++    # Mock the allow_migrate_model method
++    rename_operation.allow_migrate_model = lambda alias, model: True
++    
++    # Test database_forwards
++    print("Testing database_forwards...")
++    try:
++        rename_operation.database_forwards('test_app', schema_editor, project_state, project_state)
++        print(f"Operations called: {len(schema_editor.operations_called)}")
++        if len(schema_editor.operations_called) > 0:
++            print("✓ SUCCESS: Operations called (normal behavior working)")
++        else:
++            print("✗ FAILURE: No operations were called")
++    except Exception as e:
++        print(f"✗ ERROR: {e}")
++
++if __name__ == '__main__':
++    test_rename_model_noop_with_db_table()
++    test_rename_model_normal_without_db_table()
+\ No newline at end of file
+diff --git a/test_migration_integration.py b/test_migration_integration.py
+new file mode 100644
+index 0000000000..5c08c3a841
+--- /dev/null
++++ b/test_migration_integration.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations import operations
++from django.db.migrations.state import ProjectState, ModelState
++from django.apps import apps
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'test_app',
++        ],
++        USE_TZ=True,
++    )
++    django.setup()
++
++def test_migration_integration():
++    """Test RenameModel operation in a more realistic migration scenario"""
++    print("Testing RenameModel operation integration...")
++    
++    # Create a project state with both old and new models
++    project_state = ProjectState()
++    
++    # Create the old model with custom db_table
++    old_model_state = ModelState(
++        'test_app',
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {'db_table': 'custom_table_name'},
++        (models.Model,),
++        []
++    )
++    
++    # Create the new model (renamed) with the same custom db_table
++    new_model_state = ModelState(
++        'test_app',
++        'RenamedModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {'db_table': 'custom_table_name'},
++        (models.Model,),
++        []
++    )
++    
++    # Add both models to simulate the migration state
++    project_state.add_model(old_model_state)
++    project_state.add_model(new_model_state)
++    
++    # Create a RenameModel operation
++    rename_operation = operations.RenameModel(
++        old_name='TestModel',
++        new_name='RenamedModel',
++    )
++    
++    # Create a mock schema editor that tracks calls
++    class MockSchemaEditor:
++        def __init__(self):
++            self.calls = []
++        
++        def alter_db_table(self, *args, **kwargs):
++            self.calls.append(('alter_db_table', args, kwargs))
++            return True  # Return success
++        
++        def alter_field(self, *args, **kwargs):
++            self.calls.append(('alter_field', args, kwargs))
++            return True  # Return success
++        
++        @property
++        def connection(self):
++            return type('MockConnection', (), {'alias': 'default'})()
++    
++    schema_editor = MockSchemaEditor()
++    
++    # Mock allow_migrate_model
++    rename_operation.allow_migrate_model = lambda alias, model: True
++    
++    # Test database_forwards
++    print("Testing database_forwards with custom db_table...")
++    try:
++        schema_editor.calls = []  # Reset calls
++        rename_operation.database_forwards('test_app', schema_editor, project_state, project_state)
++        
++        print(f"Number of database operations called: {len(schema_editor.calls)}")
++        if len(schema_editor.calls) == 0:
++            print("✓ SUCCESS: No database operations called (noop behavior working)")
++        else:
++            print("✗ FAILURE: Database operations were called:")
++            for call in schema_editor.calls:
++                print(f"  - {call[0]}")
++                
++    except Exception as e:
++        print(f"✗ ERROR: {e}")
++    
++    # Now test with a model that doesn't have custom db_table
++    print("\nTesting database_forwards with default db_table...")
++    
++    # Create states without custom db_table
++    old_model_state_default = ModelState(
++        'test_app',
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {},  # No db_table defined
++        (models.Model,),
++        []
++    )
++    
++    new_model_state_default = ModelState(
++        'test_app',
++        'RenamedModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {},  # No db_table defined
++        (models.Model,),
++        []
++    )
++    
++    project_state_default = ProjectState()
++    project_state_default.add_model(old_model_state_default)
++    project_state_default.add_model(new_model_state_default)
++    
++    try:
++        schema_editor.calls = []  # Reset calls
++        rename_operation.database_forwards('test_app', schema_editor, project_state_default, project_state_default)
++        
++        print(f"Number of database operations called: {len(schema_editor.calls)}")
++        if len(schema_editor.calls) > 0:
++            print("✓ SUCCESS: Database operations called (normal behavior working)")
++        else:
++            print("✗ FAILURE: No database operations were called")
++                
++    except Exception as e:
++        print(f"✗ ERROR: {e}")
++
++if __name__ == '__main__':
++    test_migration_integration()
+\ No newline at end of file
+diff --git a/test_rename_model.py b/test_rename_model.py
+new file mode 100644
+index 0000000000..6c1144281e
+--- /dev/null
++++ b/test_rename_model.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations import operations
++from django.db.migrations.state import ProjectState, ModelState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++    django.setup()
++
++def test_rename_model_operation():
++    """Test the RenameModel operation directly"""
++    print("Testing RenameModel operation...")
++    
++    # Create a project state with a model that has db_table defined
++    project_state = ProjectState()
++    
++    # Create a model state with db_table defined
++    model_state = ModelState(
++        'test_app',
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {'db_table': 'custom_table_name'},
++        (models.Model,),
++        []
++    )
++    
++    # Add the model to the project state
++    project_state.add_model(model_state)
++    
++    # Create a RenameModel operation
++    rename_operation = operations.RenameModel(
++        old_name='TestModel',
++        new_name='RenamedModel',
++    )
++    
++    # Test the state_forwards method (should always work)
++    print("Testing state_forwards...")
++    try:
++        rename_operation.state_forwards('test_app', project_state)
++        print("✓ SUCCESS: state_forwards completed")
++        
++        # Check if the model was renamed in the state
++        old_key = ('test_app', 'testmodel')
++        new_key = ('test_app', 'renamedmodel')
++        
++        if old_key not in project_state.models and new_key in project_state.models:
++            print("✓ SUCCESS: Model was renamed in state")
++        else:
++            print("✗ FAILURE: Model was not renamed correctly in state")
++            
++    except Exception as e:
++        print(f"✗ ERROR: {e}")
++    
++    # Test the database_forwards method with a mock
++    print("\nTesting database_forwards...")
++    
++    # Create a mock schema editor that tracks calls
++    class MockSchemaEditor:
++        def __init__(self):
++            self.calls = []
++        
++        def alter_db_table(self, *args, **kwargs):
++            self.calls.append(('alter_db_table', args, kwargs))
++        
++        def alter_field(self, *args, **kwargs):
++            self.calls.append(('alter_field', args, kwargs))
++        
++        @property
++        def connection(self):
++            return type('MockConnection', (), {'alias': 'default'})()
++    
++    schema_editor = MockSchemaEditor()
++    
++    # Mock allow_migrate_model
++    rename_operation.allow_migrate_model = lambda alias, model: True
++    
++    try:
++        # Reset project state
++        project_state = ProjectState()
++        project_state.add_model(model_state)
++        
++        rename_operation.database_forwards('test_app', schema_editor, project_state, project_state)
++        
++        print(f"Number of database operations called: {len(schema_editor.calls)}")
++        if len(schema_editor.calls) == 0:
++            print("✓ SUCCESS: No database operations called (noop behavior working)")
++        else:
++            print("✗ FAILURE: Database operations were called:")
++            for call in schema_editor.calls:
++                print(f"  - {call[0]}")
++                
++    except Exception as e:
++        print(f"✗ ERROR: {e}")
++
++if __name__ == '__main__':
++    test_rename_model_operation()
+\ No newline at end of file
+diff --git a/test_rename_model_fix.py b/test_rename_model_fix.py
+new file mode 100644
+index 0000000000..41dec6f7fb
+--- /dev/null
++++ b/test_rename_model_fix.py
+@@ -0,0 +1,200 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations import operations
++from django.db.migrations.state import ProjectState, ModelState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++    django.setup()
++
++def test_rename_model_with_db_table():
++    """Test that RenameModel is a noop when db_table is defined"""
++    print("Testing RenameModel with db_table defined...")
++    
++    # Create a project state with a model that has db_table defined
++    project_state = ProjectState()
++    
++    # Create a model state with db_table defined
++    model_state = ModelState(
++        'test_app',
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {'db_table': 'custom_table_name'},
++        (models.Model,),
++        []
++    )
++    
++    # Add the model to the project state
++    project_state.add_model(model_state)
++    
++    # Create a RenameModel operation
++    rename_operation = operations.RenameModel(
++        old_name='TestModel',
++        new_name='RenamedModel',
++    )
++    
++    # Mock schema editor to track calls
++    class MockSchemaEditor:
++        def __init__(self):
++            self.calls = []
++        
++        def alter_db_table(self, *args, **kwargs):
++            self.calls.append(('alter_db_table', args, kwargs))
++        
++        def alter_field(self, *args, **kwargs):
++            self.calls.append(('alter_field', args, kwargs))
++        
++        @property
++        def connection(self):
++            return type('MockConnection', (), {'alias': 'default'})()
++    
++    schema_editor = MockSchemaEditor()
++    
++    # Mock allow_migrate_model
++    rename_operation.allow_migrate_model = lambda alias, model: True
++    
++    # Test database_forwards
++    print("Testing database_forwards...")
++    try:
++        # Create a mock to_state with the renamed model
++        to_state = ProjectState()
++        renamed_model_state = ModelState(
++            'test_app',
++            'RenamedModel',
++            [
++                ('id', models.AutoField(primary_key=True)),
++                ('name', models.CharField(max_length=100)),
++            ],
++            {'db_table': 'custom_table_name'},
++            (models.Model,),
++            []
++        )
++        to_state.add_model(renamed_model_state)
++        
++        rename_operation.database_forwards('test_app', schema_editor, project_state, to_state)
++        
++        print(f"Number of database operations called: {len(schema_editor.calls)}")
++        if len(schema_editor.calls) == 0:
++            print("✓ SUCCESS: No database operations called (noop behavior working)")
++            return True
++        else:
++            print("✗ FAILURE: Database operations were called:")
++            for call in schema_editor.calls:
++                print(f"  - {call[0]}")
++            return False
++            
++    except Exception as e:
++        print(f"✗ ERROR: {e}")
++        return False
++
++def test_rename_model_without_db_table():
++    """Test that RenameModel works normally when db_table is not defined"""
++    print("\nTesting RenameModel without db_table defined...")
++    
++    # Create a project state with a model that doesn't have db_table defined
++    project_state = ProjectState()
++    
++    # Create a model state without db_table defined
++    model_state = ModelState(
++        'test_app',
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        {},  # No db_table defined
++        (models.Model,),
++        []
++    )
++    
++    # Add the model to the project state
++    project_state.add_model(model_state)
++    
++    # Create a RenameModel operation
++    rename_operation = operations.RenameModel(
++        old_name='TestModel',
++        new_name='RenamedModel',
++    )
++    
++    # Mock schema editor to track calls
++    class MockSchemaEditor:
++        def __init__(self):
++            self.calls = []
++        
++        def alter_db_table(self, *args, **kwargs):
++            self.calls.append(('alter_db_table', args, kwargs))
++        
++        def alter_field(self, *args, **kwargs):
++            self.calls.append(('alter_field', args, kwargs))
++        
++        @property
++        def connection(self):
++            return type('MockConnection', (), {'alias': 'default'})()
++    
++    schema_editor = MockSchemaEditor()
++    
++    # Mock allow_migrate_model
++    rename_operation.allow_migrate_model = lambda alias, model: True
++    
++    # Test database_forwards
++    print("Testing database_forwards...")
++    try:
++        # Create a mock to_state with the renamed model
++        to_state = ProjectState()
++        renamed_model_state = ModelState(
++            'test_app',
++            'RenamedModel',
++            [
++                ('id', models.AutoField(primary_key=True)),
++                ('name', models.CharField(max_length=100)),
++            ],
++            {},  # No db_table defined
++            (models.Model,),
++            []
++        )
++        to_state.add_model(renamed_model_state)
++        
++        rename_operation.database_forwards('test_app', schema_editor, project_state, to_state)
++        
++        print(f"Number of database operations called: {len(schema_editor.calls)}")
++        if len(schema_editor.calls) > 0:
++            print("✓ SUCCESS: Database operations called (normal behavior working)")
++            return True
++        else:
++            print("✗ FAILURE: No database operations were called")
++            return False
++            
++    except Exception as e:
++        print(f"✗ ERROR: {e}")
++        return False
++
++if __name__ == '__main__':
++    success1 = test_rename_model_with_db_table()
++    success2 = test_rename_model_without_db_table()
++    
++    if success1 and success2:
++        print("\n✓ All tests passed!")
++    else:
++        print("\n✗ Some tests failed!")
+\ No newline at end of file
+diff --git a/test_simple_backwards.py b/test_simple_backwards.py
+new file mode 100644
+index 0000000000..6eeed785c3
+--- /dev/null
++++ b/test_simple_backwards.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations import operations
++from django.db.migrations.state import ProjectState, ModelState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++    django.setup()
++
++def test_simple_backwards_logic():
++    """Test the logic used in database_backwards indirectly"""
++    print("Testing RenameModel backwards logic...")
++    
++    # Create a RenameModel operation
++    rename_operation = operations.RenameModel(
++        old_name='TestModel',
++        new_name='RenamedModel',
++    )
++    
++    # Test that the names are swapped correctly
++    print(f"Original: old_name={rename_operation.old_name}, new_name={rename_operation.new_name}")
++    
++    # Simulate what database_backwards does
++    rename_operation.new_name_lower, rename_operation.old_name_lower = rename_operation.old_name_lower, rename_operation.new_name_lower
++    rename_operation.new_name, rename_operation.old_name = rename_operation.old_name, rename_operation.new_name
++    
++    print(f"After swap: old_name={rename_operation.old_name}, new_name={rename_operation.new_name}")
++    
++    # Swap back (like database_backwards does)
++    rename_operation.new_name_lower, rename_operation.old_name_lower = rename_operation.old_name_lower, rename_operation.new_name_lower
++    rename_operation.new_name, rename_operation.old_name = rename_operation.old_name, rename_operation.new_name
++    
++    print(f"After swap back: old_name={rename_operation.old_name}, new_name={rename_operation.new_name}")
++    
++    # Verify the names are back to original
++    if rename_operation.old_name == 'TestModel' and rename_operation.new_name == 'RenamedModel':
++        print("✓ SUCCESS: Name swapping works correctly")
++        return True
++    else:
++        print("✗ FAILURE: Name swapping doesn't work correctly")
++        return False
++
++if __name__ == '__main__':
++    success = test_simple_backwards_logic()
++    
++    if success:
++        print("\n✓ Backwards logic test passed!")
++    else:
++        print("\n✗ Backwards logic test failed!")
+\ No newline at end of file

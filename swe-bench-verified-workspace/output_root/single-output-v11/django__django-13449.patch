@@ -1,0 +1,348 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 90d90119d0..6d9563b103 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -23,7 +23,10 @@ class SQLiteNumericMixin:
+     def as_sqlite(self, compiler, connection, **extra_context):
+         sql, params = self.as_sql(compiler, connection, **extra_context)
+         try:
+-            if self.output_field.get_internal_type() == 'DecimalField':
++            # Don't cast if this function is being used within a window expression
++            # The window expression will handle the casting itself
++            if (self.output_field.get_internal_type() == 'DecimalField' and 
++                not getattr(compiler, 'compiling_window', False)):
+                 sql = 'CAST(%s AS NUMERIC)' % sql
+         except FieldError:
+             pass
+@@ -1302,6 +1305,8 @@ class Window(Expression):
+         connection.ops.check_expression_support(self)
+         if not connection.features.supports_over_clause:
+             raise NotSupportedError('This backend does not support window expressions.')
++        # Set flag to indicate we're compiling a window expression
++        compiler.compiling_window = True
+         expr_sql, params = compiler.compile(self.source_expression)
+         window_sql, window_params = [], []
+ 
+@@ -1343,6 +1348,20 @@ class Window(Expression):
+     def __repr__(self):
+         return '<%s: %s>' % (self.__class__.__name__, self)
+ 
++    def as_sqlite(self, compiler, connection, **extra_context):
++        """
++        For SQLite, CAST the entire window expression to NUMERIC when the source
++        expression has a DecimalField output. This is necessary because SQLite
++        doesn't support casting just the window function part.
++        """
++        sql, params = self.as_sql(compiler, connection, **extra_context)
++        try:
++            if self.source_expression.output_field.get_internal_type() == 'DecimalField':
++                sql = 'CAST(%s AS NUMERIC)' % sql
++        except (FieldError, AttributeError):
++            pass
++        return sql, params
++
+     def get_group_by_cols(self, alias=None):
+         return []
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..b54af70297
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F
++from django.db.models.functions import Lag
++from django.db.models import Window
++
++# Create a test model
++class LagTest(models.Model):
++    modified = models.DateField()
++    data = models.FloatField()
++    amount = models.DecimalField(decimal_places=4, max_digits=7)
++    
++    class Meta:
++        app_label = 'django.contrib.auth'
++
++# Create database tables
++from django.db import connection
++with connection.cursor() as cursor:
++    cursor.execute("CREATE TABLE reproduce_lagtest (id INTEGER PRIMARY KEY, modified DATE, data REAL, amount NUMERIC)")
++
++# Test the issue
++print("Testing Lag with DecimalField on SQLite...")
++try:
++    w = Window(expression=Lag('amount', 7), partition_by=[F('modified')], order_by=F('modified').asc())
++    q = LagTest.objects.all().annotate(w=w)
++    print("Query:", q.query)
++    # Try to evaluate the query to trigger the SQL execution
++    list(q[:1])
++    print("Success: No error occurred")
++except Exception as e:
++    print("Error:", str(e))
++    print("Error type:", type(e).__name__)
++
++# Test with FloatField (should work)
++print("\nTesting Lag with FloatField on SQLite...")
++try:
++    w2 = Window(expression=Lag('data', 7), partition_by=[F('modified')], order_by=F('modified').asc())
++    q2 = LagTest.objects.all().annotate(w2=w2)
++    print("Query:", q2.query)
++    # Try to evaluate the query to trigger the SQL execution
++    list(q2[:1])
++    print("Success: No error occurred")
++except Exception as e:
++    print("Error:", str(e))
++    print("Error type:", type(e).__name__)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..433459b94a
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F
++from django.db.models.functions import Lag, Lead
++from django.db.models import Window
++
++# Create test models
++class TestModel(models.Model):
++    date_field = models.DateField()
++    decimal_field = models.DecimalField(max_digits=10, decimal_places=2)
++    float_field = models.FloatField()
++    int_field = models.IntegerField()
++    
++    class Meta:
++        app_label = 'django.contrib.auth'
++
++print("Testing comprehensive window function casting...")
++
++# Test 1: Lag with DecimalField
++print("\n1. Testing Lag with DecimalField:")
++w1 = Window(expression=Lag('decimal_field', 1), partition_by=[F('date_field')], order_by=F('date_field').asc())
++q1 = TestModel.objects.all().annotate(w=w1)
++sql1 = str(q1.query)
++print("SQL:", sql1)
++print("CAST position correct:", "CAST(" in sql1 and "AS NUMERIC)" in sql1 and sql1.find("CAST(") < sql1.find("OVER") and sql1.find("AS NUMERIC)") > sql1.find("OVER)"))
++print()
++
++# Test 2: Lag with FloatField (should not have CAST)
++print("2. Testing Lag with FloatField:")
++w2 = Window(expression=Lag('float_field', 1), partition_by=[F('date_field')], order_by=F('date_field').asc())
++q2 = TestModel.objects.all().annotate(w=w2)
++sql2 = str(q2.query)
++print("SQL:", sql2)
++print("No CAST present:", "CAST(" not in sql2 and "AS NUMERIC)" not in sql2)
++print()
++
++# Test 3: Lead with DecimalField
++print("3. Testing Lead with DecimalField:")
++w3 = Window(expression=Lead('decimal_field', 1), partition_by=[F('date_field')], order_by=F('date_field').asc())
++q3 = TestModel.objects.all().annotate(w=w3)
++sql3 = str(q3.query)
++print("SQL:", sql3)
++print("CAST position correct:", "CAST(" in sql3 and "AS NUMERIC)" in sql3 and sql3.find("CAST(") < sql3.find("OVER") and sql3.find("AS NUMERIC)") > sql3.find("OVER)"))
++print()
++
++# Test 4: Lead with IntegerField (should not have CAST)
++print("4. Testing Lead with IntegerField:")
++w4 = Window(expression=Lead('int_field', 1), partition_by=[F('date_field')], order_by=F('date_field').asc())
++q4 = TestModel.objects.all().annotate(w=w4)
++sql4 = str(q4.query)
++print("SQL:", sql4)
++print("No CAST present:", "CAST(" not in sql4 and "AS NUMERIC)" not in sql4)
++print()
++
++# Test 5: Verify the compiler flag is working correctly
++print("5. Testing compiler flag behavior:")
++from django.db.models.sql.compiler import SQLCompiler
++
++# Create a compiler instance
++compiler = SQLCompiler(TestModel.objects.all().query, connection=None, using='default')
++print("Default compiling_window flag:", getattr(compiler, 'compiling_window', False))
++
++# Test the SQLiteNumericMixin behavior
++from django.db.models.expressions import SQLiteNumericMixin
++
++class TestFunc(SQLiteNumericMixin):
++    def __init__(self, output_field):
++        self.output_field = output_field
++    
++    def as_sql(self, compiler, connection, **extra_context):
++        return "TEST_FUNCTION()", []
++
++# Test without compiler flag
++func1 = TestFunc(models.DecimalField())
++sql1, params1 = func1.as_sqlite(compiler, None)
++print("Without compiler flag - CAST applied:", "CAST(" in sql1)
++
++# Test with compiler flag
++compiler.compiling_window = True
++func2 = TestFunc(models.DecimalField())
++sql2, params2 = func2.as_sqlite(compiler, None)
++print("With compiler flag - CAST not applied:", "CAST(" not in sql2)
++
++print("\nAll tests completed successfully!")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..8da48c67f1
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F
++from django.db.models.functions import Lag
++from django.db.models import Window
++
++# Create a test model
++class LagTest(models.Model):
++    modified = models.DateField()
++    data = models.FloatField()
++    amount = models.DecimalField(decimal_places=4, max_digits=7)
++    
++    class Meta:
++        app_label = 'django.contrib.auth'
++
++# Test the SQL generation only (no database operations)
++print("Testing SQL generation for Lag with DecimalField on SQLite...")
++
++# Test 1: DecimalField with Lag
++w = Window(expression=Lag('amount', 7), partition_by=[F('modified')], order_by=F('modified').asc())
++q = LagTest.objects.all().annotate(w=w)
++print("DecimalField Query:")
++print(q.query)
++print()
++
++# Test 2: FloatField with Lag (should not have CAST)
++w2 = Window(expression=Lag('data', 7), partition_by=[F('modified')], order_by=F('modified').asc())
++q2 = LagTest.objects.all().annotate(w2=w2)
++print("FloatField Query:")
++print(q2.query)
++print()
++
++# Test 3: Verify the CAST is in the right place
++decimal_sql = str(q.query)
++float_sql = str(q2.query)
++
++print("Analysis:")
++print("- DecimalField query contains CAST:", "CAST(" in decimal_sql and "AS NUMERIC)" in decimal_sql)
++print("- FloatField query contains CAST:", "CAST(" in float_sql and "AS NUMERIC)" in float_sql)
++print("- CAST position check (should be around entire window):", 
++      decimal_sql.find("CAST(") < decimal_sql.find("OVER") and 
++      decimal_sql.find("AS NUMERIC)") > decimal_sql.find("OVER)"))
+\ No newline at end of file
+diff --git a/test_sqlite_syntax.py b/test_sqlite_syntax.py
+new file mode 100644
+index 0000000000..789a91840d
+--- /dev/null
++++ b/test_sqlite_syntax.py
+@@ -0,0 +1,31 @@
++#!/usr/bin/env python3
++import sqlite3
++
++# Test the SQL syntax with a real SQLite database
++sqlite_conn = sqlite3.connect(':memory:')
++cursor = sqlite_conn.cursor()
++
++# Create a test table
++cursor.execute("CREATE TABLE test_lagtest (id INTEGER PRIMARY KEY, modified DATE, data REAL, amount NUMERIC)")
++
++# Test the corrected SQL (should work)
++correct_sql = '''SELECT "test_lagtest"."id", "test_lagtest"."modified", "test_lagtest"."data", "test_lagtest"."amount", CAST(LAG("test_lagtest"."amount", 7) OVER (PARTITION BY "test_lagtest"."modified" ORDER BY "test_lagtest"."modified" ASC) AS NUMERIC) AS "w" FROM "test_lagtest"'''
++
++# Test the old incorrect SQL (should fail)
++incorrect_sql = '''SELECT "test_lagtest"."id", "test_lagtest"."modified", "test_lagtest"."data", "test_lagtest"."amount", CAST(LAG("test_lagtest"."amount", 7) AS NUMERIC) OVER (PARTITION BY "test_lagtest"."modified" ORDER BY "test_lagtest"."modified" ASC) AS "w" FROM "test_lagtest"'''
++
++print("Testing corrected SQL syntax...")
++try:
++    cursor.execute(correct_sql)
++    print("✓ Corrected SQL syntax is valid")
++except sqlite3.OperationalError as e:
++    print("✗ Corrected SQL syntax error:", e)
++
++print("\nTesting old incorrect SQL syntax...")
++try:
++    cursor.execute(incorrect_sql)
++    print("✗ Old SQL syntax should have failed but didn't")
++except sqlite3.OperationalError as e:
++    print("✓ Old SQL syntax correctly failed:", e)
++
++sqlite_conn.close()
+\ No newline at end of file

@@ -1,0 +1,515 @@
+diff --git a/django/core/serializers/base.py b/django/core/serializers/base.py
+index da85cb4b92..0a979dd51c 100644
+--- a/django/core/serializers/base.py
++++ b/django/core/serializers/base.py
+@@ -336,7 +336,10 @@ def build_instance(Model, data, db):
+         and hasattr(default_manager, "get_by_natural_key")
+         and hasattr(Model, "natural_key")
+     ):
+-        natural_key = Model(**data).natural_key()
++        # Create model instance with the correct database connection
++        instance = Model(**data)
++        instance._state.db = db
++        natural_key = instance.natural_key()
+         try:
+             data[Model._meta.pk.attname] = Model._meta.pk.to_python(
+                 default_manager.db_manager(db).get_by_natural_key(*natural_key).pk
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..352349802a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,120 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the loaddata issue with natural keys on non-default databases.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++            'other': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core import serializers
++
++# Define the models from the issue
++class AuthorManager(models.Manager):
++    def get_by_natural_key(self, name):
++        return self.get(name=name)
++
++class Author(models.Model):
++    id = models.AutoField(primary_key=True)
++    name = models.CharField(max_length=255, unique=True)
++    objects = AuthorManager()
++    
++    def natural_key(self):
++        return (self.name,)
++    
++    def __str__(self):
++        return f"{self.id} {self.name}"
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++class BookManager(models.Manager):
++    def get_by_natural_key(self, title, author_name):
++        return self.get(title=title, author__name=author_name)
++
++class Book(models.Model):
++    id = models.AutoField(primary_key=True)
++    title = models.CharField(max_length=255)
++    author = models.ForeignKey(Author, models.DO_NOTHING, related_name="books")
++    objects = BookManager()
++    
++    def natural_key(self):
++        return (self.title,) + self.author.natural_key()
++    
++    natural_key.dependencies = ["contenttypes.Author"]
++    
++    class Meta:
++        unique_together = [["title", "author"]]
++        app_label = 'contenttypes'
++    
++    def __str__(self):
++        return f"{self.id}: '{self.title}' by {self.author}"
++
++# Create database tables
++from django.db import connections
++
++for db_name in ['default', 'other']:
++    with connections[db_name].cursor() as cursor:
++        cursor.execute("""
++            CREATE TABLE IF NOT EXISTS contenttypes_author (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                name VARCHAR(255) UNIQUE
++            )
++        """)
++        cursor.execute("""
++            CREATE TABLE IF NOT EXISTS contenttypes_book (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                title VARCHAR(255),
++                author_id INTEGER,
++                UNIQUE(title, author_id)
++            )
++        """)
++
++# Create test data instances
++author = Author(name="JR Tolkien")
++book = Book(title="The Ring", author=author)
++
++# Serialize the data
++json_data = serializers.serialize('json', [author, book], use_natural_foreign_keys=True)
++
++print("Fixture data:")
++print(json_data)
++
++# Try to load data into the 'other' database
++print("\nAttempting to load data into 'other' database...")
++try:
++    result = serializers.deserialize('json', json_data, using='other')
++    for obj in result:
++        obj.save(using='other')
++    print("SUCCESS: Data loaded successfully into 'other' database!")
++except Exception as e:
++    print(f"ERROR: {e}")
++    import traceback
++    traceback.print_exc()
++
++print("\nDone!")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..20756a5f9b
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,147 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the natural key fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++            'other': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core import serializers
++
++# Define test models
++class AuthorManager(models.Manager):
++    def get_by_natural_key(self, name):
++        return self.get(name=name)
++
++class Author(models.Model):
++    name = models.CharField(max_length=255, unique=True)
++    objects = AuthorManager()
++    
++    def natural_key(self):
++        return (self.name,)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++class BookManager(models.Manager):
++    def get_by_natural_key(self, title, author_name):
++        return self.get(title=title, author__name=author_name)
++
++class Book(models.Model):
++    title = models.CharField(max_length=255)
++    author = models.ForeignKey(Author, models.DO_NOTHING, related_name="books")
++    objects = BookManager()
++    
++    def natural_key(self):
++        return (self.title,) + self.author.natural_key()
++    
++    natural_key.dependencies = ["contenttypes.Author"]
++    
++    class Meta:
++        unique_together = [["title", "author"]]
++        app_label = 'contenttypes'
++
++# Create database tables
++from django.db import connections
++
++for db_name in ['default', 'other']:
++    with connections[db_name].cursor() as cursor:
++        cursor.execute("""
++            CREATE TABLE IF NOT EXISTS contenttypes_author (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                name VARCHAR(255) UNIQUE
++            )
++        """)
++        cursor.execute("""
++            CREATE TABLE IF NOT EXISTS contenttypes_book (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                title VARCHAR(255),
++                author_id INTEGER,
++                UNIQUE(title, author_id)
++            )
++        """)
++
++# Test 1: Non-existent natural key in target database
++print("Test 1: Non-existent natural key in target database")
++author = Author(name="NonExistent Author")
++book = Book(title="NonExistent Book", author=author)
++
++json_data = serializers.serialize('json', [author, book], use_natural_foreign_keys=True)
++print("Serialized data:", json_data)
++
++try:
++    result = serializers.deserialize('json', json_data, using='other')
++    for obj in result:
++        obj.save(using='other')
++    print("✓ Non-existent natural key test passed")
++except Exception as e:
++    print(f"✗ Non-existent natural key test failed: {e}")
++    # This should fail gracefully, not with a database connection error
++
++# Test 2: Multiple databases with different data
++print("\nTest 2: Multiple databases with different data")
++
++# Add data to default database
++with connections['default'].cursor() as cursor:
++    cursor.execute("INSERT INTO contenttypes_author (name) VALUES ('Default Author')")
++    cursor.execute("INSERT INTO contenttypes_book (title, author_id) VALUES ('Default Book', 1)")
++
++# Create fixture data for 'other' database
++author = Author(name="Other Author")
++book = Book(title="Other Book", author=author)
++
++json_data = serializers.serialize('json', [author, book], use_natural_foreign_keys=True)
++print("Serialized data for 'other' database:", json_data)
++
++try:
++    result = serializers.deserialize('json', json_data, using='other')
++    for obj in result:
++        obj.save(using='other')
++    print("✓ Multiple databases test passed")
++    
++    # Verify data is in correct databases
++    with connections['default'].cursor() as cursor:
++        cursor.execute("SELECT COUNT(*) FROM contenttypes_author")
++        default_authors = cursor.fetchone()[0]
++        cursor.execute("SELECT COUNT(*) FROM contenttypes_book")
++        default_books = cursor.fetchone()[0]
++    
++    with connections['other'].cursor() as cursor:
++        cursor.execute("SELECT COUNT(*) FROM contenttypes_author")
++        other_authors = cursor.fetchone()[0]
++        cursor.execute("SELECT COUNT(*) FROM contenttypes_book")
++        other_books = cursor.fetchone()[0]
++    
++    print(f"Default DB: {default_authors} authors, {default_books} books")
++    print(f"Other DB: {other_authors} authors, {other_books} books")
++    
++except Exception as e:
++    print(f"✗ Multiple databases test failed: {e}")
++
++print("\n✓ Edge case tests completed!")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..7a7e86b318
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,121 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix works and doesn't break existing functionality.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core import serializers
++
++# Define simple test models
++class AuthorManager(models.Manager):
++    def get_by_natural_key(self, name):
++        return self.get(name=name)
++
++class Author(models.Model):
++    name = models.CharField(max_length=255, unique=True)
++    objects = AuthorManager()
++    
++    def natural_key(self):
++        return (self.name,)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++class BookManager(models.Manager):
++    def get_by_natural_key(self, title, author_name):
++        return self.get(title=title, author__name=author_name)
++
++class Book(models.Model):
++    title = models.CharField(max_length=255)
++    author = models.ForeignKey(Author, models.DO_NOTHING, related_name="books")
++    objects = BookManager()
++    
++    def natural_key(self):
++        return (self.title,) + self.author.natural_key()
++    
++    natural_key.dependencies = ["contenttypes.Author"]
++    
++    class Meta:
++        unique_together = [["title", "author"]]
++        app_label = 'contenttypes'
++
++# Create database tables
++from django.db import connection
++with connection.cursor() as cursor:
++    cursor.execute("""
++        CREATE TABLE IF NOT EXISTS contenttypes_author (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            name VARCHAR(255) UNIQUE
++        )
++    """)
++    cursor.execute("""
++        CREATE TABLE IF NOT EXISTS contenttypes_book (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            title VARCHAR(255),
++            author_id INTEGER,
++            UNIQUE(title, author_id)
++        )
++    """)
++
++# Test 1: Basic serialization/deserialization with natural keys
++print("Test 1: Basic natural key functionality")
++author = Author(name="Test Author")
++book = Book(title="Test Book", author=author)
++
++# Serialize with natural keys
++json_data = serializers.serialize('json', [author, book], use_natural_foreign_keys=True)
++print("Serialized data:", json_data)
++
++# Deserialize
++try:
++    result = serializers.deserialize('json', json_data)
++    for obj in result:
++        obj.save()
++    print("✓ Basic natural key test passed")
++except Exception as e:
++    print(f"✗ Basic natural key test failed: {e}")
++    sys.exit(1)
++
++# Test 2: Verify data was saved correctly
++print("\nTest 2: Verify data integrity")
++saved_author = Author.objects.get(name="Test Author")
++saved_book = Book.objects.get(title="Test Book")
++print(f"✓ Author saved: {saved_author}")
++print(f"✓ Book saved: {saved_book}")
++
++# Test 3: Test natural key lookup
++print("\nTest 3: Natural key lookup")
++try:
++    author_by_natural = Author.objects.get_by_natural_key("Test Author")
++    book_by_natural = Book.objects.get_by_natural_key("Test Book", "Test Author")
++    print(f"✓ Author natural key lookup: {author_by_natural}")
++    print(f"✓ Book natural key lookup: {book_by_natural}")
++except Exception as e:
++    print(f"✗ Natural key lookup failed: {e}")
++    sys.exit(1)
++
++print("\n✓ All tests passed! The fix works correctly.")
+\ No newline at end of file
+diff --git a/test_no_natural_keys.py b/test_no_natural_keys.py
+new file mode 100644
+index 0000000000..db37196240
+--- /dev/null
++++ b/test_no_natural_keys.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++"""
++Test that the fix doesn't break normal serialization without natural keys.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core import serializers
++
++# Define test models without natural keys
++class SimpleAuthor(models.Model):
++    name = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++class SimpleBook(models.Model):
++    title = models.CharField(max_length=255)
++    author = models.ForeignKey(SimpleAuthor, models.DO_NOTHING)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++# Create database tables
++from django.db import connection
++with connection.cursor() as cursor:
++    cursor.execute("""
++        CREATE TABLE IF NOT EXISTS contenttypes_simpleauthor (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            name VARCHAR(255)
++        )
++    """)
++    cursor.execute("""
++        CREATE TABLE IF NOT EXISTS contenttypes_simplebook (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            title VARCHAR(255),
++            author_id INTEGER
++        )
++    """)
++
++# Test: Normal serialization without natural keys
++print("Test: Normal serialization without natural keys")
++author = SimpleAuthor(name="Simple Author")
++book = SimpleBook(title="Simple Book", author=author)
++
++# Serialize without natural keys
++json_data = serializers.serialize('json', [author, book])
++print("Serialized data:", json_data)
++
++# Deserialize
++try:
++    result = serializers.deserialize('json', json_data)
++    for obj in result:
++        obj.save()
++    print("✓ Normal serialization test passed")
++except Exception as e:
++    print(f"✗ Normal serialization test failed: {e}")
++    sys.exit(1)
++
++print("\n✓ All tests passed! The fix doesn't break normal functionality.")
+\ No newline at end of file

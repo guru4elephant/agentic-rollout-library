@@ -1,0 +1,527 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index caa03665ea..741bbff8e4 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -1495,6 +1495,9 @@ class DecimalField(Field):
+     def to_python(self, value):
+         if value is None:
+             return value
++        # Handle SimpleLazyObject by resolving it first
++        if hasattr(value, '_wrapped'):
++            value = value._wrapped
+         if isinstance(value, float):
+             return self.context.create_decimal_from_float(value)
+         try:
+@@ -1679,6 +1682,11 @@ class FloatField(Field):
+ 
+     def get_prep_value(self, value):
+         value = super().get_prep_value(value)
++        if value is None:
++            return None
++        # Handle SimpleLazyObject by resolving it first
++        if hasattr(value, '_wrapped'):
++            value = value._wrapped
+         if value is None:
+             return None
+         try:
+@@ -1766,6 +1774,11 @@ class IntegerField(Field):
+ 
+     def get_prep_value(self, value):
+         value = super().get_prep_value(value)
++        if value is None:
++            return None
++        # Handle SimpleLazyObject by resolving it first
++        if hasattr(value, '_wrapped'):
++            value = value._wrapped
+         if value is None:
+             return None
+         try:
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..60ffb0a37a
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.models import User
++from django.db import models
++from django.db.models import OuterRef, Subquery
++from django.test import TestCase
++from django.utils.functional import SimpleLazyObject
++
++# Create models similar to the original issue
++class A(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'django.contrib.auth'
++
++class B(models.Model):
++    a = models.ForeignKey(A, on_delete=models.CASCADE)
++    user_ref = models.ForeignKey(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'django.contrib.auth'
++
++def test_original_issue():
++    """Test the exact pattern from the original issue"""
++    
++    # Create the subquery pattern from the issue
++    owner_user = (
++        B.objects.filter(a=OuterRef("pk"))
++        .annotate(owner_user=Subquery(User.objects.values("id")))
++        .values("owner_user")
++    )
++    
++    # Create a SimpleLazyObject that wraps a user ID (integer)
++    user_id = SimpleLazyObject(lambda: 42)
++    
++    try:
++        # This should work now with our fix
++        result = A.objects.annotate(owner_user=Subquery(owner_user)).filter(
++            owner_user=user_id
++        )
++        print("SUCCESS: Original issue pattern works!")
++        return True
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++def test_simple_lazy_object_with_different_types():
++    """Test SimpleLazyObject with different numeric types"""
++    
++    from django.db.models import IntegerField, FloatField, DecimalField
++    
++    # Test with integer
++    int_field = IntegerField()
++    lazy_int = SimpleLazyObject(lambda: 42)
++    try:
++        result = int_field.get_prep_value(lazy_int)
++        assert result == 42
++        print("✓ Integer conversion works")
++    except Exception as e:
++        print(f"✗ Integer conversion failed: {e}")
++        return False
++    
++    # Test with float
++    float_field = FloatField()
++    lazy_float = SimpleLazyObject(lambda: 42.5)
++    try:
++        result = float_field.get_prep_value(lazy_float)
++        assert result == 42.5
++        print("✓ Float conversion works")
++    except Exception as e:
++        print(f"✗ Float conversion failed: {e}")
++        return False
++    
++    # Test with decimal
++    decimal_field = DecimalField(max_digits=5, decimal_places=2)
++    lazy_decimal = SimpleLazyObject(lambda: 42.5)
++    try:
++        result = decimal_field.get_prep_value(lazy_decimal)
++        assert result == 42.5
++        print("✓ Decimal conversion works")
++    except Exception as e:
++        print(f"✗ Decimal conversion failed: {e}")
++        return False
++    
++    return True
++
++if __name__ == "__main__":
++    print("Testing original issue pattern...")
++    success1 = test_original_issue()
++    
++    print("\nTesting SimpleLazyObject with different types...")
++    success2 = test_simple_lazy_object_with_different_types()
++    
++    if success1 and success2:
++        print("\n🎉 All tests passed! The issue has been fixed.")
++    else:
++        print("\n❌ Some tests failed.")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..a1758792c2
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.models import User
++from django.db import models, connection
++from django.db.models import OuterRef, Subquery
++from django.test import TestCase
++from django.utils.functional import SimpleLazyObject
++
++# Use existing Django models to avoid app_label issues
++# We'll use User model directly and create simple test models
++from django.contrib.auth.models import User
++
++# Create a simple test model that uses User as foreign key
++class TestModel(models.Model):
++    user_ref = models.ForeignKey(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'django.contrib.auth'
++
++# Test case from the issue - simplified version
++def test_bug():
++    # Create a subquery that references the User model
++    user_subquery = (
++        TestModel.objects.filter(user_ref=OuterRef("pk"))
++        .annotate(user_id=Subquery(User.objects.values("id")))
++        .values("user_id")
++    )
++    
++    user = SimpleLazyObject(lambda: User.objects.create_user("testuser"))
++    
++    try:
++        result = User.objects.annotate(test_user_id=Subquery(user_subquery)).filter(
++            test_user_id=user
++        )
++        print("SUCCESS: No error occurred")
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_bug()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..2cd0a44b56
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import IntegerField
++from django.utils.functional import SimpleLazyObject
++
++def test_simple_lazy_object_conversion():
++    # Create a SimpleLazyObject that wraps an integer
++    lazy_int = SimpleLazyObject(lambda: 42)
++    
++    # Create an IntegerField instance
++    field = IntegerField()
++    
++    try:
++        # This should now work with our fix
++        result = field.get_prep_value(lazy_int)
++        print(f"SUCCESS: SimpleLazyObject converted to {result}")
++        return True
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    success = test_simple_lazy_object_conversion()
++    if success:
++        print("Test passed!")
++    else:
++        print("Test failed!")
+\ No newline at end of file
+diff --git a/test_decimal.py b/test_decimal.py
+new file mode 100644
+index 0000000000..e86e9b7828
+--- /dev/null
++++ b/test_decimal.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import DecimalField
++from django.utils.functional import SimpleLazyObject
++
++def test_decimal_field():
++    # Create a SimpleLazyObject that wraps a decimal value
++    lazy_decimal = SimpleLazyObject(lambda: 42.5)
++    
++    # Create a DecimalField instance
++    field = DecimalField(max_digits=5, decimal_places=2)
++    
++    try:
++        # This should work
++        result = field.get_prep_value(lazy_decimal)
++        print(f"SUCCESS: SimpleLazyObject converted to {result}")
++        return True
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    success = test_decimal_field()
++    if success:
++        print("DecimalField test passed!")
++    else:
++        print("DecimalField test failed!")
+\ No newline at end of file
+diff --git a/test_fields.py b/test_fields.py
+new file mode 100644
+index 0000000000..d2d6ae5a96
+--- /dev/null
++++ b/test_fields.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import IntegerField, FloatField, DecimalField
++from django.utils.functional import SimpleLazyObject
++
++def test_field_conversions():
++    """Test that all numeric field types can handle SimpleLazyObject"""
++    
++    # Test IntegerField
++    int_field = IntegerField()
++    lazy_int = SimpleLazyObject(lambda: 42)
++    try:
++        result = int_field.get_prep_value(lazy_int)
++        print(f"✓ IntegerField: SimpleLazyObject({lazy_int}) -> {result}")
++    except Exception as e:
++        print(f"✗ IntegerField failed: {e}")
++        return False
++    
++    # Test FloatField
++    float_field = FloatField()
++    lazy_float = SimpleLazyObject(lambda: 42.5)
++    try:
++        result = float_field.get_prep_value(lazy_float)
++        print(f"✓ FloatField: SimpleLazyObject({lazy_float}) -> {result}")
++    except Exception as e:
++        print(f"✗ FloatField failed: {e}")
++        return False
++    
++    # Test DecimalField
++    decimal_field = DecimalField(max_digits=5, decimal_places=2)
++    lazy_decimal = SimpleLazyObject(lambda: 42.5)
++    try:
++        result = decimal_field.get_prep_value(lazy_decimal)
++        print(f"✓ DecimalField: SimpleLazyObject({lazy_decimal}) -> {result}")
++    except Exception as e:
++        print(f"✗ DecimalField failed: {e}")
++        return False
++    
++    # Test with None values - this should return None, not raise an error
++    lazy_none = SimpleLazyObject(lambda: None)
++    try:
++        result = int_field.get_prep_value(lazy_none)
++        if result is None:
++            print(f"✓ IntegerField with None: SimpleLazyObject({lazy_none}) -> {result}")
++        else:
++            print(f"✗ IntegerField with None: expected None but got {result}")
++            return False
++    except Exception as e:
++        print(f"✗ IntegerField with None failed: {e}")
++        return False
++    
++    return True
++
++if __name__ == "__main__":
++    success = test_field_conversions()
++    if success:
++        print("\nAll field conversion tests passed!")
++    else:
++        print("\nSome field conversion tests failed!")
+\ No newline at end of file
+diff --git a/test_subquery.py b/test_subquery.py
+new file mode 100644
+index 0000000000..56255c0ec8
+--- /dev/null
++++ b/test_subquery.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.models import User
++from django.db import models
++from django.db.models import OuterRef, Subquery
++from django.utils.functional import SimpleLazyObject
++
++# Create simple test models
++class TestModelA(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'django.contrib.auth'
++
++class TestModelB(models.Model):
++    a = models.ForeignKey(TestModelA, on_delete=models.CASCADE)
++    user_ref = models.ForeignKey(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'django.contrib.auth'
++
++def test_subquery_with_simple_lazy_object():
++    # Create a subquery similar to the original issue
++    user_subquery = (
++        TestModelB.objects.filter(a=OuterRef("pk"))
++        .annotate(user_id=Subquery(User.objects.values("id")))
++        .values("user_id")
++    )
++    
++    # Create a SimpleLazyObject that wraps a user ID
++    user_id = SimpleLazyObject(lambda: 42)
++    
++    try:
++        # This should work now with our fix
++        result = TestModelA.objects.annotate(test_user_id=Subquery(user_subquery)).filter(
++            test_user_id=user_id
++        )
++        print("SUCCESS: Subquery with SimpleLazyObject worked!")
++        return True
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    success = test_subquery_with_simple_lazy_object()
++    if success:
++        print("Subquery test passed!")
++    else:
++        print("Subquery test failed!")
+\ No newline at end of file

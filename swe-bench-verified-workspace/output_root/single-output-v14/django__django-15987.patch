@@ -1,0 +1,253 @@
+diff --git a/django/core/management/commands/loaddata.py b/django/core/management/commands/loaddata.py
+index ac97f13161..2831b6b031 100644
+--- a/django/core/management/commands/loaddata.py
++++ b/django/core/management/commands/loaddata.py
+@@ -362,7 +362,9 @@ class Command(BaseCommand):
+         """
+         dirs = []
+         fixture_dirs = settings.FIXTURE_DIRS
+-        if len(fixture_dirs) != len(set(fixture_dirs)):
++        # Convert all paths to strings for duplicate detection
++        fixture_dir_strings = [str(path) for path in fixture_dirs]
++        if len(fixture_dir_strings) != len(set(fixture_dir_strings)):
+             raise ImproperlyConfigured("settings.FIXTURE_DIRS contains duplicates.")
+         for app_config in apps.get_app_configs():
+             app_label = app_config.label
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..4b601d7960
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where FIXTURE_DIRS duplicates are not detected
++when directories are Path instances instead of strings.
++"""
++
++import os
++import tempfile
++from pathlib import Path
++from django.conf import settings
++from django.core.management import call_command
++from django.core.exceptions import ImproperlyConfigured
++
++# Set up minimal Django settings
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++    django.setup()
++
++# Create a temporary directory for fixtures
++with tempfile.TemporaryDirectory() as temp_dir:
++    fixture_dir = Path(temp_dir) / "fixtures"
++    fixture_dir.mkdir()
++    
++    # Create a simple fixture file
++    fixture_file = fixture_dir / "test.json"
++    fixture_file.write_text('[{"model": "auth.user", "pk": 1, "fields": {"username": "test", "password": "test"}}]')
++    
++    print("Testing with string duplicates (should raise ImproperlyConfigured):")
++    try:
++        with settings.override(FIXTURE_DIRS=[str(fixture_dir), str(fixture_dir)]):
++            call_command("loaddata", "test.json", verbosity=2)
++        print("ERROR: Duplicate string detection failed!")
++    except ImproperlyConfigured as e:
++        print(f"SUCCESS: String duplicates properly detected: {e}")
++    except Exception as e:
++        print(f"UNEXPECTED ERROR: {type(e).__name__}: {e}")
++    
++    print("\nTesting with Path instance duplicates (should raise ImproperlyConfigured but currently doesn't):")
++    try:
++        with settings.override(FIXTURE_DIRS=[fixture_dir, fixture_dir]):
++            call_command("loaddata", "test.json", verbosity=2)
++        print("ERROR: Path instance duplicates were not detected!")
++    except ImproperlyConfigured as e:
++        print(f"SUCCESS: Path instance duplicates properly detected: {e}")
++    except Exception as e:
++        print(f"UNEXPECTED ERROR: {type(e).__name__}: {e}")
++
++print("\nTest completed.")
+\ No newline at end of file
+diff --git a/test_fixture_dirs.py b/test_fixture_dirs.py
+new file mode 100644
+index 0000000000..895c128010
+--- /dev/null
++++ b/test_fixture_dirs.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++"""
++Simple test to reproduce the FIXTURE_DIRS duplicate detection issue.
++"""
++
++import os
++import tempfile
++from pathlib import Path
++from django.conf import settings
++from django.core.management.commands.loaddata import Command
++from django.core.exceptions import ImproperlyConfigured
++import traceback
++
++# Set up minimal Django settings
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++    django.setup()
++
++# Create a temporary directory for fixtures
++with tempfile.TemporaryDirectory() as temp_dir:
++    fixture_dir = Path(temp_dir) / "fixtures"
++    fixture_dir.mkdir()
++    
++    print("Testing duplicate detection with string paths:")
++    try:
++        # Test with string duplicates
++        with settings.override(FIXTURE_DIRS=[str(fixture_dir), str(fixture_dir)]):
++            cmd = Command()
++            cmd.using = 'default'
++            cmd.app_label = None
++            cmd.verbosity = 2
++            result = cmd.fixture_dirs  # This should raise ImproperlyConfigured
++        print("ERROR: String duplicates were not detected!")
++    except ImproperlyConfigured as e:
++        print(f"SUCCESS: String duplicates properly detected: {e}")
++    except Exception as e:
++        print(f"UNEXPECTED ERROR: {type(e).__name__}: {e}")
++        traceback.print_exc()
++    
++    print("\nTesting duplicate detection with Path instances:")
++    try:
++        # Test with Path instance duplicates
++        with settings.override(FIXTURE_DIRS=[fixture_dir, fixture_dir]):
++            cmd = Command()
++            cmd.using = 'default'
++            cmd.app_label = None
++            cmd.verbosity = 2
++            result = cmd.fixture_dirs  # This should raise ImproperlyConfigured but currently doesn't
++        print("ERROR: Path instance duplicates were not detected!")
++    except ImproperlyConfigured as e:
++        print(f"SUCCESS: Path instance duplicates properly detected: {e}")
++    except Exception as e:
++        print(f"UNEXPECTED ERROR: {type(e).__name__}: {e}")
++        traceback.print_exc()
++
++print("\nTest completed.")
+\ No newline at end of file
+diff --git a/test_path_duplicate_bug.py b/test_path_duplicate_bug.py
+new file mode 100644
+index 0000000000..82eb6048ab
+--- /dev/null
++++ b/test_path_duplicate_bug.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python3
++"""
++Test to reproduce the FIXTURE_DIRS duplicate detection issue with Path instances.
++This test should FAIL due to the bug.
++"""
++
++import os
++from pathlib import Path
++from django.test import TestCase, override_settings
++from django.core.management import call_command
++from django.core.exceptions import ImproperlyConfigured
++
++# Get the current directory for the test fixtures
++_cur_dir = os.path.dirname(os.path.abspath(__file__))
++
++class PathDuplicateBugTest(TestCase):
++    
++    @override_settings(
++        FIXTURE_DIRS=[
++            Path(_cur_dir) / "fixtures_1",
++            Path(_cur_dir) / "fixtures_1",  # Duplicate Path instance
++        ]
++    )
++    def test_fixture_dirs_with_path_duplicates(self):
++        """
++        Test that settings.FIXTURE_DIRS with Path instance duplicates raises ImproperlyConfigured.
++        This test should FAIL currently due to the bug.
++        """
++        with self.assertRaisesMessage(
++            ImproperlyConfigured, "settings.FIXTURE_DIRS contains duplicates."
++        ):
++            call_command("loaddata", "absolute.json", verbosity=0)
++
++if __name__ == "__main__":
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_path_duplicates.py b/test_path_duplicates.py
+new file mode 100644
+index 0000000000..12292813e9
+--- /dev/null
++++ b/test_path_duplicates.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python3
++"""
++Test to reproduce the FIXTURE_DIRS duplicate detection issue with Path instances.
++"""
++
++import os
++import tempfile
++from pathlib import Path
++from django.test import TestCase, override_settings
++from django.core.management import call_command
++from django.core.exceptions import ImproperlyConfigured
++
++# Import the test models
++from tests.fixtures_regress.models import Absolute
++
++class FixtureDirsPathDuplicatesTest(TestCase):
++    
++    @override_settings(
++        FIXTURE_DIRS=[
++            Path(__file__).parent / "fixtures_1",
++            Path(__file__).parent / "fixtures_1",  # Duplicate Path instance
++        ]
++    )
++    def test_fixture_dirs_with_path_duplicates(self):
++        """
++        Test that settings.FIXTURE_DIRS with Path instance duplicates raises ImproperlyConfigured.
++        This test should FAIL currently due to the bug.
++        """
++        with self.assertRaisesMessage(
++            ImproperlyConfigured, "settings.FIXTURE_DIRS contains duplicates."
++        ):
++            call_command("loaddata", "absolute.json", verbosity=0)
++
++if __name__ == "__main__":
++    import unittest
++    unittest.main()
+\ No newline at end of file

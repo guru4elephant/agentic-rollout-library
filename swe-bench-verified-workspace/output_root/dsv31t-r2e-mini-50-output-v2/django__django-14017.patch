@@ -1,0 +1,615 @@
+diff --git a/django/db/models/query_utils.py b/django/db/models/query_utils.py
+index c957ffa564..a586894c4e 100644
+--- a/django/db/models/query_utils.py
++++ b/django/db/models/query_utils.py
+@@ -41,7 +41,15 @@ class Q(tree.Node):
+ 
+     def _combine(self, other, conn):
+         if not isinstance(other, Q):
+-            raise TypeError(other)
++            # Allow combining with other expression types that have resolve_expression
++            if not hasattr(other, 'resolve_expression'):
++                raise TypeError(other)
++            # For non-Q expressions, create a new Q object with both as children
++            obj = type(self)()
++            obj.connector = conn
++            obj.add(self, conn)
++            obj.add(other, conn)
++            return obj
+ 
+         # If the other Q() is empty, ignore it and just use `self`.
+         if not other:
+@@ -61,9 +69,15 @@ class Q(tree.Node):
+     def __or__(self, other):
+         return self._combine(other, self.OR)
+ 
++    def __ror__(self, other):
++        return self._combine(other, self.OR)
++
+     def __and__(self, other):
+         return self._combine(other, self.AND)
+ 
++    def __rand__(self, other):
++        return self._combine(other, self.AND)
++
+     def __invert__(self):
+         obj = type(self)()
+         obj.add(self, self.AND)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..af606ef7e5
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q, Exists
++
++# Create a simple model for testing
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    price = models.DecimalField(max_digits=10, decimal_places=2)
++    
++    class Meta:
++        app_label = 'test'
++
++print("Testing Q() & Exists(...) vs Exists(...) & Q()")
++
++try:
++    # This should work (Exists on left)
++    result1 = Exists(Product.objects.all()) & Q()
++    print(f"Exists(...) & Q() works: {result1}")
++except Exception as e:
++    print(f"Exists(...) & Q() failed: {e}")
++
++try:
++    # This should fail (Q on left)
++    result2 = Q() & Exists(Product.objects.all())
++    print(f"Q() & Exists(...) works: {result2}")
++except Exception as e:
++    print(f"Q() & Exists(...) failed: {e}")
++    print(f"Error type: {type(e).__name__}")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..22347906af
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q, Exists
++
++# Create a simple model for testing
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    price = models.DecimalField(max_digits=10, decimal_places=2)
++    
++    class Meta:
++        app_label = 'test'
++
++print("Testing comprehensive Q & Exists combinations")
++
++# Test 1: Basic operations
++print("\n1. Basic operations:")
++try:
++    result1 = Exists(Product.objects.all()) & Q()
++    print(f"✓ Exists(...) & Q() works: {type(result1)}")
++except Exception as e:
++    print(f"✗ Exists(...) & Q() failed: {e}")
++
++try:
++    result2 = Q() & Exists(Product.objects.all())
++    print(f"✓ Q() & Exists(...) works: {type(result2)}")
++except Exception as e:
++    print(f"✗ Q() & Exists(...) failed: {e}")
++
++# Test 2: OR operations
++print("\n2. OR operations:")
++try:
++    result3 = Exists(Product.objects.all()) | Q()
++    print(f"✓ Exists(...) | Q() works: {type(result3)}")
++except Exception as e:
++    print(f"✗ Exists(...) | Q() failed: {e}")
++
++try:
++    result4 = Q() | Exists(Product.objects.all())
++    print(f"✓ Q() | Exists(...) works: {type(result4)}")
++except Exception as e:
++    print(f"✗ Q() | Exists(...) failed: {e}")
++
++# Test 3: Complex combinations
++print("\n3. Complex combinations:")
++try:
++    result5 = (Q(price__gt=100) & Exists(Product.objects.all())) | Q(name='test')
++    print(f"✓ Complex combination works: {type(result5)}")
++except Exception as e:
++    print(f"✗ Complex combination failed: {e}")
++
++# Test 4: Nested combinations
++print("\n4. Nested combinations:")
++try:
++    result6 = Q() & (Exists(Product.objects.all()) & Q())
++    print(f"✓ Nested combination works: {type(result6)}")
++except Exception as e:
++    print(f"✗ Nested combination failed: {e}")
++
++# Test 5: Check that invalid types still raise TypeError
++print("\n5. Error handling:")
++try:
++    result7 = Q() & "invalid"
++    print(f"✗ Should have failed with invalid type")
++except TypeError as e:
++    print(f"✓ Correctly raised TypeError for invalid type: {e}")
++except Exception as e:
++    print(f"✗ Unexpected error: {e}")
++
++print("\nAll tests completed!")
+\ No newline at end of file
+diff --git a/test_final_verification.py b/test_final_verification.py
+new file mode 100644
+index 0000000000..cf95cc6275
+--- /dev/null
++++ b/test_final_verification.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q, Exists
++
++# Create a simple model for testing
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    price = models.DecimalField(max_digits=10, decimal_places=2)
++    
++    class Meta:
++        app_label = 'test'
++
++print("Final verification: Testing the exact issue from GitHub")
++
++print("1. Testing Exists(...) & Q() - This should work (and did before):")
++try:
++    result1 = Exists(Product.objects.all()) & Q()
++    print(f"   ✓ SUCCESS: {result1}")
++except Exception as e:
++    print(f"   ✗ FAILED: {e}")
++
++print("\n2. Testing Q() & Exists(...) - This was broken before:")
++try:
++    result2 = Q() & Exists(Product.objects.all())
++    print(f"   ✓ SUCCESS: {result2}")
++    print("   ✨ ISSUE FIXED! No longer raises TypeError")
++except TypeError as e:
++    print(f"   ✗ STILL BROKEN: {e}")
++    print("   ❌ The original issue persists")
++except Exception as e:
++    print(f"   ✗ UNEXPECTED ERROR: {e}")
++
++print("\n3. Both operations should return Q objects:")
++print(f"   Exists(...) & Q() returns: {type(result1).__name__}")
++print(f"   Q() & Exists(...) returns: {type(result2).__name__}")
++
++print("\n4. Testing that both results can be used in querysets:")
++try:
++    # This should work without errors
++    from django.db.models import QuerySet
++    qs = Product.objects.filter(result1) | Product.objects.filter(result2)
++    print("   ✓ Both results can be used in querysets")
++except Exception as e:
++    print(f"   ✗ Error using in queryset: {e}")
++
++print("\n🎯 The original issue has been resolved!")
++print("   Q(...) & Exists(...) no longer raises a TypeError")
++print("   The & and | operators are now commutative for Q-Exists pairs")
+\ No newline at end of file
+diff --git a/test_non_empty_q.py b/test_non_empty_q.py
+new file mode 100644
+index 0000000000..f8933efbd9
+--- /dev/null
++++ b/test_non_empty_q.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q, Exists
++
++# Create a simple model for testing
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    price = models.DecimalField(max_digits=10, decimal_places=2)
++    
++    class Meta:
++        app_label = 'test'
++
++print("Testing with non-empty Q objects")
++
++# Test with non-empty Q objects
++print("\nTesting Exists(...) & Q(name='test'):")
++try:
++    result1 = Exists(Product.objects.all()) & Q(name='test')
++    print(f"✓ Exists(...) & Q(name='test') works: {result1}")
++except Exception as e:
++    print(f"✗ Exists(...) & Q(name='test') failed: {e}")
++
++print("\nTesting Q(name='test') & Exists(...):")
++try:
++    result2 = Q(name='test') & Exists(Product.objects.all())
++    print(f"✓ Q(name='test') & Exists(...) works: {result2}")
++except Exception as e:
++    print(f"✗ Q(name='test') & Exists(...) failed: {e}")
++
++# Test commutative property with non-empty Q
++print("\nTesting commutative property with non-empty Q:")
++if str(result1) == str(result2):
++    print("✓ Results are equivalent (commutative)")
++else:
++    print("✗ Results are not equivalent")
++    print(f"  Exists(...) & Q(name='test'): {result1}")
++    print(f"  Q(name='test') & Exists(...): {result2}")
++
++print("\nNon-empty Q test completed!")
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..bcca669574
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q, Exists
++
++# Create a simple model for testing
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    price = models.DecimalField(max_digits=10, decimal_places=2)
++    
++    class Meta:
++        app_label = 'test'
++
++print("Testing the original GitHub issue")
++
++# Test the exact scenario from the GitHub issue
++print("\nTesting Exists(...) & Q():")
++try:
++    result1 = Exists(Product.objects.all()) & Q()
++    print(f"✓ Exists(...) & Q() works: {result1}")
++    print(f"  Type: {type(result1)}")
++except Exception as e:
++    print(f"✗ Exists(...) & Q() failed: {e}")
++
++print("\nTesting Q() & Exists(...):")
++try:
++    result2 = Q() & Exists(Product.objects.all())
++    print(f"✓ Q() & Exists(...) works: {result2}")
++    print(f"  Type: {type(result2)}")
++except Exception as e:
++    print(f"✗ Q() & Exists(...) failed: {e}")
++    print(f"  Error type: {type(e).__name__}")
++
++# Test that the results are equivalent (commutative property)
++print("\nTesting commutative property:")
++if str(result1) == str(result2):
++    print("✓ Results are equivalent (commutative)")
++else:
++    print("✗ Results are not equivalent")
++    print(f"  Exists(...) & Q(): {result1}")
++    print(f"  Q() & Exists(...): {result2}")
++
++# Test OR operations as well
++print("\nTesting OR operations:")
++try:
++    result3 = Exists(Product.objects.all()) | Q()
++    print(f"✓ Exists(...) | Q() works: {result3}")
++except Exception as e:
++    print(f"✗ Exists(...) | Q() failed: {e}")
++
++try:
++    result4 = Q() | Exists(Product.objects.all())
++    print(f"✓ Q() | Exists(...) works: {result4}")
++except Exception as e:
++    print(f"✗ Q() | Exists(...) failed: {e}")
++
++print("\nOriginal issue test completed!")
+\ No newline at end of file
+diff --git a/test_other_expressions.py b/test_other_expressions.py
+new file mode 100644
+index 0000000000..4495b5bc1e
+--- /dev/null
++++ b/test_other_expressions.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q, Exists, F, Value
++
++# Create a simple model for testing
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    price = models.DecimalField(max_digits=10, decimal_places=2)
++    
++    class Meta:
++        app_label = 'test'
++
++print("Testing Q with other expression types")
++
++# Test with F expressions
++print("\n1. F expressions:")
++try:
++    result1 = Q() & F('price')
++    print(f"✓ Q() & F('price') works: {type(result1)}")
++except Exception as e:
++    print(f"✗ Q() & F('price') failed: {e}")
++
++try:
++    result2 = F('price') & Q()
++    print(f"✓ F('price') & Q() works: {type(result2)}")
++except Exception as e:
++    print(f"✗ F('price') & Q() failed: {e}")
++
++# Test with Value expressions
++print("\n2. Value expressions:")
++try:
++    result3 = Q() & Value(100)
++    print(f"✓ Q() & Value(100) works: {type(result3)}")
++except Exception as e:
++    print(f"✗ Q() & Value(100) failed: {e}")
++
++try:
++    result4 = Value(100) & Q()
++    print(f"✓ Value(100) & Q() works: {type(result4)}")
++except Exception as e:
++    print(f"✗ Value(100) & Q() failed: {e}")
++
++# Test with Exists (already tested, but let's confirm again)
++print("\n3. Exists expressions:")
++try:
++    result5 = Q() & Exists(Product.objects.all())
++    print(f"✓ Q() & Exists(...) works: {type(result5)}")
++except Exception as e:
++    print(f"✗ Q() & Exists(...) failed: {e}")
++
++try:
++    result6 = Exists(Product.objects.all()) & Q()
++    print(f"✓ Exists(...) & Q() works: {type(result6)}")
++except Exception as e:
++    print(f"✗ Exists(...) & Q() failed: {e}")
++
++print("\nAll tests completed!")
+\ No newline at end of file
+diff --git a/test_q_functionality.py b/test_q_functionality.py
+new file mode 100644
+index 0000000000..4a808c04cc
+--- /dev/null
++++ b/test_q_functionality.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Q
++
++print("Testing basic Q object functionality")
++
++# Test 1: Basic Q operations
++print("\n1. Basic Q operations:")
++try:
++    q1 = Q(name='test')
++    q2 = Q(price=100)
++    result = q1 & q2
++    print(f"✓ Q & Q works: {result}")
++except Exception as e:
++    print(f"✗ Q & Q failed: {e}")
++
++try:
++    q1 = Q(name='test')
++    q2 = Q(price=100)
++    result = q1 | q2
++    print(f"✓ Q | Q works: {result}")
++except Exception as e:
++    print(f"✗ Q | Q failed: {e}")
++
++# Test 2: Empty Q operations
++print("\n2. Empty Q operations:")
++try:
++    result = Q() & Q()
++    print(f"✓ Q() & Q() works: {result}")
++except Exception as e:
++    print(f"✗ Q() & Q() failed: {e}")
++
++try:
++    result = Q() | Q()
++    print(f"✓ Q() | Q() works: {result}")
++except Exception as e:
++    print(f"✗ Q() | Q() failed: {e}")
++
++# Test 3: Negation
++print("\n3. Negation:")
++try:
++    result = ~Q(name='test')
++    print(f"✓ ~Q works: {result}")
++except Exception as e:
++    print(f"✗ ~Q failed: {e}")
++
++# Test 4: Complex combinations
++print("\n4. Complex combinations:")
++try:
++    result = (Q(name='test') | Q(price=100)) & Q(active=True)
++    print(f"✓ Complex Q combination works: {result}")
++except Exception as e:
++    print(f"✗ Complex Q combination failed: {e}")
++
++# Test 5: Type checking
++print("\n5. Type checking:")
++try:
++    result = Q() & "invalid"
++    print(f"✗ Should have failed with invalid type")
++except TypeError as e:
++    print(f"✓ Correctly raised TypeError for invalid type: {e}")
++except Exception as e:
++    print(f"✗ Unexpected error: {e}")
++
++print("\nAll Q functionality tests completed!")
+\ No newline at end of file

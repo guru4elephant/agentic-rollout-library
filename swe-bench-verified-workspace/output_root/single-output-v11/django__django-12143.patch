@@ -1,0 +1,178 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 137e6faa0f..effc5e9296 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -1631,7 +1631,7 @@ class ModelAdmin(BaseModelAdmin):
+ 
+     def _get_edited_object_pks(self, request, prefix):
+         """Return POST data values of list_editable primary keys."""
+-        pk_pattern = re.compile(r'{}-\d+-{}$'.format(prefix, self.model._meta.pk.name))
++        pk_pattern = re.compile(r'{}-\d+-{}$'.format(re.escape(prefix), re.escape(self.model._meta.pk.name)))
+         return [value for key, value in request.POST.items() if pk_pattern.match(key)]
+ 
+     def _get_list_editable_queryset(self, request, prefix):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..17691d567b
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with regex special characters in formset prefix.
++"""
++import re
++
++# Simulate the problematic code from admin/options.py
++def _get_edited_object_pks(prefix, pk_name):
++    """Original problematic implementation"""
++    pk_pattern = re.compile(r'{}-\d+-{}$'.format(prefix, pk_name))
++    return pk_pattern
++
++# Test with normal prefix (should work)
++print("Testing with normal prefix:")
++normal_pattern = _get_edited_object_pks('form', 'id')
++print(f"Pattern: {normal_pattern.pattern}")
++print(f"Matches 'form-1-id': {normal_pattern.match('form-1-id')}")
++print(f"Matches 'form-2-id': {normal_pattern.match('form-2-id')}")
++print(f"Doesn't match 'wrong-1-id': {normal_pattern.match('wrong-1-id')}")
++
++print("\nTesting with regex special characters in prefix:")
++# Test with regex special characters (should fail or produce wrong results)
++try:
++    problematic_pattern = _get_edited_object_pks('form.*', 'id')
++    print(f"Pattern: {problematic_pattern.pattern}")
++    print(f"Matches 'form.*-1-id': {problematic_pattern.match('form.*-1-id')}")
++    print(f"Matches 'formx-1-id': {problematic_pattern.match('formx-1-id')}")  # This should NOT match but might!
++except Exception as e:
++    print(f"Error compiling regex: {e}")
++
++print("\nTesting with fixed implementation using re.escape():")
++def _get_edited_object_pks_fixed(prefix, pk_name):
++    """Fixed implementation using re.escape()"""
++    pk_pattern = re.compile(r'{}-\d+-{}$'.format(re.escape(prefix), re.escape(pk_name)))
++    return pk_pattern
++
++# Test with regex special characters (should work correctly)
++try:
++    fixed_pattern = _get_edited_object_pks_fixed('form.*', 'id')
++    print(f"Pattern: {fixed_pattern.pattern}")
++    print(f"Matches 'form.*-1-id': {fixed_pattern.match('form.*-1-id')}")
++    print(f"Matches 'formx-1-id': {fixed_pattern.match('formx-1-id')}")  # This should NOT match
++except Exception as e:
++    print(f"Error compiling regex: {e}")
+\ No newline at end of file
+diff --git a/test_django_integration.py b/test_django_integration.py
+new file mode 100644
+index 0000000000..42286ced64
+--- /dev/null
++++ b/test_django_integration.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""
++Test the fix within Django context
++"""
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.admin.options import ModelAdmin
++from django.contrib.admin.models import LogEntry
++from django.http import QueryDict
++
++# Create a simple test case
++class TestModelAdmin(ModelAdmin):
++    model = LogEntry
++
++def test_regex_escaping():
++    admin = TestModelAdmin(LogEntry, None)
++    
++    # Create a mock request with POST data
++    class MockRequest:
++        def __init__(self, post_data):
++            self.POST = post_data
++    
++    post_data = QueryDict(mutable=True)
++    post_data['form.*-1-id'] = 'test_value_1'
++    post_data['formx-1-id'] = 'test_value_2'  # This should NOT be matched
++    
++    # Test with regex special characters in prefix
++    mock_request = MockRequest(post_data)
++    pks = admin._get_edited_object_pks(mock_request, 'form.*')
++    
++    print(f"Found PKs: {pks}")
++    print(f"Expected: ['test_value_1']")
++    print(f"Test passed: {pks == ['test_value_1']}")
++
++if __name__ == '__main__':
++    test_regex_escaping()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..47aa619b13
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,41 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the regex escaping fix
++"""
++import re
++
++def _get_edited_object_pks_fixed(prefix, pk_name):
++    """Fixed implementation using re.escape()"""
++    pk_pattern = re.compile(r'{}-\d+-{}$'.format(re.escape(prefix), re.escape(pk_name)))
++    return pk_pattern
++
++# Test various edge cases with regex special characters
++test_cases = [
++    ('form', 'id'),  # Normal case
++    ('form.*', 'id'),  # Regex quantifier
++    ('form+', 'id'),  # Regex quantifier
++    ('form?', 'id'),  # Regex quantifier
++    ('form|alternative', 'id'),  # Regex alternation
++    ('form[abc]', 'id'),  # Regex character class
++    ('form^start', 'id'),  # Regex anchor
++    ('form$end', 'id'),  # Regex anchor
++    ('form\\d', 'id'),  # Regex escape sequence
++    ('form.', 'id'),  # Regex any character
++]
++
++for prefix, pk_name in test_cases:
++    print(f"\nTesting prefix: '{prefix}', pk_name: '{pk_name}'")
++    try:
++        pattern = _get_edited_object_pks_fixed(prefix, pk_name)
++        print(f"  Pattern: {pattern.pattern}")
++        
++        # Test exact match
++        exact_match = f"{prefix}-1-{pk_name}"
++        print(f"  Matches '{exact_match}': {pattern.match(exact_match) is not None}")
++        
++        # Test similar but different pattern (should not match)
++        similar_pattern = f"{prefix.replace('.', 'x')}-1-{pk_name}"
++        print(f"  Matches '{similar_pattern}': {pattern.match(similar_pattern) is not None}")
++        
++    except Exception as e:
++        print(f"  Error: {e}")
+\ No newline at end of file

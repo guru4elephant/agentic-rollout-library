@@ -1,0 +1,305 @@
+diff --git a/django/db/backends/ddl_references.py b/django/db/backends/ddl_references.py
+index c06386a2fa..923ce8cda1 100644
+--- a/django/db/backends/ddl_references.py
++++ b/django/db/backends/ddl_references.py
+@@ -65,10 +65,10 @@ class TableColumns(Table):
+         self.columns = columns
+ 
+     def references_column(self, table, column):
+-        return self.table == table and column in self.columns
++        return self.table.table == table and column in self.columns
+ 
+     def rename_column_references(self, table, old_column, new_column):
+-        if self.table == table:
++        if self.table.table == table:
+             for index, column in enumerate(self.columns):
+                 if column == old_column:
+                     self.columns[index] = new_column
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..eafc7dbef1
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.backends.ddl_references import Table, Columns
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++from django.db import connection
++
++def test_references_column_issue():
++    """Test to reproduce the issue where references_column always returns False"""
++    
++    # Create a table reference
++    table_obj = Table('test_table', lambda x: f'"{x}"')
++    
++    # Create columns reference
++    columns = Columns(table_obj, ['test_column'], lambda x: f'"{x}"')
++    
++    # Test references_column - this should return True but will return False due to the bug
++    result = columns.references_column('test_table', 'test_column')
++    print(f"references_column('test_table', 'test_column'): {result}")
++    print(f"Expected: True, Got: {result}")
++    
++    # The issue is that in TableColumns.references_column:
++    # self.table == table where:
++    # - self.table is a Table object (table_obj)
++    # - table is a string ('test_table')
++    # So the comparison fails
++    
++    # Let's also test the internal state
++    print(f"columns.table: {columns.table}")
++    print(f"columns.table.table: {columns.table.table}")
++    print(f"type(columns.table): {type(columns.table)}")
++    
++    return result
++
++if __name__ == '__main__':
++    result = test_references_column_issue()
++    if result:
++        print("✓ Test passed - no issue found")
++    else:
++        print("✗ Test failed - issue confirmed: references_column returns False when it should return True")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..eb5433d289
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.backends.ddl_references import Table, Columns, TableColumns
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++from django.db import connection
++
++def test_comprehensive():
++    """Comprehensive test to ensure the fix works for all scenarios"""
++    
++    print("Testing references_column method...")
++    
++    # Test 1: Basic functionality
++    table_obj = Table('test_table', lambda x: f'"{x}"')
++    columns = Columns(table_obj, ['test_column'], lambda x: f'"{x}"')
++    
++    result1 = columns.references_column('test_table', 'test_column')
++    print(f"✓ references_column('test_table', 'test_column'): {result1}")
++    assert result1 == True, "Should return True for matching table and column"
++    
++    result2 = columns.references_column('test_table', 'nonexistent_column')
++    print(f"✓ references_column('test_table', 'nonexistent_column'): {result2}")
++    assert result2 == False, "Should return False for non-matching column"
++    
++    result3 = columns.references_column('nonexistent_table', 'test_column')
++    print(f"✓ references_column('nonexistent_table', 'test_column'): {result3}")
++    assert result3 == False, "Should return False for non-matching table"
++    
++    print("\nTesting rename_column_references method...")
++    
++    # Test 2: rename_column_references
++    columns.rename_column_references('test_table', 'test_column', 'renamed_column')
++    result4 = columns.references_column('test_table', 'renamed_column')
++    print(f"✓ After rename, references_column('test_table', 'renamed_column'): {result4}")
++    assert result4 == True, "Should return True for renamed column"
++    
++    result5 = columns.references_column('test_table', 'test_column')
++    print(f"✓ After rename, references_column('test_table', 'test_column'): {result5}")
++    assert result5 == False, "Should return False for old column name"
++    
++    # Test 3: Verify the columns were actually renamed
++    print(f"✓ columns.columns: {columns.columns}")
++    assert columns.columns == ['renamed_column'], "Columns list should be updated"
++    
++    print("\nTesting with multiple columns...")
++    
++    # Test 4: Multiple columns
++    table_obj2 = Table('multi_table', lambda x: f'"{x}"')
++    multi_columns = Columns(table_obj2, ['col1', 'col2', 'col3'], lambda x: f'"{x}"')
++    
++    result6 = multi_columns.references_column('multi_table', 'col2')
++    print(f"✓ references_column('multi_table', 'col2'): {result6}")
++    assert result6 == True, "Should return True for existing column in multi-column setup"
++    
++    result7 = multi_columns.references_column('multi_table', 'col4')
++    print(f"✓ references_column('multi_table', 'col4'): {result7}")
++    assert result7 == False, "Should return False for non-existing column"
++    
++    # Test 5: Rename in multi-column setup
++    multi_columns.rename_column_references('multi_table', 'col2', 'renamed_col2')
++    result8 = multi_columns.references_column('multi_table', 'renamed_col2')
++    print(f"✓ After rename, references_column('multi_table', 'renamed_col2'): {result8}")
++    assert result8 == True, "Should return True for renamed column"
++    
++    result9 = multi_columns.references_column('multi_table', 'col2')
++    print(f"✓ After rename, references_column('multi_table', 'col2'): {result9}")
++    assert result9 == False, "Should return False for old column name"
++    
++    print(f"✓ multi_columns.columns: {multi_columns.columns}")
++    assert multi_columns.columns == ['col1', 'renamed_col2', 'col3'], "Multi-column list should be correctly updated"
++    
++    print("\nAll tests passed! ✓")
++    return True
++
++if __name__ == '__main__':
++    try:
++        test_comprehensive()
++        print("\n🎉 All comprehensive tests passed! The fix is working correctly.")
++    except AssertionError as e:
++        print(f"\n❌ Test failed: {e}")
++        sys.exit(1)
++    except Exception as e:
++        print(f"\n💥 Unexpected error: {e}")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_references_scenario.py b/test_references_scenario.py
+new file mode 100644
+index 0000000000..d135951af0
+--- /dev/null
++++ b/test_references_scenario.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++from django.db.models import Model, CharField
++from django.db.models.constraints import UniqueConstraint
++
++def test_references_scenario():
++    """Test the specific scenario mentioned in the GitHub issue"""
++    
++    class TestModel(Model):
++        name = CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test'
++            constraints = [
++                UniqueConstraint(fields=['name'], name='test_unique')
++            ]
++    
++    # Create the schema editor
++    with connection.schema_editor() as schema_editor:
++        # Create the model
++        schema_editor.create_model(TestModel)
++        print('✓ Model created successfully')
++        
++        # Now let's test the _create_unique_sql method specifically
++        # This is where the issue was occurring
++        unique_sql = schema_editor._create_unique_sql(
++            TestModel, 
++            ['name'], 
++            name='test_unique'
++        )
++        
++        print(f'✓ Unique SQL generated: {unique_sql}')
++        
++        # The issue was that references_column would always return False
++        # Let's test this by creating a Columns object and testing references_column
++        from django.db.backends.ddl_references import Table, Columns
++        
++        table_obj = Table(TestModel._meta.db_table, schema_editor.quote_name)
++        columns_obj = Columns(table_obj, ['name'], schema_editor.quote_name)
++        
++        # This should now return True (was False before the fix)
++        result = columns_obj.references_column(TestModel._meta.db_table, 'name')
++        print(f'✓ references_column({TestModel._meta.db_table}, "name"): {result}')
++        
++        if result:
++            print('✅ The issue has been fixed! references_column now returns True correctly')
++        else:
++            print('❌ The issue persists! references_column still returns False')
++            return False
++        
++        # Clean up
++        schema_editor.delete_model(TestModel)
++        print('✓ Model deleted successfully')
++    
++    return True
++
++if __name__ == '__main__':
++    try:
++        success = test_references_scenario()
++        if success:
++            print('\n🎉 All tests passed! The GitHub issue has been resolved.')
++        else:
++            print('\n❌ Tests failed! The issue persists.')
++            sys.exit(1)
++    except Exception as e:
++        print(f'\n💥 Unexpected error: {e}')
++        sys.exit(1)
+\ No newline at end of file

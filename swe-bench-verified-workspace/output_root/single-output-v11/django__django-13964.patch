@@ -1,0 +1,890 @@
+diff --git a/debug_foreign_key.py b/debug_foreign_key.py
+new file mode 100644
+index 0000000000..8acb21f8da
+--- /dev/null
++++ b/debug_foreign_key.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++"""
++Debug script to understand foreign key assignment behavior.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create simple test models
++class TestProduct(models.Model):
++    code = models.CharField(primary_key=True, max_length=50)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++class TestOrder(models.Model):
++    product = models.ForeignKey(TestProduct, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++def debug_foreign_key_assignment():
++    """Debug foreign key assignment behavior"""
++    print("=== Debugging Foreign Key Assignment ===")
++    
++    # Create a product without primary key
++    product = TestProduct()
++    print(f"Product created, code: '{product.code}'")
++    
++    # Create an order
++    order = TestOrder()
++    print(f"Order created, product_id: '{order.product_id}'")
++    
++    # Assign the product to the order
++    print("\nAssigning product to order...")
++    order.product = product
++    print(f"After assignment - product_id: '{order.product_id}'")
++    
++    # Now set the product's primary key
++    print("\nSetting product code...")
++    product.code = "test123"
++    print(f"Product code set to: '{product.code}'")
++    print(f"Order product_id after product code change: '{order.product_id}'")
++    
++    # Check if the foreign key field has a reference to the product object
++    print(f"\nOrder.product is product: {order.product is product}")
++    print(f"Order.product.code: '{order.product.code}'")
++    
++    # The issue: product_id doesn't get updated when product.code changes
++    print(f"\nISSUE: product_id is still '{order.product_id}' instead of '{product.code}'")
++
++if __name__ == "__main__":
++    debug_foreign_key_assignment()
+\ No newline at end of file
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 2428218696..0024c5907d 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -933,7 +933,13 @@ class Model(metaclass=ModelBase):
+                         "%s() prohibited to prevent data loss due to unsaved "
+                         "related object '%s'." % (operation_name, field.name)
+                     )
+-                elif getattr(self, field.attname) is None:
++                elif getattr(self, field.attname) is None or (
++                    # Handle the case where foreign key was set to empty string
++                    # due to assignment of unsaved related object with empty PK
++                    isinstance(getattr(self, field.attname), str) and 
++                    getattr(self, field.attname) == '' and
++                    obj.pk is not None
++                ):
+                     # Use pk from related object if it has been saved after
+                     # an assignment.
+                     setattr(self, field.attname, obj.pk)
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..f50c195f9f
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python3
++"""
++Final test that exactly reproduces the GitHub issue scenario.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, transaction
++
++# Exact models from the GitHub issue
++class Product(models.Model):
++    sku = models.CharField(primary_key=True, max_length=50)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++class Order(models.Model):
++    product = models.ForeignKey(Product, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++def create_tables():
++    """Create database tables for testing"""
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Product)
++        schema_editor.create_model(Order)
++
++def test_github_issue_exact():
++    """Test the exact scenario from the GitHub issue"""
++    print("=== Testing Exact GitHub Issue Scenario ===")
++    
++    # Test the problematic case from the issue
++    print("\n=== Previously problematic case ===")
++    try:
++        with transaction.atomic():
++            order = Order()
++            order.product = Product()
++            order.product.sku = "foo"
++            order.product.save()
++            order.save()
++            
++            # These assertions are from the GitHub issue
++            exists_empty = Order.objects.filter(product_id="").exists()
++            exists_correct = Order.objects.filter(product=order.product).exists()
++            
++            print(f"Order.objects.filter(product_id='').exists(): {exists_empty}")
++            print(f"Order.objects.filter(product=order.product).exists(): {exists_correct}")
++            
++            if exists_empty:
++                print("❌ ISSUE STILL EXISTS: product_id was set to empty string!")
++                return False
++            else:
++                print("✅ ISSUE FIXED: product_id correctly set to 'foo'!")
++                
++    except Exception as e:
++        print(f"Error in problematic case: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    
++    # Test the working case from the issue
++    print("\n=== Working case ===")
++    try:
++        with transaction.atomic():
++            order = Order()
++            order.product = Product(sku="bar")
++            order.product.save()
++            order.save()
++            
++            exists_correct = Order.objects.filter(product=order.product).exists()
++            print(f"Order.objects.filter(product=order.product).exists(): {exists_correct}")
++            
++            if not exists_correct:
++                print("❌ Working case broken!")
++                return False
++            else:
++                print("✅ Working case still functions correctly")
++                
++    except Exception as e:
++        print(f"Error in working case: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    
++    return True
++
++if __name__ == "__main__":
++    create_tables()
++    success = test_github_issue_exact()
++    
++    if success:
++        print("\n🎉 SUCCESS: The GitHub issue has been fixed!")
++        print("The foreign key value is now correctly updated when the related object's primary key changes.")
++    else:
++        print("\n❌ FAILURE: The issue is not fixed.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..7d79eeabd2
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue described in the GitHub issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'test_app',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, transaction
++
++# Define the models from the issue
++class Product(models.Model):
++    sku = models.CharField(primary_key=True, max_length=50)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Order(models.Model):
++    product = models.ForeignKey(Product, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_issue():
++    """Test the issue described in the GitHub issue"""
++    print("Testing the issue...")
++    
++    # Create database tables
++    from django.core.management.color import no_style
++    from django.db import connection
++    
++    style = no_style()
++    sql = connection.ops.sql_table_creation_suffix()
++    tables = connection.introspection.django_table_names()
++    
++    # Create tables manually since we're not using migrations
++    sqls = connection.ops.sql_create_table(Product._meta, style)
++    for sql in sqls:
++        connection.cursor().execute(sql)
++    
++    sqls = connection.ops.sql_create_table(Order._meta, style)
++    for sql in sqls:
++        connection.cursor().execute(sql)
++    
++    # Test case 1: The problematic case
++    print("\n=== Test Case 1: Problematic case ===")
++    try:
++        with transaction.atomic():
++            order = Order()
++            order.product = Product()
++            order.product.sku = "foo"
++            order.product.save()
++            order.save()
++            
++            # Check if the issue exists
++            exists_empty = Order.objects.filter(product_id="").exists()
++            exists_correct = Order.objects.filter(product=order.product).exists()
++            
++            print(f"Order.objects.filter(product_id='').exists(): {exists_empty}")
++            print(f"Order.objects.filter(product=order.product).exists(): {exists_correct}")
++            
++            if exists_empty:
++                print("❌ ISSUE REPRODUCED: product_id was set to empty string!")
++            else:
++                print("✅ Issue not reproduced")
++                
++    except Exception as e:
++        print(f"Error in test case 1: {e}")
++    
++    # Test case 2: The working case
++    print("\n=== Test Case 2: Working case ===")
++    try:
++        with transaction.atomic():
++            order = Order()
++            order.product = Product(sku="foo")
++            order.product.save()
++            order.save()
++            
++            exists_correct = Order.objects.filter(product=order.product).exists()
++            print(f"Order.objects.filter(product=order.product).exists(): {exists_correct}")
++            
++            if exists_correct:
++                print("✅ Working case functions correctly")
++            else:
++                print("❌ Working case also has issues")
++                
++    except Exception as e:
++        print(f"Error in test case 2: {e}")
++
++if __name__ == "__main__":
++    test_issue()
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..bf871db2fb
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""
++Simplified script to reproduce the issue without app complications.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, transaction
++
++# Create a simple test case that reproduces the core issue
++def test_foreign_key_assignment():
++    """Test foreign key assignment behavior"""
++    print("Testing foreign key assignment...")
++    
++    # Create a simple model structure
++    class TestProduct(models.Model):
++        code = models.CharField(primary_key=True, max_length=50)
++        
++        class Meta:
++            app_label = 'contenttypes'
++    
++    class TestOrder(models.Model):
++        product = models.ForeignKey(TestProduct, on_delete=models.CASCADE)
++        
++        class Meta:
++            app_label = 'contenttypes'
++    
++    # Test the problematic case
++    print("\n=== Problematic case ===")
++    try:
++        with transaction.atomic():
++            # Create product without primary key first
++            product = TestProduct()
++            print(f"Product before setting code: {product.code}")
++            
++            # Assign to foreign key
++            order = TestOrder()
++            order.product = product
++            print(f"Order product_id after assignment: {order.product_id}")
++            
++            # Now set the primary key
++            product.code = "test123"
++            print(f"Product after setting code: {product.code}")
++            print(f"Order product_id after product code change: {order.product_id}")
++            
++            # Save both
++            product.save()
++            order.save()
++            
++            print(f"Final order product_id: {order.product_id}")
++            
++            # Check what's in the database
++            from django.db import connection
++            cursor = connection.cursor()
++            cursor.execute("SELECT product_id FROM contenttypes_testorder")
++            rows = cursor.fetchall()
++            print(f"Database content: {rows}")
++            
++    except Exception as e:
++        print(f"Error: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_foreign_key_assignment()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..8c2c403e69
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,139 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for the foreign key fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, transaction
++
++# Test models
++class Product(models.Model):
++    sku = models.CharField(primary_key=True, max_length=50)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++class Order(models.Model):
++    product = models.ForeignKey(Product, on_delete=models.CASCADE, null=True)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++def create_tables():
++    """Create database tables for testing"""
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Product)
++        schema_editor.create_model(Order)
++
++def test_various_scenarios():
++    """Test various scenarios to ensure the fix works correctly"""
++    print("=== Comprehensive Foreign Key Fix Test ===")
++    
++    # Test 1: Original issue - assign empty product, then set PK, then save
++    print("\n1. Original issue scenario")
++    product = Product()
++    order = Order()
++    order.product = product
++    assert order.product_id == '', "Foreign key should be empty string initially"
++    
++    product.sku = "test123"
++    product.save()
++    order.save()
++    
++    assert order.product_id == "test123", f"Foreign key should be 'test123', got '{order.product_id}'"
++    print("✅ Original issue fixed")
++    
++    # Test 2: Assign product with PK already set
++    print("\n2. Assign product with PK already set")
++    product2 = Product(sku="test456")
++    order2 = Order()
++    order2.product = product2
++    assert order2.product_id == "test456", f"Foreign key should be 'test456', got '{order2.product_id}'"
++    
++    product2.save()
++    order2.save()
++    assert order2.product_id == "test456", "Foreign key should remain 'test456'"
++    print("✅ Pre-set PK works correctly")
++    
++    # Test 3: Assign None to foreign key
++    print("\n3. Assign None to foreign key")
++    order3 = Order()
++    order3.product = None
++    assert order3.product_id is None, f"Foreign key should be None, got '{order3.product_id}'"
++    order3.save()
++    print("✅ None assignment works correctly")
++    
++    # Test 4: Assign product, then change PK multiple times
++    print("\n4. Multiple PK changes")
++    product4 = Product()
++    order4 = Order()
++    order4.product = product4
++    assert order4.product_id == '', "Initial foreign key should be empty"
++    
++    product4.sku = "first"
++    assert order4.product_id == '', "Foreign key should not change until save"
++    
++    product4.sku = "second"
++    product4.save()
++    order4.save()
++    assert order4.product_id == "second", f"Foreign key should be 'second', got '{order4.product_id}'"
++    print("✅ Multiple PK changes handled correctly")
++    
++    # Test 5: Integer primary key (should work as before)
++    print("\n5. Integer primary key")
++    class IntProduct(models.Model):
++        id = models.AutoField(primary_key=True)
++        name = models.CharField(max_length=50)
++        
++        class Meta:
++            app_label = 'contenttypes'
++    
++    class IntOrder(models.Model):
++        product = models.ForeignKey(IntProduct, on_delete=models.CASCADE)
++        
++        class Meta:
++            app_label = 'contenttypes'
++    
++    # Create tables
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(IntProduct)
++        schema_editor.create_model(IntOrder)
++    
++    int_product = IntProduct(name="test")
++    int_order = IntOrder()
++    int_order.product = int_product
++    assert int_order.product_id is None, f"Integer FK should be None, got '{int_order.product_id}'"
++    
++    int_product.save()
++    int_order.save()
++    assert int_order.product_id == int_product.id, "Integer FK should match product ID"
++    print("✅ Integer primary key works correctly")
++
++if __name__ == "__main__":
++    create_tables()
++    test_various_scenarios()
++    print("\n🎉 All tests passed! The fix is working correctly.")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..f1b225ed4d
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the foreign key fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Test models
++class Product(models.Model):
++    sku = models.CharField(primary_key=True, max_length=50)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++class Order(models.Model):
++    product = models.ForeignKey(Product, on_delete=models.CASCADE, null=True)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++def create_tables():
++    """Create database tables for testing"""
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Product)
++        schema_editor.create_model(Order)
++
++def test_edge_cases():
++    """Test edge cases to ensure the fix doesn't break anything"""
++    print("=== Edge Cases Test ===")
++    
++    # Test 1: Foreign key already correctly set to non-empty string
++    print("\n1. Foreign key already correctly set")
++    product = Product(sku="correct")
++    order = Order()
++    order.product = product
++    assert order.product_id == "correct", f"FK should be 'correct', got '{order.product_id}'"
++    
++    # This should not change the foreign key value since it's already correct
++    product.save()
++    order.save()
++    assert order.product_id == "correct", f"FK should remain 'correct', got '{order.product_id}'"
++    print("✅ Already correct FK preserved")
++    
++    # Test 2: Foreign key set to empty string, but related object PK is also empty
++    print("\n2. Empty FK with empty PK")
++    product2 = Product()  # Empty PK
++    order2 = Order()
++    order2.product = product2
++    assert order2.product_id == '', f"FK should be empty, got '{order2.product_id}'"
++    
++    # Save without setting PK - should raise error
++    try:
++        product2.save()
++        print("❌ Should have raised error for empty PK")
++    except Exception as e:
++        print(f"✅ Correctly raised error for empty PK: {e}")
++    
++    # Test 3: Foreign key set to non-empty string that doesn't match related object PK
++    print("\n3. Mismatched FK and PK")
++    product3 = Product(sku="actual")
++    order3 = Order()
++    
++    # Manually set wrong foreign key value
++    order3.product_id = "wrong"
++    order3.product = product3
++    
++    # The assignment should override the manual setting
++    assert order3.product_id == "actual", f"FK should be 'actual', got '{order3.product_id}'"
++    print("✅ Assignment overrides manual FK setting")
++
++if __name__ == "__main__":
++    create_tables()
++    test_edge_cases()
++    print("\n🎉 All edge case tests passed!")
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..2ac5aa0fda
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++"""
++Test the exact scenario described in the GitHub issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, transaction
++
++# Define the exact models from the GitHub issue
++class Product(models.Model):
++    sku = models.CharField(primary_key=True, max_length=50)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++class Order(models.Model):
++    product = models.ForeignKey(Product, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++def test_github_issue():
++    """Test the exact scenario from the GitHub issue"""
++    print("=== Testing GitHub Issue Scenario ===")
++    
++    # Test case 1: The problematic case (should now work)
++    print("\n=== Test Case 1: Previously problematic case ===")
++    try:
++        with transaction.atomic():
++            order = Order()
++            order.product = Product()
++            order.product.sku = "foo"
++            order.product.save()
++            order.save()
++            
++            # Check if the issue is fixed
++            exists_empty = Order.objects.filter(product_id="").exists()
++            exists_correct = Order.objects.filter(product=order.product).exists()
++            
++            print(f"Order.objects.filter(product_id='').exists(): {exists_empty}")
++            print(f"Order.objects.filter(product=order.product).exists(): {exists_correct}")
++            
++            if exists_empty:
++                print("❌ ISSUE STILL EXISTS: product_id was set to empty string!")
++            else:
++                print("✅ ISSUE FIXED: product_id correctly set to 'foo'!")
++                
++    except Exception as e:
++        print(f"Error in test case 1: {e}")
++        import traceback
++        traceback.print_exc()
++    
++    # Test case 2: The working case (should still work)
++    print("\n=== Test Case 2: Working case ===")
++    try:
++        with transaction.atomic():
++            order = Order()
++            order.product = Product(sku="bar")
++            order.product.save()
++            order.save()
++            
++            exists_correct = Order.objects.filter(product=order.product).exists()
++            print(f"Order.objects.filter(product=order.product).exists(): {exists_correct}")
++            
++            if exists_correct:
++                print("✅ Working case still functions correctly")
++            else:
++                print("❌ Working case broken")
++                
++    except Exception as e:
++        print(f"Error in test case 2: {e}")
++        import traceback
++        traceback.print_exc()
++
++def create_tables():
++    """Create database tables for testing"""
++    from django.db import connection
++    
++    # Create tables for our models using the schema editor
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Product)
++        schema_editor.create_model(Order)
++
++if __name__ == "__main__":
++    create_tables()
++    test_github_issue()
+\ No newline at end of file
+diff --git a/test_prepare_related.py b/test_prepare_related.py
+new file mode 100644
+index 0000000000..eb79ab2164
+--- /dev/null
++++ b/test_prepare_related.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++"""
++Test the _prepare_related_fields_for_save method behavior.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create simple test models
++class TestProduct(models.Model):
++    code = models.CharField(primary_key=True, max_length=50)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++class TestOrder(models.Model):
++    product = models.ForeignKey(TestProduct, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'contenttypes'
++
++def test_prepare_related():
++    """Test _prepare_related_fields_for_save behavior"""
++    print("=== Testing _prepare_related_fields_for_save ===")
++    
++    # Create a product without primary key
++    product = TestProduct()
++    print(f"Product created, code: '{product.code}'")
++    
++    # Create an order
++    order = TestOrder()
++    print(f"Order created, product_id: {order.product_id}")
++    
++    # Assign the product to the order
++    order.product = product
++    print(f"After assignment - product_id: '{order.product_id}'")
++    
++    # Now set the product's primary key
++    product.code = "test123"
++    print(f"Product code set to: '{product.code}'")
++    print(f"Order product_id after product code change: '{order.product_id}'")
++    
++    # Check what _prepare_related_fields_for_save would do
++    print(f"\nTesting _prepare_related_fields_for_save:")
++    print(f"order.product_id is None: {order.product_id is None}")
++    print(f"order.product_id == '': {order.product_id == ''}")
++    
++    # Manually call the preparation method
++    try:
++        order._prepare_related_fields_for_save('test')
++        print(f"After _prepare_related_fields_for_save - product_id: '{order.product_id}'")
++    except Exception as e:
++        print(f"Error in _prepare_related_fields_for_save: {e}")
++
++if __name__ == "__main__":
++    test_prepare_related()
+\ No newline at end of file

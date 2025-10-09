@@ -1,0 +1,295 @@
+diff --git a/django/contrib/sessions/backends/base.py b/django/contrib/sessions/backends/base.py
+index b5453160a5..4932578c86 100644
+--- a/django/contrib/sessions/backends/base.py
++++ b/django/contrib/sessions/backends/base.py
+@@ -108,6 +108,13 @@ class SessionBase:
+ 
+     def encode(self, session_dict):
+         "Return the given session dictionary serialized and encoded as a string."
++        # RemovedInDjango40Warning: when the deprecation ends, remove this condition
++        # and always use signing.dumps().
++        if settings.DEFAULT_HASHING_ALGORITHM == 'sha1':
++            # Use legacy encoding during transition to maintain compatibility
++            serialized = self.serializer().dumps(session_dict)
++            hash = self._hash(serialized)
++            return base64.b64encode(hash.encode() + b":" + serialized).decode('ascii')
+         return signing.dumps(
+             session_dict, salt=self.key_salt, serializer=self.serializer,
+             compress=True,
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..5f8810fc26
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,116 @@
++#!/usr/bin/env python3
++"""
++Reproduce the session data decoding issue during transition to Django 3.1.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.contrib.sessions.backends.base import SessionBase
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key-for-reproduction',
++        DEFAULT_HASHING_ALGORITHM='sha1',  # This is the problematic setting
++        SESSION_SERIALIZER='django.contrib.sessions.serializers.JSONSerializer',
++        INSTALLED_APPS=[
++            'django.contrib.sessions',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_session_encoding_decoding():
++    """Test that session data can be encoded and decoded properly with sha1."""
++    print("Testing session encoding/decoding with DEFAULT_HASHING_ALGORITHM='sha1'")
++    print(f"Current DEFAULT_HASHING_ALGORITHM: {settings.DEFAULT_HASHING_ALGORITHM}")
++    
++    # Create a session instance
++    session = SessionBase()
++    
++    # Test data
++    test_data = {'user_id': 123, 'username': 'testuser'}
++    
++    try:
++        # Encode the session data
++        encoded_data = session.encode(test_data)
++        print(f"Encoded data: {encoded_data}")
++        
++        # Try to decode the session data
++        decoded_data = session.decode(encoded_data)
++        print(f"Decoded data: {decoded_data}")
++        
++        # Verify the data matches
++        if decoded_data == test_data:
++            print("SUCCESS: Session data encoded and decoded correctly!")
++            return True
++        else:
++            print(f"FAIL: Data mismatch. Expected: {test_data}, Got: {decoded_data}")
++            return False
++            
++    except Exception as e:
++        print(f"ERROR: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++def test_legacy_session_decoding():
++    """Test that legacy session data can be decoded."""
++    print("\nTesting legacy session decoding...")
++    
++    # Create a session instance
++    session = SessionBase()
++    
++    # Simulate creating legacy session data (pre-Django 3.1 format)
++    # This would be data encoded with the old _hash method
++    test_data = {'user_id': 123, 'username': 'testuser'}
++    
++    try:
++        # Manually create legacy format data
++        import base64
++        from django.utils.crypto import salted_hmac
++        
++        # Serialize the data using the same serializer
++        serialized = session.serializer().dumps(test_data)
++        
++        # Create the legacy hash using the old _hash method logic
++        key_salt = "django.contrib.sessions" + session.__class__.__name__
++        legacy_hash = salted_hmac(key_salt, serialized).hexdigest()
++        
++        # Create the legacy format: base64(hash + ':' + serialized_data)
++        legacy_encoded = legacy_hash.encode() + b':' + serialized
++        legacy_data = base64.b64encode(legacy_encoded).decode('ascii')
++        
++        print(f"Created legacy session data: {legacy_data}")
++        
++        # Try to decode the legacy data
++        decoded_data = session.decode(legacy_data)
++        print(f"Legacy decode result: {decoded_data}")
++        
++        if decoded_data == test_data:
++            print("SUCCESS: Legacy session data decoded correctly!")
++            return True
++        else:
++            print(f"FAIL: Data mismatch. Expected: {test_data}, Got: {decoded_data}")
++            return False
++            
++    except Exception as e:
++        print(f"Legacy decode failed: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == '__main__':
++    success1 = test_session_encoding_decoding()
++    success2 = test_legacy_session_decoding()
++    
++    if success1 and success2:
++        print("\nAll tests passed!")
++        sys.exit(0)
++    else:
++        print("\nSome tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..199d046fa0
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,147 @@
++#!/usr/bin/env python3
++"""
++Test the fix for session data decoding issue during transition to Django 3.1.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.contrib.sessions.backends.base import SessionBase
++
++def test_with_sha1():
++    """Test with DEFAULT_HASHING_ALGORITHM='sha1' (transition scenario)."""
++    print("=== Testing with DEFAULT_HASHING_ALGORITHM='sha1' ===")
++    
++    # Configure Django settings for transition scenario
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            SECRET_KEY='test-secret-key-for-transition',
++            DEFAULT_HASHING_ALGORITHM='sha1',
++            SESSION_SERIALIZER='django.contrib.sessions.serializers.JSONSerializer',
++            INSTALLED_APPS=['django.contrib.sessions'],
++            USE_TZ=True,
++        )
++    
++    django.setup()
++    
++    session = SessionBase()
++    test_data = {'user_id': 123, 'username': 'testuser'}
++    
++    # Test encoding with sha1 (should use legacy format)
++    encoded_data = session.encode(test_data)
++    print(f"Encoded with sha1: {encoded_data}")
++    
++    # Test decoding the same data
++    decoded_data = session.decode(encoded_data)
++    print(f"Decoded: {decoded_data}")
++    
++    # Verify it matches
++    if decoded_data == test_data:
++        print("✓ SUCCESS: sha1 encoding/decoding works correctly!")
++        return True
++    else:
++        print(f"✗ FAIL: Data mismatch. Expected: {test_data}, Got: {decoded_data}")
++        return False
++
++def test_with_sha256():
++    """Test with DEFAULT_HASHING_ALGORITHM='sha256' (normal scenario)."""
++    print("\n=== Testing with DEFAULT_HASHING_ALGORITHM='sha256' ===")
++    
++    # Clear existing configuration by resetting the module
++    import django.conf
++    django.conf.settings = django.conf.LazySettings()
++    
++    # Configure Django settings for normal scenario
++    from django.conf import settings
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key-for-normal',
++        DEFAULT_HASHING_ALGORITHM='sha256',
++        SESSION_SERIALIZER='django.contrib.sessions.serializers.JSONSerializer',
++        INSTALLED_APPS=['django.contrib.sessions'],
++        USE_TZ=True,
++    )
++    
++    django.setup()
++    
++    session = SessionBase()
++    test_data = {'user_id': 456, 'username': 'normaluser'}
++    
++    # Test encoding with sha256 (should use new signing format)
++    encoded_data = session.encode(test_data)
++    print(f"Encoded with sha256: {encoded_data}")
++    
++    # Test decoding the same data
++    decoded_data = session.decode(encoded_data)
++    print(f"Decoded: {decoded_data}")
++    
++    # Verify it matches
++    if decoded_data == test_data:
++        print("✓ SUCCESS: sha256 encoding/decoding works correctly!")
++        return True
++    else:
++        print(f"✗ FAIL: Data mismatch. Expected: {test_data}, Got: {decoded_data}")
++        return False
++
++def test_cross_compatibility():
++    """Test that data encoded with sha1 can be decoded with sha256 setup."""
++    print("\n=== Testing cross-compatibility ===")
++    
++    # First encode with sha1
++    import django.conf
++    django.conf.settings = django.conf.LazySettings()
++    from django.conf import settings
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key-cross',
++        DEFAULT_HASHING_ALGORITHM='sha1',
++        SESSION_SERIALIZER='django.contrib.sessions.serializers.JSONSerializer',
++        INSTALLED_APPS=['django.contrib.sessions'],
++        USE_TZ=True,
++    )
++    django.setup()
++    
++    session_sha1 = SessionBase()
++    test_data = {'cross': 'compatibility', 'test': True}
++    encoded_with_sha1 = session_sha1.encode(test_data)
++    print(f"Encoded with sha1: {encoded_with_sha1}")
++    
++    # Now try to decode with sha256 setup
++    import django.conf
++    django.conf.settings = django.conf.LazySettings()
++    from django.conf import settings
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key-cross',  # Same secret key!
++        DEFAULT_HASHING_ALGORITHM='sha256',
++        SESSION_SERIALIZER='django.contrib.sessions.serializers.JSONSerializer',
++        INSTALLED_APPS=['django.contrib.sessions'],
++        USE_TZ=True,
++    )
++    django.setup()
++    
++    session_sha256 = SessionBase()
++    decoded_data = session_sha256.decode(encoded_with_sha1)
++    print(f"Decoded with sha256: {decoded_data}")
++    
++    # This should work because the decode method falls back to legacy decoding
++    if decoded_data == test_data:
++        print("✓ SUCCESS: Cross-compatibility works correctly!")
++        return True
++    else:
++        print(f"✗ FAIL: Cross-compatibility failed. Expected: {test_data}, Got: {decoded_data}")
++        return False
++
++if __name__ == '__main__':
++    success1 = test_with_sha1()
++    success2 = test_with_sha256()
++    success3 = test_cross_compatibility()
++    
++    if success1 and success2 and success3:
++        print("\n🎉 All tests passed! The fix works correctly.")
++        sys.exit(0)
++    else:
++        print("\n❌ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file

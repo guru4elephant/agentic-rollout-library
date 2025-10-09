@@ -1,0 +1,623 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 69a5fbf389..db7df891e3 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -249,16 +249,17 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
+             return None
+         db = kwargs.get('using')
+ 
+-        autocomplete_fields = self.get_autocomplete_fields(request)
+-        if db_field.name in autocomplete_fields:
+-            kwargs['widget'] = AutocompleteSelectMultiple(db_field.remote_field, self.admin_site, using=db)
+-        elif db_field.name in self.raw_id_fields:
+-            kwargs['widget'] = widgets.ManyToManyRawIdWidget(db_field.remote_field, self.admin_site, using=db)
+-        elif db_field.name in [*self.filter_vertical, *self.filter_horizontal]:
+-            kwargs['widget'] = widgets.FilteredSelectMultiple(
+-                db_field.verbose_name,
+-                db_field.name in self.filter_vertical
+-            )
++        if 'widget' not in kwargs:
++            autocomplete_fields = self.get_autocomplete_fields(request)
++            if db_field.name in autocomplete_fields:
++                kwargs['widget'] = AutocompleteSelectMultiple(db_field.remote_field, self.admin_site, using=db)
++            elif db_field.name in self.raw_id_fields:
++                kwargs['widget'] = widgets.ManyToManyRawIdWidget(db_field.remote_field, self.admin_site, using=db)
++            elif db_field.name in [*self.filter_vertical, *self.filter_horizontal]:
++                kwargs['widget'] = widgets.FilteredSelectMultiple(
++                    db_field.verbose_name,
++                    db_field.name in self.filter_vertical
++                )
+ 
+         if 'queryset' not in kwargs:
+             queryset = self.get_field_queryset(db, db_field, request)
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..5a502cfdd2
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++"""
++Final test to verify the formfield_for_manytomany fix works correctly
++"""
++
++import os
++import sys
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Configure Django settings first
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test',
++    INSTALLED_APPS=['django.contrib.admin', 'django.contrib.auth', 'django.contrib.contenttypes'],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    USE_TZ=True,
++)
++
++import django
++django.setup()
++
++from django.contrib import admin
++from django.db import models
++from django import forms
++
++# Create test models
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class RelatedModel(models.Model):
++    name = models.CharField(max_length=100)
++    many_to_many = models.ManyToManyField(TestModel)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create a custom widget
++class CustomWidget(forms.SelectMultiple):
++    pass
++
++def test_widget_override():
++    """Test that formfield_for_manytomany respects widget override"""
++    
++    # Set up admin site
++    site = admin.AdminSite()
++    site.register(RelatedModel, admin.ModelAdmin)
++    
++    # Get the field
++    field = RelatedModel._meta.get_field('many_to_many')
++    
++    # Test 1: Call with custom widget in kwargs
++    print("Test 1: Custom widget override")
++    admin_instance = site._registry[RelatedModel]
++    kwargs = {'widget': CustomWidget()}
++    
++    try:
++        result = admin_instance.formfield_for_manytomany(field, None, **kwargs)
++        if isinstance(result.widget, CustomWidget):
++            print("✓ SUCCESS: Custom widget was preserved!")
++        else:
++            print("✗ FAILED: Custom widget was overridden!")
++            return False
++    except Exception as e:
++        print(f"✗ ERROR: {e}")
++        return False
++    
++    # Test 2: Default behavior (no widget in kwargs)
++    print("\nTest 2: Default behavior")
++    kwargs = {}
++    
++    try:
++        result = admin_instance.formfield_for_manytomany(field, None, **kwargs)
++        print(f"✓ SUCCESS: Default widget type: {type(result.widget).__name__}")
++    except Exception as e:
++        print(f"✗ ERROR: {e}")
++        return False
++    
++    # Test 3: Verify the fix matches formfield_for_foreignkey behavior
++    print("\nTest 3: Comparing with formfield_for_foreignkey behavior")
++    
++    # Create a ForeignKey field for comparison
++    class ForeignKeyModel(models.Model):
++        name = models.CharField(max_length=100)
++        foreign_key = models.ForeignKey(TestModel, on_delete=models.CASCADE)
++        
++        class Meta:
++            app_label = 'test'
++    
++    site.register(ForeignKeyModel, admin.ModelAdmin)
++    fk_field = ForeignKeyModel._meta.get_field('foreign_key')
++    fk_admin_instance = site._registry[ForeignKeyModel]
++    
++    # Test both methods with custom widget
++    m2m_kwargs = {'widget': CustomWidget()}
++    fk_kwargs = {'widget': CustomWidget()}
++    
++    m2m_result = admin_instance.formfield_for_manytomany(field, None, **m2m_kwargs)
++    fk_result = fk_admin_instance.formfield_for_foreignkey(fk_field, None, **fk_kwargs)
++    
++    m2m_preserved = isinstance(m2m_result.widget, CustomWidget)
++    fk_preserved = isinstance(fk_result.widget, CustomWidget)
++    
++    if m2m_preserved and fk_preserved:
++        print("✓ SUCCESS: Both methods preserve custom widgets!")
++        return True
++    else:
++        print(f"✗ FAILED: M2M preserved: {m2m_preserved}, FK preserved: {fk_preserved}")
++        return False
++
++if __name__ == '__main__':
++    success = test_widget_override()
++    print(f"\nOverall test result: {'PASSED' if success else 'FAILED'}")
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..950dd21842
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with formfield_for_manytomany not allowing widget overrides.
++"""
++
++import os
++import sys
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Configure Django settings first
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test',
++    INSTALLED_APPS=['django.contrib.admin', 'django.contrib.auth', 'django.contrib.contenttypes'],
++    USE_TZ=True,
++)
++
++import django
++django.setup()
++
++from django.contrib.admin import ModelAdmin
++from django.db import models
++from django import forms
++
++# Create a simple test model with a ManyToManyField
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    related_items = models.ManyToManyField('self')
++    
++    class Meta:
++        app_label = 'test'
++
++# Create a custom widget
++class CustomWidget(forms.SelectMultiple):
++    pass
++
++# Test the behavior directly by examining the method
++if __name__ == '__main__':
++    from django.contrib.admin.options import ModelAdmin
++    
++    # Create a minimal ModelAdmin instance with required arguments
++    admin = ModelAdmin(None, None)
++    
++    # Create a mock db_field with ManyToManyField properties
++    class MockDBField:
++        name = 'test_field'
++        remote_field = type('obj', (object,), {
++            'through': type('obj', (object,), {
++                '_meta': type('obj', (object,), {
++                    'auto_created': True
++                })()
++            })()
++        })()
++    
++    # Create a mock request
++    class MockRequest:
++        pass
++    
++    db_field = MockDBField()
++    request = MockRequest()
++    
++    # Test 1: Call with custom widget in kwargs
++    print("Test 1: Calling with custom widget in kwargs")
++    kwargs = {'widget': CustomWidget()}
++    try:
++        result = admin.formfield_for_manytomany(db_field, request, **kwargs)
++        print(f"Result widget type: {type(result.widget)}")
++        print(f"Is CustomWidget? {isinstance(result.widget, CustomWidget)}")
++    except Exception as e:
++        print(f"Error: {e}")
++    
++    # Test 2: Check if the method overwrites existing widget
++    print("\nTest 2: Checking if method respects existing widget")
++    admin.raw_id_fields = ['test_field']  # This should trigger widget override
++    kwargs = {'widget': CustomWidget()}
++    try:
++        result = admin.formfield_for_manytomany(db_field, request, **kwargs)
++        print(f"Result widget type: {type(result.widget)}")
++        print(f"Is CustomWidget? {isinstance(result.widget, CustomWidget)}")
++        print(f"Is ManyToManyRawIdWidget? {'ManyToManyRawIdWidget' in str(type(result.widget))}")
++    except Exception as e:
++        print(f"Error: {e}")
+\ No newline at end of file
+diff --git a/run_admin_ordering_test.py b/run_admin_ordering_test.py
+new file mode 100644
+index 0000000000..64d208585c
+--- /dev/null
++++ b/run_admin_ordering_test.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++"""
++Run a specific test from admin_ordering to verify our changes don't break existing functionality
++"""
++
++import os
++import sys
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Configure Django settings first
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test',
++    INSTALLED_APPS=[
++        'django.contrib.admin', 
++        'django.contrib.auth', 
++        'django.contrib.contenttypes',
++        'tests.admin_ordering',
++    ],
++    USE_TZ=True,
++)
++
++import django
++django.setup()
++
++from django.contrib import admin
++from django.test import TestCase
++from tests.admin_ordering.models import Band, Song
++from tests.admin_ordering.tests import MockRequest, MockSuperUser
++
++def test_admin_ordering():
++    """Test that the admin ordering functionality still works"""
++    
++    # Set up the test environment
++    request = MockRequest()
++    request.user = MockSuperUser()
++    site = admin.AdminSite()
++    
++    # Create test data
++    b1 = Band.objects.create(name='Radiohead', bio='', rank=1)
++    b2 = Band.objects.create(name='Aerosmith', bio='', rank=3)
++    
++    # Register the models with admin
++    from django.contrib.admin import ModelAdmin
++    site.register(Band, ModelAdmin)
++    site.register(Song, ModelAdmin)
++    
++    # Test formfield_for_manytomany
++    print("Testing formfield_for_manytomany...")
++    try:
++        admin_instance = site._registry[Song]
++        field = Song._meta.get_field('other_interpreters')
++        
++        # Test without widget override
++        result = admin_instance.formfield_for_manytomany(field, request)
++        print(f"✓ Default behavior works - Widget type: {type(result.widget).__name__}")
++        
++        # Test with widget override
++        from django import forms
++        class TestWidget(forms.SelectMultiple):
++            pass
++            
++        kwargs = {'widget': TestWidget()}
++        result = admin_instance.formfield_for_manytomany(field, request, **kwargs)
++        
++        if isinstance(result.widget, TestWidget):
++            print("✓ Widget override works - Custom widget preserved")
++        else:
++            print("✗ Widget override failed - Custom widget was overridden")
++            return False
++            
++        return True
++        
++    except Exception as e:
++        print(f"✗ Error: {e}")
++        return False
++
++if __name__ == '__main__':
++    success = test_admin_ordering()
++    print(f"\nTest {'PASSED' if success else 'FAILED'}")
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_default_behavior.py b/test_default_behavior.py
+new file mode 100644
+index 0000000000..e644c61208
+--- /dev/null
++++ b/test_default_behavior.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++"""
++Test to verify that formfield_for_manytomany default behavior still works
++"""
++
++import os
++import sys
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Configure Django settings first
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test',
++    INSTALLED_APPS=['django.contrib.admin', 'django.contrib.auth', 'django.contrib.contenttypes'],
++    USE_TZ=True,
++)
++
++import django
++django.setup()
++
++from django.contrib import admin
++from django.db import models
++
++# Create test models
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class RelatedModel(models.Model):
++    name = models.CharField(max_length=100)
++    many_to_many = models.ManyToManyField(TestModel)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_default_behavior():
++    """Test that formfield_for_manytomany default behavior still works"""
++    
++    # Set up admin site
++    site = admin.AdminSite()
++    site.register(RelatedModel, admin.ModelAdmin)
++    
++    # Get the field
++    field = RelatedModel._meta.get_field('many_to_many')
++    
++    # Test: Call the method without custom widget
++    print("Test: Calling without custom widget in kwargs")
++    admin_instance = site._registry[RelatedModel]
++    kwargs = {}
++    
++    try:
++        result = admin_instance.formfield_for_manytomany(field, None, **kwargs)
++        widget_type = type(result.widget)
++        print(f"Widget type: {widget_type.__name__}")
++        
++        # Should use default widget (likely FilteredSelectMultiple)
++        print("✓ SUCCESS: Default widget behavior works!")
++        return True
++            
++    except Exception as e:
++        print(f"✗ ERROR: {e}")
++        return False
++
++if __name__ == '__main__':
++    success = test_default_behavior()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..7029717897
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the formfield_for_manytomany fix
++"""
++
++import os
++import sys
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Configure Django settings first
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test',
++    INSTALLED_APPS=['django.contrib.admin', 'django.contrib.auth', 'django.contrib.contenttypes'],
++    USE_TZ=True,
++)
++
++import django
++django.setup()
++
++from django.contrib.admin.options import ModelAdmin
++from django import forms
++
++# Create a custom widget
++class CustomWidget(forms.SelectMultiple):
++    pass
++
++# Create a simple test
++def test_widget_override():
++    """Test that formfield_for_manytomany respects widget override"""
++    
++    # Create a mock db_field
++    class MockDBField:
++        name = 'test_field'
++        remote_field = type('obj', (object,), {
++            'through': type('obj', (object,), {
++                '_meta': type('obj', (object,), {
++                    'auto_created': True
++                })()
++            })()
++        })()
++    
++    # Create a mock request
++    class MockRequest:
++        pass
++    
++    # Create a ModelAdmin instance
++    class TestModelAdmin(ModelAdmin):
++        def __init__(self):
++            # Bypass normal initialization for testing
++            self.model = None
++            self.admin_site = None
++            self.raw_id_fields = []
++            self.filter_vertical = []
++            self.filter_horizontal = []
++        
++        def get_field_queryset(self, db, db_field, request):
++            # Override to avoid accessing admin_site._registry
++            return None
++    
++    admin = TestModelAdmin()
++    db_field = MockDBField()
++    request = MockRequest()
++    
++    # Test 1: Call without widget in kwargs (should use default behavior)
++    print("Test 1: No widget in kwargs")
++    kwargs = {}
++    try:
++        result = admin.formfield_for_manytomany(db_field, request, **kwargs)
++        print(f"✓ Success - Widget type: {type(result.widget).__name__}")
++    except Exception as e:
++        print(f"✗ Error: {e}")
++    
++    # Test 2: Call with custom widget in kwargs (should respect our widget)
++    print("\nTest 2: Custom widget in kwargs")
++    kwargs = {'widget': CustomWidget()}
++    try:
++        result = admin.formfield_for_manytomany(db_field, request, **kwargs)
++        widget_type = type(result.widget)
++        print(f"Widget type: {widget_type.__name__}")
++        print(f"Is CustomWidget? {isinstance(result.widget, CustomWidget)}")
++        if isinstance(result.widget, CustomWidget):
++            print("✓ Success - Custom widget was preserved!")
++        else:
++            print("✗ Failed - Custom widget was overridden!")
++    except Exception as e:
++        print(f"✗ Error: {e}")
++    
++    # Test 3: Test with raw_id_fields (should still respect our widget)
++    print("\nTest 3: Custom widget with raw_id_fields")
++    admin.raw_id_fields = ['test_field']
++    kwargs = {'widget': CustomWidget()}
++    try:
++        result = admin.formfield_for_manytomany(db_field, request, **kwargs)
++        widget_type = type(result.widget)
++        print(f"Widget type: {widget_type.__name__}")
++        print(f"Is CustomWidget? {isinstance(result.widget, CustomWidget)}")
++        if isinstance(result.widget, CustomWidget):
++            print("✓ Success - Custom widget was preserved despite raw_id_fields!")
++        else:
++            print("✗ Failed - Custom widget was overridden by raw_id_fields!")
++    except Exception as e:
++        print(f"✗ Error: {e}")
++
++if __name__ == '__main__':
++    test_widget_override()
+\ No newline at end of file
+diff --git a/test_widget_fix.py b/test_widget_fix.py
+new file mode 100644
+index 0000000000..c44f1f4baf
+--- /dev/null
++++ b/test_widget_fix.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""
++Test to verify that formfield_for_manytomany respects widget overrides
++"""
++
++import os
++import sys
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Configure Django settings first
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test',
++    INSTALLED_APPS=['django.contrib.admin', 'django.contrib.auth', 'django.contrib.contenttypes'],
++    USE_TZ=True,
++)
++
++import django
++django.setup()
++
++from django.contrib import admin
++from django.db import models
++from django import forms
++
++# Create test models
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class RelatedModel(models.Model):
++    name = models.CharField(max_length=100)
++    many_to_many = models.ManyToManyField(TestModel)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create a custom widget
++class CustomWidget(forms.SelectMultiple):
++    pass
++
++# Create a ModelAdmin that tries to override the widget
++class TestModelAdmin(admin.ModelAdmin):
++    def formfield_for_manytomany(self, db_field, request, **kwargs):
++        if db_field.name == 'many_to_many':
++            # Try to override the widget
++            kwargs['widget'] = CustomWidget()
++        return super().formfield_for_manytomany(db_field, request, **kwargs)
++
++def test_widget_override():
++    """Test that formfield_for_manytomany respects widget override"""
++    
++    # Set up admin site
++    site = admin.AdminSite()
++    site.register(RelatedModel, TestModelAdmin)
++    
++    # Get the field
++    field = RelatedModel._meta.get_field('many_to_many')
++    
++    # Test 1: Call the method directly with custom widget
++    print("Test 1: Calling with custom widget in kwargs")
++    admin_instance = site._registry[RelatedModel]
++    kwargs = {'widget': CustomWidget()}
++    
++    try:
++        result = admin_instance.formfield_for_manytomany(field, None, **kwargs)
++        widget_type = type(result.widget)
++        print(f"Widget type: {widget_type.__name__}")
++        print(f"Is CustomWidget? {isinstance(result.widget, CustomWidget)}")
++        
++        if isinstance(result.widget, CustomWidget):
++            print("✓ SUCCESS: Custom widget was preserved!")
++            return True
++        else:
++            print("✗ FAILED: Custom widget was overridden!")
++            return False
++            
++    except Exception as e:
++        print(f"✗ ERROR: {e}")
++        return False
++
++if __name__ == '__main__':
++    success = test_widget_override()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

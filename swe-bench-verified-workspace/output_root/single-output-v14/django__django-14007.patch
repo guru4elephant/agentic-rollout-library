@@ -1,0 +1,439 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 387deca527..87b730ae5f 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -504,6 +504,9 @@ class QuerySet:
+                 )
+                 for obj_with_pk, results in zip(objs_with_pk, returned_columns):
+                     for result, field in zip(results, opts.db_returning_fields):
++                        # Apply field converters (including from_db_value)
++                        for converter in field.get_db_converters(self.db):
++                            result = converter(result, field, self.db)
+                         if field != opts.pk:
+                             setattr(obj_with_pk, field.attname, result)
+                 for obj_with_pk in objs_with_pk:
+@@ -518,6 +521,9 @@ class QuerySet:
+                     assert len(returned_columns) == len(objs_without_pk)
+                 for obj_without_pk, results in zip(objs_without_pk, returned_columns):
+                     for result, field in zip(results, opts.db_returning_fields):
++                        # Apply field converters (including from_db_value)
++                        for converter in field.get_db_converters(self.db):
++                            result = converter(result, field, self.db)
+                         setattr(obj_without_pk, field.attname, result)
+                     obj_without_pk._state.adding = False
+                     obj_without_pk._state.db = self.db
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index f02199d97c..150c665d0e 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -1411,14 +1411,32 @@ class SQLInsertCompiler(SQLCompiler):
+                 cursor.execute(sql, params)
+             if not self.returning_fields:
+                 return []
++            
++            # Get the returned values from the database
+             if self.connection.features.can_return_rows_from_bulk_insert and len(self.query.objs) > 1:
+-                return self.connection.ops.fetch_returned_insert_rows(cursor)
+-            if self.connection.features.can_return_columns_from_insert:
++                returned_rows = self.connection.ops.fetch_returned_insert_rows(cursor)
++            elif self.connection.features.can_return_columns_from_insert:
+                 assert len(self.query.objs) == 1
+-                return [self.connection.ops.fetch_returned_insert_columns(cursor, self.returning_params)]
+-            return [(self.connection.ops.last_insert_id(
+-                cursor, self.query.get_meta().db_table, self.query.get_meta().pk.column
+-            ),)]
++                returned_rows = [self.connection.ops.fetch_returned_insert_columns(cursor, self.returning_params)]
++            else:
++                returned_rows = [(self.connection.ops.last_insert_id(
++                    cursor, self.query.get_meta().db_table, self.query.get_meta().pk.column
++                ),)]
++            
++            # Apply field converters to the returned values
++            if returned_rows and self.returning_fields:
++                converted_rows = []
++                for row in returned_rows:
++                    converted_row = []
++                    for value, field in zip(row, self.returning_fields):
++                        # Apply field converters (including from_db_value)
++                        for converter in field.get_db_converters(self.connection):
++                            value = converter(value, field, self.connection)
++                        converted_row.append(value)
++                    converted_rows.append(converted_row)
++                return converted_rows
++            
++            return returned_rows
+ 
+ 
+ class SQLDeleteCompiler(SQLCompiler):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..424e967870
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,113 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the Django testbed to the path
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Define a custom field wrapper
++class MyIntWrapper:
++    def __init__(self, value):
++        self.value = value
++    
++    def __repr__(self):
++        return f"<MyIntWrapper: {self.value}>"
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return self.value == other
++
++# Define the custom field
++class MyAutoField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        return int(value)
++
++# Define the model
++class AutoModel(models.Model):
++    id = MyAutoField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the issue
++def test_issue():
++    from django.db import connection
++    from django.test.utils import CaptureQueriesContext
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(AutoModel)
++    
++    # Test 1: Query existing instances (should work correctly)
++    print("=== Testing query existing instances ===")
++    am1 = AutoModel.objects.create()
++    print(f"Created instance: {am1}")
++    print(f"ID type: {type(am1.id)}, value: {am1.id}")
++    
++    # Query it back
++    queried = AutoModel.objects.first()
++    print(f"Queried instance: {queried}")
++    print(f"ID type: {type(queried.id)}, value: {queried.id}")
++    
++    # Test 2: Create new instance (should show the issue)
++    print("\n=== Testing create new instance ===")
++    am2 = AutoModel.objects.create()
++    print(f"Created instance: {am2}")
++    print(f"ID type: {type(am2.id)}, value: {am2.id}")
++    
++    # The issue: am2.id should be MyIntWrapper but it's int
++    
++    # Test 3: Bulk create (should also show the issue)
++    print("\n=== Testing bulk create ===")
++    ams = [AutoModel()]
++    created = AutoModel.objects.bulk_create(ams)
++    print(f"Bulk created instances: {created}")
++    if created:
++        print(f"First instance ID type: {type(created[0].id)}, value: {created[0].id}")
++    print(f"Original instance ID type: {type(ams[0].id)}, value: {ams[0].id}")
++    
++    # Test 4: Test with multiple objects in bulk create
++    print("\n=== Testing bulk create with multiple objects ===")
++    ams_multi = [AutoModel(), AutoModel(), AutoModel()]
++    created_multi = AutoModel.objects.bulk_create(ams_multi)
++    print(f"Bulk created multiple instances: {created_multi}")
++    for i, obj in enumerate(created_multi):
++        print(f"Instance {i} ID type: {type(obj.id)}, value: {obj.id}")
++    for i, obj in enumerate(ams_multi):
++        print(f"Original instance {i} ID type: {type(obj.id)}, value: {obj.id}")
++
++if __name__ == "__main__":
++    test_issue()
+\ No newline at end of file
+diff --git a/reproduce_issue_postgres.py b/reproduce_issue_postgres.py
+new file mode 100644
+index 0000000000..71234eadbe
+--- /dev/null
++++ b/reproduce_issue_postgres.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the Django testbed to the path
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
++
++import django
++from django.conf import settings
++
++# Configure Django settings for PostgreSQL
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.postgresql',
++                'NAME': 'testdb',
++                'USER': 'postgres',
++                'PASSWORD': 'password',
++                'HOST': 'localhost',
++                'PORT': '5432',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Define a custom field wrapper
++class MyIntWrapper:
++    def __init__(self, value):
++        self.value = value
++    
++    def __repr__(self):
++        return f"<MyIntWrapper: {self.value}>"
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return self.value == other
++
++# Define the custom field
++class MyAutoField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        return int(value)
++
++# Define the model
++class AutoModel(models.Model):
++    id = MyAutoField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the issue
++def test_issue():
++    from django.db import connection
++    from django.test.utils import CaptureQueriesContext
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(AutoModel)
++    
++    # Test 1: Query existing instances (should work correctly)
++    print("=== Testing query existing instances ===")
++    am1 = AutoModel.objects.create()
++    print(f"Created instance: {am1}")
++    print(f"ID type: {type(am1.id)}, value: {am1.id}")
++    
++    # Query it back
++    queried = AutoModel.objects.first()
++    print(f"Queried instance: {queried}")
++    print(f"ID type: {type(queried.id)}, value: {queried.id}")
++    
++    # Test 2: Create new instance (should show the issue)
++    print("\n=== Testing create new instance ===")
++    am2 = AutoModel.objects.create()
++    print(f"Created instance: {am2}")
++    print(f"ID type: {type(am2.id)}, value: {am2.id}")
++    
++    # The issue: am2.id should be MyIntWrapper but it's int
++    
++    # Test 3: Bulk create (should also show the issue)
++    print("\n=== Testing bulk create ===")
++    ams = [AutoModel()]
++    created = AutoModel.objects.bulk_create(ams)
++    print(f"Bulk created instances: {created}")
++    if created:
++        print(f"First instance ID type: {type(created[0].id)}, value: {created[0].id}")
++    print(f"Original instance ID type: {type(ams[0].id)}, value: {ams[0].id}")
++
++if __name__ == "__main__":
++    test_issue()
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 0000000000..9f45cf8896
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,131 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the Django testbed to the path
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Define a custom field wrapper
++class MyIntWrapper:
++    def __init__(self, value):
++        self.value = value
++    
++    def __repr__(self):
++        return f"<MyIntWrapper: {self.value}>"
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return self.value == other
++
++# Define the custom field
++class MyAutoField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        if isinstance(value, MyIntWrapper):
++            return value.value
++        return int(value)
++
++# Define the model
++class AutoModel(models.Model):
++    id = MyAutoField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_comprehensive():
++    """Test the fix comprehensively"""
++    from django.db import connection
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(AutoModel)
++    
++    print("=== Comprehensive Test ===")
++    
++    # Test 1: Regular create() operation
++    print("1. Testing regular create() operation...")
++    obj1 = AutoModel.objects.create()
++    print(f"   Created object: {obj1}")
++    print(f"   ID type: {type(obj1.id)}, value: {obj1.id}")
++    assert isinstance(obj1.id, MyIntWrapper), f"Expected MyIntWrapper, got {type(obj1.id)}"
++    print("   ✓ PASS: create() returns wrapped value")
++    
++    # Test 2: Querying the object back
++    print("2. Testing query operation...")
++    queried = AutoModel.objects.get(id=obj1.id.value)
++    print(f"   Queried object: {queried}")
++    print(f"   ID type: {type(queried.id)}, value: {queried.id}")
++    assert isinstance(queried.id, MyIntWrapper), f"Expected MyIntWrapper, got {type(queried.id)}"
++    assert queried.id.value == obj1.id.value, "ID values don't match"
++    print("   ✓ PASS: query returns wrapped value")
++    
++    # Test 3: Multiple create operations
++    print("3. Testing multiple create() operations...")
++    obj2 = AutoModel.objects.create()
++    obj3 = AutoModel.objects.create()
++    print(f"   Object 2: {obj2}, ID type: {type(obj2.id)}")
++    print(f"   Object 3: {obj3}, ID type: {type(obj3.id)}")
++    assert isinstance(obj2.id, MyIntWrapper), f"Expected MyIntWrapper, got {type(obj2.id)}"
++    assert isinstance(obj3.id, MyIntWrapper), f"Expected MyIntWrapper, got {type(obj3.id)}"
++    print("   ✓ PASS: multiple create() operations return wrapped values")
++    
++    # Test 4: Bulk create (though SQLite doesn't support returning values)
++    print("4. Testing bulk create...")
++    bulk_objs = [AutoModel(), AutoModel()]
++    created = AutoModel.objects.bulk_create(bulk_objs)
++    print(f"   Bulk created objects: {created}")
++    # For SQLite, we expect None values since it doesn't support returning values
++    if created and created[0].id is not None:
++        print(f"   First object ID type: {type(created[0].id)}, value: {created[0].id}")
++        # If we get a value (shouldn't happen with SQLite), check it's wrapped
++        if created[0].id is not None:
++            assert isinstance(created[0].id, MyIntWrapper), f"Expected MyIntWrapper, got {type(created[0].id)}"
++    print("   ✓ PASS: bulk create handled correctly")
++    
++    # Test 5: Test with objects that have explicit PKs
++    print("5. Testing objects with explicit PKs...")
++    obj_with_pk = AutoModel(id=MyIntWrapper(100))
++    obj_with_pk.save()
++    print(f"   Object with explicit PK: {obj_with_pk}")
++    print(f"   ID type: {type(obj_with_pk.id)}, value: {obj_with_pk.id}")
++    assert isinstance(obj_with_pk.id, MyIntWrapper), f"Expected MyIntWrapper, got {type(obj_with_pk.id)}"
++    assert obj_with_pk.id.value == 100, "Explicit PK value not preserved"
++    print("   ✓ PASS: objects with explicit PKs work correctly")
++    
++    print("\n=== All tests passed! ===")
++    print("The fix successfully ensures that from_db_value is called for returning fields on insert operations.")
++
++if __name__ == "__main__":
++    test_comprehensive()
+\ No newline at end of file

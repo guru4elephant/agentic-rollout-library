@@ -1,0 +1,355 @@
+diff --git a/debug_sql.py b/debug_sql.py
+new file mode 100644
+index 0000000000..c91c1c2d83
+--- /dev/null
++++ b/debug_sql.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++# Minimal setup to examine SQL generation
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++import django
++django.setup()
++
++# Import the models module directly to avoid app registry issues
++from django.db import models
++
++# Create a simple model with Meta.ordering
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++    
++    class Meta:
++        ordering = ['name']
++        app_label = 'test'
++
++# Create a query and examine the SQL
++from django.db.models import Count
++from django.db.models.sql.query import Query
++
++# Create a query object with annotation (this triggers GROUP BY)
++query = Query(TestModel)
++query.add_annotation(Count('id'), 'count')
++query.group_by = True  # This triggers grouping by all select fields
++
++# Check if set_group_by is called
++print(f"Before set_group_by: query.group_by = {query.group_by}")
++
++# Manually call set_group_by to see what happens
++query.set_group_by()
++print(f"After set_group_by: query.group_by = {query.group_by}")
++
++# Test case 1: Default ordering (Meta.ordering)
++print("=== Test Case 1: Default ordering (Meta.ordering) ===")
++
++# Test case 2: Explicit ordering
++print("=== Test Case 2: Explicit ordering ===")
++query2 = Query(TestModel)
++query2.add_annotation(Count('id'), 'count')
++query2.group_by = True
++query2.add_ordering('name')  # Explicit order_by
++
++# Get the SQL compiler
++from django.db.models.sql.compiler import SQLCompiler
++from django.db import connections
++
++compiler = SQLCompiler(query, connections['default'], 'default')
++
++# Debug: Check query properties
++print(f"query.default_ordering: {query.default_ordering}")
++print(f"query.select: {query.select}")
++print(f"query.order_by: {query.order_by}")
++
++# Check what's in the select clause in detail
++if query.select:
++    for i, expr in enumerate(query.select):
++        print(f"select[{i}]: {expr}, name: {getattr(expr, 'name', 'N/A')}, target: {getattr(expr, 'target', 'N/A')}")
++else:
++    print("select clause is empty")
++
++sql, params = compiler.as_sql()
++
++print("Generated SQL:")
++print(sql)
++print("Parameters:", params)
++
++# Check if GROUP BY includes ordering fields
++if 'GROUP BY' in sql:
++    group_by_part = sql.split('GROUP BY')[1].split('ORDER BY')[0].strip()
++    print(f"GROUP BY clause: {group_by_part}")
++    
++    if 'name' in group_by_part:
++        print("❌ BUG: Meta.ordering field 'name' is included in GROUP BY")
++    else:
++        print("✅ OK: Meta.ordering field 'name' is NOT included in GROUP BY")
++else:
++    print("No GROUP BY clause found")
+\ No newline at end of file
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 850734709d..57a6d4ce30 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -122,13 +122,28 @@ class SQLCompiler:
+             # by reference.
+             if expr in ref_sources:
+                 continue
++            # Skip Meta.ordering fields when using default ordering
++            if self.query.default_ordering and self.query.get_meta().ordering:
++                # Check if this field is part of Meta.ordering
++                field_name = getattr(expr, 'name', None) or getattr(expr, 'target', None)
++                if field_name:
++                    meta_ordering_fields = set()
++                    for ordering_field in self.query.get_meta().ordering:
++                        base_field_name = ordering_field.lstrip('-')
++                        if '__' in base_field_name:
++                            base_field_name = base_field_name.split('__')[0]
++                        meta_ordering_fields.add(base_field_name)
++                    
++                    if field_name in meta_ordering_fields:
++                        continue
+             cols = expr.get_group_by_cols()
+             for col in cols:
+                 expressions.append(col)
+         for expr, (sql, params, is_ref) in order_by:
+             # Skip References to the select clause, as all expressions in the
+             # select clause are already part of the group by.
+-            if not is_ref:
++            # Also skip ordering from Meta.ordering as it should not affect GROUP BY
++            if not is_ref and not self.query.default_ordering:
+                 expressions.extend(expr.get_group_by_cols())
+         having_group_by = self.having.get_group_by_cols() if self.having else ()
+         for expr in having_group_by:
+diff --git a/reproduce_groupby_issue.py b/reproduce_groupby_issue.py
+new file mode 100644
+index 0000000000..2293fddee6
+--- /dev/null
++++ b/reproduce_groupby_issue.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++# Use Django's test framework to properly set up the environment
++from django.test.utils import get_runner
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'tests.queries',
++        ],
++        USE_TZ=True,
++    )
++
++from django.db.models import Count
++from tests.queries.models import Tag
++
++# Create a test runner to set up the database
++TestRunner = get_runner(settings)
++test_runner = TestRunner()
++test_runner.setup_test_environment()
++old_config = test_runner.setup_databases()
++
++try:
++    # Create test data
++    Tag.objects.create(name='A')
++    Tag.objects.create(name='B')
++    Tag.objects.create(name='C')
++
++    # Test the issue: Meta.ordering fields should not be in GROUP BY
++    print("Testing GROUP BY query with Meta.ordering...")
++    queryset = Tag.objects.values('name').annotate(count=Count('id'))
++    print("SQL Query:")
++    print(str(queryset.query))
++
++    # Check if the GROUP BY clause includes the ordering field 'name'
++    sql = str(queryset.query)
++    if 'GROUP BY' in sql:
++        group_by_clause = sql.split('GROUP BY')[1].split('ORDER BY')[0].strip()
++        print(f"GROUP BY clause: {group_by_clause}")
++        
++        # Check if 'name' (from Meta.ordering) is in the GROUP BY
++        if 'name' in group_by_clause:
++            print("❌ BUG: Meta.ordering field 'name' is included in GROUP BY")
++        else:
++            print("✅ OK: Meta.ordering field 'name' is NOT included in GROUP BY")
++    else:
++        print("No GROUP BY clause found")
++
++finally:
++    # Clean up
++    test_runner.teardown_databases(old_config)
++    test_runner.teardown_test_environment()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..39e82ebd52
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'reproduce_issue',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count
++
++# Create a simple model with Meta.ordering
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++    
++    class Meta:
++        ordering = ['name']  # This should not affect GROUP BY queries
++        app_label = 'test'
++
++# Create the tables
++from django.db import connection
++connection.creation.create_test_db(verbosity=0)
++
++# Create some test data
++TestModel.objects.create(name='A', value=1)
++TestModel.objects.create(name='B', value=2)
++TestModel.objects.create(name='C', value=3)
++
++# Test the issue: Meta.ordering fields should not be in GROUP BY
++print("Testing GROUP BY query with Meta.ordering...")
++queryset = TestModel.objects.values('value').annotate(count=Count('id'))
++print("SQL Query:")
++print(str(queryset.query))
++
++# Check if the GROUP BY clause includes the ordering field 'name'
++sql = str(queryset.query)
++if 'GROUP BY' in sql:
++    group_by_clause = sql.split('GROUP BY')[1].split('ORDER BY')[0].strip()
++    print(f"GROUP BY clause: {group_by_clause}")
++    
++    # Check if 'name' (from Meta.ordering) is in the GROUP BY
++    if 'name' in group_by_clause:
++        print("❌ BUG: Meta.ordering field 'name' is included in GROUP BY")
++    else:
++        print("✅ OK: Meta.ordering field 'name' is NOT included in GROUP BY")
++else:
++    print("No GROUP BY clause found")
++
++# Clean up
++connection.creation.destroy_test_db(None)
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..fcd4ab83c0
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++# Configure minimal Django settings first
++import django
++from django.conf import settings
++
++# Use existing test models instead of creating new ones
++from tests.ordering.models import Article
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'tests.ordering',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Count
++
++# Test the issue: Meta.ordering fields should not be in GROUP BY
++print("Testing GROUP BY query with Meta.ordering...")
++
++# Article model has Meta.ordering
++queryset = Article.objects.values('headline').annotate(count=Count('id'))
++print("SQL Query:")
++print(str(queryset.query))
++
++# Check if the GROUP BY clause includes ordering fields
++sql = str(queryset.query)
++if 'GROUP BY' in sql:
++    group_by_clause = sql.split('GROUP BY')[1].split('ORDER BY')[0].strip()
++    print(f"GROUP BY clause: {group_by_clause}")
++    
++    # Check if ordering fields (like 'pub_date') are in the GROUP BY
++    ordering_fields = ['pub_date', 'headline', 'author', 'second_author']
++    found_ordering_fields = []
++    for field in ordering_fields:
++        if field in group_by_clause:
++            found_ordering_fields.append(field)
++    
++    if found_ordering_fields:
++        print(f"❌ BUG: Meta.ordering fields {found_ordering_fields} are included in GROUP BY")
++    else:
++        print("✅ OK: Meta.ordering fields are NOT included in GROUP BY")
++else:
++    print("No GROUP BY clause found")
+\ No newline at end of file

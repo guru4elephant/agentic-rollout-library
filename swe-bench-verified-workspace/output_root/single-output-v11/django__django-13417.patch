@@ -1,0 +1,230 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 85cd8311a7..e1c51be61b 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1225,6 +1225,9 @@ class QuerySet:
+         if self.query.extra_order_by or self.query.order_by:
+             return True
+         elif self.query.default_ordering and self.query.get_meta().ordering:
++            # Check if GROUP BY would nullify meta ordering
++            if self.query.group_by and not (self.query.extra_order_by or self.query.order_by):
++                return False
+             return True
+         else:
+             return False
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..b4c585ff90
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count
++
++# Create a test model with Meta.ordering
++class Foo(models.Model):
++    uuid = models.UUIDField(primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        ordering = ['name']
++        app_label = 'test'
++
++# We don't need to create tables for this test, just examine the query structure
++
++# Test the issue
++print("=== Testing QuerySet.ordered property ===")
++
++# Test 1: Basic query without annotation
++qs = Foo.objects.all()
++print(f"Basic query ordered: {qs.ordered}")
++print(f"Basic query default_ordering: {qs.query.default_ordering}")
++print(f"Basic query SQL: {str(qs.query)}")
++print()
++
++# Test 2: Query with annotation (GROUP BY)
++qs2 = Foo.objects.annotate(pk_count=Count("pk")).all()
++print(f"Annotated query ordered: {qs2.ordered}")
++print(f"Annotated query default_ordering: {qs2.query.default_ordering}")
++print(f"Annotated query SQL: {str(qs2.query)}")
++print()
++
++# Test 3: Check if GROUP BY is set
++print(f"Basic query has group_by: {bool(qs.query.group_by)}")
++print(f"Annotated query has group_by: {bool(qs2.query.group_by)}")
+\ No newline at end of file
+diff --git a/run_specific_test.py b/run_specific_test.py
+new file mode 100644
+index 0000000000..0deb272e31
+--- /dev/null
++++ b/run_specific_test.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.test import TestCase
++from django.db.models import Count
++
++# Import the test model
++try:
++    from tests.queries.models import Annotation
++except ImportError:
++    # Fallback: Create a simple test model without ordering
++    from django.db import models
++    
++    class Annotation(models.Model):
++        name = models.CharField(max_length=10)
++        
++        class Meta:
++            app_label = 'test'
++
++class TestOrderedProperty(TestCase):
++    def test_annotated_ordering(self):
++        qs = Annotation.objects.annotate(num_notes=Count('notes'))
++        self.assertIs(qs.ordered, False)
++        self.assertIs(qs.order_by('num_notes').ordered, True)
++
++if __name__ == '__main__':
++    test = TestOrderedProperty()
++    test.test_annotated_ordering()
++    print("Test passed!")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..b225da0d63
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count
++
++# Create a test model with Meta.ordering
++class Foo(models.Model):
++    uuid = models.UUIDField(primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        ordering = ['name']
++        app_label = 'test'
++
++print("=== Testing edge cases ===")
++
++# Test 1: Basic query without annotation (should be ordered)
++qs = Foo.objects.all()
++print(f"Basic query ordered: {qs.ordered}")
++print(f"Basic query has group_by: {bool(qs.query.group_by)}")
++print()
++
++# Test 2: Query with annotation (GROUP BY, should NOT be ordered)
++qs2 = Foo.objects.annotate(pk_count=Count("pk")).all()
++print(f"Annotated query ordered: {qs2.ordered}")
++print(f"Annotated query has group_by: {bool(qs2.query.group_by)}")
++print()
++
++# Test 3: Query with explicit order_by (should be ordered even with GROUP BY)
++qs3 = Foo.objects.annotate(pk_count=Count("pk")).order_by('name')
++print(f"Annotated with explicit order_by ordered: {qs3.ordered}")
++print(f"Annotated with explicit order_by has group_by: {bool(qs3.query.group_by)}")
++print()
++
++# Test 4: Query with extra_order_by (should be ordered even with GROUP BY)
++qs4 = Foo.objects.annotate(pk_count=Count("pk")).extra(order_by=['name'])
++print(f"Annotated with extra_order_by ordered: {qs4.ordered}")
++print(f"Annotated with extra_order_by has group_by: {bool(qs4.query.group_by)}")
++print()
++
++# Test 5: Model without Meta.ordering (should NOT be ordered)
++class Bar(models.Model):
++    uuid = models.UUIDField(primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++qs5 = Bar.objects.annotate(pk_count=Count("pk")).all()
++print(f"Model without ordering, annotated query ordered: {qs5.ordered}")
++print(f"Model without ordering, annotated query has group_by: {bool(qs5.query.group_by)}")
++print()
++
++# Test 6: Query with default_ordering=False (should NOT be ordered)
++qs6 = Foo.objects.annotate(pk_count=Count("pk")).all()
++qs6.query.default_ordering = False
++print(f"Annotated query with default_ordering=False ordered: {qs6.ordered}")
++print(f"Annotated query with default_ordering=False has group_by: {bool(qs6.query.group_by)}")
+\ No newline at end of file

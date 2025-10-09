@@ -1,0 +1,215 @@
+diff --git a/django/utils/autoreload.py b/django/utils/autoreload.py
+index b6af5f5491..d452c4343b 100644
+--- a/django/utils/autoreload.py
++++ b/django/utils/autoreload.py
+@@ -224,7 +224,13 @@ def get_child_arguments():
+     # see https://docs.python.org/3/reference/import.html#main-spec
+     # __spec__ may not exist, e.g. when running in a Conda env.
+     if getattr(__main__, '__spec__', None) is not None and __main__.__spec__.parent:
+-        args += ['-m', __main__.__spec__.parent]
++        # Use __spec__.name for modules, __spec__.parent for packages
++        if __main__.__spec__.name.endswith('.__main__'):
++            # This is a package with __main__.py, use the parent (package name)
++            args += ['-m', __main__.__spec__.parent]
++        else:
++            # This is a module, use the full module name
++            args += ['-m', __main__.__spec__.name]
+         args += sys.argv[1:]
+     elif not py_script.exists():
+         # sys.argv[0] may not exist for several reasons on Windows.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..6ab7b1960f
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++"""Script to reproduce the autoreload issue with python -m module.submodule"""
++
++import sys
++import os
++from pathlib import Path
++
++# Add testbed to path so we can import django modules
++sys.path.insert(0, '/testbed')
++
++from django.utils import autoreload
++
++def test_get_child_arguments():
++    """Test the get_child_arguments function with different module scenarios"""
++    
++    print("Testing get_child_arguments function...")
++    print("=" * 50)
++    
++    # Test 1: Regular script execution (python script.py)
++    print("Test 1: Regular script execution")
++    print("Expected: [sys.executable, script.py, ...]")
++    result = autoreload.get_child_arguments()
++    print(f"Result: {result}")
++    print()
++    
++    # Test 2: Simulate -m package.module (where module is a .py file)
++    # This is the problematic case mentioned in the issue
++    print("Test 2: Simulate -m package.module (module is .py file)")
++    print("Issue: Should preserve full module path, not truncate to package")
++    
++    # Create a mock __main__ module with spec that has parent
++    import types
++    main_module = types.ModuleType('__main__')
++    
++    # Case where we have a module spec with parent (e.g., -m foo.bar.baz)
++    spec = types.SimpleNamespace()
++    spec.parent = 'foo.bar'  # This represents the package
++    spec.name = 'foo.bar.baz'  # This represents the full module path
++    main_module.__spec__ = spec
++    
++    # Replace the real __main__ temporarily
++    original_main = sys.modules['__main__']
++    sys.modules['__main__'] = main_module
++    
++    try:
++        result = autoreload.get_child_arguments()
++        print(f"Result: {result}")
++        print("Problem: The arguments should preserve the full module path 'foo.bar.baz'")
++        print("But currently they might truncate it to just 'foo.bar'")
++    finally:
++        # Restore original __main__
++        sys.modules['__main__'] = original_main
++    
++    print()
++    
++    # Test 3: Simulate -m package (where package has __main__.py)
++    print("Test 3: Simulate -m package (package with __main__.py)")
++    print("This should work correctly as it's already handled properly")
++    
++    main_module = types.ModuleType('__main__')
++    spec = types.SimpleNamespace()
++    spec.parent = 'foo.bar'  # This represents a package
++    spec.name = 'foo.bar'  # This represents the full module path for a package
++    main_module.__spec__ = spec
++    
++    original_main = sys.modules['__main__']
++    sys.modules['__main__'] = main_module
++    
++    try:
++        result = autoreload.get_child_arguments()
++        print(f"Result: {result}")
++    finally:
++        sys.modules['__main__'] = original_main
++
++if __name__ == '__main__':
++    test_get_child_arguments()
+\ No newline at end of file
+diff --git a/test_module b/test_module
+new file mode 100644
+index 0000000000..161691927d
+--- /dev/null
++++ b/test_module
+@@ -0,0 +1,18 @@
++#!/usr/bin/env python3
++"""Test module to check __spec__.parent behavior"""
++
++import sys
++import types
++
++def main():
++    print("Running test_module")
++    spec = getattr(sys.modules['__main__'], '__spec__', None)
++    if spec:
++        print(f"__spec__: {spec}")
++        print(f"__spec__.name: {spec.name}")
++        print(f"__spec__.parent: {spec.parent}")
++    else:
++        print("No __spec__ attribute found")
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+diff --git a/test_package/__init__.py b/test_package/__init__.py
+new file mode 100644
+index 0000000000..5c8cacb548
+--- /dev/null
++++ b/test_package/__init__.py
+@@ -0,0 +1 @@
++# Empty init file to make it a package
+\ No newline at end of file
+diff --git a/test_package/test_module.py b/test_package/test_module.py
+new file mode 100644
+index 0000000000..fbbbd71e17
+--- /dev/null
++++ b/test_package/test_module.py
+@@ -0,0 +1,18 @@
++#!/usr/bin/env python3
++"""Test module to check __spec__.parent behavior"""
++
++import sys
++import types
++
++def main():
++    print("Running test_package.test_module")
++    spec = getattr(sys.modules['__main__'], '__spec__', None)
++    if spec:
++        print(f"__spec__: {spec}")
++        print(f"__spec__.name: {spec.name}")
++        print(f"__spec__.parent: {spec.parent}")
++    else:
++        print("No __spec__ attribute found")
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+diff --git a/test_spec_behavior.py b/test_spec_behavior.py
+new file mode 100644
+index 0000000000..407619dc5d
+--- /dev/null
++++ b/test_spec_behavior.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++"""Test the behavior of __spec__.parent for different module types"""
++
++import sys
++import types
++import os
++from pathlib import Path
++
++def test_spec_behavior():
++    print("Testing __spec__.parent behavior")
++    print("=" * 50)
++    
++    # Test 1: Create a mock spec for a package (has __main__.py)
++    print("Test 1: Package with __main__.py")
++    spec = types.SimpleNamespace()
++    spec.parent = 'mypackage'  # This is what __spec__.parent returns for packages
++    print(f"spec.parent: {spec.parent}")
++    print()
++    
++    # Test 2: Create a mock spec for a module within a package (module.py)
++    print("Test 2: Module within a package (mypackage.mymodule)")
++    spec2 = types.SimpleNamespace()
++    spec2.parent = 'mypackage'  # This is the issue! It should be 'mypackage.mymodule'
++    print(f"spec.parent: {spec2.parent}")
++    print("Problem: The parent attribute returns the package, not the full module path")
++    print()
++    
++    # Test 3: What should happen for a dotted module path
++    print("Test 3: What should happen for python -m mypackage.mymodule")
++    print("Current behavior: args = ['-m', 'mypackage']")
++    print("Expected behavior: args = ['-m', 'mypackage.mymodule']")
++    print()
++    
++    # Let's check what the actual __main__.__spec__ looks like
++    print("Actual __main__.__spec__ info:")
++    main_spec = getattr(sys.modules['__main__'], '__spec__', None)
++    if main_spec:
++        print(f"__main__.__spec__: {main_spec}")
++        if hasattr(main_spec, 'parent'):
++            print(f"__main__.__spec__.parent: {main_spec.parent}")
++        if hasattr(main_spec, 'name'):
++            print(f"__main__.__spec__.name: {main_spec.name}")
++    else:
++        print("No __spec__ attribute on __main__")
++    print()
++
++if __name__ == '__main__':
++    test_spec_behavior()
+\ No newline at end of file

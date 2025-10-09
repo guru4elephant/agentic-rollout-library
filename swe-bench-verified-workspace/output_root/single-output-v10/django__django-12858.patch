@@ -1,0 +1,461 @@
+diff --git a/app/__init__.py b/app/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/app/models.py b/app/models.py
+new file mode 100644
+index 0000000000..8b733846b9
+--- /dev/null
++++ b/app/models.py
+@@ -0,0 +1,20 @@
++from django.db import models
++
++class Product(models.Model):
++    parent = models.ForeignKey('self', models.CASCADE, null=True)
++    
++    class Meta:
++        app_label = 'app'
++
++class Supply(models.Model):
++    product = models.ForeignKey(Product, models.CASCADE)
++    
++    class Meta:
++        app_label = 'app'
++
++class Stock(models.Model):
++    supply = models.ForeignKey(Supply, models.CASCADE)
++    
++    class Meta:
++        app_label = 'app'
++        ordering = ['supply__product__parent__isnull']
+\ No newline at end of file
+diff --git a/debug_ordering.py b/debug_ordering.py
+new file mode 100644
+index 0000000000..4526a23277
+--- /dev/null
++++ b/debug_ordering.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to the Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'app',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from app.models import Stock
++
++# Let's debug what happens in the _check_ordering method
++from django.db.models.base import Model
++
++# Monkey patch the _check_ordering method to add debug info
++original_check_ordering = Model._check_ordering
++
++def debug_check_ordering(cls):
++    print(f"Checking ordering for {cls}")
++    print(f"Ordering: {cls._meta.ordering}")
++    
++    errors = original_check_ordering(cls)
++    print(f"Found errors: {errors}")
++    return errors
++
++Model._check_ordering = classmethod(debug_check_ordering)
++
++# Run the check
++from django.core.checks import run_checks
++
++errors = run_checks()
++print("Check completed")
++for error in errors:
++    print(f"Error: {error}")
+\ No newline at end of file
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 6c9e9d3707..a3c01b99b5 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -1747,7 +1747,8 @@ class Model(metaclass=ModelBase):
+                     else:
+                         _cls = None
+                 except (FieldDoesNotExist, AttributeError):
+-                    if fld is None or fld.get_transform(part) is None:
++                    # If fld is None, we can't check lookups, so it's an error
++                    if fld is None:
+                         errors.append(
+                             checks.Error(
+                                 "'ordering' refers to the nonexistent field, "
+@@ -1756,6 +1757,22 @@ class Model(metaclass=ModelBase):
+                                 id='models.E015',
+                             )
+                         )
++                    # If fld is not None, check if the part is a valid transform or lookup
++                    else:
++                        # First check if it's a valid transform
++                        transform = fld.get_transform(part)
++                        if transform is None:
++                            # If not a transform, check if it's a valid lookup
++                            lookup = fld.get_lookup(part)
++                            if lookup is None:
++                                errors.append(
++                                    checks.Error(
++                                        "'ordering' refers to the nonexistent field, "
++                                        "related field, or lookup '%s'." % field,
++                                        obj=cls,
++                                        id='models.E015',
++                                    )
++                                )
+ 
+         # Skip ordering on pk. This is always a valid order_by field
+         # but is an alias and therefore won't be found by opts.get_field.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..9b594a4f97
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,47 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to the Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'app',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Import the models from the app module
++from app.models import Stock
++
++# Run the check to reproduce the error
++from django.core.checks import run_checks
++
++try:
++    errors = run_checks()
++    print("Check completed without error")
++    for error in errors:
++        print(f"Error: {error}")
++except Exception as e:
++    print(f"Exception occurred: {e}")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..2d905c3764
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the testbed directory to the Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core.checks import run_checks
++
++# Test 1: Original issue - isnull lookup should work
++class Product(models.Model):
++    parent = models.ForeignKey('self', models.CASCADE, null=True)
++    
++    class Meta:
++        app_label = 'test_app1'
++
++class Supply(models.Model):
++    product = models.ForeignKey(Product, models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app1'
++
++class Stock(models.Model):
++    supply = models.ForeignKey(Supply, models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app1'
++        ordering = ['supply__product__parent__isnull']
++
++# Test 2: Other lookups should work too
++class ModelWithLookup(models.Model):
++    date_field = models.DateField(null=True)
++    
++    class Meta:
++        app_label = 'test_app2'
++        ordering = ['date_field__year']
++
++# Test 3: Transforms should still work
++class ModelWithTransform(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app3'
++        ordering = ['name__lower']
++
++# Test 4: Invalid field should still raise error
++class ModelWithInvalidField(models.Model):
++    class Meta:
++        app_label = 'test_app4'
++        ordering = ['nonexistent_field']
++
++# Test 5: Invalid lookup should still raise error
++class ModelWithInvalidLookup(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app5'
++        ordering = ['name__nonexistent_lookup']
++
++# Run checks
++errors = run_checks()
++
++# Count errors for each test case
++test_cases = {
++    'isnull lookup': 'supply__product__parent__isnull',
++    'year lookup': 'date_field__year', 
++    'lower transform': 'name__lower',
++    'invalid field': 'nonexistent_field',
++    'invalid lookup': 'name__nonexistent_lookup'
++}
++
++results = {}
++for test_name, search_term in test_cases.items():
++    matching_errors = [e for e in errors if search_term in str(e)]
++    results[test_name] = len(matching_errors)
++
++print("Test results:")
++for test_name, error_count in results.items():
++    status = "PASS" if error_count == 0 else "FAIL"
++    if test_name in ['invalid field', 'invalid lookup']:
++        status = "PASS" if error_count > 0 else "FAIL"
++    print(f"{test_name}: {status} ({error_count} errors)")
++
++print(f"\nTotal errors: {len(errors)}")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..848551a7db
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the testbed directory to the Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'app',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core.checks import run_checks
++
++# Test case 1: Invalid field should still raise error
++class InvalidModel(models.Model):
++    class Meta:
++        app_label = 'test_app'
++        ordering = ['nonexistent_field']
++
++errors = run_checks()
++invalid_errors = [e for e in errors if 'nonexistent_field' in str(e)]
++print(f"Invalid field errors: {len(invalid_errors)}")
++
++# Test case 2: Valid transform should work
++class TransformModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ['name__lower']
++
++errors = run_checks()
++transform_errors = [e for e in errors if 'name__lower' in str(e)]
++print(f"Transform errors: {len(transform_errors)}")
++
++# Test case 3: Valid lookup (isnull) should work
++class LookupModel(models.Model):
++    parent = models.ForeignKey('self', models.CASCADE, null=True)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ['parent__isnull']
++
++errors = run_checks()
++lookup_errors = [e for e in errors if 'parent__isnull' in str(e)]
++print(f"Lookup errors: {len(lookup_errors)}")
++
++# Test case 4: Invalid lookup should raise error
++class InvalidLookupModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ['name__nonexistent_lookup']
++
++errors = run_checks()
++invalid_lookup_errors = [e for e in errors if 'name__nonexistent_lookup' in str(e)]
++print(f"Invalid lookup errors: {len(invalid_lookup_errors)}")
++
++print("Edge case testing completed!")
+\ No newline at end of file
+diff --git a/test_ordering_fix.py b/test_ordering_fix.py
+new file mode 100644
+index 0000000000..5ff417d87e
+--- /dev/null
++++ b/test_ordering_fix.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the testbed directory to the Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'app',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from app.models import Stock
++
++# Test that the ordering validation now works correctly
++from django.core.checks import run_checks
++
++print("Running system checks...")
++errors = run_checks()
++print(f"Number of errors: {len(errors)}")
++
++for error in errors:
++    print(f"Error: {error}")
++
++# Test that the actual ordering works
++from django.db import connection
++from django.db import models
++
++# Create the tables
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Stock)
++
++# Test the ordering works in practice
++try:
++    # This should work without raising an error
++    queryset = Stock.objects.order_by('supply__product__parent__isnull')
++    print("Ordering by 'supply__product__parent__isnull' works!")
++except Exception as e:
++    print(f"Error during ordering: {e}")
++
++try:
++    # This should also work without raising an error
++    queryset = Stock.objects.order_by('-supply__product__parent__isnull')
++    print("Ordering by '-supply__product__parent__isnull' works!")
++except Exception as e:
++    print(f"Error during ordering: {e}")
++
++print("Test completed successfully!")
+\ No newline at end of file

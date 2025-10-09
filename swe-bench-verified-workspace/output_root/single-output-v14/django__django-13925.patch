@@ -1,0 +1,347 @@
+diff --git a/django/db/models/options.py b/django/db/models/options.py
+index 4028e05b99..2a4adef460 100644
+--- a/django/db/models/options.py
++++ b/django/db/models/options.py
+@@ -280,6 +280,9 @@ class Options:
+                 if already_created:
+                     field = already_created[0]
+                 field.primary_key = True
++                # When promoting a parent link to be the primary key, it's no longer
++                # an auto-created field but an inherited primary key
++                field.auto_created = False
+                 self.setup_pk(field)
+             else:
+                 pk_class = self._get_default_pk_class()
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..655809d0cd
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.core import checks
++
++# Create test models that reproduce the issue
++class Entity(models.Model):
++    id = models.BigAutoField(primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        abstract = True
++
++# Test case 1: Regular inheritance from abstract base with explicit PK
++class User(Entity):
++    email = models.EmailField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Test case 2: Another inherited model
++class ReservedUsername(Entity):
++    username = models.CharField(max_length=50)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Test case 3: Model without explicit primary key (should trigger warning)
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Test case 4: Multi-level inheritance
++class BaseModel(models.Model):
++    custom_id = models.BigAutoField(primary_key=True)
++    created_at = models.DateTimeField(auto_now_add=True)
++    
++    class Meta:
++        abstract = True
++
++class ExtendedModel(BaseModel):
++    extra_field = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Check for warnings
++print("Checking for W042 warnings...")
++errors = checks.run_checks()
++w042_errors = [error for error in errors if error.id == 'models.W042']
++
++if w042_errors:
++    print(f"Found {len(w042_errors)} W042 warnings:")
++    for error in w042_errors:
++        print(f"  - {error.obj}: {error.msg}")
++else:
++    print("No W042 warnings found.")
++
++# Let's also inspect the models to understand the issue
++print("\nModel inspection:")
++print(f"User._meta.pk: {User._meta.pk}")
++print(f"User._meta.pk.auto_created: {User._meta.pk.auto_created}")
++print(f"ReservedUsername._meta.pk: {ReservedUsername._meta.pk}")
++print(f"ReservedUsername._meta.pk.auto_created: {ReservedUsername._meta.pk.auto_created}")
+\ No newline at end of file
+diff --git a/test_inheritance_fix.py b/test_inheritance_fix.py
+new file mode 100644
+index 0000000000..e9033e6954
+--- /dev/null
++++ b/test_inheritance_fix.py
+@@ -0,0 +1,137 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.core import checks
++
++# Test case that reproduces the exact issue from the GitHub issue
++# Models which inherit from other models and should inherit the primary key
++
++class Entity(models.Model):
++    id = models.BigAutoField(primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# These models should inherit the primary key from Entity and NOT trigger W042
++class User(Entity):
++    email = models.EmailField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++class ReservedUsername(Entity):
++    username = models.CharField(max_length=50)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Block(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Feedback(models.Model):
++    message = models.TextField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++class ReadMark(models.Model):
++    bookmarked = models.BooleanField(default=False)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Follow(models.Model):
++    followed_at = models.DateTimeField(auto_now_add=True)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Friend(models.Model):
++    since = models.DateField(auto_now_add=True)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class FriendshipRequest(models.Model):
++    message = models.TextField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++class UserLike(models.Model):
++    liked = models.BooleanField(default=True)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Image(models.Model):
++    caption = models.CharField(max_length=200)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Check for warnings
++print("Checking for W042 warnings...")
++errors = checks.run_checks()
++w042_errors = [error for error in errors if error.id == 'models.W042']
++
++if w042_errors:
++    print(f"Found {len(w042_errors)} W042 warnings:")
++    for error in w042_errors:
++        print(f"  - {error.obj}: {error.msg}")
++        print(f"    PK: {error.obj._meta.pk}")
++        print(f"    PK.auto_created: {error.obj._meta.pk.auto_created}")
++else:
++    print("No W042 warnings found.")
++
++# Let's also inspect the models to understand the issue
++print("\nModel inspection:")
++print(f"Entity._meta.pk: {Entity._meta.pk}")
++print(f"Entity._meta.pk.auto_created: {Entity._meta.pk.auto_created}")
++print(f"User._meta.pk: {User._meta.pk}")
++print(f"User._meta.pk.auto_created: {User._meta.pk.auto_created}")
++print(f"ReservedUsername._meta.pk: {ReservedUsername._meta.pk}")
++print(f"ReservedUsername._meta.pk.auto_created: {ReservedUsername._meta.pk.auto_created}")
++
++# Check that models without explicit PKs still get warnings
++print(f"\nBlock._meta.pk: {Block._meta.pk}")
++print(f"Block._meta.pk.auto_created: {Block._meta.pk.auto_created}")
++print(f"Feedback._meta.pk: {Feedback._meta.pk}")
++print(f"Feedback._meta.pk.auto_created: {Feedback._meta.pk.auto_created}")
++
++# Test that the fix doesn't break normal auto-created PK warnings
++simple_models = [Block, Feedback, ReadMark, Follow, Friend, FriendshipRequest, UserLike, Image]
++for model in simple_models:
++    pk = model._meta.pk
++    print(f"{model.__name__}: pk={pk}, auto_created={pk.auto_created}")
++
++print("\nTest completed successfully!")
+\ No newline at end of file
+diff --git a/test_inheritance_issue.py b/test_inheritance_issue.py
+new file mode 100644
+index 0000000000..a753e070bd
+--- /dev/null
++++ b/test_inheritance_issue.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.core import checks
++
++# Test case that should reproduce the issue described in the GitHub issue
++# Models which inherit from other models and should inherit the primary key
++
++class Entity(models.Model):
++    id = models.BigAutoField(primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# This should inherit the primary key from Entity
++class User(Entity):
++    email = models.EmailField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++# This should also inherit the primary key from Entity  
++class ReservedUsername(Entity):
++    username = models.CharField(max_length=50)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Check for warnings
++print("Checking for W042 warnings...")
++errors = checks.run_checks()
++w042_errors = [error for error in errors if error.id == 'models.W042']
++
++if w042_errors:
++    print(f"Found {len(w042_errors)} W042 warnings:")
++    for error in w042_errors:
++        print(f"  - {error.obj}: {error.msg}")
++        print(f"    PK: {error.obj._meta.pk}")
++        print(f"    PK.auto_created: {error.obj._meta.pk.auto_created}")
++else:
++    print("No W042 warnings found.")
++
++# Let's also inspect the models to understand the issue
++print("\nModel inspection:")
++print(f"Entity._meta.pk: {Entity._meta.pk}")
++print(f"Entity._meta.pk.auto_created: {Entity._meta.pk.auto_created}")
++print(f"User._meta.pk: {User._meta.pk}")
++print(f"User._meta.pk.auto_created: {User._meta.pk.auto_created}")
++print(f"ReservedUsername._meta.pk: {ReservedUsername._meta.pk}")
++print(f"ReservedUsername._meta.pk.auto_created: {ReservedUsername._meta.pk.auto_created}")
++
++# Let's also check the parents
++print(f"\nUser._meta.parents: {User._meta.parents}")
++print(f"ReservedUsername._meta.parents: {ReservedUsername._meta.parents}")
++
++# Check if the primary key fields are the same objects
++print(f"\nEntity.pk is User.pk: {Entity._meta.pk is User._meta.pk}")
++print(f"Entity.pk is ReservedUsername.pk: {Entity._meta.pk is ReservedUsername._meta.pk}")
+\ No newline at end of file

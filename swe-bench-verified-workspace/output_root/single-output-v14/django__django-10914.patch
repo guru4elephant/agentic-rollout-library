@@ -1,0 +1,139 @@
+diff --git a/django/core/files/storage.py b/django/core/files/storage.py
+index cbdab1de47..b45423c833 100644
+--- a/django/core/files/storage.py
++++ b/django/core/files/storage.py
+@@ -282,6 +282,12 @@ class FileSystemStorage(Storage):
+ 
+         if self.file_permissions_mode is not None:
+             os.chmod(full_path, self.file_permissions_mode)
++        elif hasattr(content, 'temporary_file_path'):
++            # Set default permissions for files moved from temporary storage
++            # when FILE_UPLOAD_PERMISSIONS is None
++            current_umask = os.umask(0)
++            os.umask(current_umask)  # Restore original umask
++            os.chmod(full_path, 0o666 & ~current_umask)
+ 
+         # Store filenames with forward slashes, even on Windows.
+         return name.replace('\\', '/')
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..11e5669adc
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the file upload permission issue.
++This demonstrates that files uploaded via FileSystemStorage have inconsistent
++permissions depending on whether they come from InMemoryUploadedFile or TemporaryUploadedFile.
++"""
++
++import os
++import tempfile
++from io import BytesIO
++from django.core.files.storage import FileSystemStorage
++from django.core.files.uploadedfile import TemporaryUploadedFile, InMemoryUploadedFile
++from django.conf import settings
++
++# Configure Django settings
++settings.configure(
++    MEDIA_ROOT=tempfile.mkdtemp(),
++    # FILE_UPLOAD_PERMISSIONS=None,  # Now defaults to 0o644 in global_settings
++)
++
++def test_file_permissions():
++    storage = FileSystemStorage()
++    
++    # Test 1: Create a proper TemporaryUploadedFile
++    print("Testing TemporaryUploadedFile scenario...")
++    temp_uploaded_file = TemporaryUploadedFile(
++        name="test_temp.txt",
++        content_type="text/plain",
++        size=12,
++        charset="utf-8"
++    )
++    # Write content to the temporary file
++    with open(temp_uploaded_file.temporary_file_path(), 'wb') as f:
++        f.write(b"test content")
++    
++    # Save using FileSystemStorage
++    saved_name = storage.save("test_temp.txt", temp_uploaded_file)
++    saved_path = storage.path(saved_name)
++    
++    # Check permissions
++    permissions = oct(os.stat(saved_path).st_mode)[-3:]
++    print(f"Temporary file permissions after save: {permissions}")
++    
++    # Test 2: Create a memory file (simulates InMemoryUploadedFile)
++    print("Testing InMemoryUploadedFile scenario...")
++    memory_file = InMemoryUploadedFile(
++        file=BytesIO(b"test content"),
++        field_name="test_field",
++        name="test_memory.txt",
++        content_type="text/plain",
++        size=12,
++        charset="utf-8"
++    )
++    
++    # Save using FileSystemStorage
++    saved_name2 = storage.save("test_memory.txt", memory_file)
++    saved_path2 = storage.path(saved_name2)
++    
++    # Check permissions
++    permissions2 = oct(os.stat(saved_path2).st_mode)[-3:]
++    print(f"Memory file permissions after save: {permissions2}")
++    
++    # Clean up
++    os.unlink(saved_path)
++    os.unlink(saved_path2)
++    
++    print(f"Permissions are now consistent: {permissions} vs {permissions2}")
++
++if __name__ == "__main__":
++    test_file_permissions()
+\ No newline at end of file
+diff --git a/test_backward_compatibility.py b/test_backward_compatibility.py
+new file mode 100644
+index 0000000000..ee6a202302
+--- /dev/null
++++ b/test_backward_compatibility.py
+@@ -0,0 +1,38 @@
++#!/usr/bin/env python3
++"""
++Test that the fix doesn't break backward compatibility.
++"""
++
++import os
++import tempfile
++from django.core.files.storage import FileSystemStorage
++from django.core.files.base import ContentFile
++from django.conf import settings
++
++# Configure Django settings
++settings.configure(
++    MEDIA_ROOT=tempfile.mkdtemp(),
++)
++
++def test_backward_compatibility():
++    storage = FileSystemStorage()
++    
++    # Test 1: Regular file save (should use system default behavior)
++    print("Testing regular file save...")
++    fname = storage.save("regular_file.txt", ContentFile("regular content"))
++    mode = os.stat(storage.path(fname))[0] & 0o777
++    print(f"Regular file permissions: {oct(mode)}")
++    
++    # Test 2: With explicit FILE_UPLOAD_PERMISSIONS setting
++    print("Testing with explicit permissions...")
++    storage_with_perms = FileSystemStorage(file_permissions_mode=0o755)
++    fname2 = storage_with_perms.save("explicit_file.txt", ContentFile("explicit content"))
++    mode2 = os.stat(storage_with_perms.path(fname2))[0] & 0o777
++    print(f"Explicit permissions file: {oct(mode2)}")
++    
++    # Clean up
++    os.unlink(storage.path(fname))
++    os.unlink(storage_with_perms.path(fname2))
++
++if __name__ == "__main__":
++    test_backward_compatibility()
+\ No newline at end of file

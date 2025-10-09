@@ -1,0 +1,550 @@
+diff --git a/django/contrib/staticfiles/storage.py b/django/contrib/staticfiles/storage.py
+index 494890cc23..27a422a0ab 100644
+--- a/django/contrib/staticfiles/storage.py
++++ b/django/contrib/staticfiles/storage.py
+@@ -226,20 +226,31 @@ class HashedFilesMixin:
+             path for path in paths
+             if matches_patterns(path, self._patterns)
+         ]
++        
++        # Track which files have already been yielded to avoid duplicates
++        yielded_files = set()
++
+         # Do a single pass first. Post-process all files once, then repeat for
+         # adjustable files.
+         for name, hashed_name, processed, _ in self._post_process(paths, adjustable_paths, hashed_files):
+-            yield name, hashed_name, processed
++            if name not in yielded_files:
++                yield name, hashed_name, processed
++                yielded_files.add(name)
+ 
+         paths = {path: paths[path] for path in adjustable_paths}
+ 
++        # Initialize substitutions outside the loop
++        substitutions = False
+         for i in range(self.max_post_process_passes):
+-            substitutions = False
++            current_substitutions = False
+             for name, hashed_name, processed, subst in self._post_process(paths, adjustable_paths, hashed_files):
+-                yield name, hashed_name, processed
+-                substitutions = substitutions or subst
++                if name not in yielded_files:
++                    yield name, hashed_name, processed
++                    yielded_files.add(name)
++                current_substitutions = current_substitutions or subst
+ 
+-            if not substitutions:
++            substitutions = substitutions or current_substitutions
++            if not current_substitutions:
+                 break
+ 
+         if substitutions:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e6bf4320aa
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where HashedFilesMixin's post_process()
++yields multiple times for the same file.
++"""
++
++import os
++import tempfile
++from django.conf import settings
++from django.contrib.staticfiles.storage import HashedFilesMixin, StaticFilesStorage
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATIC_ROOT=tempfile.mkdtemp(),
++        INSTALLED_APPS=[
++            'django.contrib.staticfiles',
++        ],
++    )
++
++class TestStorage(HashedFilesMixin, StaticFilesStorage):
++    """Test storage that uses HashedFilesMixin"""
++
++def test_multiple_yields():
++    """Test that post_process doesn't yield multiple times for the same file"""
++    
++    # Create a temporary directory structure
++    with tempfile.TemporaryDirectory() as temp_dir:
++        # Create a simple CSS file
++        css_content = """
++body { background: white; }
++.imported { background: url('test.png'); }
++"""
++        
++        css_file = os.path.join(temp_dir, 'test.css')
++        with open(css_file, 'w') as f:
++            f.write(css_content)
++        
++        # Create a storage instance
++        storage = TestStorage(location=temp_dir)
++        
++        # Create paths dictionary as expected by post_process
++        paths = {
++            'test.css': (storage, 'test.css')
++        }
++        
++        # Call post_process and collect all yields
++        results = list(storage.post_process(paths))
++        
++        print(f"Number of yields: {len(results)}")
++        print("Yields:")
++        for name, hashed_name, processed in results:
++            print(f"  - {name} -> {hashed_name} (processed: {processed})")
++        
++        # Check if the same file is yielded multiple times
++        names_yielded = [name for name, _, _ in results]
++        unique_names = set(names_yielded)
++        
++        print(f"\nUnique files yielded: {len(unique_names)}")
++        print(f"Total yields: {len(names_yielded)}")
++        
++        if len(names_yielded) != len(unique_names):
++            print("❌ ISSUE REPRODUCED: Same file yielded multiple times!")
++            for name in unique_names:
++                count = names_yielded.count(name)
++                if count > 1:
++                    print(f"  - {name}: yielded {count} times")
++            return False
++        else:
++            print("✅ No duplicate yields detected")
++            return True
++
++if __name__ == '__main__':
++    success = test_multiple_yields()
++    exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/run_storage_tests.py b/run_storage_tests.py
+new file mode 100644
+index 0000000000..62bcf2a6f8
+--- /dev/null
++++ b/run_storage_tests.py
+@@ -0,0 +1,111 @@
++#!/usr/bin/env python3
++"""
++Run specific storage tests to verify the fix doesn't break existing functionality.
++"""
++
++import os
++import tempfile
++import sys
++from django.conf import settings
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage, StaticFilesStorage
++from django.test import override_settings
++
++# Configure Django settings for testing
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATIC_ROOT=tempfile.mkdtemp(),
++        INSTALLED_APPS=[
++            'django.contrib.staticfiles',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++def test_basic_functionality():
++    """Test basic hashed files functionality"""
++    print("Testing basic hashed files functionality...")
++    
++    with tempfile.TemporaryDirectory() as temp_dir:
++        # Create a test storage instance with HashedFilesMixin
++        test_storage = ManifestStaticFilesStorage(location=temp_dir)
++        
++        # Create a simple CSS file
++        css_content = "body { color: red; }"
++        css_file = os.path.join(temp_dir, 'test.css')
++        with open(css_file, 'w') as f:
++            f.write(css_content)
++        
++        # Test hashed_name method
++        hashed_name = test_storage.hashed_name('test.css')
++        print(f"Hashed name: {hashed_name}")
++        
++        # Test that it contains a hash
++        assert '.' in hashed_name and hashed_name.endswith('.css')
++        print("✅ Basic hashing functionality works")
++        
++        return True
++
++def test_post_process_yield_count():
++    """Test that post_process yields each file only once"""
++    print("\nTesting post_process yield count...")
++    
++    with tempfile.TemporaryDirectory() as temp_dir:
++        # Create a test storage instance with HashedFilesMixin
++        test_storage = ManifestStaticFilesStorage(location=temp_dir)
++        
++        # Create multiple files
++        css_content = "body { background: url('test.png'); }"
++        css_file = os.path.join(temp_dir, 'test.css')
++        with open(css_file, 'w') as f:
++            f.write(css_content)
++        
++        txt_content = "plain text file"
++        txt_file = os.path.join(temp_dir, 'test.txt')
++        with open(txt_file, 'w') as f:
++            f.write(txt_content)
++        
++        # Create paths dictionary
++        paths = {
++            'test.css': (test_storage, 'test.css'),
++            'test.txt': (test_storage, 'test.txt')
++        }
++        
++        # Call post_process
++        results = list(test_storage.post_process(paths))
++        
++        print(f"Number of yields: {len(results)}")
++        names_yielded = [name for name, _, _ in results]
++        unique_names = set(names_yielded)
++        
++        print(f"Unique files yielded: {len(unique_names)}")
++        print(f"Total yields: {len(names_yielded)}")
++        
++        # Check for duplicates
++        if len(names_yielded) != len(unique_names):
++            print("❌ FAILED: Duplicate yields detected!")
++            return False
++        else:
++            print("✅ PASSED: No duplicate yields")
++            return True
++
++if __name__ == '__main__':
++    print("Running storage tests to verify fix...")
++    
++    success = True
++    try:
++        success &= test_basic_functionality()
++        success &= test_post_process_yield_count()
++        
++        if success:
++            print("\n🎉 All storage tests passed!")
++            sys.exit(0)
++        else:
++            print("\n💥 Some tests failed!")
++            sys.exit(1)
++            
++    except Exception as e:
++        print(f"\n💥 Test failed with exception: {e}")
++        import traceback
++        traceback.print_exc()
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_all_yield_proper.py b/test_all_yield_proper.py
+new file mode 100644
+index 0000000000..550ddbb5d5
+--- /dev/null
++++ b/test_all_yield_proper.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++"""
++Test the "All" yield properly by creating a scenario with infinite substitutions.
++"""
++
++import os
++import tempfile
++from django.conf import settings
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATIC_ROOT=tempfile.mkdtemp(),
++        INSTALLED_APPS=[
++            'django.contrib.staticfiles',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++def test_all_yield():
++    """Test that the 'All' yield works correctly when substitutions continue"""
++    print("Testing 'All' yield handling...")
++    
++    with tempfile.TemporaryDirectory() as temp_dir:
++        # Create a test storage instance
++        test_storage = ManifestStaticFilesStorage(location=temp_dir)
++        
++        # Set a very low max_post_process_passes to trigger the "All" yield
++        original_max_passes = test_storage.max_post_process_passes
++        test_storage.max_post_process_passes = 1
++        
++        # Create a CSS file that references itself (causing infinite substitutions)
++        css_content = "body { background: url('test.css'); }"
++        css_file = os.path.join(temp_dir, 'test.css')
++        with open(css_file, 'w') as f:
++            f.write(css_content)
++        
++        paths = {
++            'test.css': (test_storage, 'test.css')
++        }
++        
++        # Call post_process
++        results = list(test_storage.post_process(paths))
++        
++        print(f"Number of yields: {len(results)}")
++        for name, hashed_name, processed in results:
++            print(f"  - {name} -> {hashed_name} (processed: {processed})")
++        
++        # Restore original value
++        test_storage.max_post_process_passes = original_max_passes
++        
++        # Check if 'All' was yielded (it should be since we have infinite substitutions)
++        all_yields = [name for name, _, _ in results if name == 'All']
++        if len(all_yields) > 0:
++            print("✅ 'All' yield handled correctly")
++            return True
++        else:
++            print("❌ 'All' yield not found")
++            return False
++
++if __name__ == '__main__':
++    print("Testing 'All' yield properly...")
++    
++    success = test_all_yield()
++    
++    if success:
++        print("\n🎉 'All' yield test passed!")
++        exit(0)
++    else:
++        print("\n💥 'All' yield test failed!")
++        exit(1)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..59585a86fb
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,138 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the fix for multiple yields issue.
++"""
++
++import os
++import tempfile
++from django.conf import settings
++from django.contrib.staticfiles.storage import HashedFilesMixin, StaticFilesStorage
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATIC_ROOT=tempfile.mkdtemp(),
++        INSTALLED_APPS=[
++            'django.contrib.staticfiles',
++        ],
++    )
++
++class TestStorage(HashedFilesMixin, StaticFilesStorage):
++    """Test storage that uses HashedFilesMixin"""
++
++def test_multiple_files():
++    """Test with multiple files to ensure no duplicates"""
++    
++    with tempfile.TemporaryDirectory() as temp_dir:
++        # Create multiple CSS files with imports
++        css1_content = """
++body { background: white; }
++.imported { background: url('test1.png'); }
++"""
++        css2_content = """
++.container { border: 1px solid black; }
++.imported { background: url('test2.png'); }
++"""
++        
++        css1_file = os.path.join(temp_dir, 'test1.css')
++        css2_file = os.path.join(temp_dir, 'test2.css')
++        
++        with open(css1_file, 'w') as f:
++            f.write(css1_content)
++        with open(css2_file, 'w') as f:
++            f.write(css2_content)
++        
++        storage = TestStorage(location=temp_dir)
++        
++        paths = {
++            'test1.css': (storage, 'test1.css'),
++            'test2.css': (storage, 'test2.css')
++        }
++        
++        results = list(storage.post_process(paths))
++        
++        print(f"Test 1 - Multiple files:")
++        print(f"Number of yields: {len(results)}")
++        names_yielded = [name for name, _, _ in results]
++        unique_names = set(names_yielded)
++        
++        print(f"Unique files yielded: {len(unique_names)}")
++        print(f"Total yields: {len(names_yielded)}")
++        
++        if len(names_yielded) != len(unique_names):
++            print("❌ FAILED: Duplicate yields detected!")
++            return False
++        else:
++            print("✅ PASSED: No duplicate yields")
++            return True
++
++def test_no_adjustable_files():
++    """Test with files that don't need adjustment"""
++    
++    with tempfile.TemporaryDirectory() as temp_dir:
++        # Create a simple text file (not adjustable)
++        txt_content = "This is just a text file"
++        
++        txt_file = os.path.join(temp_dir, 'test.txt')
++        with open(txt_file, 'w') as f:
++            f.write(txt_content)
++        
++        storage = TestStorage(location=temp_dir)
++        
++        paths = {
++            'test.txt': (storage, 'test.txt')
++        }
++        
++        results = list(storage.post_process(paths))
++        
++        print(f"\nTest 2 - Non-adjustable files:")
++        print(f"Number of yields: {len(results)}")
++        names_yielded = [name for name, _, _ in results]
++        unique_names = set(names_yielded)
++        
++        print(f"Unique files yielded: {len(unique_names)}")
++        print(f"Total yields: {len(names_yielded)}")
++        
++        if len(names_yielded) != len(unique_names):
++            print("❌ FAILED: Duplicate yields detected!")
++            return False
++        else:
++            print("✅ PASSED: No duplicate yields")
++            return True
++
++def test_empty_paths():
++    """Test with empty paths"""
++    
++    with tempfile.TemporaryDirectory() as temp_dir:
++        storage = TestStorage(location=temp_dir)
++        
++        paths = {}
++        
++        results = list(storage.post_process(paths))
++        
++        print(f"\nTest 3 - Empty paths:")
++        print(f"Number of yields: {len(results)}")
++        
++        if len(results) > 0:
++            print("❌ FAILED: Should yield nothing for empty paths!")
++            return False
++        else:
++            print("✅ PASSED: No yields for empty paths")
++            return True
++
++if __name__ == '__main__':
++    print("Running comprehensive tests for HashedFilesMixin fix...")
++    
++    success = True
++    success &= test_multiple_files()
++    success &= test_no_adjustable_files()
++    success &= test_empty_paths()
++    
++    if success:
++        print("\n🎉 All tests passed!")
++        exit(0)
++    else:
++        print("\n💥 Some tests failed!")
++        exit(1)
+\ No newline at end of file
+diff --git a/test_edge_case.py b/test_edge_case.py
+new file mode 100644
+index 0000000000..161cf45ddf
+--- /dev/null
++++ b/test_edge_case.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++"""
++Test edge case for the "All" yield in post_process.
++"""
++
++import os
++import tempfile
++from django.conf import settings
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATIC_ROOT=tempfile.mkdtemp(),
++        INSTALLED_APPS=[
++            'django.contrib.staticfiles',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++def test_all_yield():
++    """Test that the 'All' yield is handled correctly"""
++    print("Testing 'All' yield handling...")
++    
++    with tempfile.TemporaryDirectory() as temp_dir:
++        # Create a test storage instance
++        test_storage = ManifestStaticFilesStorage(location=temp_dir)
++        
++        # Force max_post_process_passes to be exceeded to trigger the 'All' yield
++        original_max_passes = test_storage.max_post_process_passes
++        test_storage.max_post_process_passes = 0  # Force immediate failure
++        
++        # Create a simple CSS file
++        css_content = "body { background: url('test.png'); }"
++        css_file = os.path.join(temp_dir, 'test.css')
++        with open(css_file, 'w') as f:
++            f.write(css_content)
++        
++        paths = {
++            'test.css': (test_storage, 'test.css')
++        }
++        
++        # Call post_process
++        results = list(test_storage.post_process(paths))
++        
++        print(f"Number of yields: {len(results)}")
++        for name, hashed_name, processed in results:
++            print(f"  - {name} -> {hashed_name} (processed: {processed})")
++        
++        # Restore original value
++        test_storage.max_post_process_passes = original_max_passes
++        
++        # Check if 'All' was yielded (it should be since we forced max passes exceeded)
++        all_yields = [name for name, _, _ in results if name == 'All']
++        if len(all_yields) > 0:
++            print("✅ 'All' yield handled correctly")
++            return True
++        else:
++            print("❌ 'All' yield not found as expected")
++            return False
++
++if __name__ == '__main__':
++    print("Testing edge case for 'All' yield...")
++    
++    success = test_all_yield()
++    
++    if success:
++        print("\n🎉 Edge case test passed!")
++        exit(0)
++    else:
++        print("\n💥 Edge case test failed!")
++        exit(1)
+\ No newline at end of file

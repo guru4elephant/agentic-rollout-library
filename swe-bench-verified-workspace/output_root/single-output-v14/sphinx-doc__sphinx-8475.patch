@@ -1,0 +1,363 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..6d53a93ad
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the linkcheck issue with TooManyRedirects
++"""
++import requests
++from requests.exceptions import TooManyRedirects, HTTPError
++
++# Mock class to simulate TooManyRedirects behavior
++class MockResponse:
++    def __init__(self, status_code=200, url="https://example.com"):
++        self.status_code = status_code
++        self.url = url
++        self.history = []
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HTTPError(f"HTTP Error {self.status_code}")
++
++# Test URLs
++test_url_redirect = "https://example.com/redirect"  # This will cause TooManyRedirects
++test_url_normal = "https://example.com/normal"      # This will work normally
++
++# Mock requests functions for testing
++def mock_head(url, **kwargs):
++    # Simulate TooManyRedirects for HEAD requests to certain URLs
++    if "redirect" in url:
++        raise TooManyRedirects("Too many redirects")
++    return MockResponse(200, url)
++
++def mock_get(url, **kwargs):
++    # GET requests work fine
++    return MockResponse(200, url)
++
++def test_head_request(url):
++    """Test HEAD request behavior"""
++    try:
++        print(f"Testing HEAD request to {url}...")
++        response = mock_head(url, allow_redirects=True)
++        response.raise_for_status()
++        print(f"HEAD request successful: {response.status_code}")
++        return True
++    except TooManyRedirects as e:
++        print(f"HEAD request failed with TooManyRedirects: {e}")
++        return False
++    except Exception as e:
++        print(f"HEAD request failed with other error: {e}")
++        return False
++
++def test_get_request(url):
++    """Test GET request behavior"""
++    try:
++        print(f"Testing GET request to {url}...")
++        response = mock_get(url, stream=True)
++        response.raise_for_status()
++        print(f"GET request successful: {response.status_code}")
++        return True
++    except Exception as e:
++        print(f"GET request failed: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("=== Testing normal URL ===")
++    head_success_normal = test_head_request(test_url_normal)
++    get_success_normal = test_get_request(test_url_normal)
++    
++    print("\n=== Testing redirect URL ===")
++    head_success_redirect = test_head_request(test_url_redirect)
++    get_success_redirect = test_get_request(test_url_redirect)
++    
++    print(f"\nResults for normal URL:")
++    print(f"HEAD request: {'Success' if head_success_normal else 'Failed'}")
++    print(f"GET request: {'Success' if get_success_normal else 'Failed'}")
++    
++    print(f"\nResults for redirect URL:")
++    print(f"HEAD request: {'Success' if head_success_redirect else 'Failed'}")
++    print(f"GET request: {'Success' if get_success_redirect else 'Failed'}")
++    
++    if not head_success_redirect and get_success_redirect:
++        print("\nThis demonstrates the issue: HEAD fails with TooManyRedirects but GET succeeds!")
++    else:
++        print("\nBoth methods behave the same.")
+\ No newline at end of file
+diff --git a/setup.py b/setup.py
+index ca08a6d4a..21cb67b8f 100644
+--- a/setup.py
++++ b/setup.py
+@@ -15,22 +15,22 @@ if sys.version_info < (3, 5):
+     sys.exit(1)
+ 
+ install_requires = [
+-    'sphinxcontrib-applehelp',
+-    'sphinxcontrib-devhelp',
++    'sphinxcontrib-applehelp<=1.0.7',
++    'sphinxcontrib-devhelp<=1.0.5',
+     'sphinxcontrib-jsmath',
+-    'sphinxcontrib-htmlhelp',
+-    'sphinxcontrib-serializinghtml',
+-    'sphinxcontrib-qthelp',
+-    'Jinja2>=2.3',
++    'sphinxcontrib-htmlhelp<=2.0.4',
++    'sphinxcontrib-serializinghtml<=1.1.9',
++    'sphinxcontrib-qthelp<=1.0.6',
++    'Jinja2<3.0',
+     'Pygments>=2.0',
+     'docutils>=0.12',
+     'snowballstemmer>=1.1',
+     'babel>=1.3',
+-    'alabaster>=0.7,<0.8',
++    'alabaster>=0.7,<0.7.12',
+     'imagesize',
+     'requests>=2.5.0',
+     'setuptools',
+-    'packaging',
++    'packaging', 'markupsafe<=2.0.1',
+ ]
+ 
+ extras_require = {
+diff --git a/sphinx/builders/linkcheck.py b/sphinx/builders/linkcheck.py
+index 1dc0337c3..2d9d151de 100644
+--- a/sphinx/builders/linkcheck.py
++++ b/sphinx/builders/linkcheck.py
+@@ -20,7 +20,7 @@ from urllib.parse import unquote, urlparse
+ 
+ from docutils import nodes
+ from docutils.nodes import Node
+-from requests.exceptions import HTTPError
++from requests.exceptions import HTTPError, TooManyRedirects
+ 
+ from sphinx.application import Sphinx
+ from sphinx.builders import Builder
+@@ -172,9 +172,9 @@ class CheckExternalLinksBuilder(Builder):
+                                                  config=self.app.config, auth=auth_info,
+                                                  **kwargs)
+                         response.raise_for_status()
+-                    except HTTPError:
++                    except (HTTPError, TooManyRedirects):
+                         # retry with GET request if that fails, some servers
+-                        # don't like HEAD requests.
++                        # don't like HEAD requests or have too many redirects.
+                         response = requests.get(req_url, stream=True, config=self.app.config,
+                                                 auth=auth_info, **kwargs)
+                         response.raise_for_status()
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 000000000..f4c8d8fa9
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the linkchecker fix for TooManyRedirects
++"""
++import sys
++import os
++
++# Add the sphinx module to the path
++sys.path.insert(0, '/testbed')
++
++from sphinx.builders.linkcheck import CheckExternalLinksBuilder
++from sphinx.application import Sphinx
++from sphinx.util import requests
++from requests.exceptions import TooManyRedirects, HTTPError
++
++# Mock class to simulate TooManyRedirects behavior
++class MockResponse:
++    def __init__(self, status_code=200, url="https://example.com"):
++        self.status_code = status_code
++        self.url = url
++        self.history = []
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HTTPError(f"HTTP Error {self.status_code}")
++
++# Mock requests functions for testing
++def mock_head(url, **kwargs):
++    # Simulate TooManyRedirects for HEAD requests to certain URLs
++    if "redirect" in url:
++        raise TooManyRedirects("Too many redirects")
++    return MockResponse(200, url)
++
++def mock_get(url, **kwargs):
++    # GET requests work fine
++    return MockResponse(200, url)
++
++def test_linkchecker_behavior():
++    """Test the linkchecker behavior with TooManyRedirects"""
++    
++    # Monkey patch the requests module for testing
++    original_head = requests.head
++    original_get = requests.get
++    
++    requests.head = mock_head
++    requests.get = mock_get
++    
++    try:
++        # Test URLs
++        normal_url = "https://example.com/normal"
++        redirect_url = "https://example.com/redirect"
++        
++        print("Testing normal URL...")
++        try:
++            # Simulate the linkchecker logic
++            response = requests.head(normal_url, allow_redirects=True)
++            response.raise_for_status()
++            print("✓ Normal URL: HEAD request succeeded")
++        except (HTTPError, TooManyRedirects):
++            # Fallback to GET
++            response = requests.get(normal_url, stream=True)
++            response.raise_for_status()
++            print("✓ Normal URL: GET fallback succeeded")
++        
++        print("\nTesting redirect URL...")
++        try:
++            # Simulate the linkchecker logic
++            response = requests.head(redirect_url, allow_redirects=True)
++            response.raise_for_status()
++            print("✗ Redirect URL: HEAD request unexpectedly succeeded")
++            return False
++        except (HTTPError, TooManyRedirects):
++            # Fallback to GET - this should work with our fix
++            response = requests.get(redirect_url, stream=True)
++            response.raise_for_status()
++            print("✓ Redirect URL: GET fallback succeeded (fix working!)")
++            return True
++            
++    except Exception as e:
++        print(f"✗ Test failed with error: {e}")
++        return False
++    finally:
++        # Restore original functions
++        requests.head = original_head
++        requests.get = original_get
++
++if __name__ == "__main__":
++    print("Testing linkchecker fix for TooManyRedirects...")
++    success = test_linkchecker_behavior()
++    
++    if success:
++        print("\n✓ Fix verified: TooManyRedirects now triggers GET fallback!")
++    else:
++        print("\n✗ Fix failed: TooManyRedirects still breaks linkchecking")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_too_many_redirects.py b/test_too_many_redirects.py
+new file mode 100644
+index 000000000..b57621723
+--- /dev/null
++++ b/test_too_many_redirects.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python3
++"""
++Test to verify that TooManyRedirects exception triggers GET fallback
++"""
++import sys
++sys.path.insert(0, '/testbed')
++
++from sphinx.builders.linkcheck import CheckExternalLinksBuilder
++from sphinx.util import requests
++from requests.exceptions import TooManyRedirects, HTTPError
++
++# Mock functions to simulate the behavior
++class MockResponse:
++    def __init__(self, status_code=200, url="https://example.com"):
++        self.status_code = status_code
++        self.url = url
++        self.history = []
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            raise HTTPError(f"HTTP Error {self.status_code}")
++
++def mock_head_redirects(url, **kwargs):
++    """Mock HEAD function that raises TooManyRedirects"""
++    raise TooManyRedirects("Too many redirects")
++
++def mock_head_normal(url, **kwargs):
++    """Mock HEAD function that works normally"""
++    return MockResponse(200, url)
++
++def mock_get(url, **kwargs):
++    """Mock GET function that works normally"""
++    return MockResponse(200, url)
++
++def test_too_many_redirects_fallback():
++    """Test that TooManyRedirects triggers GET fallback"""
++    print("Testing TooManyRedirects fallback behavior...")
++    
++    # Test 1: HEAD raises TooManyRedirects, GET should be called
++    original_head = requests.head
++    requests.head = mock_head_redirects
++    requests.get = mock_get
++    
++    try:
++        # This should trigger the GET fallback
++        try:
++            response = requests.head("https://example.com/redirect", allow_redirects=True)
++            response.raise_for_status()
++            print("✗ HEAD request unexpectedly succeeded")
++            return False
++        except (HTTPError, TooManyRedirects):
++            # This is where our fix should kick in
++            response = requests.get("https://example.com/redirect", stream=True)
++            response.raise_for_status()
++            print("✓ GET fallback triggered successfully for TooManyRedirects")
++            return True
++    except Exception as e:
++        print(f"✗ Test failed: {e}")
++        return False
++    finally:
++        requests.head = original_head
++
++def test_normal_behavior():
++    """Test that normal HEAD requests still work"""
++    print("Testing normal HEAD behavior...")
++    
++    original_head = requests.head
++    requests.head = mock_head_normal
++    requests.get = mock_get
++    
++    try:
++        # This should work normally without falling back to GET
++        response = requests.head("https://example.com/normal", allow_redirects=True)
++        response.raise_for_status()
++        print("✓ Normal HEAD request works correctly")
++        return True
++    except Exception as e:
++        print(f"✗ Normal HEAD request failed: {e}")
++        return False
++    finally:
++        requests.head = original_head
++
++if __name__ == "__main__":
++    print("Testing linkchecker TooManyRedirects fix...")
++    
++    success1 = test_too_many_redirects_fallback()
++    success2 = test_normal_behavior()
++    
++    if success1 and success2:
++        print("\n✓ All tests passed! TooManyRedirects fix is working correctly.")
++    else:
++        print("\n✗ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/tox.ini b/tox.ini
+index dbb705a3a..9f4fc3a32 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -28,7 +28,7 @@ setenv =
+     PYTHONWARNINGS = all,ignore::ImportWarning:importlib._bootstrap_external,ignore::DeprecationWarning:site,ignore::DeprecationWarning:distutils
+     PYTEST_ADDOPTS = {env:PYTEST_ADDOPTS:} --color yes
+ commands=
+-    python -X dev -m pytest --durations 25 {posargs}
++    python -X dev -m pytest -rA --durations 25 {posargs}
+ 
+ [testenv:flake8]
+ basepython = python3

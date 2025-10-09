@@ -1,0 +1,321 @@
+diff --git a/django/contrib/auth/tokens.py b/django/contrib/auth/tokens.py
+index 93e2d71af2..132a01474d 100644
+--- a/django/contrib/auth/tokens.py
++++ b/django/contrib/auth/tokens.py
+@@ -85,6 +85,7 @@ class PasswordResetTokenGenerator:
+            same password is chosen, due to password salting).
+         2. The last_login field will usually be updated very shortly after
+            a password reset.
++        3. The email field will change if the user updates their email address.
+         Failing those things, settings.PASSWORD_RESET_TIMEOUT eventually
+         invalidates the token.
+ 
+@@ -94,7 +95,9 @@ class PasswordResetTokenGenerator:
+         # Truncate microseconds so that tokens are consistent even if the
+         # database doesn't support microseconds.
+         login_timestamp = '' if user.last_login is None else user.last_login.replace(microsecond=0, tzinfo=None)
+-        return str(user.pk) + user.password + str(login_timestamp) + str(timestamp)
++        # Include email in the hash value to invalidate tokens when email changes
++        email = user.email if hasattr(user, 'email') else ''
++        return str(user.pk) + user.password + str(login_timestamp) + str(timestamp) + str(email)
+ 
+     def _num_seconds(self, dt):
+         return int((dt - datetime(2001, 1, 1)).total_seconds())
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..d608cff892
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where changing user's email doesn't invalidate password reset tokens.
++"""
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings first
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key-for-reproduction',
++        USE_TZ=True,
++    )
++
++# Mock a simple user object for testing
++class MockUser:
++    def __init__(self, pk, password, last_login=None, email=None):
++        self.pk = pk
++        self.password = password
++        self.last_login = last_login
++        self.email = email
++
++from django.contrib.auth.tokens import PasswordResetTokenGenerator
++
++def test_password_reset_token_with_email_change():
++    """Test that password reset tokens are invalidated when email changes."""
++    
++    # Create a mock user
++    user = MockUser(
++        pk=1,
++        password='testpass123',
++        email='foo@example.com'
++    )
++    
++    # Create token generator
++    token_generator = PasswordResetTokenGenerator()
++    
++    # Generate initial token
++    initial_token = token_generator.make_token(user)
++    print(f"Initial token: {initial_token}")
++    
++    # Verify token works initially
++    initial_check = token_generator.check_token(user, initial_token)
++    print(f"Initial token check: {initial_check}")
++    
++    # Change user's email
++    user.email = 'bar@example.com'
++    print(f"Changed email from 'foo@example.com' to 'bar@example.com'")
++    
++    # Verify token should be invalidated after email change
++    after_email_change_check = token_generator.check_token(user, initial_token)
++    print(f"Token check after email change: {after_email_change_check}")
++    
++    # The token should be invalidated, so this should return False
++    if after_email_change_check:
++        print("❌ BUG: Token was NOT invalidated after email change!")
++        return False
++    else:
++        print("✅ SUCCESS: Token was invalidated after email change!")
++        return True
++
++if __name__ == '__main__':
++    result = test_password_reset_token_with_email_change()
++    sys.exit(0 if result else 1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..8bbaf16140
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++"""
++Script to test edge cases for the password reset token fix.
++"""
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings first
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key-for-edge-cases',
++        USE_TZ=True,
++    )
++
++# Mock a simple user object for testing
++class MockUser:
++    def __init__(self, pk, password, last_login=None, email=None):
++        self.pk = pk
++        self.password = password
++        self.last_login = last_login
++        self.email = email
++
++from django.contrib.auth.tokens import PasswordResetTokenGenerator
++
++def test_edge_cases():
++    """Test edge cases for the password reset token fix."""
++    token_generator = PasswordResetTokenGenerator()
++    
++    # Test case 1: User without email attribute
++    user_no_email = MockUser(pk=1, password='testpass123')
++    del user_no_email.email  # Remove email attribute
++    
++    token_no_email = token_generator.make_token(user_no_email)
++    check_no_email = token_generator.check_token(user_no_email, token_no_email)
++    print(f"User without email - Token check: {check_no_email}")
++    
++    # Test case 2: User with None email
++    user_none_email = MockUser(pk=2, password='testpass123', email=None)
++    token_none_email = token_generator.make_token(user_none_email)
++    check_none_email = token_generator.check_token(user_none_email, token_none_email)
++    print(f"User with None email - Token check: {check_none_email}")
++    
++    # Test case 3: User with empty string email
++    user_empty_email = MockUser(pk=3, password='testpass123', email='')
++    token_empty_email = token_generator.make_token(user_empty_email)
++    check_empty_email = token_generator.check_token(user_empty_email, token_empty_email)
++    print(f"User with empty email - Token check: {check_empty_email}")
++    
++    # Test case 4: Normal user with email change
++    user_normal = MockUser(pk=4, password='testpass123', email='test@example.com')
++    token_normal = token_generator.make_token(user_normal)
++    check_normal = token_generator.check_token(user_normal, token_normal)
++    print(f"Normal user before email change - Token check: {check_normal}")
++    
++    user_normal.email = 'changed@example.com'
++    check_after_change = token_generator.check_token(user_normal, token_normal)
++    print(f"Normal user after email change - Token check: {check_after_change}")
++    
++    # All should work correctly
++    return all([
++        check_no_email,  # Should work even without email
++        check_none_email,  # Should work with None email
++        check_empty_email,  # Should work with empty email
++        check_normal,  # Should work initially
++        not check_after_change  # Should fail after email change
++    ])
++
++if __name__ == '__main__':
++    result = test_edge_cases()
++    if result:
++        print("✅ All edge cases passed!")
++        sys.exit(0)
++    else:
++        print("❌ Some edge cases failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_no_email_field.py b/test_no_email_field.py
+new file mode 100644
+index 0000000000..a94adedc68
+--- /dev/null
++++ b/test_no_email_field.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python3
++"""
++Script to test that the fix works with AbstractBaseUser (users without email field).
++"""
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings first
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key-for-no-email-test',
++        USE_TZ=True,
++    )
++
++# Mock a user without email field (like AbstractBaseUser)
++class MockUserNoEmail:
++    def __init__(self, pk, password, last_login=None):
++        self.pk = pk
++        self.password = password
++        self.last_login = last_login
++        # No email field
++
++from django.contrib.auth.tokens import PasswordResetTokenGenerator
++
++def test_user_without_email_field():
++    """Test that the fix works with users that don't have an email field."""
++    token_generator = PasswordResetTokenGenerator()
++    
++    # Create a user without email field
++    user = MockUserNoEmail(pk=1, password='testpass123')
++    
++    # Generate token and check it
++    token = token_generator.make_token(user)
++    check = token_generator.check_token(user, token)
++    print(f"User without email field - Token check: {check}")
++    
++    # This should work fine (no error) and return True
++    return check
++
++if __name__ == '__main__':
++    result = test_user_without_email_field()
++    if result:
++        print("✅ Users without email field work correctly!")
++        sys.exit(0)
++    else:
++        print("❌ Users without email field failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_password_change.py b/test_password_change.py
+new file mode 100644
+index 0000000000..39f4613351
+--- /dev/null
++++ b/test_password_change.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++"""
++Script to test that password changes still invalidate tokens.
++"""
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings first
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key-for-password-test',
++        USE_TZ=True,
++    )
++
++# Mock a simple user object for testing
++class MockUser:
++    def __init__(self, pk, password, last_login=None, email=None):
++        self.pk = pk
++        self.password = password
++        self.last_login = last_login
++        self.email = email
++
++from django.contrib.auth.tokens import PasswordResetTokenGenerator
++
++def test_password_change_invalidates_token():
++    """Test that password changes still invalidate tokens."""
++    token_generator = PasswordResetTokenGenerator()
++    
++    # Create a user
++    user = MockUser(pk=1, password='oldpassword123', email='test@example.com')
++    
++    # Generate initial token
++    initial_token = token_generator.make_token(user)
++    initial_check = token_generator.check_token(user, initial_token)
++    print(f"Initial token check: {initial_check}")
++    
++    # Change user's password (simulating password reset)
++    user.password = 'newpassword456'
++    after_password_change_check = token_generator.check_token(user, initial_token)
++    print(f"Token check after password change: {after_password_change_check}")
++    
++    # The token should be invalidated after password change
++    if after_password_change_check:
++        print("❌ BUG: Token was NOT invalidated after password change!")
++        return False
++    else:
++        print("✅ SUCCESS: Token was invalidated after password change!")
++        return True
++
++if __name__ == '__main__':
++    result = test_password_change_invalidates_token()
++    sys.exit(0 if result else 1)
+\ No newline at end of file

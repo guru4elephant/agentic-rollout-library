@@ -1,0 +1,289 @@
+diff --git a/django/contrib/auth/forms.py b/django/contrib/auth/forms.py
+index b9eb33329f..1bd95e255d 100644
+--- a/django/contrib/auth/forms.py
++++ b/django/contrib/auth/forms.py
+@@ -56,6 +56,7 @@ class ReadOnlyPasswordHashField(forms.Field):
+ 
+     def __init__(self, *args, **kwargs):
+         kwargs.setdefault("required", False)
++        kwargs.setdefault("disabled", True)
+         super().__init__(*args, **kwargs)
+ 
+     def bound_data(self, data, initial):
+@@ -163,11 +164,7 @@ class UserChangeForm(forms.ModelForm):
+         if user_permissions:
+             user_permissions.queryset = user_permissions.queryset.select_related('content_type')
+ 
+-    def clean_password(self):
+-        # Regardless of what the user provides, return the initial value.
+-        # This is done here, rather than on the field, because the
+-        # field does not have access to the initial value
+-        return self.initial.get('password')
++    
+ 
+ 
+ class AuthenticationForm(forms.Form):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..97276bba13
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with ReadOnlyPasswordHashField and UserChangeForm.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.contrib.auth.forms import ReadOnlyPasswordHashField, UserChangeForm
++from django.contrib.auth.models import User
++
++def test_readonly_password_hash_field():
++    """Test the current behavior of ReadOnlyPasswordHashField"""
++    print("=== Testing ReadOnlyPasswordHashField ===")
++    
++    # Create a ReadOnlyPasswordHashField instance
++    field = ReadOnlyPasswordHashField()
++    
++    print(f"Field disabled attribute: {getattr(field, 'disabled', 'Not set')}")
++    print(f"Field widget attrs: {field.widget.attrs}")
++    
++    # Test bound data behavior
++    initial_value = "pbkdf2_sha256$260000$abc123$hashedpassword=="
++    data_value = "malicious_user_input"
++    
++    bound_data = field.bound_data(data_value, initial_value)
++    print(f"Bound data result: {bound_data} (should be initial value: {initial_value})")
++    
++    has_changed = field.has_changed(initial_value, data_value)
++    print(f"Has changed: {has_changed} (should be False)")
++    
++    # Test that disabled=True is set by default
++    print(f"Field is disabled by default: {field.disabled}")
++
++def test_user_change_form():
++    """Test the current behavior of UserChangeForm"""
++    print("\n=== Testing UserChangeForm ===")
++    
++    # Create a user instance
++    user = User(username='testuser', password='pbkdf2_sha256$260000$abc123$hashedpassword==')
++    
++    # Create UserChangeForm instance
++    form = UserChangeForm(instance=user)
++    
++    print("Form fields:")
++    for field_name, field in form.fields.items():
++        disabled = getattr(field, 'disabled', 'Not set')
++        print(f"  {field_name}: disabled={disabled}")
++    
++    # Test that clean_password method is no longer needed (should not exist)
++    if hasattr(form, 'clean_password'):
++        print("WARNING: clean_password method still exists!")
++        try:
++            cleaned_password = form.clean_password()
++            print(f"clean_password() result: {cleaned_password}")
++        except Exception as e:
++            print(f"clean_password() error: {e}")
++    else:
++        print("clean_password method removed (as expected)")
++    
++    # Test form validation with disabled field
++    form_data = {'password': 'malicious_input'}
++    form = UserChangeForm(data=form_data, instance=user)
++    form.initial = {'password': user.password}
++    
++    if form.is_valid():
++        print("Form is valid")
++        print(f"Cleaned data password: {form.cleaned_data.get('password')}")
++    else:
++        print("Form is invalid")
++        print(f"Form errors: {form.errors}")
++
++if __name__ == '__main__':
++    test_readonly_password_hash_field()
++    test_user_change_form()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..0c67ba063b
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the ReadOnlyPasswordHashField disabled behavior.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.contrib.auth.forms import ReadOnlyPasswordHashField, UserChangeForm
++from django.contrib.auth.models import User
++
++def test_disabled_field_behavior():
++    """Test that disabled field properly ignores user input"""
++    print("=== Testing disabled field behavior ===")
++    
++    # Test 1: Field with disabled=True should ignore user input
++    field = ReadOnlyPasswordHashField(disabled=True)
++    initial_value = "initial_hash"
++    user_input = "malicious_input"
++    
++    bound_data = field.bound_data(user_input, initial_value)
++    print(f"Test 1 - Bound data: {bound_data} (should be '{initial_value}')")
++    assert bound_data == initial_value, f"Expected {initial_value}, got {bound_data}"
++    
++    has_changed = field.has_changed(initial_value, user_input)
++    print(f"Test 1 - Has changed: {has_changed} (should be False)")
++    assert has_changed == False, "Field should not report changes"
++    
++    # Test 2: Field should still work when explicitly set to disabled=False
++    field2 = ReadOnlyPasswordHashField(disabled=False)
++    bound_data2 = field2.bound_data(user_input, initial_value)
++    print(f"Test 2 - Bound data with disabled=False: {bound_data2} (should be '{initial_value}')")
++    assert bound_data2 == initial_value, f"Expected {initial_value}, got {bound_data2}"
++    
++    # Test 3: Field should have disabled=True by default
++    field3 = ReadOnlyPasswordHashField()
++    print(f"Test 3 - Default disabled value: {field3.disabled} (should be True)")
++    assert field3.disabled == True, "Field should be disabled by default"
++    
++    print("All tests passed! ✅")
++
++if __name__ == '__main__':
++    test_disabled_field_behavior()
+\ No newline at end of file
+diff --git a/test_final_verification.py b/test_final_verification.py
+new file mode 100644
+index 0000000000..499ab93e14
+--- /dev/null
++++ b/test_final_verification.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""
++Final verification test for the ReadOnlyPasswordHashField disabled fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings with all required apps
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sites',
++        ],
++        USE_TZ=True,
++        SITE_ID=1,
++    )
++
++django.setup()
++
++from django import forms
++from django.contrib.auth.forms import ReadOnlyPasswordHashField, UserChangeForm
++from django.contrib.auth.models import User
++
++def test_final_verification():
++    """Final verification that our fix works correctly"""
++    print("=== Final Verification Test ===")
++    
++    # Test 1: ReadOnlyPasswordHashField should be disabled by default
++    field = ReadOnlyPasswordHashField()
++    assert field.disabled == True, "Field should be disabled by default"
++    print("✓ ReadOnlyPasswordHashField is disabled by default")
++    
++    # Test 2: Field should still accept explicit disabled=False
++    field2 = ReadOnlyPasswordHashField(disabled=False)
++    assert field2.disabled == False, "Field should accept explicit disabled=False"
++    print("✓ Field accepts explicit disabled=False")
++    
++    # Test 3: Field should properly handle bound data
++    initial_value = "pbkdf2_sha256$260000$abc123$hashedpassword=="
++    user_input = "malicious_input"
++    
++    bound_data = field.bound_data(user_input, initial_value)
++    assert bound_data == initial_value, "Field should return initial value"
++    print("✓ Field properly handles bound data")
++    
++    # Test 4: Field should report no changes
++    has_changed = field.has_changed(initial_value, user_input)
++    assert has_changed == False, "Field should report no changes"
++    print("✓ Field correctly reports no changes")
++    
++    # Test 5: UserChangeForm password field should be disabled
++    user = User(username='testuser', password=initial_value)
++    form = UserChangeForm(instance=user)
++    password_field = form.fields['password']
++    assert password_field.disabled == True, "Password field should be disabled"
++    print("✓ UserChangeForm password field is disabled")
++    
++    # Test 6: clean_password method should not exist (removed)
++    assert not hasattr(form, 'clean_password'), "clean_password method should be removed"
++    print("✓ clean_password method removed from UserChangeForm")
++    
++    print("\n🎉 All tests passed! The fix is working correctly.")
++    print("\nSummary of changes:")
++    print("1. Added kwargs.setdefault('disabled', True) to ReadOnlyPasswordHashField.__init__()")
++    print("2. Removed clean_password() method from UserChangeForm")
++    print("3. The field now properly prevents user input via HTML disabled attribute")
++
++if __name__ == '__main__':
++    test_final_verification()
+\ No newline at end of file

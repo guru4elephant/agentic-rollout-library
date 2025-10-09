@@ -1,0 +1,263 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 29e33c075f..8173217143 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -1423,7 +1423,10 @@ class SQLDeleteCompiler(SQLCompiler):
+         Create the SQL for this query. Return the SQL string and list of
+         parameters.
+         """
+-        if self.single_alias:
++        self.pre_sql_setup()
++        # Check single_alias dynamically after setup
++        single_alias = sum(self.query.alias_refcount[t] > 0 for t in self.query.alias_map) == 1
++        if single_alias:
+             return self._as_sql(self.query)
+         innerq = self.query.clone()
+         innerq.__class__ = Query
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..5f3fbd7fe3
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=False,
++    )
++
++django.setup()
++
++from django.db import models, connection
++
++# Create a simple model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'testapp'
++
++# Create the table
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Test the delete query generation
++queryset = TestModel.objects.all()
++delete_query = queryset.query.clone()
++delete_query.__class__ = models.sql.subqueries.DeleteQuery
++
++# Get the compiler
++compiler = delete_query.get_compiler(using='default')
++
++print("=== Testing DELETE query generation ===")
++print(f"single_alias: {compiler.single_alias}")
++print(f"alias_map: {compiler.query.alias_map}")
++print(f"alias_refcount: {compiler.query.alias_refcount}")
++print(f"alias_map keys: {list(compiler.query.alias_map.keys())}")
++print(f"alias_refcount keys: {list(compiler.query.alias_refcount.keys())}")
++print(f"alias_refcount values: {list(compiler.query.alias_refcount.values())}")
++
++# Let's see what happens after calling get_initial_alias
++initial_alias = compiler.query.get_initial_alias()
++print(f"After get_initial_alias(): alias={initial_alias}")
++print(f"alias_map: {compiler.query.alias_map}")
++print(f"alias_refcount: {compiler.query.alias_refcount}")
++
++# Generate the SQL
++sql, params = compiler.as_sql()
++print(f"SQL: {sql}")
++print(f"Params: {params}")
++
++# Let's also test with a simple filter
++queryset_with_filter = TestModel.objects.filter(name='test')
++delete_query_filter = queryset_with_filter.query.clone()
++delete_query_filter.__class__ = models.sql.subqueries.DeleteQuery
++compiler_filter = delete_query_filter.get_compiler(using='default')
++
++print("\n=== Testing DELETE query with filter ===")
++print(f"single_alias: {compiler_filter.single_alias}")
++sql_filter, params_filter = compiler_filter.as_sql()
++print(f"SQL: {sql_filter}")
++print(f"Params: {params_filter}")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..52bfba60aa
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=False,
++    )
++
++django.setup()
++
++from django.db import models, connection
++
++# Create a simple model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    age = models.IntegerField()
++    
++    class Meta:
++        app_label = 'testapp'
++
++# Create the table
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Test various delete scenarios
++def test_delete_scenario(description, queryset):
++    print(f"\n=== {description} ===")
++    delete_query = queryset.query.clone()
++    delete_query.__class__ = models.sql.subqueries.DeleteQuery
++    compiler = delete_query.get_compiler(using='default')
++    
++    sql, params = compiler.as_sql()
++    print(f"SQL: {sql}")
++    print(f"Params: {params}")
++    return sql, params
++
++# Test 1: Simple all().delete()
++sql1, params1 = test_delete_scenario(
++    "Test 1: Model.objects.all().delete()",
++    TestModel.objects.all()
++)
++
++# Test 2: Filtered delete
++sql2, params2 = test_delete_scenario(
++    "Test 2: Model.objects.filter(name='test').delete()",
++    TestModel.objects.filter(name='test')
++)
++
++# Test 3: Complex filter
++sql3, params3 = test_delete_scenario(
++    "Test 3: Model.objects.filter(name='test', age=25).delete()",
++    TestModel.objects.filter(name='test', age=25)
++)
++
++# Test 4: Empty result delete
++sql4, params4 = test_delete_scenario(
++    "Test 4: Model.objects.filter(name='nonexistent').delete()",
++    TestModel.objects.filter(name='nonexistent')
++)
++
++# Verify the fixes
++print("\n=== Verification ===")
++print(f"Test 1 (all().delete()): {'PASS' if 'IN (' not in sql1 else 'FAIL'} - {sql1}")
++print(f"Test 2 (filtered delete): {'PASS' if 'WHERE' in sql2 else 'FAIL'} - {sql2}")
++print(f"Test 3 (complex filter): {'PASS' if 'WHERE' in sql3 else 'FAIL'} - {sql3}")
++print(f"Test 4 (empty result): {'PASS' if 'WHERE' in sql4 else 'FAIL'} - {sql4}")
+\ No newline at end of file
+diff --git a/test_joins.py b/test_joins.py
+new file mode 100644
+index 0000000000..78a3ede630
+--- /dev/null
++++ b/test_joins.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=False,
++    )
++
++django.setup()
++
++from django.db import models, connection
++
++# Create related models to test joins
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'testapp'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'testapp'
++
++# Create the tables
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Author)
++    schema_editor.create_model(Book)
++
++# Test delete with joins (should still use subquery when needed)
++def test_join_delete():
++    print("\n=== Testing delete with joins ===")
++    
++    # Create a query with a join
++    queryset = Book.objects.filter(author__name='test_author')
++    delete_query = queryset.query.clone()
++    delete_query.__class__ = models.sql.subqueries.DeleteQuery
++    compiler = delete_query.get_compiler(using='default')
++    
++    sql, params = compiler.as_sql()
++    print(f"SQL: {sql}")
++    print(f"Params: {params}")
++    
++    # This should use the subquery path because of the join
++    if "IN (" in sql:
++        print("✅ PASS: Subquery correctly used for join queries")
++    else:
++        print("❌ FAIL: Subquery not used for join queries")
++    
++    return sql, params
++
++test_join_delete()
+\ No newline at end of file

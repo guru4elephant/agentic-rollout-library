@@ -1,0 +1,344 @@
+diff --git a/django/contrib/contenttypes/management/__init__.py b/django/contrib/contenttypes/management/__init__.py
+index 2b5f688136..563cba2fdf 100644
+--- a/django/contrib/contenttypes/management/__init__.py
++++ b/django/contrib/contenttypes/management/__init__.py
+@@ -24,7 +24,7 @@ class RenameContentType(migrations.RunPython):
+             content_type.model = new_model
+             try:
+                 with transaction.atomic(using=db):
+-                    content_type.save(update_fields={'model'})
++                    content_type.save(using=db, update_fields={'model'})
+             except IntegrityError:
+                 # Gracefully fallback if a stale content type causes a
+                 # conflict as remove_stale_contenttypes will take care of
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..4f41ac37fd
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++"""
++Final verification that the fix addresses the GitHub issue.
++This script demonstrates that the content_type.save() call now uses the correct database.
++"""
++
++import inspect
++from django.contrib.contenttypes.management import RenameContentType
++
++def verify_fix():
++    """Verify that the fix has been applied correctly"""
++    
++    print("=== Final Verification of the GitHub Issue Fix ===\n")
++    
++    # Get the source code of the _rename method
++    rename_op = RenameContentType('test_app', 'oldmodel', 'newmodel')
++    source = inspect.getsource(rename_op._rename)
++    
++    # Check 1: The fix is present
++    print("1. Checking if the fix is present...")
++    if "content_type.save(using=db, update_fields={'model'})" in source:
++        print("   ✅ SUCCESS: content_type.save() now includes using=db parameter")
++    else:
++        print("   ❌ FAIL: content_type.save() still missing using=db parameter")
++        return False
++    
++    # Check 2: The original problematic line is gone
++    print("\n2. Checking if the original problematic line is gone...")
++    if "content_type.save(update_fields={'model'})" in source:
++        print("   ❌ FAIL: Original problematic line still exists")
++        return False
++    else:
++        print("   ✅ SUCCESS: Original problematic line has been removed")
++    
++    # Check 3: The db variable is properly defined and used
++    print("\n3. Checking if db variable is properly defined and used...")
++    lines = source.split('\n')
++    db_def_line = None
++    db_usage_line = None
++    
++    for i, line in enumerate(lines):
++        if 'db = schema_editor.connection.alias' in line:
++            db_def_line = i + 1
++        if 'content_type.save(using=db,' in line:
++            db_usage_line = i + 1
++    
++    if db_def_line and db_usage_line:
++        print(f"   ✅ SUCCESS: db variable defined on line {db_def_line} and used on line {db_usage_line}")
++    else:
++        print("   ❌ FAIL: db variable not properly defined or used")
++        return False
++    
++    # Check 4: The transaction context uses the correct database
++    print("\n4. Checking if transaction context uses correct database...")
++    if "with transaction.atomic(using=db):" in source:
++        print("   ✅ SUCCESS: transaction.atomic() uses using=db parameter")
++    else:
++        print("   ❌ FAIL: transaction.atomic() doesn't use using=db parameter")
++        return False
++    
++    # Check 5: The ContentType query uses the correct database manager
++    print("\n5. Checking if ContentType query uses correct database manager...")
++    if "ContentType.objects.db_manager(db).get_by_natural_key" in source:
++        print("   ✅ SUCCESS: ContentType query uses db_manager(db) correctly")
++    else:
++        print("   ❌ FAIL: ContentType query doesn't use db_manager(db)")
++        return False
++    
++    print("\n=== SUMMARY ===")
++    print("✅ The fix has been successfully applied!")
++    print("✅ The content_type.save() call now properly uses the using=db parameter")
++    print("✅ This ensures that content types are saved to the correct database")
++    print("✅ The issue described in the GitHub issue has been resolved")
++    
++    return True
++
++if __name__ == '__main__':
++    verify_fix()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..fc4d8d4668
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++"""
++Simplified script to reproduce the issue with RenameContentType._rename() not saving 
++the content type on the correct database.
++"""
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_rename_contenttype_issue():
++    """Test that demonstrates the issue with RenameContentType"""
++    
++    from django.contrib.contenttypes.management import RenameContentType
++    
++    # Create a mock schema editor with a specific database alias
++    class MockSchemaEditor:
++        def __init__(self, db_alias):
++            self.connection = type('obj', (object,), {'alias': db_alias})
++    
++    # Test with a specific database alias
++    schema_editor = MockSchemaEditor('custom_db')
++    
++    print("Testing RenameContentType._rename()...")
++    print(f"Schema editor connection alias: {schema_editor.connection.alias}")
++    
++    # Mock apps object
++    from django.apps.registry import Apps
++    apps = Apps(['django.contrib.contenttypes'])
++    
++    # Create RenameContentType instance
++    rename_op = RenameContentType('test_app', 'oldmodel', 'newmodel')
++    
++    # The issue: _rename method should use the db from schema_editor.connection.alias
++    # but currently doesn't pass it to content_type.save()
++    print("\nExamining the _rename method implementation...")
++    
++    # Let's look at the actual source code to see the issue
++    import inspect
++    source = inspect.getsource(rename_op._rename)
++    print("Source of _rename method:")
++    print(source)
++    
++    # The issue is on line 27: content_type.save(update_fields={'model'})
++    # should be content_type.save(using=db, update_fields={'model'})
++
++if __name__ == '__main__':
++    test_rename_contenttype_issue()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..2b70dedf75
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,35 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the fix by examining the source code directly.
++"""
++
++import inspect
++from django.contrib.contenttypes.management import RenameContentType
++
++def test_fix():
++    """Test that the fix has been applied correctly"""
++    
++    # Create a RenameContentType instance
++    rename_op = RenameContentType('test_app', 'oldmodel', 'newmodel')
++    
++    # Get the source code of the _rename method
++    source = inspect.getsource(rename_op._rename)
++    print("Source code of _rename method:")
++    print(source)
++    
++    # Check if the fix is present
++    if "content_type.save(using=db, update_fields={'model'})" in source:
++        print("\n✅ SUCCESS: The fix has been applied correctly!")
++        print("The content_type.save() call now includes using=db parameter.")
++    else:
++        print("\n❌ ERROR: The fix has NOT been applied!")
++        print("The content_type.save() call is still missing using=db parameter.")
++    
++    # Also check the original problematic line is gone
++    if "content_type.save(update_fields={'model'})" in source:
++        print("❌ ERROR: The original problematic line still exists!")
++    else:
++        print("✅ SUCCESS: The original problematic line has been removed!")
++
++if __name__ == '__main__':
++    test_fix()
+\ No newline at end of file
+diff --git a/test_default.db b/test_default.db
+new file mode 100644
+index 0000000000..292481fa76
+Binary files /dev/null and b/test_default.db differ
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..8d050558f9
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for RenameContentType._rename() issue.
++"""
++
++import django
++from django.conf import settings
++from django.db import connections, models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': 'test_default.db',
++            },
++            'other': {
++                'ENGINE': 'django.db.backends.sqlite3', 
++                'NAME': 'test_other.db',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_fix():
++    """Test that the fix works correctly"""
++    
++    from django.contrib.contenttypes.models import ContentType
++    
++    # Create databases
++    for db_alias in ['default', 'other']:
++        connection = connections[db_alias]
++        with connection.schema_editor() as schema_editor:
++            # Create contenttypes table
++            schema_editor.create_model(ContentType)
++    
++    # Create content types in both databases
++    ContentType.objects.using('default').create(
++        app_label='test_app',
++        model='oldmodel'
++    )
++    
++    ContentType.objects.using('other').create(
++        app_label='test_app',
++        model='oldmodel'
++    )
++    
++    # Import the fixed RenameContentType
++    from django.contrib.contenttypes.management import RenameContentType
++    
++    # Create a mock schema editor
++    class MockSchemaEditor:
++        def __init__(self, db_alias):
++            self.connection = type('obj', (object,), {'alias': db_alias})
++    
++    # Test with 'other' database
++    schema_editor = MockSchemaEditor('other')
++    
++    # Mock apps object
++    from django.apps.registry import Apps
++    apps = Apps(['django.contrib.contenttypes'])
++    
++    # Create RenameContentType instance
++    rename_op = RenameContentType('test_app', 'oldmodel', 'newmodel')
++    
++    print("Testing the fixed RenameContentType._rename()...")
++    print(f"Using database alias: {schema_editor.connection.alias}")
++    
++    try:
++        # Call the _rename method
++        rename_op._rename(apps, schema_editor, 'oldmodel', 'newmodel')
++        print("SUCCESS: _rename method completed without error")
++        
++        # Verify the content type was renamed in the correct database
++        try:
++            renamed_ct = ContentType.objects.using('other').get(
++                app_label='test_app', 
++                model='newmodel'
++            )
++            print(f"SUCCESS: Found renamed content type in 'other' database: {renamed_ct}")
++        except ContentType.DoesNotExist:
++            print("ERROR: Renamed content type not found in 'other' database")
++        
++        # Verify the content type was NOT renamed in the default database
++        try:
++            default_ct = ContentType.objects.using('default').get(
++                app_label='test_app', 
++                model='newmodel'
++            )
++            print(f"ERROR: Renamed content type found in default database: {default_ct}")
++        except ContentType.DoesNotExist:
++            print("SUCCESS: Renamed content type not found in default database")
++            
++        # Verify the original content type is gone from the other database
++        try:
++            old_ct = ContentType.objects.using('other').get(
++                app_label='test_app', 
++                model='oldmodel'
++            )
++            print(f"ERROR: Original content type still exists in 'other' database: {old_ct}")
++        except ContentType.DoesNotExist:
++            print("SUCCESS: Original content type no longer exists in 'other' database")
++            
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    test_fix()
+\ No newline at end of file
+diff --git a/test_other.db b/test_other.db
+new file mode 100644
+index 0000000000..292481fa76
+Binary files /dev/null and b/test_other.db differ

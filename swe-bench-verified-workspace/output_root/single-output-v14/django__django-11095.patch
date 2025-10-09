@@ -1,0 +1,149 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 5e7b23f9a0..f226d8a68d 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -580,9 +580,19 @@ class ModelAdmin(BaseModelAdmin):
+     def __str__(self):
+         return "%s.%s" % (self.model._meta.app_label, self.__class__.__name__)
+ 
++    def get_inlines(self, request, obj=None):
++        """
++        Hook for specifying the list of inline classes to use based on the
++        request or model instance.
++        
++        By default, this returns the inlines attribute. Subclasses can override
++        this method to return different inlines based on the request or obj.
++        """
++        return self.inlines
++
+     def get_inline_instances(self, request, obj=None):
+         inline_instances = []
+-        for inline_class in self.inlines:
++        for inline_class in self.get_inlines(request, obj):
+             inline = inline_class(self.model, self.admin_site)
+             if request:
+                 if not (inline.has_view_or_change_permission(request, obj) or
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..ecbb1d99c4
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python3
++
++"""
++Script to reproduce the issue and test the new get_inlines() hook
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.contrib import admin
++from django.db import models
++from django.http import HttpRequest
++
++# Test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++class Review(models.Model):
++    content = models.TextField()
++    book = models.ForeignKey(Book, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test inline classes
++class BookInline(admin.TabularInline):
++    model = Book
++
++class ReviewInline(admin.TabularInline):
++    model = Review
++
++# Custom ModelAdmin to test the new get_inlines hook
++class AuthorAdmin(admin.ModelAdmin):
++    # Current approach - overriding get_inline_instances
++    def get_inline_instances(self, request, obj=None):
++        print(f"Current get_inline_instances called with obj: {obj}")
++        inlines = []
++        for inline_class in self.inlines:
++            inline = inline_class(self.model, self.admin_site)
++            if request:
++                if not (inline.has_view_or_change_permission(request, obj) or
++                        inline.has_add_permission(request, obj) or
++                        inline.has_delete_permission(request, obj)):
++                    continue
++                if not inline.has_add_permission(request, obj):
++                    inline.max_num = 0
++            inlines.append(inline)
++        return inlines
++    
++    # We want to implement get_inlines instead
++    def get_inlines(self, request, obj=None):
++        print(f"New get_inlines called with obj: {obj}")
++        # This should return inline classes, not instances
++        if obj and obj.name == "Special Author":
++            return [BookInline]  # Only show books for special authors
++        return [BookInline, ReviewInline]  # Show both for others
++
++# Test the current behavior
++def test_current_behavior():
++    print("=== Testing Current Behavior ===")
++    
++    author_admin = AuthorAdmin(Author, admin.site)
++    author_admin.inlines = [BookInline, ReviewInline]
++    
++    # Create a simple mock request - skip permission checks for testing
++    request = HttpRequest()
++    request.method = 'GET'
++    
++    # Test without object - just show what the current method does
++    print("Testing without object:")
++    print("Current get_inline_instances method loops through self.inlines and creates instances")
++    print("The issue is that to customize inlines based on request/obj, we have to:")
++    print("1. Copy the entire for loop logic")
++    print("2. Duplicate permission checking logic")
++    print("3. Instead, we want a simple get_inlines(request, obj) method")
++    print("   that just returns the inline classes we want")
++    
++    print("\nWhat we want to implement:")
++    print("def get_inlines(self, request, obj=None):")
++    print("    if obj and obj.name == 'Special Author':")
++    print("        return [BookInline]  # Only show books")
++    print("    return [BookInline, ReviewInline]  # Show both")
++
++if __name__ == '__main__':
++    test_current_behavior()
+\ No newline at end of file

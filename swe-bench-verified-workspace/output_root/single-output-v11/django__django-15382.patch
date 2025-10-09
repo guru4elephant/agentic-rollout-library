@@ -1,0 +1,573 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 81f8f79c71..6ecb973a25 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -1199,6 +1199,7 @@ class Subquery(BaseExpression, Combinable):
+ class Exists(Subquery):
+     template = 'EXISTS(%(subquery)s)'
+     output_field = fields.BooleanField()
++    empty_result_set_value = False
+ 
+     def __init__(self, queryset, negated=False, **kwargs):
+         self.negated = negated
+@@ -1211,15 +1212,23 @@ class Exists(Subquery):
+ 
+     def as_sql(self, compiler, connection, template=None, **extra_context):
+         query = self.query.exists(using=connection.alias)
+-        sql, params = super().as_sql(
+-            compiler,
+-            connection,
+-            template=template,
+-            query=query,
+-            **extra_context,
+-        )
+-        if self.negated:
+-            sql = 'NOT {}'.format(sql)
++        try:
++            sql, params = super().as_sql(
++                compiler,
++                connection,
++                template=template,
++                query=query,
++                **extra_context,
++            )
++        except EmptyResultSet:
++            # Handle empty subquery for EXISTS
++            if self.negated:
++                sql, params = '1', ()  # NOT EXISTS(empty) -> TRUE
++            else:
++                sql, params = '0', ()  # EXISTS(empty) -> FALSE
++        else:
++            if self.negated:
++                sql = 'NOT {}'.format(sql)
+         return sql, params
+ 
+     def select_format(self, compiler, sql, params):
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..a85959db85
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,161 @@
++#!/usr/bin/env python3
++"""
++Final comprehensive test to verify the fix for the GitHub issue:
++filter on exists-subquery with empty queryset removes whole WHERE block
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple test model
++class MyModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_original_issue():
++    """Test the exact case from the GitHub issue"""
++    print("1. Testing original GitHub issue case:")
++    print("   MyModel.objects.filter(~models.Exists(MyModel.objects.none()), name='test')")
++    
++    qs = MyModel.objects.filter(~models.Exists(MyModel.objects.none()), name='test')
++    
++    try:
++        query_str = str(qs.query)
++        print(f"   Generated query: {query_str}")
++        
++        # The issue was that the WHERE clause was completely removed
++        # With the fix, it should be preserved with both conditions
++        if "WHERE" not in query_str:
++            print("   ❌ FAILED: WHERE clause is missing entirely")
++            return False
++            
++        if "name" not in query_str:
++            print("   ❌ FAILED: name condition is missing from WHERE clause")
++            return False
++            
++        # The NOT EXISTS(empty) should evaluate to 1 (TRUE)
++        if "1" not in query_str:
++            print("   ❌ FAILED: NOT EXISTS(empty) not correctly evaluated to 1 (TRUE)")
++            return False
++            
++        print("   ✅ SUCCESS: WHERE clause is preserved with both conditions")
++        return True
++        
++    except Exception as e:
++        print(f"   ❌ ERROR: {e}")
++        return False
++
++def test_various_cases():
++    """Test various edge cases"""
++    print("\n2. Testing various edge cases:")
++    
++    test_cases = [
++        {
++            'name': 'EXISTS(empty)',
++            'qs': MyModel.objects.filter(models.Exists(MyModel.objects.none())),
++            'expected': '0',
++            'description': 'EXISTS(empty) should evaluate to 0 (FALSE)'
++        },
++        {
++            'name': 'NOT EXISTS(empty)',
++            'qs': MyModel.objects.filter(~models.Exists(MyModel.objects.none())),
++            'expected': '1', 
++            'description': 'NOT EXISTS(empty) should evaluate to 1 (TRUE)'
++        },
++        {
++            'name': 'EXISTS(empty) with condition',
++            'qs': MyModel.objects.filter(models.Exists(MyModel.objects.none()), name='test'),
++            'expected': '0',
++            'description': 'EXISTS(empty) with condition should preserve both'
++        },
++        {
++            'name': 'NOT EXISTS(empty) with multiple conditions',
++            'qs': MyModel.objects.filter(~models.Exists(MyModel.objects.none()), name='test', id=1),
++            'expected': '1',
++            'description': 'NOT EXISTS(empty) with multiple conditions should preserve all'
++        }
++    ]
++    
++    for i, case in enumerate(test_cases, 1):
++        print(f"   {i}. {case['name']}: {case['description']}")
++        try:
++            query_str = str(case['qs'].query)
++            if case['expected'] in query_str:
++                print(f"      ✅ SUCCESS: Correctly evaluated to {case['expected']}")
++            else:
++                print(f"      ❌ FAILED: Expected {case['expected']} in query: {query_str}")
++                return False
++        except Exception as e:
++            print(f"      ❌ ERROR: {e}")
++            return False
++    
++    return True
++
++def test_non_empty_exists():
++    """Test that non-empty EXISTS still works correctly"""
++    print("\n3. Testing that non-empty EXISTS still works:")
++    
++    # This should work as before (not raising EmptyResultSet)
++    qs = MyModel.objects.filter(~models.Exists(MyModel.objects.all()), name='test')
++    
++    try:
++        query_str = str(qs.query)
++        print(f"   Generated query: {query_str}")
++        
++        if "EXISTS" in query_str and "name" in query_str:
++            print("   ✅ SUCCESS: Non-empty EXISTS works correctly")
++            return True
++        else:
++            print("   ❌ FAILED: Non-empty EXISTS not working correctly")
++            return False
++            
++    except Exception as e:
++        print(f"   ❌ ERROR: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("Testing fix for GitHub issue: filter on exists-subquery with empty queryset removes whole WHERE block")
++    print("=" * 80)
++    
++    success1 = test_original_issue()
++    success2 = test_various_cases() 
++    success3 = test_non_empty_exists()
++    
++    if success1 and success2 and success3:
++        print("\n" + "=" * 80)
++        print("🎉 ALL TESTS PASSED! The issue has been successfully fixed.")
++        print("\nSummary of the fix:")
++        print("- EXISTS(empty_query) now evaluates to 0 (FALSE)")
++        print("- NOT EXISTS(empty_query) now evaluates to 1 (TRUE)") 
++        print("- WHERE clauses are preserved when using EXISTS with empty querysets")
++        print("- Non-empty EXISTS queries continue to work as before")
++        sys.exit(0)
++    else:
++        print("\n" + "=" * 80)
++        print("💥 SOME TESTS FAILED!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..121ea63e4c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple test model
++class MyModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the issue
++print("Testing the issue with EXISTS subquery and empty queryset...")
++
++# Create the queryset as described in the issue
++qs = MyModel.objects.filter(~models.Exists(MyModel.objects.none()), name='test')
++print(f"QuerySet type: {type(qs)}")
++
++try:
++    print(f"Query: {qs.query}")
++except Exception as e:
++    print(f"Error getting query: {e}")
++    print(f"Exception type: {type(e)}")
++
++# Let's also test what happens with a regular empty queryset
++print("\nTesting with regular empty queryset:")
++empty_qs = MyModel.objects.none()
++try:
++    print(f"Empty QuerySet query: {empty_qs.query}")
++except Exception as e:
++    print(f"Error getting empty query: {e}")
++
++# Test what happens with just the EXISTS part
++print("\nTesting just the EXISTS part:")
++exists_qs = MyModel.objects.filter(~models.Exists(MyModel.objects.none()))
++try:
++    print(f"EXISTS QuerySet query: {exists_qs.query}")
++except Exception as e:
++    print(f"Error getting EXISTS query: {e}")
++    print(f"Exception type: {type(e)}")
++
++# Test what happens with non-empty EXISTS (just query generation)
++print("\nTesting with non-empty EXISTS (query generation only):")
++non_empty_qs = MyModel.objects.filter(~models.Exists(MyModel.objects.all()), name='test')
++try:
++    print(f"Non-empty EXISTS QuerySet query: {non_empty_qs.query}")
++except Exception as e:
++    print(f"Error getting non-empty EXISTS query: {e}")
++    print(f"Exception type: {type(e)}")
++
++# Test what happens with positive EXISTS (not negated)
++print("\nTesting with positive EXISTS (query generation only):")
++positive_exists_qs = MyModel.objects.filter(models.Exists(MyModel.objects.none()), name='test')
++try:
++    print(f"Positive EXISTS QuerySet query: {positive_exists_qs.query}")
++except Exception as e:
++    print(f"Error getting positive EXISTS query: {e}")
++    print(f"Exception type: {type(e)}")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..95277f4dcc
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple test model
++class MyModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++print("Testing edge cases for EXISTS subquery fix:")
++
++# Test 1: Regular EXISTS with empty queryset
++print("\n1. Testing EXISTS(empty):")
++qs1 = MyModel.objects.filter(models.Exists(MyModel.objects.none()))
++try:
++    query_str = str(qs1.query)
++    print(f"Query: {query_str}")
++    if "WHERE" in query_str and "0" in query_str:
++        print("SUCCESS: EXISTS(empty) correctly evaluates to 0 (FALSE)")
++    else:
++        print("FAILED: EXISTS(empty) not handled correctly")
++except Exception as e:
++    print(f"Error: {e}")
++
++# Test 2: NOT EXISTS with empty queryset  
++print("\n2. Testing NOT EXISTS(empty):")
++qs2 = MyModel.objects.filter(~models.Exists(MyModel.objects.none()))
++try:
++    query_str = str(qs2.query)
++    print(f"Query: {query_str}")
++    if "WHERE" in query_str and "1" in query_str:
++        print("SUCCESS: NOT EXISTS(empty) correctly evaluates to 1 (TRUE)")
++    else:
++        print("FAILED: NOT EXISTS(empty) not handled correctly")
++except Exception as e:
++    print(f"Error: {e}")
++
++# Test 3: Multiple conditions with EXISTS(empty)
++print("\n3. Testing multiple conditions with EXISTS(empty):")
++qs3 = MyModel.objects.filter(models.Exists(MyModel.objects.none()), name='test')
++try:
++    query_str = str(qs3.query)
++    print(f"Query: {query_str}")
++    if "WHERE" in query_str and "0" in query_str and "name" in query_str:
++        print("SUCCESS: Multiple conditions preserved with EXISTS(empty)")
++    else:
++        print("FAILED: Multiple conditions not handled correctly")
++except Exception as e:
++    print(f"Error: {e}")
++
++# Test 4: Multiple conditions with NOT EXISTS(empty)
++print("\n4. Testing multiple conditions with NOT EXISTS(empty):")
++qs4 = MyModel.objects.filter(~models.Exists(MyModel.objects.none()), name='test')
++try:
++    query_str = str(qs4.query)
++    print(f"Query: {query_str}")
++    if "WHERE" in query_str and "1" in query_str and "name" in query_str:
++        print("SUCCESS: Multiple conditions preserved with NOT EXISTS(empty)")
++    else:
++        print("FAILED: Multiple conditions not handled correctly")
++except Exception as e:
++    print(f"Error: {e}")
++
++print("\nAll edge case tests completed!")
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..aae0dd37f9
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple test model
++class MyModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the exact case from the GitHub issue
++print("Testing the exact GitHub issue case:")
++qs = MyModel.objects.filter(~models.Exists(MyModel.objects.none()), name='test')
++
++try:
++    query_str = str(qs.query)
++    print(f"Query: {query_str}")
++    # Check if the WHERE clause is preserved
++    if "WHERE" in query_str and "name" in query_str:
++        print("SUCCESS: WHERE clause is preserved with both conditions!")
++    else:
++        print("FAILED: WHERE clause is not properly preserved")
++except Exception as e:
++    print(f"Error: {e}")
+\ No newline at end of file
+diff --git a/test_github_issue_fix.py b/test_github_issue_fix.py
+new file mode 100644
+index 0000000000..9327f4a199
+--- /dev/null
++++ b/test_github_issue_fix.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++"""
++Test to verify the fix for the GitHub issue:
++filter on exists-subquery with empty queryset removes whole WHERE block
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple test model
++class MyModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_github_issue():
++    """Test the exact case from the GitHub issue"""
++    print("Testing GitHub issue: filter on exists-subquery with empty queryset removes whole WHERE block")
++    
++    # This is the exact case from the issue
++    qs = MyModel.objects.filter(~models.Exists(MyModel.objects.none()), name='test')
++    
++    try:
++        query_str = str(qs.query)
++        print(f"Generated query: {query_str}")
++        
++        # The issue was that the WHERE clause was completely removed
++        # With the fix, it should be preserved with both conditions
++        if "WHERE" not in query_str:
++            print("❌ FAILED: WHERE clause is missing entirely")
++            return False
++            
++        if "name" not in query_str:
++            print("❌ FAILED: name condition is missing from WHERE clause")
++            return False
++            
++        # The NOT EXISTS(empty) should evaluate to 1 (TRUE)
++        if "1" not in query_str:
++            print("❌ FAILED: NOT EXISTS(empty) not correctly evaluated to 1 (TRUE)")
++            return False
++            
++        print("✅ SUCCESS: WHERE clause is preserved with both conditions")
++        return True
++        
++    except Exception as e:
++        print(f"❌ ERROR: {e}")
++        return False
++
++def test_related_cases():
++    """Test related cases to ensure the fix is comprehensive"""
++    print("\nTesting related cases:")
++    
++    # Test 1: EXISTS(empty) should evaluate to 0 (FALSE)
++    qs1 = MyModel.objects.filter(models.Exists(MyModel.objects.none()), name='test')
++    try:
++        query_str = str(qs1.query)
++        if "WHERE" in query_str and "0" in query_str and "name" in query_str:
++            print("✅ EXISTS(empty) correctly evaluates to 0 (FALSE)")
++        else:
++            print("❌ EXISTS(empty) not handled correctly")
++            return False
++    except Exception as e:
++        print(f"❌ ERROR in EXISTS(empty) test: {e}")
++        return False
++    
++    # Test 2: NOT EXISTS(empty) with multiple conditions
++    qs2 = MyModel.objects.filter(~models.Exists(MyModel.objects.none()), name='test', id=1)
++    try:
++        query_str = str(qs2.query)
++        if "WHERE" in query_str and "1" in query_str and "name" in query_str and "id" in query_str:
++            print("✅ NOT EXISTS(empty) with multiple conditions works correctly")
++        else:
++            print("❌ NOT EXISTS(empty) with multiple conditions not handled correctly")
++            return False
++    except Exception as e:
++        print(f"❌ ERROR in multiple conditions test: {e}")
++        return False
++    
++    return True
++
++if __name__ == "__main__":
++    success1 = test_github_issue()
++    success2 = test_related_cases()
++    
++    if success1 and success2:
++        print("\n🎉 All tests passed! The GitHub issue has been fixed.")
++        sys.exit(0)
++    else:
++        print("\n💥 Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file

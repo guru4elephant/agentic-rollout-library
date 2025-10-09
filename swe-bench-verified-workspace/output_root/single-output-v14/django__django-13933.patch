@@ -1,0 +1,414 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..d402e53fee
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.core.exceptions import ValidationError
++
++def test_model_choice_field():
++    # Create a simple mock model for testing
++    class MockModel:
++        pk = 1
++        
++        class DoesNotExist(Exception):
++            pass
++    
++    # Create a mock queryset that always raises DoesNotExist
++    class MockQuerySet:
++        def __init__(self):
++            self.model = MockModel
++        
++        def all(self):
++            return self
++        
++        def get(self, **kwargs):
++            raise MockModel.DoesNotExist()
++    
++    # Test 1: Integer value
++    print("Test 1: Integer invalid value")
++    field = forms.ModelChoiceField(queryset=MockQuerySet())
++    try:
++        result = field.clean(999)
++        print(f"Unexpected success: {result}")
++    except ValidationError as e:
++        print(f"Error message: {e}")
++        print(f"Error params: {e.params}")
++        print()
++    
++    # Test 2: String value
++    print("Test 2: String invalid value")
++    try:
++        result = field.clean("invalid_string")
++        print(f"Unexpected success: {result}")
++    except ValidationError as e:
++        print(f"Error message: {e}")
++        print(f"Error params: {e.params}")
++        print()
++    
++    # Test 3: Model instance (should work differently)
++    print("Test 3: Model instance")
++    try:
++        mock_obj = MockModel()
++        result = field.clean(mock_obj)
++        print(f"Unexpected success: {result}")
++    except ValidationError as e:
++        print(f"Error message: {e}")
++        print(f"Error params: {e.params}")
++        print()
++
++if __name__ == "__main__":
++    test_model_choice_field()
+\ No newline at end of file
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 422bc5d178..cd8bfcba5b 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -1188,7 +1188,7 @@ class ModelChoiceField(ChoiceField):
+     # This class is a subclass of ChoiceField for purity, but it doesn't
+     # actually use any of ChoiceField's implementation.
+     default_error_messages = {
+-        'invalid_choice': _('Select a valid choice. That choice is not one of'
++        'invalid_choice': _('Select a valid choice. %(value)s is not one of'
+                             ' the available choices.'),
+     }
+     iterator = ModelChoiceIterator
+@@ -1280,11 +1280,16 @@ class ModelChoiceField(ChoiceField):
+             return None
+         try:
+             key = self.to_field_name or 'pk'
++            original_value = value
+             if isinstance(value, self.queryset.model):
+                 value = getattr(value, key)
+             value = self.queryset.get(**{key: value})
+         except (ValueError, TypeError, self.queryset.model.DoesNotExist):
+-            raise ValidationError(self.error_messages['invalid_choice'], code='invalid_choice')
++            raise ValidationError(
++                self.error_messages['invalid_choice'], 
++                code='invalid_choice',
++                params={'value': original_value}
++            )
+         return value
+ 
+     def validate(self, value):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..9f38c21447
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.db import models
++from django.core.exceptions import ValidationError
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++    
++    def __str__(self):
++        return self.name
++
++# Test the ModelChoiceField behavior
++def test_model_choice_field():
++    # Create some test objects
++    obj1 = TestModel.objects.create(name="Object 1")
++    obj2 = TestModel.objects.create(name="Object 2")
++    
++    # Create a ModelChoiceField
++    field = forms.ModelChoiceField(queryset=TestModel.objects.all())
++    
++    # Test with valid choice
++    try:
++        result = field.clean(obj1.pk)
++        print(f"Valid choice result: {result}")
++    except ValidationError as e:
++        print(f"Unexpected error with valid choice: {e}")
++    
++    # Test with invalid choice
++    try:
++        result = field.clean(999)  # Non-existent ID
++        print(f"Invalid choice result: {result}")
++    except ValidationError as e:
++        print(f"Error with invalid choice: {e}")
++        print(f"Error message: {e.message}")
++        print(f"Error code: {e.code}")
++        print(f"Error params: {e.params}")
++    
++    # Compare with ModelMultipleChoiceField
++    multi_field = forms.ModelMultipleChoiceField(queryset=TestModel.objects.all())
++    
++    try:
++        result = multi_field.clean([999])  # Non-existent ID
++        print(f"Multi invalid choice result: {result}")
++    except ValidationError as e:
++        print(f"Multi error with invalid choice: {e}")
++        print(f"Multi error message: {e.message}")
++        print(f"Multi error code: {e.code}")
++        print(f"Multi error params: {e.params}")
++
++if __name__ == "__main__":
++    test_model_choice_field()
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..92d21effdb
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.core.exceptions import ValidationError
++
++# Test the ModelChoiceField behavior with a simple mock
++def test_model_choice_field():
++    # Create a simple mock model for testing
++    class MockModel:
++        pk = 1
++        
++        class DoesNotExist(Exception):
++            pass
++    
++    # Create a mock queryset that always raises DoesNotExist
++    class MockQuerySet:
++        def __init__(self):
++            self.model = MockModel
++        
++        def all(self):
++            return self
++        
++        def get(self, **kwargs):
++            raise MockModel.DoesNotExist()
++    
++    # Create ModelChoiceField with mock queryset
++    field = forms.ModelChoiceField(queryset=MockQuerySet())
++    
++    # Test with invalid choice
++    try:
++        result = field.clean(999)  # Non-existent ID
++        print(f"Invalid choice result: {result}")
++    except ValidationError as e:
++        print(f"Error with invalid choice: {e}")
++        print(f"Error message: {e.message}")
++        print(f"Error code: {e.code}")
++        print(f"Error params: {e.params}")
++    
++    # Compare with ModelMultipleChoiceField
++    multi_field = forms.ModelMultipleChoiceField(queryset=MockQuerySet())
++    
++    try:
++        result = multi_field.clean([999])  # Non-existent ID
++        print(f"Multi invalid choice result: {result}")
++    except ValidationError as e:
++        print(f"Multi error with invalid choice: {e}")
++        print(f"Multi error message: {e.message}")
++        print(f"Multi error code: {e.code}")
++        print(f"Multi error params: {e.params}")
++
++if __name__ == "__main__":
++    test_model_choice_field()
+\ No newline at end of file
+diff --git a/test_issue.py b/test_issue.py
+new file mode 100644
+index 0000000000..55285bcdde
+--- /dev/null
++++ b/test_issue.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.core.exceptions import ValidationError
++
++# Test the ModelChoiceField behavior with a simple mock
++def test_model_choice_field():
++    # Create a simple mock model for testing
++    class MockModel:
++        pk = 1
++        
++        class DoesNotExist(Exception):
++            pass
++    
++    # Create a mock queryset that always raises DoesNotExist
++    class MockQuerySet:
++        def __init__(self):
++            self.model = MockModel
++        
++        def all(self):
++            return self
++        
++        def get(self, **kwargs):
++            raise MockModel.DoesNotExist()
++    
++    # Create ModelChoiceField with mock queryset
++    field = forms.ModelChoiceField(queryset=MockQuerySet())
++    
++    # Test with invalid choice
++    try:
++        result = field.clean(999)  # Non-existent ID
++        print(f"Invalid choice result: {result}")
++    except ValidationError as e:
++        print(f"Error with invalid choice: {e}")
++        print(f"Error message: {e.message}")
++        print(f"Error code: {e.code}")
++        print(f"Error params: {e.params}")
++        print("This shows the issue: ModelChoiceField doesn't pass the invalid value as a parameter!")
++
++if __name__ == "__main__":
++    test_model_choice_field()
+\ No newline at end of file
+diff --git a/test_valid_choice.py b/test_valid_choice.py
+new file mode 100644
+index 0000000000..37f7a1865a
+--- /dev/null
++++ b/test_valid_choice.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.core.exceptions import ValidationError
++
++def test_valid_choice():
++    # Create a simple mock model for testing
++    class MockModel:
++        def __init__(self, pk):
++            self.pk = pk
++        
++        class DoesNotExist(Exception):
++            pass
++    
++    # Create a mock queryset that returns a specific object
++    class MockQuerySet:
++        def __init__(self):
++            self.model = MockModel
++            self.valid_obj = MockModel(1)
++        
++        def all(self):
++            return self
++        
++        def get(self, **kwargs):
++            if kwargs.get('pk') == 1:
++                return self.valid_obj
++            raise MockModel.DoesNotExist()
++    
++    # Test with valid choice
++    print("Test: Valid choice")
++    field = forms.ModelChoiceField(queryset=MockQuerySet())
++    try:
++        result = field.clean(1)
++        print(f"Success: {result}")
++        print(f"Result type: {type(result)}")
++        print(f"Result pk: {result.pk}")
++    except ValidationError as e:
++        print(f"Unexpected error: {e}")
++        print(f"Error params: {e.params}")
++    
++    # Test with empty value
++    print("\nTest: Empty value")
++    try:
++        result = field.clean(None)
++        print(f"Success with None: {result}")
++    except ValidationError as e:
++        print(f"Error with None: {e}")
++    
++    # Test with empty string
++    try:
++        result = field.clean("")
++        print(f"Success with empty string: {result}")
++    except ValidationError as e:
++        print(f"Error with empty string: {e}")
++
++if __name__ == "__main__":
++    test_valid_choice()
+\ No newline at end of file

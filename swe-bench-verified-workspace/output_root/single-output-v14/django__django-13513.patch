@@ -1,0 +1,531 @@
+diff --git a/django/views/debug.py b/django/views/debug.py
+index 7a89f7bd15..485b1328f2 100644
+--- a/django/views/debug.py
++++ b/django/views/debug.py
+@@ -397,7 +397,7 @@ class ExceptionReporter:
+     def get_traceback_frames(self):
+         def explicit_or_implicit_cause(exc_value):
+             explicit = getattr(exc_value, '__cause__', None)
+-            suppress_context = getattr(exc_value, '__suppress_context__', None)
++            suppress_context = getattr(exc_value, '__suppress_context__', False)
+             implicit = getattr(exc_value, '__context__', None)
+             return explicit or (None if suppress_context else implicit)
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..533bd2086c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,50 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key-for-debug',
++        DEFAULT_CHARSET='utf-8',
++    )
++    django.setup()
++
++from django.views import View
++from django.http import HttpRequest
++from django.views.debug import ExceptionReporter
++
++class TestView(View):
++    def get(self, request, *args, **kwargs):
++        try:
++            raise RuntimeError('my error')
++        except Exception as exc:
++            raise ValueError('my new error') from None
++
++# Create a test request
++request = HttpRequest()
++request.method = 'GET'
++
++# Create the view and trigger the exception
++view = TestView()
++try:
++    view.get(request)
++except ValueError as e:
++    # Create ExceptionReporter to see what it shows
++    reporter = ExceptionReporter(request, type(e), e, e.__traceback__)
++    frames = reporter.get_traceback_frames()
++    
++    print("Exception chain frames:")
++    for i, frame in enumerate(frames):
++        print(f"Frame {i}: {frame.get('exc_type', 'Unknown')}: {frame.get('exc_value', 'Unknown')}")
++        if 'exc_value' in frame:
++            exc_value = frame['exc_value']
++            print(f"  __cause__: {getattr(exc_value, '__cause__', None)}")
++            print(f"  __context__: {getattr(exc_value, '__context__', None)}")
++            print(f"  __suppress_context__: {getattr(exc_value, '__suppress_context__', None)}")
++    
++    print("\nFull traceback from ExceptionReporter:")
++    print(reporter.get_traceback_text())
+\ No newline at end of file
+diff --git a/test_before_after_fix.py b/test_before_after_fix.py
+new file mode 100644
+index 0000000000..cc845cef5a
+--- /dev/null
++++ b/test_before_after_fix.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++
++# Test to verify the behavior before and after the fix
++
++def old_explicit_or_implicit_cause(exc_value):
++    """Original implementation with None default"""
++    explicit = getattr(exc_value, '__cause__', None)
++    suppress_context = getattr(exc_value, '__suppress_context__', None)  # Wrong: None default
++    implicit = getattr(exc_value, '__context__', None)
++    return explicit or (None if suppress_context else implicit)
++
++def new_explicit_or_implicit_cause(exc_value):
++    """Fixed implementation with False default"""
++    explicit = getattr(exc_value, '__cause__', None)
++    suppress_context = getattr(exc_value, '__suppress_context__', False)  # Correct: False default
++    implicit = getattr(exc_value, '__context__', None)
++    return explicit or (None if suppress_context else implicit)
++
++# Test with an exception that doesn't have __suppress_context__ set
++class SimpleException(Exception):
++    pass
++
++# Create an exception without __suppress_context__ attribute
++simple_exc = SimpleException("simple error")
++
++print("=== Testing exception without __suppress_context__ attribute ===")
++print("Old implementation result:", old_explicit_or_implicit_cause(simple_exc))
++print("New implementation result:", new_explicit_or_implicit_cause(simple_exc))
++print()
++
++# Test with normal exception that has the default __suppress_context__ = False
++try:
++    raise ValueError("test error")
++except ValueError as e:
++    print("=== Testing normal exception with default __suppress_context__ ===")
++    print("Old implementation result:", old_explicit_or_implicit_cause(e))
++    print("New implementation result:", new_explicit_or_implicit_cause(e))
++    print()
++
++# Test with exception that has __suppress_context__ = True
++try:
++    try:
++        raise RuntimeError("original error")
++    except:
++        raise ValueError("new error") from None
++except ValueError as e:
++    print("=== Testing exception with __suppress_context__ = True ===")
++    print("Old implementation result:", old_explicit_or_implicit_cause(e))
++    print("New implementation result:", new_explicit_or_implicit_cause(e))
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..42abedadda
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++
++# Test to show the actual difference in behavior
++
++def old_explicit_or_implicit_cause(exc_value):
++    """Original implementation with None default"""
++    explicit = getattr(exc_value, '__cause__', None)
++    suppress_context = getattr(exc_value, '__suppress_context__', None)  # Wrong: None default
++    implicit = getattr(exc_value, '__context__', None)
++    return explicit or (None if suppress_context else implicit)
++
++def new_explicit_or_implicit_cause(exc_value):
++    """Fixed implementation with False default"""
++    explicit = getattr(exc_value, '__cause__', None)
++    suppress_context = getattr(exc_value, '__suppress_context__', False)  # Correct: False default
++    implicit = getattr(exc_value, '__context__', None)
++    return explicit or (None if suppress_context else implicit)
++
++# Test case 1: Exception with context but no explicit cause or suppress_context
++class CustomException(Exception):
++    pass
++
++# Create a scenario where we have context but no explicit suppression
++try:
++    try:
++        raise RuntimeError("context error")
++    except:
++        exc = CustomException("main error")
++        # Manually set context but leave suppress_context as default (False)
++        exc.__context__ = RuntimeError("context error")
++        raise exc
++except CustomException as e:
++    print("=== Test case 1: Exception with context but default suppress_context ===")
++    print(f"Exception: {e}")
++    print(f"__context__: {getattr(e, '__context__', None)}")
++    print(f"__suppress_context__: {getattr(e, '__suppress_context__', 'NOT_SET')}")
++    
++    old_result = old_explicit_or_implicit_cause(e)
++    new_result = new_explicit_or_implicit_cause(e)
++    
++    print(f"Old implementation result: {old_result} ({type(old_result).__name__})")
++    print(f"New implementation result: {new_result} ({type(new_result).__name__})")
++    print(f"Results are equal: {old_result == new_result}")
++    print()
++
++# Test case 2: The actual issue from the GitHub issue
++try:
++    try:
++        raise RuntimeError('my error')
++    except Exception as exc:
++        raise ValueError('my new error') from None
++except ValueError as e:
++    print("=== Test case 2: raise from None (GitHub issue) ===")
++    print(f"Exception: {e}")
++    print(f"__cause__: {getattr(e, '__cause__', None)}")
++    print(f"__context__: {getattr(e, '__context__', None)}")
++    print(f"__suppress_context__: {getattr(e, '__suppress_context__', 'NOT_SET')}")
++    
++    old_result = old_explicit_or_implicit_cause(e)
++    new_result = new_explicit_or_implicit_cause(e)
++    
++    print(f"Old implementation result: {old_result} ({type(old_result).__name__})")
++    print(f"New implementation result: {new_result} ({type(new_result).__name__})")
++    print(f"Results are equal: {old_result == new_result}")
++    print()
++
++# Test case 3: Show the actual boolean evaluation difference
++print("=== Test case 3: Boolean evaluation of None vs False ===")
++print("None evaluated as boolean:", bool(None))
++print("False evaluated as boolean:", bool(False))
++print("None == False:", None == False)
++print("None is False:", None is False)
++print()
++
++# Show what happens in the ternary expression
++suppress_none = None
++suppress_false = False
++context = RuntimeError("test context")
++
++print("None if suppress_none else context:", None if suppress_none else context)
++print("None if suppress_false else context:", None if suppress_false else context)
+\ No newline at end of file
+diff --git a/test_debug_view.py b/test_debug_view.py
+new file mode 100644
+index 0000000000..d19c3ad671
+--- /dev/null
++++ b/test_debug_view.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key-for-debug',
++        DEFAULT_CHARSET='utf-8',
++    )
++    django.setup()
++
++from django.views.debug import ExceptionReporter
++
++def test_exception_chain():
++    # Test case 1: raise from None (should suppress context)
++    try:
++        try:
++            raise RuntimeError('my error')
++        except Exception as exc:
++            raise ValueError('my new error') from None
++    except ValueError as e:
++        print("=== Test case 1: raise from None ===")
++        reporter = ExceptionReporter(None, type(e), e, e.__traceback__)
++        frames = reporter.get_traceback_frames()
++        
++        print("Number of frames in chain:", len(frames))
++        for i, frame in enumerate(frames):
++            if 'exc_value' in frame:
++                exc_value = frame['exc_value']
++                print(f"Frame {i}: {type(exc_value).__name__}: {exc_value}")
++                print(f"  __cause__: {getattr(exc_value, '__cause__', None)}")
++                print(f"  __context__: {getattr(exc_value, '__context__', None)}")
++                print(f"  __suppress_context__: {getattr(exc_value, '__suppress_context__', False)}")
++        print()
++    
++    # Test case 2: normal raise (should show context)
++    try:
++        try:
++            raise RuntimeError('my error')
++        except Exception as exc:
++            raise ValueError('my new error')
++    except ValueError as e:
++        print("=== Test case 2: normal raise ===")
++        reporter = ExceptionReporter(None, type(e), e, e.__traceback__)
++        frames = reporter.get_traceback_frames()
++        
++        print("Number of frames in chain:", len(frames))
++        for i, frame in enumerate(frames):
++            if 'exc_value' in frame:
++                exc_value = frame['exc_value']
++                print(f"Frame {i}: {type(exc_value).__name__}: {exc_value}")
++                print(f"  __cause__: {getattr(exc_value, '__cause__', None)}")
++                print(f"  __context__: {getattr(exc_value, '__context__', None)}")
++                print(f"  __suppress_context__: {getattr(exc_value, '__suppress_context__', False)}")
++        print()
++
++if __name__ == '__main__':
++    test_exception_chain()
+\ No newline at end of file
+diff --git a/test_edge_case.py b/test_edge_case.py
+new file mode 100644
+index 0000000000..ad72bfebb8
+--- /dev/null
++++ b/test_edge_case.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++
++# Test edge case where an exception doesn't have __suppress_context__ attribute
++
++def current_implementation(exc_value):
++    """Current implementation with None default"""
++    explicit = getattr(exc_value, '__cause__', None)
++    suppress_context = getattr(exc_value, '__suppress_context__', None)  # None default
++    implicit = getattr(exc_value, '__context__', None)
++    return explicit or (None if suppress_context else implicit)
++
++def fixed_implementation(exc_value):
++    """Fixed implementation with False default"""
++    explicit = getattr(exc_value, '__cause__', None)
++    suppress_context = getattr(exc_value, '__suppress_context__', False)  # False default
++    implicit = getattr(exc_value, '__context__', None)
++    return explicit or (None if suppress_context else implicit)
++
++# Create an exception that doesn't have __suppress_context__ attribute at all
++class CustomException(Exception):
++    def __init__(self, message):
++        super().__init__(message)
++        # Don't set __suppress_context__ attribute
++
++# Create an exception with context but no suppress_context attribute
++try:
++    try:
++        raise RuntimeError("context error")
++    except:
++        exc = CustomException("main error")
++        exc.__context__ = RuntimeError("context error")
++        # Don't set __suppress_context__ attribute at all
++        raise exc
++except CustomException as e:
++    print("=== Edge Case: Exception without __suppress_context__ attribute ===")
++    print(f"Exception: {e}")
++    print(f"Has __suppress_context__: {hasattr(e, '__suppress_context__')}")
++    if hasattr(e, '__suppress_context__'):
++        print(f"__suppress_context__ value: {getattr(e, '__suppress_context__')}")
++    print(f"__context__: {getattr(e, '__context__', None)}")
++    print()
++    
++    current_result = current_implementation(e)
++    fixed_result = fixed_implementation(e)
++    
++    print("Current implementation result:", current_result)
++    print("Fixed implementation result:", fixed_result)
++    print("Results are equal:", current_result == fixed_result)
++    print()
++
++# Test what happens when we manually delete the __suppress_context__ attribute
++try:
++    try:
++        raise RuntimeError("context error")
++    except:
++        # Create a normal exception and then delete the attribute
++        exc = ValueError("main error")
++        exc.__context__ = RuntimeError("context error")
++        # Delete the __suppress_context__ attribute if it exists
++        if hasattr(exc, '__suppress_context__'):
++            delattr(exc, '__suppress_context__')
++        raise exc
++except ValueError as e:
++    print("=== Edge Case: Exception with __suppress_context__ manually deleted ===")
++    print(f"Exception: {e}")
++    print(f"Has __suppress_context__: {hasattr(e, '__suppress_context__')}")
++    print(f"__context__: {getattr(e, '__context__', None)}")
++    print()
++    
++    current_result = current_implementation(e)
++    fixed_result = fixed_implementation(e)
++    
++    print("Current implementation result:", current_result)
++    print("Fixed implementation result:", fixed_result)
++    print("Results are equal:", current_result == fixed_result)
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..6f988feea2
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++
++# Test to reproduce the original issue from the GitHub issue
++
++def original_implementation(exc_value):
++    """The original implementation before any fixes"""
++    explicit = getattr(exc_value, '__cause__', None)
++    implicit = getattr(exc_value, '__context__', None)
++    return explicit or implicit
++
++def current_implementation(exc_value):
++    """Current implementation with None default"""
++    explicit = getattr(exc_value, '__cause__', None)
++    suppress_context = getattr(exc_value, '__suppress_context__', None)  # Wrong default
++    implicit = getattr(exc_value, '__context__', None)
++    return explicit or (None if suppress_context else implicit)
++
++def fixed_implementation(exc_value):
++    """Fixed implementation with False default"""
++    explicit = getattr(exc_value, '__cause__', None)
++    suppress_context = getattr(exc_value, '__suppress_context__', False)  # Correct default
++    implicit = getattr(exc_value, '__context__', None)
++    return explicit or (None if suppress_context else implicit)
++
++# Test the exact scenario from the GitHub issue
++try:
++    try:
++        raise RuntimeError('my error')
++    except Exception as exc:
++        raise ValueError('my new error') from None
++except ValueError as e:
++    print("=== GitHub Issue Test Case ===")
++    print(f"Exception: {e}")
++    print(f"__cause__: {getattr(e, '__cause__', None)}")
++    print(f"__context__: {getattr(e, '__context__', None)}")
++    print(f"__suppress_context__: {getattr(e, '__suppress_context__', 'NOT_SET')}")
++    print()
++    
++    print("Original implementation result:", original_implementation(e))
++    print("Current implementation result:", current_implementation(e))
++    print("Fixed implementation result:", fixed_implementation(e))
++    print()
++
++# Test edge case: what if __suppress_context__ is not set at all?
++class CustomException(Exception):
++    pass
++
++try:
++    try:
++        raise RuntimeError('context error')
++    except:
++        exc = CustomException('main error')
++        exc.__context__ = RuntimeError('context error')
++        # Don't set __suppress_context__ at all
++        raise exc
++except CustomException as e:
++    print("=== Edge Case: No __suppress_context__ attribute ===")
++    print(f"Exception: {e}")
++    print(f"__context__: {getattr(e, '__context__', None)}")
++    print(f"__suppress_context__: {getattr(e, '__suppress_context__', 'NOT_SET')}")
++    print()
++    
++    print("Original implementation result:", original_implementation(e))
++    print("Current implementation result:", current_implementation(e))
++    print("Fixed implementation result:", fixed_implementation(e))
++    print()
++
++# Show the problem with None default
++print("=== The Core Issue ===")
++print("When __suppress_context__ is not set:")
++print("getattr(e, '__suppress_context__', None) returns:", getattr(CustomException(), '__suppress_context__', None))
++print("getattr(e, '__suppress_context__', False) returns:", getattr(CustomException(), '__suppress_context__', False))
++print()
++
++print("In the expression 'None if suppress_context else context':")
++suppress_none = None  # What current implementation returns
++suppress_false = False  # What fixed implementation returns
++context = RuntimeError("test context")
++
++print("None if None else context:", None if suppress_none else context)
++print("None if False else context:", None if suppress_false else context)
+\ No newline at end of file
+diff --git a/test_settings.py b/test_settings.py
+new file mode 100644
+index 0000000000..38f5dd1053
+--- /dev/null
++++ b/test_settings.py
+@@ -0,0 +1,9 @@
++SECRET_KEY = 'test-key-for-debug'
++DEBUG = True
++INSTALLED_APPS = []
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
+\ No newline at end of file
+diff --git a/test_suppress_context.py b/test_suppress_context.py
+new file mode 100644
+index 0000000000..aabac765f4
+--- /dev/null
++++ b/test_suppress_context.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python3
++
++# Test the explicit_or_implicit_cause function directly
++def explicit_or_implicit_cause(exc_value):
++    explicit = getattr(exc_value, '__cause__', None)
++    suppress_context = getattr(exc_value, '__suppress_context__', False)
++    implicit = getattr(exc_value, '__context__', None)
++    return explicit or (None if suppress_context else implicit)
++
++# Test case 1: raise from None (should suppress context)
++try:
++    try:
++        raise RuntimeError('my error')
++    except Exception as exc:
++        raise ValueError('my new error') from None
++except ValueError as e:
++    print("Test case 1 - raise from None:")
++    print(f"ValueError: {e}")
++    print(f"__cause__: {getattr(e, '__cause__', None)}")
++    print(f"__context__: {getattr(e, '__context__', None)}")
++    print(f"__suppress_context__: {getattr(e, '__suppress_context__', False)}")
++    result = explicit_or_implicit_cause(e)
++    print(f"explicit_or_implicit_cause result: {result}")
++    print()
++
++# Test case 2: normal raise (should show context)
++try:
++    try:
++        raise RuntimeError('my error')
++    except Exception as exc:
++        raise ValueError('my new error')
++except ValueError as e:
++    print("Test case 2 - normal raise:")
++    print(f"ValueError: {e}")
++    print(f"__cause__: {getattr(e, '__cause__', None)}")
++    print(f"__context__: {getattr(e, '__context__', None)}")
++    print(f"__suppress_context__: {getattr(e, '__suppress_context__', False)}")
++    result = explicit_or_implicit_cause(e)
++    print(f"explicit_or_implicit_cause result: {result}")
++    print()
++
++# Test case 3: explicit raise from (should show cause)
++try:
++    try:
++        raise RuntimeError('my error')
++    except Exception as exc:
++        raise ValueError('my new error') from exc
++except ValueError as e:
++    print("Test case 3 - raise from exc:")
++    print(f"ValueError: {e}")
++    print(f"__cause__: {getattr(e, '__cause__', None)}")
++    print(f"__context__: {getattr(e, '__context__', None)}")
++    print(f"__suppress_context__: {getattr(e, '__suppress_context__', False)}")
++    result = explicit_or_implicit_cause(e)
++    print(f"explicit_or_implicit_cause result: {result}")
+\ No newline at end of file

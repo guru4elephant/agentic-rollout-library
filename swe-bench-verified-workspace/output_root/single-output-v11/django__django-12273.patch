@@ -1,0 +1,171 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 844c01e95e..ca4e77f916 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -569,7 +569,12 @@ class Model(metaclass=ModelBase):
+         return getattr(self, meta.pk.attname)
+ 
+     def _set_pk_val(self, value):
+-        return setattr(self, self._meta.pk.attname, value)
++        # If setting primary key to None, mark the object as adding (new)
++        if value is None:
++            self._state.adding = True
++        result = setattr(self, self._meta.pk.attname, value)
++        print(f'_set_pk_val: value={value}, {self._meta.pk.attname}={getattr(self, self._meta.pk.attname, "NOT_SET")}')
++        return result
+ 
+     pk = property(_get_pk_val, _set_pk_val)
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..b8216b3344
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where resetting primary key for a child model doesn't work.
++Based on the GitHub issue description.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.test import TestCase
++import uuid
++
++class Item(models.Model):
++    # uid = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++    uid = models.AutoField(primary_key=True, editable=False)
++    f = models.BooleanField(default=False)
++    
++    def reset(self):
++        self.uid = None
++        self.f = False
++
++class Derived(Item):
++    pass
++
++class SaveTestCase(TestCase):
++    def setUp(self):
++        self.derived = Derived.objects.create(f=True) # create the first object
++        item = Item.objects.get(pk=self.derived.pk)
++        obj1 = item.derived
++        obj1.reset()
++        obj1.save() # the first object is overwritten
++    
++    def test_f_true(self):
++        obj = Item.objects.get(pk=self.derived.pk)
++        self.assertTrue(obj.f)
++
++if __name__ == '__main__':
++    # Run the test
++    test_case = SaveTestCase()
++    test_case.setUp()
++    test_case.test_f_true()
++    print("Test completed")
+\ No newline at end of file
+diff --git a/tests/model_inheritance/test_primary_key_reset.py b/tests/model_inheritance/test_primary_key_reset.py
+new file mode 100644
+index 0000000000..573fd4e0e8
+--- /dev/null
++++ b/tests/model_inheritance/test_primary_key_reset.py
+@@ -0,0 +1,75 @@
++"""
++Test case for the issue where resetting primary key for a child model doesn't work.
++Based on the GitHub issue description.
++"""
++from django.db import models, connection
++from django.test import TestCase
++
++
++class Item(models.Model):
++    uid = models.AutoField(primary_key=True, editable=False)
++    f = models.BooleanField(default=False)
++    
++    def reset(self):
++        self.pk = None
++        self.f = False
++
++    class Meta:
++        app_label = 'model_inheritance'
++
++
++class Derived(Item):
++    class Meta:
++        app_label = 'model_inheritance'
++
++
++class PrimaryKeyResetTestCase(TestCase):
++    def test_primary_key_reset_for_child_model(self):
++        """
++        Test that resetting primary key for a child model works correctly.
++        The issue is that when reset() is called and save() is called,
++        the existing object is overwritten instead of creating a new one.
++        """
++        # Create the first object
++        derived = Derived.objects.create(f=True)
++        original_pk = derived.pk
++        
++        # Get the item and its derived object
++        item = Item.objects.get(pk=derived.pk)
++        obj1 = item.derived
++        print(f'Original PK: {original_pk}, obj1 PK before reset: {obj1.pk}')
++        print(f'obj1._meta.pk.attname: {obj1._meta.pk.attname}')
++        print(f'Item._meta.pk.attname: {Item._meta.pk.attname}')
++        print(f'Derived._meta.pk.attname: {Derived._meta.pk.attname}')
++        
++        # Reset the object (set primary key to None)
++        obj1.reset()
++        print(f'obj1 PK after reset: {obj1.pk}, obj1._state.adding: {obj1._state.adding}')
++        
++        # This should create a new object, not overwrite the existing one
++        print(f'Before save: pk={obj1.pk}, _state.adding={obj1._state.adding}')
++        
++        # Enable SQL logging
++        from django.db import connection
++        connection.queries_log.clear()
++        
++        obj1.save()
++        print(f'obj1 PK after save: {obj1.pk}')
++        
++        # Check what SQL queries were executed
++        for query in connection.queries:
++            print(f'SQL: {query["sql"]}')
++        
++        # Check how many objects exist now
++        all_items = Item.objects.all()
++        print(f'Total items after save: {all_items.count()}')
++        for item in all_items:
++            print(f'Item PK: {item.pk}, f: {item.f}')
++        
++        # The original object should still exist with its original values
++        original_obj = Item.objects.get(pk=original_pk)
++        self.assertTrue(original_obj.f)
++        
++        # A new object should have been created with a different PK
++        self.assertNotEqual(obj1.pk, original_pk)
++        self.assertFalse(obj1.f)
+\ No newline at end of file

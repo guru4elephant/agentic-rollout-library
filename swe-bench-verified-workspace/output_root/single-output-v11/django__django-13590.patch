@@ -1,0 +1,395 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 4648daf395..9bd3fe3bdf 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1077,10 +1077,17 @@ class Query(BaseExpression):
+         elif isinstance(value, (list, tuple)):
+             # The items of the iterable may be expressions and therefore need
+             # to be resolved independently.
+-            return type(value)(
++            resolved_values = [
+                 self.resolve_lookup_value(sub_value, can_reuse, allow_joins)
+                 for sub_value in value
+-            )
++            ]
++            # For named tuples and other types that expect individual arguments,
++            # we need to unpack the resolved values
++            try:
++                return type(value)(*resolved_values)
++            except TypeError:
++                # Fallback for types that don't accept *args
++                return type(value)(resolved_values)
+         return value
+ 
+     def solve_lookup_type(self, lookup):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..0de4f5b6dc
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,24 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with named tuples used as arguments to __range
++"""
++from collections import namedtuple
++from django.db.models.sql.query import Query
++from django.db.models.sql.where import WhereNode
++
++# Create a named tuple
++RangeTuple = namedtuple('RangeTuple', ['near', 'far'])
++
++# Create a query instance with proper parameters
++query = Query(None, WhereNode)
++
++# Create a named tuple instance
++range_arg = RangeTuple(near=1, far=10)
++
++try:
++    # This should fail with TypeError: __new__() missing 1 required positional argument: 'far'
++    result = query.resolve_lookup_value(range_arg, can_reuse=None, allow_joins=True)
++    print("Success! Result:", result)
++except TypeError as e:
++    print("Error reproduced:", e)
++    print("Error type:", type(e).__name__)
+\ No newline at end of file
+diff --git a/test_django_orm_range.py b/test_django_orm_range.py
+new file mode 100644
+index 0000000000..6525102554
+--- /dev/null
++++ b/test_django_orm_range.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++"""
++Test the fix with actual Django ORM range lookups using named tuples
++"""
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from collections import namedtuple
++from django.db import models
++from django.test import TestCase
++
++# Create a simple test model
++class TestModel(models.Model):
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Create a named tuple for range arguments
++RangeTuple = namedtuple('RangeTuple', ['start', 'end'])
++
++class RangeLookupTest(TestCase):
++    def test_range_lookup_with_named_tuple(self):
++        """Test that range lookups work with named tuples"""
++        
++        # Create some test data
++        TestModel.objects.bulk_create([
++            TestModel(value=5),
++            TestModel(value=15),
++            TestModel(value=25),
++        ])
++        
++        # Test with named tuple as range argument
++        range_arg = RangeTuple(start=10, end=20)
++        
++        # This should work without throwing TypeError
++        results = TestModel.objects.filter(value__range=range_arg)
++        
++        # Should find the object with value=15
++        self.assertEqual(results.count(), 1)
++        self.assertEqual(results.first().value, 15)
++        
++        print("Range lookup with named tuple succeeded!")
++        
++    def test_range_lookup_with_regular_tuple(self):
++        """Test that range lookups still work with regular tuples"""
++        
++        # Test with regular tuple as range argument
++        range_arg = (10, 20)
++        
++        # This should work as before
++        results = TestModel.objects.filter(value__range=range_arg)
++        
++        # Should find the object with value=15
++        self.assertEqual(results.count(), 1)
++        self.assertEqual(results.first().value, 15)
++        
++        print("Range lookup with regular tuple succeeded!")
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..8b75d671ab
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,50 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the fix to ensure we didn't break regular tuples and lists
++"""
++from collections import namedtuple
++from django.db.models.sql.query import Query
++from django.db.models.sql.where import WhereNode
++
++# Create a named tuple
++RangeTuple = namedtuple('RangeTuple', ['near', 'far'])
++
++# Create a query instance with proper parameters
++query = Query(None, WhereNode)
++
++# Test 1: Regular tuple
++print("Testing regular tuple...")
++regular_tuple = (1, 10)
++result1 = query.resolve_lookup_value(regular_tuple, can_reuse=None, allow_joins=True)
++print("Regular tuple result:", result1)
++print("Type:", type(result1))
++
++# Test 2: Regular list
++print("\nTesting regular list...")
++regular_list = [1, 10]
++result2 = query.resolve_lookup_value(regular_list, can_reuse=None, allow_joins=True)
++print("Regular list result:", result2)
++print("Type:", type(result2))
++
++# Test 3: Named tuple
++print("\nTesting named tuple...")
++range_arg = RangeTuple(near=1, far=10)
++result3 = query.resolve_lookup_value(range_arg, can_reuse=None, allow_joins=True)
++print("Named tuple result:", result3)
++print("Type:", type(result3))
++
++# Test 4: Empty tuple
++print("\nTesting empty tuple...")
++empty_tuple = ()
++result4 = query.resolve_lookup_value(empty_tuple, can_reuse=None, allow_joins=True)
++print("Empty tuple result:", result4)
++print("Type:", type(result4))
++
++# Test 5: Empty list
++print("\nTesting empty list...")
++empty_list = []
++result5 = query.resolve_lookup_value(empty_list, can_reuse=None, allow_joins=True)
++print("Empty list result:", result5)
++print("Type:", type(result5))
++
++print("\nAll tests completed successfully!")
+\ No newline at end of file
+diff --git a/test_fallback_case.py b/test_fallback_case.py
+new file mode 100644
+index 0000000000..6e8d29a8ea
+--- /dev/null
++++ b/test_fallback_case.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++"""
++Test the fallback case for types that don't accept *args
++"""
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++from django.db.models.sql.where import WhereNode
++
++class CustomContainer:
++    """A custom container that only accepts a single list argument"""
++    def __init__(self, items):
++        self.items = items
++    
++    def __repr__(self):
++        return f"CustomContainer({self.items})"
++
++def test_fallback_case():
++    """Test that the fallback mechanism works for types that don't accept *args"""
++    
++    # Create a query instance
++    query = Query(None, WhereNode)
++    
++    # Create a custom container
++    custom_container = CustomContainer([10, 20])
++    
++    # Test resolution - this should use the fallback
++    try:
++        resolved = query.resolve_lookup_value(custom_container, can_reuse=None, allow_joins=True)
++        print("✓ Fallback resolution succeeded!")
++        print(f"  Original: {custom_container}")
++        print(f"  Resolved: {resolved}")
++        print(f"  Type: {type(resolved)}")
++        
++        # Verify the resolved value is the same type and has correct values
++        assert isinstance(resolved, CustomContainer)
++        assert resolved.items == [10, 20]
++        
++    except Exception as e:
++        print("✗ Fallback resolution failed!")
++        print(f"  Error: {e}")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    success = test_fallback_case()
++    if success:
++        print("\n🎉 Fallback test passed! The fix handles edge cases correctly.")
++    else:
++        print("\n❌ Fallback test failed!")
+\ No newline at end of file
+diff --git a/test_nested_cases.py b/test_nested_cases.py
+new file mode 100644
+index 0000000000..93208a7818
+--- /dev/null
++++ b/test_nested_cases.py
+@@ -0,0 +1,38 @@
++#!/usr/bin/env python3
++"""
++Test nested structures to ensure the fix handles complex cases
++"""
++from collections import namedtuple
++from django.db.models.sql.query import Query
++from django.db.models.sql.where import WhereNode
++
++# Create a named tuple
++RangeTuple = namedtuple('RangeTuple', ['near', 'far'])
++Point = namedtuple('Point', ['x', 'y'])
++
++# Create a query instance with proper parameters
++query = Query(None, WhereNode)
++
++# Test 1: Nested named tuples
++print("Testing nested named tuples...")
++nested_named = (RangeTuple(near=1, far=10), Point(x=5, y=15))
++result1 = query.resolve_lookup_value(nested_named, can_reuse=None, allow_joins=True)
++print("Nested named tuples result:", result1)
++print("Type:", type(result1))
++
++# Test 2: Mixed types in tuple
++print("\nTesting mixed types in tuple...")
++mixed_tuple = (RangeTuple(near=1, far=10), [2, 20], "test")
++result2 = query.resolve_lookup_value(mixed_tuple, can_reuse=None, allow_joins=True)
++print("Mixed types result:", result2)
++print("Type:", type(result2))
++
++# Test 3: Single element named tuple
++print("\nTesting single element named tuple...")
++SingleTuple = namedtuple('SingleTuple', ['value'])
++single_arg = SingleTuple(value=42)
++result3 = query.resolve_lookup_value(single_arg, can_reuse=None, allow_joins=True)
++print("Single element result:", result3)
++print("Type:", type(result3))
++
++print("\nAll nested tests completed successfully!")
+\ No newline at end of file
+diff --git a/test_simple_range_resolution.py b/test_simple_range_resolution.py
+new file mode 100644
+index 0000000000..14b02bc3b5
+--- /dev/null
++++ b/test_simple_range_resolution.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++"""
++Test the fix with simple range value resolution without database operations
++"""
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from collections import namedtuple
++from django.db.models.sql.query import Query
++from django.db.models.sql.where import WhereNode
++
++def test_range_resolution():
++    """Test that range value resolution works with named tuples"""
++    
++    # Create a query instance
++    query = Query(None, WhereNode)
++    
++    # Create a named tuple for range arguments
++    RangeTuple = namedtuple('RangeTuple', ['start', 'end'])
++    range_arg = RangeTuple(start=10, end=20)
++    
++    # Test resolution - this should work without throwing TypeError
++    try:
++        resolved = query.resolve_lookup_value(range_arg, can_reuse=None, allow_joins=True)
++        print("✓ Range resolution with named tuple succeeded!")
++        print(f"  Original: {range_arg}")
++        print(f"  Resolved: {resolved}")
++        print(f"  Type: {type(resolved)}")
++        
++        # Verify the resolved value is the same type and has correct values
++        assert isinstance(resolved, RangeTuple)
++        assert resolved.start == 10
++        assert resolved.end == 20
++        
++    except TypeError as e:
++        print("✗ Range resolution with named tuple failed!")
++        print(f"  Error: {e}")
++        return False
++    
++    # Test with regular tuple
++    try:
++        regular_tuple = (10, 20)
++        resolved_regular = query.resolve_lookup_value(regular_tuple, can_reuse=None, allow_joins=True)
++        print("✓ Range resolution with regular tuple succeeded!")
++        print(f"  Original: {regular_tuple}")
++        print(f"  Resolved: {resolved_regular}")
++        print(f"  Type: {type(resolved_regular)}")
++        
++        # Verify the resolved value is the same type and has correct values
++        assert isinstance(resolved_regular, tuple)
++        assert resolved_regular[0] == 10
++        assert resolved_regular[1] == 20
++        
++    except Exception as e:
++        print("✗ Range resolution with regular tuple failed!")
++        print(f"  Error: {e}")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    success = test_range_resolution()
++    if success:
++        print("\n🎉 All tests passed! The fix is working correctly.")
++    else:
++        print("\n❌ Some tests failed!")
+\ No newline at end of file

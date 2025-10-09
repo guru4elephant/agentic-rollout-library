@@ -1,0 +1,340 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..49c36ea51
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,32 @@
++#!/usr/bin/env python3
++
++import tempfile
++import os
++from sphinx.domains.cpp import CPPDomain
++from sphinx.environment import BuildEnvironment
++
++def test_udl_parsing():
++    """Test parsing of user-defined literals"""
++    
++    # Test case from the issue
++    test_code = "constexpr auto units::si::planck_constant = 6.62607015e-34q_J * 1q_s"
++    
++    print(f"Testing: {test_code}")
++    
++    # Create a temporary domain instance with a mock environment
++    domain = CPPDomain(None)
++    
++    try:
++        # Try to parse the definition
++        result = domain.parse_definition(test_code)
++        print("SUCCESS: Parsed successfully")
++        print(f"Result: {result}")
++    except Exception as e:
++        print(f"ERROR: {e}")
++        return False
++    
++    return True
++
++if __name__ == "__main__":
++    success = test_udl_parsing()
++    exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/reproduce_udl.py b/reproduce_udl.py
+new file mode 100644
+index 000000000..33f0ed308
+--- /dev/null
++++ b/reproduce_udl.py
+@@ -0,0 +1,35 @@
++#!/usr/bin/env python3
++
++import sys
++import os
++sys.path.insert(0, '/testbed')
++
++from sphinx.domains.cpp import DefinitionParser
++
++def test_udl_parsing():
++    """Test parsing of user-defined literals"""
++    
++    # Test case from the issue
++    test_code = "6.62607015e-34q_J * 1q_s"
++    
++    print(f"Testing: {test_code}")
++    
++    # Create a parser instance
++    parser = DefinitionParser(test_code, location=None)
++    
++    try:
++        # Try to parse the expression
++        result = parser._parse_expression()
++        print("SUCCESS: Parsed successfully")
++        print(f"Result type: {type(result)}")
++        print(f"Result: {result}")
++        return True
++    except Exception as e:
++        print(f"ERROR: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    success = test_udl_parsing()
++    exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/setup.py b/setup.py
+index a427d5493..978e3d8e0 100644
+--- a/setup.py
++++ b/setup.py
+@@ -15,22 +15,22 @@ if sys.version_info < (3, 5):
+     sys.exit(1)
+ 
+ install_requires = [
+-    'sphinxcontrib-applehelp',
+-    'sphinxcontrib-devhelp',
++    'sphinxcontrib-applehelp<=1.0.7',
++    'sphinxcontrib-devhelp<=1.0.5',
+     'sphinxcontrib-jsmath',
+-    'sphinxcontrib-htmlhelp',
+-    'sphinxcontrib-serializinghtml',
+-    'sphinxcontrib-qthelp',
+-    'Jinja2>=2.3',
++    'sphinxcontrib-htmlhelp<=2.0.4',
++    'sphinxcontrib-serializinghtml<=1.1.9',
++    'sphinxcontrib-qthelp<=1.0.6',
++    'Jinja2<3.0',
+     'Pygments>=2.0',
+     'docutils>=0.12',
+     'snowballstemmer>=1.1',
+     'babel>=1.3',
+-    'alabaster>=0.7,<0.8',
++    'alabaster>=0.7,<0.7.12',
+     'imagesize',
+     'requests>=2.5.0',
+     'setuptools',
+-    'packaging',
++    'packaging', 'markupsafe<=2.0.1',
+ ]
+ 
+ extras_require = {
+diff --git a/sphinx/domains/cpp.py b/sphinx/domains/cpp.py
+index fe52d881d..05264b938 100644
+--- a/sphinx/domains/cpp.py
++++ b/sphinx/domains/cpp.py
+@@ -35,7 +35,7 @@ from sphinx.util.cfamily import (
+     BaseParser, DefinitionError, UnsupportedMultiCharacterCharLiteral,
+     identifier_re, anon_identifier_re, integer_literal_re, octal_literal_re,
+     hex_literal_re, binary_literal_re, float_literal_re,
+-    char_literal_re
++    char_literal_re, udl_suffix_re
+ )
+ from sphinx.util.docfields import Field, GroupedField
+ from sphinx.util.docutils import SphinxDirective
+@@ -838,6 +838,24 @@ class ASTNumberLiteral(ASTLiteral):
+         signode.append(nodes.Text(txt, txt))
+ 
+ 
++class ASTUserDefinedLiteral(ASTLiteral):
++    def __init__(self, literal: str, suffix: str) -> None:
++        self.literal = literal
++        self.suffix = suffix
++
++    def _stringify(self, transform: StringifyTransform) -> str:
++        return self.literal + self.suffix
++
++    def get_id(self, version: int) -> str:
++        # Use the same ID scheme as regular literals but include the suffix
++        return "L%s%sE" % (self.literal, self.suffix)
++
++    def describe_signature(self, signode: TextElement, mode: str,
++                           env: "BuildEnvironment", symbol: "Symbol") -> None:
++        txt = str(self)
++        signode.append(nodes.Text(txt, txt))
++
++
+ class ASTStringLiteral(ASTLiteral):
+     def __init__(self, data: str) -> None:
+         self.data = data
+@@ -4664,7 +4682,14 @@ class DefinitionParser(BaseParser):
+             if self.match(regex):
+                 while self.current_char in 'uUlLfF':
+                     self.pos += 1
+-                return ASTNumberLiteral(self.definition[pos:self.pos])
++                
++                # Check for user-defined literal suffix
++                literal_text = self.definition[pos:self.pos]
++                if self.match(udl_suffix_re):
++                    suffix = self.matched_text
++                    return ASTUserDefinedLiteral(literal_text, suffix)
++                
++                return ASTNumberLiteral(literal_text)
+ 
+         string = self._parse_string()
+         if string is not None:
+diff --git a/sphinx/util/cfamily.py b/sphinx/util/cfamily.py
+index 790a492a5..4ac3ee255 100644
+--- a/sphinx/util/cfamily.py
++++ b/sphinx/util/cfamily.py
+@@ -67,6 +67,9 @@ char_literal_re = re.compile(r'''(?x)
+     )'
+ ''')
+ 
++# User-defined literal suffix: starts with underscore or letter, followed by letters, digits, or underscores
++udl_suffix_re = re.compile(r'[_a-zA-Z][_a-zA-Z0-9]*')
++
+ 
+ def verify_description_mode(mode: str) -> None:
+     if mode not in ('lastIsName', 'noneIsName', 'markType', 'markName', 'param'):
+diff --git a/test_full_issue.py b/test_full_issue.py
+new file mode 100644
+index 000000000..9b37f61f1
+--- /dev/null
++++ b/test_full_issue.py
+@@ -0,0 +1,41 @@
++#!/usr/bin/env python3
++
++import sys
++sys.path.insert(0, '/testbed')
++
++from sphinx.domains.cpp import DefinitionParser, DefinitionError
++
++class Config:
++    cpp_id_attributes = ["id_attr"]
++    cpp_paren_attributes = ["paren_attr"]
++
++def test_full_issue():
++    """Test parsing of the full issue case"""
++    
++    # Test case from the issue
++    test_code = "constexpr auto units::si::planck_constant = 6.62607015e-34q_J * 1q_s"
++    
++    print(f"Testing: {test_code}")
++    
++    try:
++        # Create a parser instance
++        parser = DefinitionParser(test_code, location=None, config=Config())
++        parser.allowFallbackExpressionParsing = False
++        
++        # Try to parse the declaration
++        result = parser.parse_declaration("variable", "variable")
++        print("SUCCESS: Parsed successfully")
++        print(f"Result: {result}")
++        parser.assert_end()
++        
++    except Exception as e:
++        print(f"ERROR: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    
++    return True
++
++if __name__ == "__main__":
++    success = test_full_issue()
++    exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_udl.py b/test_udl.py
+new file mode 100644
+index 000000000..fe7167b10
+--- /dev/null
++++ b/test_udl.py
+@@ -0,0 +1,35 @@
++#!/usr/bin/env python3
++
++import sys
++import os
++sys.path.insert(0, '/testbed')
++
++from sphinx.domains.cpp import CPPSymbolParser
++
++def test_udl_parsing():
++    """Test parsing of user-defined literals directly with the parser"""
++    
++    # Test case from the issue
++    test_code = "6.62607015e-34q_J * 1q_s"
++    
++    print(f"Testing: {test_code}")
++    
++    # Create a parser instance
++    parser = CPPSymbolParser(test_code, location=None)
++    
++    try:
++        # Try to parse the expression
++        result = parser._parse_expression()
++        print("SUCCESS: Parsed successfully")
++        print(f"Result type: {type(result)}")
++        print(f"Result: {result}")
++        return True
++    except Exception as e:
++        print(f"ERROR: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    success = test_udl_parsing()
++    exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_udl_simple.py b/test_udl_simple.py
+new file mode 100644
+index 000000000..6df53c473
+--- /dev/null
++++ b/test_udl_simple.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++
++import sys
++sys.path.insert(0, '/testbed')
++
++from sphinx.domains.cpp import DefinitionParser, DefinitionError
++
++class Config:
++    cpp_id_attributes = ["id_attr"]
++    cpp_paren_attributes = ["paren_attr"]
++
++def test_udl_parsing():
++    """Test parsing of user-defined literals"""
++    
++    # Test cases from the issue
++    test_cases = [
++        "6.62607015e-34q_J * 1q_s",
++        "6.62607015e-34q_J",
++        "1q_s"
++    ]
++    
++    for test_code in test_cases:
++        print(f"Testing: {test_code}")
++        
++        try:
++            # Create a parser instance
++            parser = DefinitionParser(test_code, location=None, config=Config())
++            parser.allowFallbackExpressionParsing = False
++            
++            # Try to parse the expression
++            result = parser._parse_expression()
++            print("SUCCESS: Parsed successfully")
++            print(f"Result: {result}")
++            parser.assert_end()
++            
++        except Exception as e:
++            print(f"ERROR: {e}")
++            import traceback
++            traceback.print_exc()
++            return False
++    
++    return True
++
++if __name__ == "__main__":
++    success = test_udl_parsing()
++    exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/tox.ini b/tox.ini
+index d9f040544..bf39854b6 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -28,7 +28,7 @@ extras =
+ setenv =
+     PYTHONWARNINGS = all,ignore::ImportWarning:importlib._bootstrap_external,ignore::DeprecationWarning:site,ignore::DeprecationWarning:distutils
+ commands=
+-    pytest --durations 25 {posargs}
++    pytest -rA --durations 25 {posargs}
+ 
+ [testenv:flake8]
+ basepython = python3

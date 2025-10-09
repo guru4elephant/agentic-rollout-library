@@ -1,0 +1,137 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index caa03665ea..a386bb095d 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -21,7 +21,7 @@ from django.utils.dateparse import (
+     parse_date, parse_datetime, parse_duration, parse_time,
+ )
+ from django.utils.duration import duration_microseconds, duration_string
+-from django.utils.functional import Promise, cached_property
++from django.utils.functional import Promise, cached_property, SimpleLazyObject, empty
+ from django.utils.ipv6 import clean_ipv6_address
+ from django.utils.itercompat import is_iterable
+ from django.utils.text import capfirst
+@@ -1768,6 +1768,9 @@ class IntegerField(Field):
+         value = super().get_prep_value(value)
+         if value is None:
+             return None
++        # Handle SimpleLazyObject by resolving it to its actual value
++        if isinstance(value, SimpleLazyObject):
++            value = value._wrapped if value._wrapped is not empty else value._setupfunc()
+         try:
+             return int(value)
+         except (TypeError, ValueError) as e:
+diff --git a/reproduce_app/__init__.py b/reproduce_app/__init__.py
+new file mode 100644
+index 0000000000..f915298b92
+--- /dev/null
++++ b/reproduce_app/__init__.py
+@@ -0,0 +1 @@
++# Empty init file to make this a Python package
+\ No newline at end of file
+diff --git a/reproduce_app/models.py b/reproduce_app/models.py
+new file mode 100644
+index 0000000000..9b4f98f1d4
+--- /dev/null
++++ b/reproduce_app/models.py
+@@ -0,0 +1,10 @@
++from django.db import models
++
++class A(models.Model):
++    pass
++
++class B(models.Model):
++    a = models.ForeignKey(A, on_delete=models.CASCADE)
++
++class C(models.Model):
++    owner = models.ForeignKey('auth.User', on_delete=models.CASCADE)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..24901f5fb2
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the SimpleLazyObject issue with nested subquery annotations
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'reproduce_app',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.models import User
++from django.db.models import OuterRef, Subquery
++from django.utils.functional import SimpleLazyObject
++
++# Import the models from the app
++from reproduce_app.models import A, B, C
++
++def test_bug():
++    """Reproduce the bug described in the issue"""
++    print("Testing SimpleLazyObject with nested subquery annotation...")
++    
++    # Create database tables using Django's schema editor
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(User)
++        schema_editor.create_model(A)
++        schema_editor.create_model(B)
++        schema_editor.create_model(C)
++    
++    # Create the subquery
++    owner_user = (
++        B.objects.filter(a=OuterRef("pk"))
++        .annotate(owner_user=Subquery(C.objects.values("owner")))
++        .values("owner_user")
++    )
++    
++    # Create a SimpleLazyObject
++    user = SimpleLazyObject(lambda: User.objects.create_user("testuser"))
++    
++    # This should trigger the error
++    try:
++        result = A.objects.annotate(owner_user=Subquery(owner_user)).filter(
++            owner_user=user
++        )
++        print("SUCCESS: No error occurred")
++        return True
++    except TypeError as e:
++        print(f"ERROR: {e}")
++        # Debug: check what type of object we're getting
++        print(f"User object type: {type(user)}")
++        print(f"User object: {user}")
++        print(f"User ID: {getattr(user, 'id', 'No id attribute')}")
++        try:
++            print(f"int(user) attempt: {int(user)}")
++        except Exception as int_error:
++            print(f"int(user) failed: {int_error}")
++        return False
++
++if __name__ == "__main__":
++    success = test_bug()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

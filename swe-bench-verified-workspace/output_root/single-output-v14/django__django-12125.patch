@@ -1,0 +1,587 @@
+diff --git a/better_test.py b/better_test.py
+new file mode 100644
+index 0000000000..4ce8df4860
+--- /dev/null
++++ b/better_test.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python3
++
++import sys
++import os
++sys.path.insert(0, '/testbed')
++
++from django.db import models
++from django.db.migrations.serializer import serializer_factory, DeconstructableSerializer
++
++# Create the test case from the issue
++class Outer(object):
++    class Inner(models.CharField):
++        pass
++
++# Test the path serialization directly
++path = "__main__.Outer.Inner"
++print(f"Testing path: {path}")
++
++# Test the _serialize_path method directly
++result_name, result_imports = DeconstructableSerializer._serialize_path(path)
++print(f"Serialized name: {result_name}")
++print(f"Imports: {result_imports}")
++
++# Test with a more realistic example
++path2 = "myapp.models.Outer.Inner"
++print(f"\nTesting path: {path2}")
++result_name2, result_imports2 = DeconstructableSerializer._serialize_path(path2)
++print(f"Serialized name: {result_name2}")
++print(f"Imports: {result_imports2}")
++
++# Test with a normal field for comparison
++path3 = "django.db.models.CharField"
++print(f"\nTesting path: {path3}")
++result_name3, result_imports3 = DeconstructableSerializer._serialize_path(path3)
++print(f"Serialized name: {result_name3}")
++print(f"Imports: {result_imports3}")
+\ No newline at end of file
+diff --git a/django/db/migrations/serializer.py b/django/db/migrations/serializer.py
+index 7d226955d5..4ad963792a 100644
+--- a/django/db/migrations/serializer.py
++++ b/django/db/migrations/serializer.py
+@@ -90,13 +90,44 @@ class DeconstructableSerializer(BaseSerializer):
+ 
+     @staticmethod
+     def _serialize_path(path):
+-        module, name = path.rsplit(".", 1)
+-        if module == "django.db.models":
+-            imports = {"from django.db import models"}
+-            name = "models.%s" % name
++        # Handle inner classes by splitting the path properly
++        if path.startswith("django.db.models"):
++            # Special handling for Django model fields
++            if path == "django.db.models":
++                imports = {"from django.db import models"}
++                name = "models"
++            else:
++                module, name = path.rsplit(".", 1)
++                if module == "django.db.models":
++                    imports = {"from django.db import models"}
++                    name = "models.%s" % name
++                else:
++                    # Handle inner classes in django.db.models
++                    module_parts = path.split(".")
++                    if len(module_parts) > 3 and module_parts[:3] == ["django", "db", "models"]:
++                        imports = {"from django.db import models"}
++                        name = "models." + ".".join(module_parts[3:])
++                    else:
++                        imports = {"import %s" % module}
++                        name = path
+         else:
+-            imports = {"import %s" % module}
+-            name = path
++            # For non-Django paths, handle inner classes properly
++            parts = path.split(".")
++            if len(parts) > 1:
++                # Check if this is a main module context (which can't be imported)
++                if parts[0] == "__main__":
++                    # For __main__ context, we can't import it, so use the full path
++                    imports = set()
++                    name = path
++                else:
++                    # For regular modules, import just the top-level module
++                    module = parts[0]
++                    imports = {"import %s" % module}
++                    name = path
++            else:
++                # Single component path (unlikely but possible)
++                imports = set()
++                name = path
+         return name, imports
+ 
+     def serialize(self):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..98eee8389a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'test_app',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create the test case from the issue
++class Outer(object):
++    class Inner(models.CharField):
++        pass
++
++class A(models.Model):
++    field = Outer.Inner(max_length=20)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Test with enum case as well
++import enum
++try:
++    from enumfields import Enum, EnumField
++except ImportError:
++    # Create a simple mock for EnumField if not available
++    class Enum:
++        pass
++    
++    class EnumField(models.CharField):
++        def __init__(self, *args, **kwargs):
++            super().__init__(*args, **kwargs)
++
++class Thing(models.Model):
++    @enum.unique
++    class State(enum.Enum):
++        on = 'on'
++        off = 'off'
++    
++    state = EnumField(enum=State)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Now let's test the serialization
++from django.db.migrations.serializer import serializer_factory
++
++# Test the Inner field serialization
++inner_field = Outer.Inner(max_length=20)
++serialized_inner, imports = serializer_factory(inner_field).serialize()
++print("Inner field serialization:")
++print(f"Result: {serialized_inner}")
++print(f"Imports: {imports}")
++
++# Test the State enum serialization  
++state_field = Thing.state
++serialized_state, imports = serializer_factory(state_field).serialize()
++print("\nState field serialization:")
++print(f"Result: {serialized_state}")
++print(f"Imports: {imports}")
++
++# Test the State enum itself
++state_enum = Thing.State
++serialized_enum, imports = serializer_factory(state_enum).serialize()
++print("\nState enum serialization:")
++print(f"Result: {serialized_enum}")
++print(f"Imports: {imports}")
+\ No newline at end of file
+diff --git a/run_migration_test.py b/run_migration_test.py
+new file mode 100644
+index 0000000000..e9d1329a91
+--- /dev/null
++++ b/run_migration_test.py
+@@ -0,0 +1,43 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        TEST_RUNNER='django.test.runner.DiscoverRunner',
++    )
++
++django.setup()
++
++# Run a specific migration test
++from tests.migrations.test_writer import MigrationWriterTests
++
++# Create a test instance and run a simple test
++test_instance = MigrationWriterTests()
++try:
++    test_instance.test_serialize_field()
++    print("Field serialization test passed!")
++except Exception as e:
++    print(f"Field serialization test failed: {e}")
++
++try:
++    test_instance.test_serialize_deconstructable()
++    print("Deconstructable serialization test passed!")
++except Exception as e:
++    print(f"Deconstructable serialization test failed: {e}")
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..ea5bfed5a6
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,38 @@
++#!/usr/bin/env python3
++
++import sys
++import os
++sys.path.insert(0, '/testbed')
++
++from django.db import models
++from django.db.migrations.serializer import serializer_factory
++
++# Create the test case from the issue
++class Outer(object):
++    class Inner(models.CharField):
++        pass
++
++# Test the Inner field serialization
++inner_field = Outer.Inner(max_length=20)
++serialized_inner, imports = serializer_factory(inner_field).serialize()
++print("Inner field serialization:")
++print(f"Result: {serialized_inner}")
++print(f"Imports: {imports}")
++
++# Let's also check what deconstruct() returns
++print("\nDeconstruct result:")
++print(inner_field.deconstruct())
++
++# Test with a nested class that's not a field
++class Outer2:
++    class NestedClass:
++        pass
++
++nested_instance = Outer2.NestedClass()
++try:
++    serialized_nested, imports = serializer_factory(nested_instance).serialize()
++    print("\nNested class serialization:")
++    print(f"Result: {serialized_nested}")
++    print(f"Imports: {imports}")
++except Exception as e:
++    print(f"\nNested class serialization failed: {e}")
+\ No newline at end of file
+diff --git a/test_app/__init__.py b/test_app/__init__.py
+new file mode 100644
+index 0000000000..495da4dea0
+--- /dev/null
++++ b/test_app/__init__.py
+@@ -0,0 +1 @@
++# Empty init file to make test_app a proper Python package
+\ No newline at end of file
+diff --git a/test_app/models.py b/test_app/models.py
+new file mode 100644
+index 0000000000..f81ba2f626
+--- /dev/null
++++ b/test_app/models.py
+@@ -0,0 +1,11 @@
++from django.db import models
++
++class Outer(object):
++    class Inner(models.CharField):
++        pass
++
++class A(models.Model):
++    field = Outer.Inner(max_length=20)
++    
++    class Meta:
++        app_label = 'test_app'
+\ No newline at end of file
+diff --git a/test_app/models2.py b/test_app/models2.py
+new file mode 100644
+index 0000000000..ad0d37bec7
+--- /dev/null
++++ b/test_app/models2.py
+@@ -0,0 +1,20 @@
++from django.db import models
++import enum
++
++# Create a simple mock for EnumField if not available
++class EnumField(models.CharField):
++    def __init__(self, *args, **kwargs):
++        # Remove enum parameter before passing to parent
++        enum_val = kwargs.pop('enum', None)
++        super().__init__(*args, **kwargs)
++
++class Thing(models.Model):
++    @enum.unique
++    class State(enum.Enum):
++        on = 'on'
++        off = 'off'
++    
++    state = EnumField(enum=State)
++    
++    class Meta:
++        app_label = 'test_app'
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..4d0ea13345
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,47 @@
++#!/usr/bin/env python3
++
++import sys
++import os
++sys.path.insert(0, '/testbed')
++
++from django.db import models
++from django.db.migrations.serializer import DeconstructableSerializer
++
++def test_edge_cases():
++    print("Testing edge cases for path serialization...")
++    
++    test_cases = [
++        # Simple case
++        ("django.db.models.CharField", "models.CharField", {"from django.db import models"}),
++        
++        # Inner class in Django models
++        ("django.db.models.fields.related.ForeignKey", "models.ForeignKey", {"from django.db import models"}),
++        
++        # Deeply nested inner class in Django models  
++        ("django.db.models.fields.related.Outer.Inner", "models.Outer.Inner", {"from django.db import models"}),
++        
++        # Regular module with inner classes
++        ("myapp.models.Outer.Inner", "myapp.models.Outer.Inner", {"import myapp"}),
++        
++        # Very deep nesting
++        ("myapp.models.Outer.Middle.Inner", "myapp.models.Outer.Middle.Inner", {"import myapp"}),
++        
++        # __main__ context (should not import)
++        ("__main__.Outer.Inner", "__main__.Outer.Inner", set()),
++        
++        # Single component (edge case)
++        ("SomeClass", "SomeClass", set()),
++    ]
++    
++    for path, expected_name, expected_imports in test_cases:
++        name, imports = DeconstructableSerializer._serialize_path(path)
++        success = name == expected_name and imports == expected_imports
++        status = "✓" if success else "✗"
++        print(f"{status} {path} -> {name} (imports: {imports})")
++        if not success:
++            print(f"  Expected: {expected_name} (imports: {expected_imports})")
++    
++    print("Edge case testing completed!")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_enum.py b/test_enum.py
+new file mode 100644
+index 0000000000..1e62bfd6d2
+--- /dev/null
++++ b/test_enum.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'test_app',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Now test the enum serialization
++from test_app.models2 import Thing
++from django.db.migrations.serializer import serializer_factory
++
++# Test the State enum serialization
++state_enum = Thing.State
++try:
++    serialized_enum, imports = serializer_factory(state_enum).serialize()
++    print("State enum serialization:")
++    print(f"Result: {serialized_enum}")
++    print(f"Imports: {imports}")
++except Exception as e:
++    print(f"State enum serialization failed: {e}")
++
++# Test the state field serialization
++state_field = Thing.state
++serialized_field, imports = serializer_factory(state_field).serialize()
++print("\nState field serialization:")
++print(f"Result: {serialized_field}")
++print(f"Imports: {imports}")
++
++# Let's also check what deconstruct() returns for the field
++print("\nDeconstruct result:")
++deconstruct_result = state_field.deconstruct()
++print(deconstruct_result)
+\ No newline at end of file
+diff --git a/test_makemigrations.py b/test_makemigrations.py
+new file mode 100644
+index 0000000000..cd920932f4
+--- /dev/null
++++ b/test_makemigrations.py
+@@ -0,0 +1,50 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'test_app',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Now test the serialization in a more realistic context
++from test_app.models import Outer, A
++from django.db.migrations.serializer import serializer_factory
++
++# Test the Inner field serialization
++inner_field = Outer.Inner(max_length=20)
++serialized_inner, imports = serializer_factory(inner_field).serialize()
++print("Inner field serialization:")
++print(f"Result: {serialized_inner}")
++print(f"Imports: {imports}")
++
++# Let's also check what deconstruct() returns
++print("\nDeconstruct result:")
++deconstruct_result = inner_field.deconstruct()
++print(deconstruct_result)
++
++# Test the path serialization directly
++path = deconstruct_result[1]  # This should be 'test_app.models.Outer.Inner'
++print(f"\nTesting path: {path}")
++from django.db.migrations.serializer import DeconstructableSerializer
++result_name, result_imports = DeconstructableSerializer._serialize_path(path)
++print(f"Serialized name: {result_name}")
++print(f"Imports: {result_imports}")
+\ No newline at end of file
+diff --git a/test_serializer_fix.py b/test_serializer_fix.py
+new file mode 100644
+index 0000000000..b20cb7bb08
+--- /dev/null
++++ b/test_serializer_fix.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations.serializer import serializer_factory, DeconstructableSerializer
++
++def test_serializer_fix():
++    print("Testing serializer fix for inner classes...")
++    
++    # Test 1: Normal field (should work as before)
++    normal_field = models.CharField(max_length=100)
++    result, imports = serializer_factory(normal_field).serialize()
++    expected_result = "models.CharField(max_length=100)"
++    expected_imports = {"from django.db import models"}
++    assert result == expected_result, f"Expected {expected_result}, got {result}"
++    assert imports == expected_imports, f"Expected {expected_imports}, got {imports}"
++    print("✓ Normal field serialization works correctly")
++    
++    # Test 2: Inner class field (the main fix)
++    class Outer(object):
++        class Inner(models.CharField):
++            pass
++    
++    inner_field = Outer.Inner(max_length=50)
++    result, imports = serializer_factory(inner_field).serialize()
++    # Should serialize to the full path but not import __main__ (which can't be imported)
++    assert "Outer.Inner" in result, f"Result should contain Outer.Inner: {result}"
++    assert imports == set(), f"Expected no imports for __main__, got {imports}"
++    print("✓ Inner class field serialization works correctly")
++    
++    # Test 3: Test _serialize_path directly with various cases
++    test_cases = [
++        ("django.db.models.CharField", "models.CharField", {"from django.db import models"}),
++        ("myapp.models.Outer.Inner", "myapp.models.Outer.Inner", {"import myapp"}),
++        ("__main__.Outer.Inner", "__main__.Outer.Inner", set()),  # Should not import __main__
++    ]
++    
++    for path, expected_name, expected_imports in test_cases:
++        name, imports = DeconstructableSerializer._serialize_path(path)
++        assert name == expected_name, f"Path {path}: expected {expected_name}, got {name}"
++        assert imports == expected_imports, f"Path {path}: expected {expected_imports}, got {imports}"
++        print(f"✓ Path serialization for {path} works correctly")
++    
++    print("All tests passed! The fix is working correctly.")
++
++if __name__ == "__main__":
++    test_serializer_fix()
+\ No newline at end of file

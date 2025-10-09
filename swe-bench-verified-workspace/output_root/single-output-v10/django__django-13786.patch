@@ -1,0 +1,324 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..b6d25b2b3e
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++
++"""
++Comprehensive test for the CreateModel and AlterModelOptions fix.
++"""
++
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++
++def test_comprehensive():
++    print("Running comprehensive test...")
++    
++    # Test all ALTER_OPTION_KEYS to ensure they're properly handled
++    alter_option_keys = [
++        "base_manager_name", "default_manager_name", "default_related_name",
++        "get_latest_by", "managed", "ordering", "permissions", "default_permissions",
++        "select_on_save", "verbose_name", "verbose_name_plural"
++    ]
++    
++    # Create a CreateModel operation with all ALTER_OPTION_KEYS
++    initial_options = {}
++    for key in alter_option_keys:
++        if key == "ordering":
++            initial_options[key] = ["name"]
++        elif key == "permissions":
++            initial_options[key] = [("can_view", "Can view")]
++        elif key == "default_permissions":
++            initial_options[key] = ["add", "change", "delete", "view"]
++        elif key == "managed":
++            initial_options[key] = True
++        elif key == "select_on_save":
++            initial_options[key] = False
++        else:
++            initial_options[key] = f"test_{key}"
++    
++    create_op = CreateModel(
++        name="TestModel",
++        fields=[],
++        options=initial_options,
++        bases=[],
++        managers=[]
++    )
++    
++    # Create an AlterModelOptions that removes most options but keeps a few
++    alter_options = {
++        "verbose_name": "Updated Test Model",
++        "ordering": ["-created_date"],  # Change ordering
++        "managed": False  # Change managed
++    }
++    
++    alter_op = AlterModelOptions(
++        name="TestModel",
++        options=alter_options
++    )
++    
++    # Test the reduction
++    result = create_op.reduce(operation=alter_op, app_label="test_app")
++    result_options = result[0].options
++    
++    print(f"Initial options count: {len(initial_options)}")
++    print(f"Alter options count: {len(alter_options)}")
++    print(f"Result options count: {len(result_options)}")
++    
++    # Check that only the altered options remain, plus any non-ALTER_OPTION_KEYS
++    expected_keys = set(alter_options.keys())
++    
++    # Verify that options not in alter_options are removed
++    for key in alter_option_keys:
++        if key not in alter_options:
++            if key in result_options:
++                print(f"❌ Option '{key}' should be removed but is still present")
++                return False
++    
++    # Verify that options in alter_options are present and correct
++    for key, value in alter_options.items():
++        if key not in result_options or result_options[key] != value:
++            print(f"❌ Option '{key}' should be '{value}' but is '{result_options.get(key)}'")
++            return False
++    
++    print("✅ All ALTER_OPTION_KEYS correctly handled")
++    return True
++
++if __name__ == "__main__":
++    test_comprehensive()
+\ No newline at end of file
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index dddf7c679c..e1ef2398c5 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -137,11 +137,16 @@ class CreateModel(ModelOperation):
+                 ),
+             ]
+         elif isinstance(operation, AlterModelOptions) and self.name_lower == operation.name_lower:
++            # Merge options and remove any that are not present in operation.options
++            options = {**self.options, **operation.options}
++            for key in operation.ALTER_OPTION_KEYS:
++                if key not in operation.options:
++                    options.pop(key, None)
+             return [
+                 CreateModel(
+                     self.name,
+                     fields=self.fields,
+-                    options={**self.options, **operation.options},
++                    options=options,
+                     bases=self.bases,
+                     managers=self.managers,
+                 ),
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..2691dbdd22
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++
++"""
++Reproduction script for the issue where squashing migrations does not unset 
++model options when optimizing CreateModel and AlterModelOptions.
++"""
++
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++
++def test_option_removal():
++    print("Testing CreateModel and AlterModelOptions option handling...")
++    
++    # Create a CreateModel operation with some options
++    create_op = CreateModel(
++        name="TestModel",
++        fields=[],
++        options={
++            "verbose_name": "Test Model",
++            "ordering": ["name"],
++            "permissions": [("can_view", "Can view test model")]
++        },
++        bases=[],
++        managers=[]
++    )
++    
++    # Create an AlterModelOptions operation that removes some options
++    alter_op = AlterModelOptions(
++        name="TestModel",
++        options={
++            # Note: we're not including 'ordering' and 'permissions' here,
++            # which should mean they get removed from the final options
++            "verbose_name": "Updated Test Model"
++        }
++    )
++    
++    # Test the current behavior (broken)
++    print("\nCurrent behavior (broken):")
++    result = create_op.reduce(operation=alter_op, app_label="test_app")
++    print(f"Original create options: {create_op.options}")
++    print(f"Alter operation options: {alter_op.options}")
++    print(f"Resulting options after reduce: {result[0].options}")
++    
++    # The issue: 'ordering' and 'permissions' should be removed but they're not
++    if "ordering" in result[0].options or "permissions" in result[0].options:
++        print("❌ BUG: Options that should be removed are still present!")
++        return False
++    else:
++        print("✅ Options correctly removed")
++        return True
++
++if __name__ == "__main__":
++    test_option_removal()
+\ No newline at end of file
+diff --git a/test_basic_functionality.py b/test_basic_functionality.py
+new file mode 100644
+index 0000000000..069e1fae6c
+--- /dev/null
++++ b/test_basic_functionality.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++
++"""
++Test basic functionality to ensure our changes don't break anything.
++"""
++
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++
++def test_basic_functionality():
++    print("Testing basic functionality...")
++    
++    # Test 1: Normal case - adding/updating options
++    create_op = CreateModel(
++        name="TestModel",
++        fields=[],
++        options={"verbose_name": "Test Model"},
++        bases=[],
++        managers=[]
++    )
++    
++    alter_op = AlterModelOptions(
++        name="TestModel",
++        options={"verbose_name": "Updated Test Model", "ordering": ["name"]}
++    )
++    
++    result = create_op.reduce(operation=alter_op, app_label="test_app")
++    expected_options = {"verbose_name": "Updated Test Model", "ordering": ["name"]}
++    
++    if result[0].options == expected_options:
++        print("✅ Normal option addition/update works correctly")
++    else:
++        print(f"❌ Normal option addition/update failed. Expected: {expected_options}, Got: {result[0].options}")
++        return False
++    
++    # Test 2: No options change
++    create_op2 = CreateModel(
++        name="TestModel2",
++        fields=[],
++        options={"verbose_name": "Test Model"},
++        bases=[],
++        managers=[]
++    )
++    
++    alter_op2 = AlterModelOptions(
++        name="TestModel2",
++        options={"verbose_name": "Test Model"}  # Same value
++    )
++    
++    result2 = create_op2.reduce(operation=alter_op2, app_label="test_app")
++    expected_options2 = {"verbose_name": "Test Model"}
++    
++    if result2[0].options == expected_options2:
++        print("✅ No change case works correctly")
++    else:
++        print(f"❌ No change case failed. Expected: {expected_options2}, Got: {result2[0].options}")
++        return False
++    
++    return True
++
++if __name__ == "__main__":
++    test_basic_functionality()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..d7eaeb8005
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++
++"""
++Test edge cases for the CreateModel and AlterModelOptions fix.
++"""
++
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++
++def test_edge_cases():
++    print("Testing edge cases...")
++    
++    # Test case 1: Empty options in AlterModelOptions
++    print("\n1. Testing empty options:")
++    create_op = CreateModel(
++        name="TestModel",
++        fields=[],
++        options={
++            "verbose_name": "Test Model",
++            "ordering": ["name"]
++        },
++        bases=[],
++        managers=[]
++    )
++    
++    alter_op = AlterModelOptions(
++        name="TestModel",
++        options={}  # Empty options should remove all ALTER_OPTION_KEYS
++    )
++    
++    result = create_op.reduce(operation=alter_op, app_label="test_app")
++    print(f"Original options: {create_op.options}")
++    print(f"Alter options: {alter_op.options}")
++    print(f"Result options: {result[0].options}")
++    
++    # Should have no ALTER_OPTION_KEYS left
++    remaining_keys = [key for key in alter_op.ALTER_OPTION_KEYS if key in result[0].options]
++    if remaining_keys:
++        print(f"❌ Still has ALTER_OPTION_KEYS: {remaining_keys}")
++    else:
++        print("✅ All ALTER_OPTION_KEYS correctly removed")
++    
++    # Test case 2: Non-ALTER_OPTION_KEYS should be preserved
++    print("\n2. Testing non-ALTER_OPTION_KEYS preservation:")
++    create_op2 = CreateModel(
++        name="TestModel2",
++        fields=[],
++        options={
++            "verbose_name": "Test Model",
++            "custom_option": "custom_value",  # Not in ALTER_OPTION_KEYS
++            "ordering": ["name"]
++        },
++        bases=[],
++        managers=[]
++    )
++    
++    alter_op2 = AlterModelOptions(
++        name="TestModel2",
++        options={"verbose_name": "Updated Test Model"}  # Remove ordering
++    )
++    
++    result2 = create_op2.reduce(operation=alter_op2, app_label="test_app")
++    print(f"Original options: {create_op2.options}")
++    print(f"Alter options: {alter_op2.options}")
++    print(f"Result options: {result2[0].options}")
++    
++    # custom_option should be preserved, ordering should be removed
++    if "custom_option" in result2[0].options and result2[0].options["custom_option"] == "custom_value":
++        print("✅ Non-ALTER_OPTION_KEYS correctly preserved")
++    else:
++        print("❌ Non-ALTER_OPTION_KEYS not preserved correctly")
++    
++    if "ordering" not in result2[0].options:
++        print("✅ ALTER_OPTION_KEYS correctly removed")
++    else:
++        print("❌ ALTER_OPTION_KEYS not removed correctly")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file

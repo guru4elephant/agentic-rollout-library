@@ -1,0 +1,228 @@
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index 3a462f1c4c..6d4ab7d3ac 100644
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -231,10 +231,11 @@ class Collector:
+     def related_objects(self, related, objs):
+         """
+         Get a QuerySet of objects related to `objs` via the relation `related`.
++        Only select primary key field(s) to avoid fetching unnecessary data.
+         """
+         return related.related_model._base_manager.using(self.using).filter(
+             **{"%s__in" % related.field.name: objs}
+-        )
++        ).only('pk')
+ 
+     def instances_with_model(self):
+         for model, instances in self.data.items():
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..b455bb2f32
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the UnicodeDecodeError issue during .delete() operations.
++This simulates the scenario where a text field contains invalid UTF-8 data.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create test models that simulate the issue
++class Job(models.Model):
++    guid = models.CharField(max_length=255, unique=True)
++    name = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'test'
++
++class FailureLine(models.Model):
++    job = models.ForeignKey(Job, on_delete=models.CASCADE, to_field='guid')
++    line = models.TextField()  # This field could contain invalid UTF-8 data
++    
++    class Meta:
++        app_label = 'test'
++
++def test_delete_with_invalid_utf8():
++    """Test that .delete() works even with invalid UTF-8 data in text fields"""
++    from django.db import connection
++    from django.test.utils import CaptureQueriesContext
++    
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Job)
++        schema_editor.create_model(FailureLine)
++    
++    # Enable foreign key support for SQLite
++    if connection.vendor == 'sqlite':
++        with connection.cursor() as cursor:
++            cursor.execute('PRAGMA foreign_keys = ON')
++    
++    # Create test data
++    job = Job.objects.create(guid='test-guid-1', name='Test Job')
++    
++    # Create a failure line with text data
++    # The optimization should prevent fetching the full text field during deletion
++    FailureLine.objects.create(job=job, line="Test line data")
++    
++    print("Created test data")
++    
++    # Now try to delete the job - this should trigger cascade deletion
++    # and attempt to fetch the failure line records
++    try:
++        # Capture the queries to see what's being executed
++        with CaptureQueriesContext(connection) as context:
++            Job.objects.filter(guid=job.guid).delete()
++        
++        print("SUCCESS: .delete() operation completed without UnicodeDecodeError")
++        print("Queries executed:")
++        for i, query in enumerate(context.captured_queries):
++            print(f"{i+1}. {query['sql']}")
++        
++        return True
++        
++    except UnicodeDecodeError as e:
++        print(f"FAILED: UnicodeDecodeError occurred: {e}")
++        return False
++    except Exception as e:
++        print(f"FAILED: Other error occurred: {e}")
++        return False
++
++if __name__ == '__main__':
++    success = test_delete_with_invalid_utf8()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_optimization.py b/test_optimization.py
+new file mode 100644
+index 0000000000..f168918709
+--- /dev/null
++++ b/test_optimization.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++"""
++Test script to verify that the .only('pk') optimization works in related_objects method.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.deletion import Collector
++
++# Create test models
++class Job(models.Model):
++    guid = models.CharField(max_length=255, unique=True)
++    name = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'test'
++
++class FailureLine(models.Model):
++    job_guid = models.CharField(max_length=255)
++    line = models.TextField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_related_objects_optimization():
++    """Test that related_objects method uses .only('pk') optimization"""
++    from django.db import connection
++    
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Job)
++        schema_editor.create_model(FailureLine)
++    
++    # Create test data
++    job = Job.objects.create(guid='test-guid-1', name='Test Job')
++    FailureLine.objects.create(job_guid=job.guid, line="Test line data")
++    
++    # Create a collector and test the related_objects method
++    collector = Collector(using='default')
++    
++    # Create a mock related object
++    class MockRelated:
++        def __init__(self, model):
++            self.related_model = model
++            self.field = MockField()
++    
++    class MockField:
++        name = 'job_guid'
++    
++    # Get the related objects query
++    related = MockRelated(FailureLine)
++    objs = [job.guid]
++    
++    query = collector.related_objects(related, objs)
++    
++    # Check if the query uses .only('pk') optimization
++    print(f"Query: {query.query}")
++    print(f"Query select fields: {query.query.select}")
++    
++    # The query should only select the primary key field
++    if hasattr(query.query, 'select') and len(query.query.select) == 1:
++        field = query.query.select[0]
++        if hasattr(field, 'target') and hasattr(field.target, 'name'):
++            if field.target.name == 'id':  # Assuming 'id' is the primary key field name
++                print("SUCCESS: Query is optimized to only select primary key field")
++                return True
++            else:
++                print(f"FAILED: Query is selecting field '{field.target.name}' instead of primary key")
++                return False
++        else:
++            print("FAILED: Could not determine selected fields")
++            return False
++    else:
++        print("FAILED: Query is selecting multiple fields")
++        return False
++
++if __name__ == '__main__':
++    success = test_related_objects_optimization()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

@@ -1,0 +1,484 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index dddf7c679c..5f2d5e9f69 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -137,11 +137,16 @@ class CreateModel(ModelOperation):
+                 ),
+             ]
+         elif isinstance(operation, AlterModelOptions) and self.name_lower == operation.name_lower:
++            # Merge options and remove any that should be unset
++            options = {**self.options, **operation.options}
++            for key in operation.ALTER_OPTION_KEYS:
++                if key not in operation.options:
++                    options.pop(key, False)
+             return [
+                 CreateModel(
+                     self.name,
+                     fields=self.fields,
+-                    options={**self.options, **operation.options},
++                    options=options,
+                     bases=self.bases,
+                     managers=self.managers,
+                 ),
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..f3ca3afa62
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++"""
++Final verification that the fix works correctly and doesn't break existing functionality.
++"""
++
++import sys
++import os
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Mock minimal Django settings to avoid import issues
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++# Import the specific modules we need
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++
++def test_original_issue():
++    """Test the exact scenario described in the GitHub issue."""
++    print("Testing the original GitHub issue scenario...")
++    
++    # This is the exact scenario described in the issue:
++    # AlterModelOptions(name="test_model", options={}) should unset all options
++    # when squashed into CreateModel
++    
++    create_op = CreateModel(
++        name='test_model',
++        fields=[],
++        options={'verbose_name': 'Test Model', 'ordering': ['name'], 'permissions': []},
++        bases=[],
++        managers=[]
++    )
++    
++    alter_op = AlterModelOptions(
++        name='test_model',
++        options={}  # Empty options should unset all ALTER_OPTION_KEYS
++    )
++    
++    reduced_ops = create_op.reduce(operation=alter_op, app_label='test_app')
++    
++    if not reduced_ops:
++        print("❌ FAIL: No reduction occurred")
++        return False
++    
++    reduced_create = reduced_ops[0]
++    result = reduced_create.options
++    
++    # With the fix, all ALTER_OPTION_KEYS should be unset
++    expected = {}
++    
++    if result == expected:
++        print("✅ PASS: Original issue fixed - all options correctly unset")
++        print(f"   Result: {result}")
++        return True
++    else:
++        print("❌ FAIL: Original issue not fixed")
++        print(f"   Result: {result}")
++        print(f"   Expected: {expected}")
++        return False
++
++def test_backwards_compatibility():
++    """Test that normal operations still work correctly."""
++    print("\nTesting backwards compatibility...")
++    
++    # Test normal case: adding/updating options without unsetting
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[],
++        options={'verbose_name': 'Old Name'},
++        bases=[],
++        managers=[]
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel',
++        options={'verbose_name': 'New Name', 'ordering': ['name']}  # Adding new option
++    )
++    
++    reduced_ops = create_op.reduce(operation=alter_op, app_label='test_app')
++    
++    if not reduced_ops:
++        print("❌ FAIL: No reduction occurred")
++        return False
++    
++    reduced_create = reduced_ops[0]
++    result = reduced_create.options
++    expected = {'verbose_name': 'New Name', 'ordering': ['name']}
++    
++    if result == expected:
++        print("✅ PASS: Backwards compatibility maintained")
++        print(f"   Result: {result}")
++        return True
++    else:
++        print("❌ FAIL: Backwards compatibility broken")
++        print(f"   Result: {result}")
++        print(f"   Expected: {expected}")
++        return False
++
++if __name__ == '__main__':
++    success1 = test_original_issue()
++    success2 = test_backwards_compatibility()
++    
++    if success1 and success2:
++        print("\n🎉 ALL TESTS PASSED! The fix is working correctly.")
++        sys.exit(0)
++    else:
++        print("\n❌ SOME TESTS FAILED!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..1e784046b6
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with squashing migrations not unsetting model options
++when optimizing CreateModel and AlterModelOptions.
++"""
++
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++
++def test_squash_issue():
++    # Create a CreateModel operation with some options
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[],
++        options={'verbose_name': 'Test Model', 'ordering': ['name']},
++        bases=[],
++        managers=[]
++    )
++    
++    # Create an AlterModelOptions operation that unsets some options
++    alter_op = AlterModelOptions(
++        name='TestModel',
++        options={'verbose_name': 'New Test Model'}  # Note: 'ordering' is not present, so it should be unset
++    )
++    
++    # Try to reduce the operations
++    reduced_ops = create_op.reduce(operation=alter_op, app_label='test_app')
++    
++    if reduced_ops:
++        reduced_create = reduced_ops[0]
++        print("Original CreateModel options:", create_op.options)
++        print("AlterModelOptions options:", alter_op.options)
++        print("Reduced CreateModel options:", reduced_create.options)
++        
++        # Check if 'ordering' is still present (it shouldn't be)
++        if 'ordering' in reduced_create.options:
++            print("❌ ISSUE CONFIRMED: 'ordering' option was not unset during reduction")
++            return False
++        else:
++            print("✅ ISSUE FIXED: 'ordering' option was correctly unset during reduction")
++            return True
++    else:
++        print("No reduction occurred")
++        return False
++
++if __name__ == '__main__':
++    test_squash_issue()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..6772c0a752
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the fix handles various edge cases.
++"""
++
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++
++def test_comprehensive():
++    print("Testing comprehensive scenarios...")
++    
++    # Test 1: Basic unsetting of options
++    print("\n1. Testing basic unsetting of options:")
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[],
++        options={'verbose_name': 'Test Model', 'ordering': ['name'], 'permissions': []},
++        bases=[],
++        managers=[]
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel',
++        options={'verbose_name': 'New Test Model'}  # Should unset 'ordering' and 'permissions'
++    )
++    
++    reduced_ops = create_op.reduce(operation=alter_op, app_label='test_app')
++    if reduced_ops:
++        reduced_create = reduced_ops[0]
++        print(f"   Result: {reduced_create.options}")
++        expected = {'verbose_name': 'New Test Model'}
++        if reduced_create.options == expected:
++            print("   ✅ PASS: Options correctly unset")
++        else:
++            print(f"   ❌ FAIL: Expected {expected}, got {reduced_create.options}")
++    
++    # Test 2: Adding new options while keeping some existing
++    print("\n2. Testing adding new options while keeping some existing:")
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[],
++        options={'verbose_name': 'Test Model', 'ordering': ['name']},
++        bases=[],
++        managers=[]
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel',
++        options={'verbose_name': 'New Test Model', 'permissions': []}  # Should unset 'ordering', add 'permissions'
++    )
++    
++    reduced_ops = create_op.reduce(operation=alter_op, app_label='test_app')
++    if reduced_ops:
++        reduced_create = reduced_ops[0]
++        print(f"   Result: {reduced_create.options}")
++        expected = {'verbose_name': 'New Test Model', 'permissions': []}
++        if reduced_create.options == expected:
++            print("   ✅ PASS: Options correctly updated")
++        else:
++            print(f"   ❌ FAIL: Expected {expected}, got {reduced_create.options}")
++    
++    # Test 3: Empty options should unset all ALTER_OPTION_KEYS
++    print("\n3. Testing empty options (should unset all):")
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[],
++        options={'verbose_name': 'Test Model', 'ordering': ['name'], 'permissions': []},
++        bases=[],
++        managers=[]
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel',
++        options={}  # Should unset all options
++    )
++    
++    reduced_ops = create_op.reduce(operation=alter_op, app_label='test_app')
++    if reduced_ops:
++        reduced_create = reduced_ops[0]
++        print(f"   Result: {reduced_create.options}")
++        expected = {}
++        if reduced_create.options == expected:
++            print("   ✅ PASS: All options correctly unset")
++        else:
++            print(f"   ❌ FAIL: Expected {expected}, got {reduced_create.options}")
++    
++    # Test 4: Non-ALTER_OPTION_KEYS should be preserved
++    print("\n4. Testing non-ALTER_OPTION_KEYS preservation:")
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[],
++        options={'verbose_name': 'Test Model', 'custom_option': 'custom_value'},
++        bases=[],
++        managers=[]
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel',
++        options={'verbose_name': 'New Test Model'}  # Should preserve 'custom_option'
++    )
++    
++    reduced_ops = create_op.reduce(operation=alter_op, app_label='test_app')
++    if reduced_ops:
++        reduced_create = reduced_ops[0]
++        print(f"   Result: {reduced_create.options}")
++        expected = {'verbose_name': 'New Test Model', 'custom_option': 'custom_value'}
++        if reduced_create.options == expected:
++            print("   ✅ PASS: Non-ALTER_OPTION_KEYS correctly preserved")
++        else:
++            print(f"   ❌ FAIL: Expected {expected}, got {reduced_create.options}")
++
++if __name__ == '__main__':
++    test_comprehensive()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..bc2080324a
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++"""
++Test edge cases to ensure the fix is robust.
++"""
++
++import sys
++import os
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Mock minimal Django settings to avoid import issues
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++# Import the specific modules we need
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++
++def test_edge_cases():
++    """Test various edge cases for the fix."""
++    print("Testing edge cases for the AlterModelOptions fix...")
++    
++    # Test 1: Empty options in both CreateModel and AlterModelOptions
++    print("\n1. Testing empty options:")
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[],
++        options={},
++        bases=[],
++        managers=[]
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel',
++        options={}
++    )
++    
++    reduced_ops = create_op.reduce(operation=alter_op, app_label='test_app')
++    if reduced_ops:
++        result = reduced_ops[0].options
++        expected = {}
++        if result == expected:
++            print("   ✅ PASS: Empty options handled correctly")
++        else:
++            print(f"   ❌ FAIL: Expected {expected}, got {result}")
++            return False
++    
++    # Test 2: Options that are not in ALTER_OPTION_KEYS
++    print("\n2. Testing non-ALTER_OPTION_KEYS preservation:")
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[],
++        options={'custom_option': 'value', 'verbose_name': 'Test'},
++        bases=[],
++        managers=[]
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel',
++        options={'verbose_name': 'New Test'}
++    )
++    
++    reduced_ops = create_op.reduce(operation=alter_op, app_label='test_app')
++    if reduced_ops:
++        result = reduced_ops[0].options
++        expected = {'custom_option': 'value', 'verbose_name': 'New Test'}
++        if result == expected:
++            print("   ✅ PASS: Non-ALTER_OPTION_KEYS preserved correctly")
++        else:
++            print(f"   ❌ FAIL: Expected {expected}, got {result}")
++            return False
++    
++    # Test 3: Multiple ALTER_OPTION_KEYS being unset
++    print("\n3. Testing multiple option unsetting:")
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[],
++        options={'verbose_name': 'Test', 'ordering': ['name'], 'permissions': []},
++        bases=[],
++        managers=[]
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel',
++        options={'verbose_name': 'New Test'}  # Should unset 'ordering' and 'permissions'
++    )
++    
++    reduced_ops = create_op.reduce(operation=alter_op, app_label='test_app')
++    if reduced_ops:
++        result = reduced_ops[0].options
++        expected = {'verbose_name': 'New Test'}
++        if result == expected:
++            print("   ✅ PASS: Multiple options unset correctly")
++        else:
++            print(f"   ❌ FAIL: Expected {expected}, got {result}")
++            return False
++    
++    print("\n✅ All edge case tests passed!")
++    return True
++
++if __name__ == '__main__':
++    success = test_edge_cases()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_focused.py b/test_focused.py
+new file mode 100644
+index 0000000000..57952c0fce
+--- /dev/null
++++ b/test_focused.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""
++Focused test to verify the fix without requiring full Django setup.
++"""
++
++import sys
++import os
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Mock minimal Django settings to avoid import issues
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++# Import the specific modules we need
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++
++def test_fix():
++    """Test that the fix works correctly."""
++    print("Testing the fix for AlterModelOptions reduction...")
++    
++    # Test case 1: Basic unsetting
++    create_op = CreateModel(
++        name='TestModel',
++        fields=[],
++        options={'verbose_name': 'Test Model', 'ordering': ['name']},
++        bases=[],
++        managers=[]
++    )
++    
++    alter_op = AlterModelOptions(
++        name='TestModel',
++        options={'verbose_name': 'New Test Model'}  # Should unset 'ordering'
++    )
++    
++    reduced_ops = create_op.reduce(operation=alter_op, app_label='test_app')
++    
++    if not reduced_ops:
++        print("❌ FAIL: No reduction occurred")
++        return False
++    
++    reduced_create = reduced_ops[0]
++    result = reduced_create.options
++    
++    expected = {'verbose_name': 'New Test Model'}
++    if result == expected:
++        print("✅ PASS: Options correctly unset")
++        print(f"   Result: {result}")
++        print(f"   Expected: {expected}")
++        return True
++    else:
++        print("❌ FAIL: Options not correctly unset")
++        print(f"   Result: {result}")
++        print(f"   Expected: {expected}")
++        return False
++
++if __name__ == '__main__':
++    success = test_fix()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

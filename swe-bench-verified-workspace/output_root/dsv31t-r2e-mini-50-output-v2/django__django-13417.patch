@@ -1,0 +1,198 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 85cd8311a7..888e875db7 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1225,6 +1225,12 @@ class QuerySet:
+         if self.query.extra_order_by or self.query.order_by:
+             return True
+         elif self.query.default_ordering and self.query.get_meta().ordering:
++            # Check if GROUP BY would remove ordering for meta ordering
++            if (self.query.group_by is not None and 
++                not self.query.order_by and 
++                not self.query.extra_order_by):
++                # GROUP BY queries with meta ordering have ordering removed
++                return False
+             return True
+         else:
+             return False
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..ac17515cf1
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count
++
++# Create a simple model with default ordering
++class Foo(models.Model):
++    uuid = models.UUIDField(primary_key=True, default='12345678-1234-5678-1234-567812345678')
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        ordering = ['name']
++        app_label = 'test'
++
++# Create tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Foo)
++
++# Test the issue
++qs = Foo.objects.all()
++print("Original query:")
++print(qs.query)
++print(f"qs.ordered: {qs.ordered}")
++print(f"qs.query.default_ordering: {qs.query.default_ordering}")
++
++print("\n" + "="*50 + "\n")
++
++qs2 = Foo.objects.annotate(Count("pk")).all()
++print("Query with annotate:")
++print(qs2.query)
++print(f"qs2.ordered: {qs2.ordered}")
++print(f"qs2.query.default_ordering: {qs2.query.default_ordering}")
++
++print("\n" + "="*50 + "\n")
++
++# Check if the SQL actually has ORDER BY
++print("Does original query SQL have ORDER BY?")
++sql1 = str(qs.query)
++print("ORDER BY" in sql1)
++
++print("Does annotated query SQL have ORDER BY?")
++sql2 = str(qs2.query)
++print("ORDER BY" in sql2)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..1ac5641348
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,100 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count
++
++# Create a simple model with default ordering
++class Foo(models.Model):
++    uuid = models.UUIDField(primary_key=True, default='12345678-1234-5678-1234-567812345678')
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        ordering = ['name']
++        app_label = 'test'
++
++# Create tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Foo)
++
++print("=" * 60)
++print("Testing edge cases for ordered property")
++print("=" * 60)
++
++# Test 1: Original query with default ordering
++qs = Foo.objects.all()
++print("1. Original query with default ordering:")
++print(f"   SQL has ORDER BY: {'ORDER BY' in str(qs.query)}")
++print(f"   qs.ordered: {qs.ordered}")
++print()
++
++# Test 2: Query with annotate (GROUP BY) - should have ordering removed
++qs2 = Foo.objects.annotate(Count("pk")).all()
++print("2. Query with annotate (GROUP BY):")
++print(f"   SQL has ORDER BY: {'ORDER BY' in str(qs2.query)}")
++print(f"   qs2.ordered: {qs2.ordered}")
++print()
++
++# Test 3: Query with explicit order_by (should still be ordered)
++qs3 = Foo.objects.annotate(Count("pk")).order_by('name')
++print("3. Query with annotate + explicit order_by:")
++print(f"   SQL has ORDER BY: {'ORDER BY' in str(qs3.query)}")
++print(f"   qs3.ordered: {qs3.ordered}")
++print()
++
++# Test 4: Query with values() + annotate (different GROUP BY scenario)
++qs4 = Foo.objects.values('name').annotate(Count("pk"))
++print("4. Query with values() + annotate:")
++print(f"   SQL has ORDER BY: {'ORDER BY' in str(qs4.query)}")
++print(f"   qs4.ordered: {qs4.ordered}")
++print()
++
++# Test 5: Query with values() + annotate + order_by
++qs5 = Foo.objects.values('name').annotate(Count("pk")).order_by('name')
++print("5. Query with values() + annotate + explicit order_by:")
++print(f"   SQL has ORDER BY: {'ORDER BY' in str(qs5.query)}")
++print(f"   qs5.ordered: {qs5.ordered}")
++print()
++
++# Test 6: Query without default ordering
++class Bar(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Bar)
++
++qs6 = Bar.objects.annotate(Count("pk")).all()
++print("6. Query without default ordering + annotate:")
++print(f"   SQL has ORDER BY: {'ORDER BY' in str(qs6.query)}")
++print(f"   qs6.ordered: {qs6.ordered}")
++print()
++
++print("=" * 60)
++print("Summary: The ordered property should match whether SQL has ORDER BY")
++print("=" * 60)
+\ No newline at end of file

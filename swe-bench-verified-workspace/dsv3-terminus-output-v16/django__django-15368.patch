@@ -1,0 +1,262 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index f8d848e926..f2f9797d88 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -670,7 +670,7 @@ class QuerySet:
+                 when_statements = []
+                 for obj in batch_objs:
+                     attr = getattr(obj, field.attname)
+-                    if not isinstance(attr, Expression):
++                    if not hasattr(attr, 'resolve_expression'):
+                         attr = Value(attr, output_field=field)
+                     when_statements.append(When(pk=obj.pk, then=attr))
+                 case_statement = Case(*when_statements, output_field=field)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e6c14d0c41
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models import F
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    c8 = models.CharField(max_length=100, null=True, blank=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create a test instance
++obj = TestModel.objects.create(name="test_name", c8="original_value")
++print(f"Created object: id={obj.id}, name={obj.name}, c8={obj.c8}")
++
++# Try to update with F expression
++obj.c8 = F('name')
++print(f"Set c8 to F('name'): {obj.c8}")
++
++# Attempt bulk update
++try:
++    updated_count = TestModel.objects.bulk_update([obj], ['c8'])
++    print(f"Bulk update completed, updated {updated_count} objects")
++    
++    # Refresh and check result
++    obj.refresh_from_db()
++    print(f"After refresh - c8: {obj.c8}")
++    
++    # Check the SQL that was executed
++    print("\nLast SQL query:")
++    if connection.queries:
++        last_query = connection.queries[-1]
++        print(f"SQL: {last_query['sql']}")
++        print(f"Time: {last_query['time']}")
++    
++    # Check if it worked correctly
++    if obj.c8 == "test_name":
++        print("SUCCESS: F() expression was properly resolved!")
++    else:
++        print(f"FAILURE: Expected 'test_name', got '{obj.c8}'")
++        
++except Exception as e:
++    print(f"Error during bulk update: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..9284664099
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models import F, Expression
++from django.db.models.expressions import Value
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    c8 = models.CharField(max_length=100, null=True, blank=True)
++    number = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Test 1: Regular F expression (should work)
++print("=== Test 1: Regular F expression ===")
++obj1 = TestModel.objects.create(name="test1", c8="original1", number=10)
++obj1.c8 = F('name')
++TestModel.objects.bulk_update([obj1], ['c8'])
++obj1.refresh_from_db()
++print(f"F('name') result: {obj1.c8} (expected: test1)")
++
++# Test 2: Regular string value (should still work)
++print("=== Test 2: Regular string value ===")
++obj2 = TestModel.objects.create(name="test2", c8="original2", number=20)
++obj2.c8 = "plain_string"
++TestModel.objects.bulk_update([obj2], ['c8'])
++obj2.refresh_from_db()
++print(f"String value result: {obj2.c8} (expected: plain_string)")
++
++# Test 3: Integer field with F expression
++print("=== Test 3: Integer field with F expression ===")
++obj3 = TestModel.objects.create(name="test3", c8="original3", number=30)
++obj3.number = F('number') + 5  # This creates a CombinedExpression
++TestModel.objects.bulk_update([obj3], ['number'])
++obj3.refresh_from_db()
++print(f"F('number') + 5 result: {obj3.number} (expected: 35)")
++
++# Test 4: Value expression (should work)
++print("=== Test 4: Value expression ===")
++obj4 = TestModel.objects.create(name="test4", c8="original4", number=40)
++obj4.c8 = Value("value_expr")
++TestModel.objects.bulk_update([obj4], ['c8'])
++obj4.refresh_from_db()
++print(f"Value expression result: {obj4.c8} (expected: value_expr)")
++
++# Test 5: None value (should work)
++print("=== Test 5: None value ===")
++obj5 = TestModel.objects.create(name="test5", c8="original5", number=50)
++obj5.c8 = None
++TestModel.objects.bulk_update([obj5], ['c8'])
++obj5.refresh_from_db()
++print(f"None value result: {obj5.c8} (expected: None)")
++
++print("\n=== All tests completed ===")
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..91d5b50378
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models import F
++
++# Create the exact model from the GitHub issue
++class SelfRef(models.Model):
++    name = models.CharField(max_length=100)
++    c8 = models.CharField(max_length=100, null=True, blank=True)
++    
++    class Meta:
++        app_label = 'exampleapp'
++
++# Create the table
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(SelfRef)
++
++# Create a test instance
++o = SelfRef.objects.create(name="test_name", c8="original_value")
++print(f"Created object: id={o.id}, name={o.name}, c8={o.c8}")
++
++# Reproduce the exact issue from GitHub
++o.c8 = F('name')  # model has char fields 'c8' and 'name'
++print(f"Set c8 to F('name'): {o.c8}")
++
++# Perform bulk update
++result = SelfRef.objects.bulk_update([o], ['c8'])
++print(f"bulk_update result: {result}")
++
++# Refresh and check
++o.refresh_from_db()
++print(f"After refresh - c8: {o.c8}")
++
++# Check the SQL that was executed
++print("\nLast SQL query:")
++if connection.queries:
++    last_query = connection.queries[-2]  # The update query should be second to last
++    print(f"SQL: {last_query['sql']}")
++    print(f"Time: {last_query['time']}")
++
++# Verify the fix
++if o.c8 == "test_name":
++    print("SUCCESS: The GitHub issue has been fixed!")
++else:
++    print(f"FAILURE: Expected 'test_name', got '{o.c8}'")
+\ No newline at end of file

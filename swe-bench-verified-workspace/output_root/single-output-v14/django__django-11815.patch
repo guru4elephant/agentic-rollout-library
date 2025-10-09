@@ -1,0 +1,415 @@
+diff --git a/django/db/migrations/serializer.py b/django/db/migrations/serializer.py
+index 27b5cbd379..bed1638a7a 100644
+--- a/django/db/migrations/serializer.py
++++ b/django/db/migrations/serializer.py
+@@ -120,9 +120,10 @@ class EnumSerializer(BaseSerializer):
+     def serialize(self):
+         enum_class = self.value.__class__
+         module = enum_class.__module__
+-        v_string, v_imports = serializer_factory(self.value.value).serialize()
++        # Use the enum name instead of value to avoid issues with translated values
++        v_string, v_imports = serializer_factory(self.value.name).serialize()
+         imports = {'import %s' % module, *v_imports}
+-        return "%s.%s(%s)" % (module, enum_class.__name__, v_string), imports
++        return "%s.%s[%s]" % (module, enum_class.__name__, v_string), imports
+ 
+ 
+ class FloatSerializer(BaseSimpleSerializer):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..75e87caf3b
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++"""Script to reproduce the enum migration issue."""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++    django.setup()
++
++from enum import Enum
++from django.utils.translation import gettext_lazy as _
++from django.db import models
++
++
++class Status(Enum):
++    GOOD = _('Good')  # 'Good' will be translated
++    BAD = _('Bad')   # 'Bad' will be translated
++    
++    def __str__(self):
++        return self.name
++
++
++class Item(models.Model):
++    status = models.CharField(default=Status.GOOD, max_length=128)
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++if __name__ == "__main__":
++    # Let's see what the default value looks like when serialized
++    from django.db.migrations.serializer import serializer_factory
++    
++    field = Item._meta.get_field('status')
++    default_value = field.default
++    
++    print(f"Default value: {default_value}")
++    print(f"Default value type: {type(default_value)}")
++    print(f"Default value repr: {repr(default_value)}")
++    print(f"Enum name: {default_value.name}")
++    print(f"Enum value: {default_value.value}")
++    
++    # Try to serialize it
++    try:
++        serialized = serializer_factory(default_value).serialize()
++        print(f"Serialized: {serialized}")
++        
++        # The problem: the serialized version uses the value ('Good') instead of the name ('GOOD')
++        # This will break when 'Good' gets translated to another language
++        
++        # Let's simulate what happens after translation
++        print("\n--- Simulating translation issue ---")
++        print("After translation, 'Good' might become 'Bueno' (Spanish)")
++        
++        # Try to evaluate the serialized string - this should fail after translation
++        serialized_code, imports = serialized
++        print(f"Trying to evaluate: {serialized_code}")
++        
++        # Import the required modules
++        for import_stmt in imports:
++            exec(import_stmt)
++        
++        # This will work now, but would fail if 'Good' was translated
++        try:
++            result = eval(serialized_code)
++            print(f"Evaluation result: {result}")
++        except Exception as e:
++            print(f"Evaluation error (this would happen after translation): {e}")
++            
++    except Exception as e:
++        print(f"Serialization error: {e}")
+\ No newline at end of file
+diff --git a/test_enum_serializer.py b/test_enum_serializer.py
+new file mode 100644
+index 0000000000..c96e396dcb
+--- /dev/null
++++ b/test_enum_serializer.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++"""Test script to verify the enum serializer fix."""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++    django.setup()
++
++import enum
++from django.db.migrations.serializer import serializer_factory
++
++
++class TextEnum(enum.Enum):
++    A = 'a-value'
++    B = 'value-b'
++
++
++class BinaryEnum(enum.Enum):
++    A = b'a-value'
++    B = b'value-b'
++
++
++class IntEnum(enum.IntEnum):
++    A = 1
++    B = 2
++
++
++def test_enum_serialization():
++    """Test that enums are serialized using their names instead of values."""
++    
++    # Test TextEnum
++    serialized, imports = serializer_factory(TextEnum.A).serialize()
++    print(f"TextEnum.A serialized: {serialized}")
++    assert "TextEnum['A']" in serialized, f"Expected TextEnum['A'], got {serialized}"
++    
++    # Test BinaryEnum  
++    serialized, imports = serializer_factory(BinaryEnum.A).serialize()
++    print(f"BinaryEnum.A serialized: {serialized}")
++    assert "BinaryEnum['A']" in serialized, f"Expected BinaryEnum['A'], got {serialized}"
++    
++    # Test IntEnum
++    serialized, imports = serializer_factory(IntEnum.B).serialize()
++    print(f"IntEnum.B serialized: {serialized}")
++    assert "IntEnum['B']" in serialized, f"Expected IntEnum['B'], got {serialized}"
++    
++    print("All tests passed! Enum serialization now uses names instead of values.")
++
++
++if __name__ == "__main__":
++    test_enum_serialization()
+\ No newline at end of file
+diff --git a/test_translated_enum.py b/test_translated_enum.py
+new file mode 100644
+index 0000000000..7fff30a832
+--- /dev/null
++++ b/test_translated_enum.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++"""Test script to verify the fix for translated enum values."""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++    django.setup()
++
++import enum
++from django.utils.translation import gettext_lazy as _
++from django.db.migrations.serializer import serializer_factory
++
++
++class TranslatedStatus(enum.Enum):
++    GOOD = _('Good')  # This will be translated
++    BAD = _('Bad')    # This will be translated
++    
++    def __str__(self):
++        return self.name
++
++
++def test_translated_enum_serialization():
++    """Test that translated enums are serialized using their names."""
++    
++    # Test the translated enum
++    serialized, imports = serializer_factory(TranslatedStatus.GOOD).serialize()
++    print(f"TranslatedStatus.GOOD serialized: {serialized}")
++    print(f"Imports: {imports}")
++    
++    # Verify it uses the name 'GOOD' instead of the translated value 'Good'
++    assert "TranslatedStatus['GOOD']" in serialized, f"Expected TranslatedStatus['GOOD'], got {serialized}"
++    
++    # The key point: the serialization should NOT contain the translated value
++    assert "'Good'" not in serialized, "Serialization should not contain the translated value"
++    
++    # Test that we can evaluate the serialized code
++    serialized_code, imports = serialized, imports
++    
++    # Import the required modules
++    for import_stmt in imports:
++        exec(import_stmt)
++    
++    # This should work even if the translated value changes
++    result = eval(serialized_code)
++    print(f"Evaluation result: {result}")
++    assert result == TranslatedStatus.GOOD, f"Expected TranslatedStatus.GOOD, got {result}"
++    
++    print("Test passed! Translated enums are now serialized using names, making them translation-safe.")
++
++
++def simulate_translation_issue():
++    """Simulate what would happen if the translation changed."""
++    
++    print("\n--- Simulating translation change ---")
++    
++    # Create a new enum class that simulates what happens after translation
++    # The original enum had values 'Good' and 'Bad', but after translation
++    # they become 'Bueno' and 'Malo'
++    
++    class SpanishTranslatedStatus(enum.Enum):
++        GOOD = 'Bueno'  # Translated value
++        BAD = 'Malo'    # Translated value
++        
++        def __str__(self):
++            return self.name
++    
++    print("Original enum values: 'Good', 'Bad'")
++    print("Translated enum values: 'Bueno', 'Malo'")
++    
++    # This is what the old migration would contain (using the value)
++    old_migration_code = "SpanishTranslatedStatus('Good')"
++    
++    # This is what the new migration contains (using the name)
++    new_migration_code = "SpanishTranslatedStatus['GOOD']"
++    
++    print(f"Old migration code (would break): {old_migration_code}")
++    print(f"New migration code (works): {new_migration_code}")
++    
++    try:
++        # This should fail because 'Good' is not a valid value in the translated enum
++        result = eval(old_migration_code)
++        print(f"Old approach result: {result} (unexpected - should have failed)")
++    except ValueError as e:
++        print(f"Old approach fails (as expected): {e}")
++    
++    # This should work because it uses the enum name which doesn't change
++    result = eval(new_migration_code)
++    print(f"New approach result: {result}")
++    assert result == SpanishTranslatedStatus.GOOD, "New approach should work despite translation changes"
++
++
++if __name__ == "__main__":
++    test_translated_enum_serialization()
++    simulate_translation_issue()
+\ No newline at end of file
+diff --git a/test_updated_behavior.py b/test_updated_behavior.py
+new file mode 100644
+index 0000000000..375f8d62b6
+--- /dev/null
++++ b/test_updated_behavior.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++"""Test script to verify the updated enum serialization behavior."""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++    django.setup()
++
++import enum
++from django.db.migrations.serializer import serializer_factory
++
++
++class TextEnum(enum.Enum):
++    A = 'a-value'
++    B = 'value-b'
++
++
++class BinaryEnum(enum.Enum):
++    A = b'a-value'
++    B = b'value-b'
++
++
++class IntEnum(enum.IntEnum):
++    A = 1
++    B = 2
++
++
++def test_updated_enum_serialization():
++    """Test that enums are now serialized using their names."""
++    
++    # Test TextEnum
++    serialized, imports = serializer_factory(TextEnum.A).serialize()
++    expected = "['A']"  # Just check that it uses bracket notation with the name
++    assert expected in serialized, f"Expected bracket notation with name, got {serialized}"
++    print(f"✓ TextEnum.A serialized correctly: {serialized}")
++    
++    # Test BinaryEnum  
++    serialized, imports = serializer_factory(BinaryEnum.A).serialize()
++    expected = "['A']"
++    assert expected in serialized, f"Expected bracket notation with name, got {serialized}"
++    print(f"✓ BinaryEnum.A serialized correctly: {serialized}")
++    
++    #2 Test IntEnum
++    serialized, imports = serializer_factory(IntEnum.B).serialize()
++    expected = "['B']"
++    assert expected in serialized, f"Expected bracket notation with name, got {serialized}"
++    print(f"✓ IntEnum.B serialized correctly: {serialized}")
++    
++    print("All enum serialization tests passed!")
++
++
++if __name__ == "__main__":
++    test_updated_enum_serialization()
+\ No newline at end of file
+diff --git a/tests/migrations/test_writer.py b/tests/migrations/test_writer.py
+index f97d76e9ad..375fbf726a 100644
+--- a/tests/migrations/test_writer.py
++++ b/tests/migrations/test_writer.py
+@@ -267,15 +267,15 @@ class WriterTests(SimpleTestCase):
+ 
+         self.assertSerializedResultEqual(
+             TextEnum.A,
+-            ("migrations.test_writer.TextEnum('a-value')", {'import migrations.test_writer'})
++            ("migrations.test_writer.TextEnum['A']", {'import migrations.test_writer'})
+         )
+         self.assertSerializedResultEqual(
+             BinaryEnum.A,
+-            ("migrations.test_writer.BinaryEnum(b'a-value')", {'import migrations.test_writer'})
++            ("migrations.test_writer.BinaryEnum['A']", {'import migrations.test_writer'})
+         )
+         self.assertSerializedResultEqual(
+             IntEnum.B,
+-            ("migrations.test_writer.IntEnum(2)", {'import migrations.test_writer'})
++            ("migrations.test_writer.IntEnum['B']", {'import migrations.test_writer'})
+         )
+ 
+         field = models.CharField(default=TextEnum.B, choices=[(m.value, m) for m in TextEnum])

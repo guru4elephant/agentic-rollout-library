@@ -1,0 +1,232 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..c95d0888dd
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,46 @@
++import matplotlib.pyplot as plt
++import numpy as np
++import warnings
++
++def test_colormap_with_dtype(dtype, test_values, description):
++    """Test colormap with specific dtype and values"""
++    cmap = plt.get_cmap('viridis')
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        try:
++            result = cmap(np.array(test_values, dtype=dtype))
++            numpy_warnings = [warning for warning in w if "NumPy will stop allowing conversion" in str(warning.message)]
++            if numpy_warnings:
++                print(f"FAILED {description}: Found {len(numpy_warnings)} NumPy deprecation warnings")
++                return False
++            else:
++                print(f"PASSED {description}")
++                return True
++        except Exception as e:
++            print(f"ERROR {description}: {e}")
++            return False
++
++# Test various scenarios
++print("Testing colormap with different dtypes and values...")
++
++# Test 1: Original issue - empty uint8 array
++test_colormap_with_dtype(np.uint8, [], "Empty uint8 array")
++
++# Test 2: Regular uint8 values
++test_colormap_with_dtype(np.uint8, [0, 127, 255], "Regular uint8 values")
++
++# Test 3: Out of bounds values that should use special indices
++test_colormap_with_dtype(np.int32, [-1, 256], "Out of bounds int32 values")
++
++# Test 4: Different integer dtypes
++for dtype in [np.int8, np.int16, np.int32, np.int64]:
++    test_colormap_with_dtype(dtype, [0, 10, 20], f"{dtype.__name__} values")
++
++# Test 5: Different unsigned integer dtypes  
++for dtype in [np.uint8, np.uint16, np.uint32]:
++    test_colormap_with_dtype(dtype, [0, 10, 20], f"{dtype.__name__} values")
++
++# Test 6: Float arrays (should be converted to int internally)
++test_colormap_with_dtype(np.float64, [0.0, 0.5, 1.0], "Float64 values")
++
++print("All tests completed!")
+\ No newline at end of file
+diff --git a/debug_dtype.py b/debug_dtype.py
+new file mode 100644
+index 0000000000..2ccfd38508
+--- /dev/null
++++ b/debug_dtype.py
+@@ -0,0 +1,14 @@
++import numpy as np
++
++# Debug the dtype issue
++dtypes_to_test = [np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32, np.uint64]
++
++for dtype in dtypes_to_test:
++    info = np.iinfo(dtype) if np.issubdtype(dtype, np.integer) else None
++    itemsize = dtype().itemsize
++    int_itemsize = np.dtype(int).itemsize
++    needs_conversion = not np.issubdtype(dtype, np.integer) or itemsize < int_itemsize
++    
++    print(f"{dtype.__name__}: itemsize={itemsize}, int_itemsize={int_itemsize}, needs_conversion={needs_conversion}")
++    if info:
++        print(f"  Range: {info.min} to {info.max}")
+\ No newline at end of file
+diff --git a/debug_uint64.py b/debug_uint64.py
+new file mode 100644
+index 0000000000..e143a9d992
+--- /dev/null
++++ b/debug_uint64.py
+@@ -0,0 +1,14 @@
++import matplotlib.pyplot as plt
++import numpy as np
++
++# Debug the uint64 issue
++cmap = plt.get_cmap('viridis')
++arr = np.array([0, 10, 20], dtype=np.uint64)
++print(f"Input array dtype: {arr.dtype}")
++print(f"Input array: {arr}")
++
++try:
++    result = cmap(arr)
++    print("Success!")
++except Exception as e:
++    print(f"Error: {e}")
+\ No newline at end of file
+diff --git a/lib/matplotlib/colors.py b/lib/matplotlib/colors.py
+index 2d3072da04..4f58f21bee 100644
+--- a/lib/matplotlib/colors.py
++++ b/lib/matplotlib/colors.py
+@@ -727,9 +727,16 @@ class Colormap:
+                 xa = xa.astype(int)
+         # Set the over-range indices before the under-range;
+         # otherwise the under-range values get converted to over-range.
+-        xa[xa > self.N - 1] = self._i_over
+-        xa[xa < 0] = self._i_under
+-        xa[mask_bad] = self._i_bad
++        # Ensure xa has a signed integer dtype suitable for indexing before assigning special indices
++        if (not np.issubdtype(xa.dtype, np.integer) or 
++            not np.issubdtype(xa.dtype, np.signedinteger) or
++            xa.dtype.itemsize < np.dtype(int).itemsize):
++            xa = xa.astype(int)
++        
++        # Use np.array().astype() to handle integer overflow properly per NumPy 1.24+ deprecation
++        xa[xa > self.N - 1] = np.array(self._i_over).astype(xa.dtype)
++        xa[xa < 0] = np.array(self._i_under).astype(xa.dtype)
++        xa[mask_bad] = np.array(self._i_bad).astype(xa.dtype)
+ 
+         lut = self._lut
+         if bytes:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e695f07984
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,6 @@
++import matplotlib.pyplot as plt
++import numpy as np
++
++# Reproduce the issue from the GitHub issue
++result = plt.get_cmap()(np.empty((0, ), dtype=np.uint8))
++print("Script completed successfully")
+\ No newline at end of file
+diff --git a/test_condition.py b/test_condition.py
+new file mode 100644
+index 0000000000..8fdc97abe7
+--- /dev/null
++++ b/test_condition.py
+@@ -0,0 +1,15 @@
++import numpy as np
++
++# Test our new condition
++dtypes_to_test = [np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32, np.uint64]
++
++for dtype in dtypes_to_test:
++    is_integer = np.issubdtype(dtype, np.integer)
++    is_signed = np.issubdtype(dtype, np.signedinteger)
++    itemsize = dtype().itemsize
++    int_itemsize = np.dtype(int).itemsize
++    
++    # Our new condition
++    needs_conversion = (not is_integer or not is_signed or itemsize < int_itemsize)
++    
++    print(f"{dtype.__name__}: integer={is_integer}, signed={is_signed}, itemsize={itemsize}, needs_conversion={needs_conversion}")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..701fbb33e2
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,41 @@
++import matplotlib.pyplot as plt
++import numpy as np
++import warnings
++
++# Capture all warnings
++with warnings.catch_warnings(record=True) as w:
++    warnings.simplefilter("always")
++    
++    # Test case 1: Empty array (original issue)
++    cmap = plt.get_cmap()
++    result1 = cmap(np.empty((0, ), dtype=np.uint8))
++    print("Test 1 - Empty array: PASSED")
++    
++    # Test case 2: Regular uint8 array
++    result2 = cmap(np.array([0, 127, 255], dtype=np.uint8))
++    print("Test 2 - Regular uint8 array: PASSED")
++    
++    # Test case 3: Float array that gets converted to int
++    result3 = cmap(np.array([0.0, 0.5, 1.0]))
++    print("Test 3 - Float array: PASSED")
++    
++    # Test case 4: Out of bounds values
++    result4 = cmap(np.array([-1, 256], dtype=np.int32))
++    print("Test 4 - Out of bounds int32: PASSED")
++    
++    # Test case 5: Different dtypes
++    for dtype in [np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32, np.uint64]:
++        result = cmap(np.array([0, 128], dtype=dtype))
++        print(f"Test 5 - {dtype}: PASSED")
++    
++    # Check for NumPy deprecation warnings
++    numpy_warnings = [warning for warning in w if "NumPy will stop allowing conversion" in str(warning.message)]
++    
++    if numpy_warnings:
++        print(f"FAILED: Found {len(numpy_warnings)} NumPy deprecation warnings")
++        for warning in numpy_warnings:
++            print(f"  {warning.filename}:{warning.lineno}: {warning.message}")
++    else:
++        print("SUCCESS: No NumPy deprecation warnings found")
++
++print("All tests completed")
+\ No newline at end of file
+diff --git a/test_uint64.py b/test_uint64.py
+new file mode 100644
+index 0000000000..d6584aa8f1
+--- /dev/null
++++ b/test_uint64.py
+@@ -0,0 +1,23 @@
++import matplotlib.pyplot as plt
++import numpy as np
++import warnings
++
++# Test uint64 specifically since it was causing issues before
++cmap = plt.get_cmap('viridis')
++
++with warnings.catch_warnings(record=True) as w:
++    warnings.simplefilter("always")
++    
++    # Test uint64 with values that should work
++    result = cmap(np.array([0, 10, 20], dtype=np.uint64))
++    
++    numpy_warnings = [warning for warning in w if "NumPy will stop allowing conversion" in str(warning.message)]
++    
++    if numpy_warnings:
++        print(f"FAILED: Found {len(numpy_warnings)} NumPy deprecation warnings")
++        for warning in numpy_warnings:
++            print(f"  {warning.filename}:{warning.lineno}: {warning.message}")
++    else:
++        print("PASSED: No NumPy deprecation warnings for uint64")
++
++print("uint64 test completed")
+\ No newline at end of file

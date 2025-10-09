@@ -1,0 +1,148 @@
+diff --git a/django/core/mail/message.py b/django/core/mail/message.py
+index e393b4cf5c..f2ca628f03 100644
+--- a/django/core/mail/message.py
++++ b/django/core/mail/message.py
+@@ -1,4 +1,5 @@
+ import mimetypes
++import idna
+ from email import (
+     charset as Charset, encoders as Encoders, generator, message_from_string,
+ )
+@@ -257,7 +258,13 @@ class EmailMessage:
+             msg['Date'] = formatdate(localtime=settings.EMAIL_USE_LOCALTIME)
+         if 'message-id' not in header_names:
+             # Use cached DNS_NAME for performance
+-            msg['Message-ID'] = make_msgid(domain=DNS_NAME)
++            # Convert domain to punycode to handle non-ASCII characters
++            domain = str(DNS_NAME)
++            try:
++                punycode_domain = idna.encode(domain).decode('ascii')
++            except (idna.IDNAError, UnicodeError):
++                punycode_domain = domain
++            msg['Message-ID'] = make_msgid(domain=punycode_domain)
+         for name, value in self.extra_headers.items():
+             if name.lower() != 'from':  # From is already handled
+                 msg[name] = value
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..de27869453
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,32 @@
++#!/usr/bin/env python3
++"""Script to reproduce the non-ASCII domain email encoding issue."""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        EMAIL_USE_LOCALTIME=False,
++    )
++
++from unittest.mock import patch
++from django.core.mail import EmailMessage
++
++# Test case from the issue description
++with patch("django.core.mail.message.DNS_NAME", "漢字"):
++    email = EmailMessage('subject', '', 'from@example.com', ['to@example.com'])
++    email.encoding = 'iso-8859-1'
++    try:
++        message = email.message()
++        print("SUCCESS: Message created without error")
++        print(f"Message-ID: {message['Message-ID']}")
++        # Check if punycode is present
++        if 'xn--p8s937b' in message['Message-ID']:
++            print("SUCCESS: Punycode found in Message-ID")
++        else:
++            print("WARNING: Punycode not found in Message-ID")
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
+\ No newline at end of file
+diff --git a/test_ascii_domain.py b/test_ascii_domain.py
+new file mode 100644
+index 0000000000..5d24326229
+--- /dev/null
++++ b/test_ascii_domain.py
+@@ -0,0 +1,32 @@
++#!/usr/bin/env python3
++"""Script to test that ASCII domain names still work correctly."""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        EMAIL_USE_LOCALTIME=False,
++    )
++
++from unittest.mock import patch
++from django.core.mail import EmailMessage
++
++# Test case with ASCII domain name
++with patch("django.core.mail.message.DNS_NAME", "example.com"):
++    email = EmailMessage('subject', '', 'from@example.com', ['to@example.com'])
++    email.encoding = 'iso-8859-1'
++    try:
++        message = email.message()
++        print("SUCCESS: ASCII domain message created without error")
++        print(f"Message-ID: {message['Message-ID']}")
++        # Check that the domain is still correct
++        if 'example.com' in message['Message-ID']:
++            print("SUCCESS: ASCII domain preserved correctly")
++        else:
++            print("WARNING: ASCII domain not found in Message-ID")
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..a6fe67cee9
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,38 @@
++#!/usr/bin/env python3
++"""Script to test edge cases for domain name handling."""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        EMAIL_USE_LOCALTIME=False,
++    )
++
++from unittest.mock import patch
++from django.core.mail import EmailMessage
++
++# Test case with invalid domain name that might cause IDNAError
++with patch("django.core.mail.message.DNS_NAME", "invalid-漢字-unicode-domain"):
++    email = EmailMessage('subject', '', 'from@example.com', ['to@example.com'])
++    email.encoding = 'iso-8859-1'
++    try:
++        message = email.message()
++        print("SUCCESS: Invalid domain handled gracefully")
++        print(f"Message-ID: {message['Message-ID']}")
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++
++# Test case with empty domain name
++with patch("django.core.mail.message.DNS_NAME", ""):
++    email = EmailMessage('subject', '', 'from@example.com', ['to@example.com'])
++    email.encoding = 'iso-8859-1'
++    try:
++        message = email.message()
++        print("SUCCESS: Empty domain handled gracefully")
++        print(f"Message-ID: {message['Message-ID']}")
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
+\ No newline at end of file

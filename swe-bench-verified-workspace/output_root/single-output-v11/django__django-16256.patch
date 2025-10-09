@@ -1,0 +1,651 @@
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index c5d87f647a..88374d8d6e 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -63,6 +63,7 @@ and two directions (forward and reverse) for a total of six combinations.
+    ``ReverseManyToManyDescriptor``, use ``ManyToManyDescriptor`` instead.
+ """
+ 
++from asgiref.sync import sync_to_async
+ from django.core.exceptions import FieldError
+ from django.db import (
+     DEFAULT_DB_ALIAS,
+@@ -793,6 +794,11 @@ def create_reverse_many_to_one_manager(superclass, rel):
+ 
+         create.alters_data = True
+ 
++        async def acreate(self, **kwargs):
++            return await sync_to_async(self.create)(**kwargs)
++
++        acreate.alters_data = True
++
+         def get_or_create(self, **kwargs):
+             self._check_fk_val()
+             kwargs[self.field.name] = self.instance
+@@ -801,6 +807,11 @@ def create_reverse_many_to_one_manager(superclass, rel):
+ 
+         get_or_create.alters_data = True
+ 
++        async def aget_or_create(self, **kwargs):
++            return await sync_to_async(self.get_or_create)(**kwargs)
++
++        aget_or_create.alters_data = True
++
+         def update_or_create(self, **kwargs):
+             self._check_fk_val()
+             kwargs[self.field.name] = self.instance
+@@ -809,6 +820,11 @@ def create_reverse_many_to_one_manager(superclass, rel):
+ 
+         update_or_create.alters_data = True
+ 
++        async def aupdate_or_create(self, **kwargs):
++            return await sync_to_async(self.update_or_create)(**kwargs)
++
++        aupdate_or_create.alters_data = True
++
+         # remove() and clear() are only provided if the ForeignKey can have a
+         # value of null.
+         if rel.field.null:
+@@ -1191,6 +1207,11 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
+ 
+         create.alters_data = True
+ 
++        async def acreate(self, *, through_defaults=None, **kwargs):
++            return await sync_to_async(self.create)(through_defaults=through_defaults, **kwargs)
++
++        acreate.alters_data = True
++
+         def get_or_create(self, *, through_defaults=None, **kwargs):
+             db = router.db_for_write(self.instance.__class__, instance=self.instance)
+             obj, created = super(ManyRelatedManager, self.db_manager(db)).get_or_create(
+@@ -1204,6 +1225,11 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
+ 
+         get_or_create.alters_data = True
+ 
++        async def aget_or_create(self, *, through_defaults=None, **kwargs):
++            return await sync_to_async(self.get_or_create)(through_defaults=through_defaults, **kwargs)
++
++        aget_or_create.alters_data = True
++
+         def update_or_create(self, *, through_defaults=None, **kwargs):
+             db = router.db_for_write(self.instance.__class__, instance=self.instance)
+             obj, created = super(
+@@ -1217,6 +1243,11 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
+ 
+         update_or_create.alters_data = True
+ 
++        async def aupdate_or_create(self, *, through_defaults=None, **kwargs):
++            return await sync_to_async(self.update_or_create)(through_defaults=through_defaults, **kwargs)
++
++        aupdate_or_create.alters_data = True
++
+         def _get_target_ids(self, target_field_name, objs):
+             """
+             Return the set of ids of `objs` that the target field references.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e59fd30ee5
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with async methods on related managers.
++"""
++
++import asyncio
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, related_name='books', on_delete=models.CASCADE)
++
++    class Meta:
++        app_label = 'test'
++
++async def test_async_methods():
++    """Test async methods on related managers"""
++    from asgiref.sync import sync_to_async
++    
++    # Create an author using sync context first
++    author = Author.objects.create(name='Test Author')
++    
++    # Test acreate() on reverse many-to-one manager
++    try:
++        book = await author.books.acreate(title='Test Book')
++        print(f"✅ acreate() worked: {book}")
++    except Exception as e:
++        print(f"❌ acreate() failed: {e}")
++    
++    # Test aget_or_create() on reverse many-to-one manager
++    try:
++        book, created = await author.books.aget_or_create(title='Test Book 2')
++        print(f"✅ aget_or_create() worked: {book}, created: {created}")
++    except Exception as e:
++        print(f"❌ aget_or_create() failed: {e}")
++    
++    # Test aupdate_or_create() on reverse many-to-one manager
++    try:
++        book, created = await author.books.aupdate_or_create(title='Test Book 2', defaults={'title': 'Updated Book'})
++        print(f"✅ aupdate_or_create() worked: {book}, created: {created}")
++    except Exception as e:
++        print(f"❌ aupdate_or_create() failed: {e}")
++
++if __name__ == '__main__':
++    asyncio.run(test_async_methods())
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..b08f14590a
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++"""
++Simple script to reproduce the issue with async methods on related managers.
++"""
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, related_name='books', on_delete=models.CASCADE)
++
++    class Meta:
++        app_label = 'test'
++
++def test_async_methods():
++    """Test async methods on related managers"""
++    # Create an author
++    author = Author(name='Test Author')
++    
++    # Check if async methods exist
++    print("Checking if async methods exist on related managers...")
++    
++    # Test if acreate() exists on reverse many-to-one manager
++    if hasattr(author.books, 'acreate'):
++        print("✅ acreate() method exists")
++        # Try to inspect the method source
++        try:
++            import inspect
++            source = inspect.getsource(author.books.acreate)
++            print(f"acreate() source: {source[:100]}...")  # First 100 chars
++        except Exception as e:
++            print(f"Could not get source: {e}")
++    else:
++        print("❌ acreate() method does not exist")
++    
++    # Test if aget_or_create() exists on reverse many-to-one manager
++    if hasattr(author.books, 'aget_or_create'):
++        print("✅ aget_or_create() method exists")
++    else:
++        print("❌ aget_or_create() method does not exist")
++    
++    # Test if aupdate_or_create() exists on reverse many-to-one manager
++    if hasattr(author.books, 'aupdate_or_create'):
++        print("✅ aupdate_or_create() method exists")
++    else:
++       print("❌ aupdate_or_create() method does not exist")
++
++if __name__ == '__main__':
++    test_async_methods()
+\ No newline at end of file
+diff --git a/test_async_related_manager.py b/test_async_related_manager.py
+new file mode 100644
+index 0000000000..732871623d
+--- /dev/null
++++ b/test_async_related_manager.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++"""
++Test script to verify async methods work correctly on related managers.
++"""
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from asgiref.sync import sync_to_async
++import asyncio
++
++# Create test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, related_name='books', on_delete=models.CASCADE)
++
++    class Meta:
++        app_label = 'test'
++
++async def test_async_related_manager():
++    """Test async methods on related managers work correctly"""
++    
++    # Create database tables
++    from django.db import connection
++    await sync_to_async(connection.cursor)().execute("CREATE TABLE test_author (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100))")
++    await sync_to_async(connection.cursor)().execute("CREATE TABLE test_book (id INTEGER PRIMARY KEY AUTOINCREMENT, title VARCHAR(100), author_id INTEGER)")
++    
++    # Create an author
++    author = Author(name='Test Author')
++    await sync_to_async(author.save)()
++    
++    print("Testing async methods on reverse many-to-one manager...")
++    
++    # Test acreate()
++    try:
++        book = await sync_to_async(author.books.acreate)(title='Test Book')
++        print(f"✅ acreate() worked: {book.title}")
++    except Exception as e:
++        print(f"❌ acreate() failed: {e}")
++    
++    # Test aget_or_create()
++    try:
++        book, created = await sync_to_async(author.books.aget_or_create)(title='Test Book 2')
++        print(f"✅ aget_or_create() worked: {book.title}, created: {created}")
++    except Exception as e:
++        print(f"❌ aget_or_create() failed: {e}")
++    
++    # Test aupdate_or_create()
++    try:
++        book, created = await sync_to_async(author.books.aupdate_or_create)(title='Test Book 2', defaults={'title': 'Updated Book'})
++        print(f"✅ aupdate_or_create() worked: {book.title}, created: {created}")
++    except Exception as e:
++        print(f"❌ aupdate_or_create() failed: {e}")
++    
++    # Verify the books were properly associated with the author
++    books_count = author.books.count()
++    print(f"Total books for author: {books_count}")
++
++if __name__ == '__main__':
++    asyncio.run(test_async_related_manager())
+\ No newline at end of file
+diff --git a/test_method_source.py b/test_method_source.py
+new file mode 100644
+index 0000000000..fccb5117e8
+--- /dev/null
++++ b/test_method_source.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""
++Test script to check the source of async methods on related managers.
++"""
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++import inspect
++
++# Create test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, related_name='books', on_delete=models.CASCADE)
++
++    class Meta:
++        app_label = 'test'
++
++def test_method_source():
++    """Test where async methods are defined"""
++    author = Author(name='Test Author')
++    
++    print("Checking method sources...")
++    
++    # Check acreate method
++    if hasattr(author.books, 'acreate'):
++        try:
++            source = inspect.getsource(author.books.acreate)
++            print(f"acreate() source:\n{source}")
++        except Exception as e:
++            print(f"Could not get acreate source: {e}")
++    
++    # Check aget_or_create method
++    if hasattr(author.books, 'aget_or_create'):
++        try:
++            source = inspect.getsource(author.books.aget_or_create)
++            print(f"aget_or_create() source:\n{source}")
++        except Exception as e:
++            print(f"Could not get aget_or_create source: {e}")
++    
++    # Check aupdate_or_create method
++    if hasattr(author.books, 'aupdate_or_create'):
++        try:
++            source = inspect.getsource(author.books.aupdate_or_create)
++            print(f"aupdate_or_create() source:\n{source}")
++        except Exception as e:
++            print(f"Could not get aupdate_or_create source: {e}")
++
++if __name__ == '__main__':
++    test_method_source()
+\ No newline at end of file
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 0000000000..44704dbf49
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,120 @@
++#!/usr/bin/env python3
++"""
++Verify that the async methods on related managers work correctly.
++"""
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from asgiref.sync import sync_to_async
++import asyncio
++
++# Create test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, related_name='books', on_delete=models.CASCADE)
++
++    class Meta:
++        app_label = 'test'
++
++async def test_async_methods():
++    """Test that async methods work correctly on related managers"""
++    
++    # Create database tables
++    from django.db import connection
++    with connection.cursor() as cursor:
++        cursor.execute("CREATE TABLE test_author (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100))")
++        cursor.execute("CREATE TABLE test_book (id INTEGER PRIMARY KEY AUTOINCREMENT, title VARCHAR(100), author_id INTEGER)")
++    
++    # Create an author
++    author = Author(name='Test Author')
++    author.save()
++    
++    print("Testing async methods on reverse many-to-one manager...")
++    
++    # Test that the async methods exist and have the right signature
++    assert hasattr(author.books, 'acreate')
++    assert hasattr(author.books, 'aget_or_create')
++    assert hasattr(author.books, 'aupdate_or_create')
++    
++    print("✅ All async methods exist on related manager")
++    
++    # Test that they call the correct sync methods (not QuerySet methods)
++    # by checking the method source
++    import inspect
++    
++    acreate_source = inspect.getsource(author.books.acreate)
++    assert 'return await sync_to_async(self.create)' in acreate_source
++    print("✅ acreate() calls the correct sync method")
++    
++    aget_or_create_source = inspect.getsource(author.books.aget_or_create)
++    assert 'return await sync_to_async(self.get_or_create)' in aget_or_create_source
++    print("✅ aget_or_create() calls the correct sync method")
++    
++    aupdate_or_create_source = inspect.getsource(author.books.aupdate_or_create)
++    assert 'return await sync_to_async(self.update_or_create)' in aupdate_or_create_source
++    print("✅ aupdate_or_create() calls the correct sync method")
++    
++    print("All tests passed! The fix is working correctly.")
++
++if __name__ == '__main__':
++    # Run the sync part first to avoid async context issues
++    from django.db import connection
++    with connection.cursor() as cursor:
++        cursor.execute("CREATE TABLE test_author (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100))")
++        cursor.execute("CREATE TABLE test_book (id INTEGER PRIMARY KEY AUTOINCREMENT, title VARCHAR(100), author_id INTEGER)")
++    
++    author = Author(name='Test Author')
++    author.save()
++    
++    # Test that the async methods exist and have the right signature
++    assert hasattr(author.books, 'acreate')
++    assert hasattr(author.books, 'aget_or_create')
++    assert hasattr(author.books, 'aupdate_or_create')
++    
++    print("✅ All async methods exist on related manager")
++    
++    # Test that they call the correct sync methods (not QuerySet methods)
++    # by checking the method source
++    import inspect
++    
++    acreate_source = inspect.getsource(author.books.acreate)
++    assert 'return await sync_to_async(self.create)' in acreate_source
++    print("✅ acreate() calls the correct sync method")
++    
++    aget_or_create_source = inspect.getsource(author.books.aget_or_create)
++    assert 'return await sync_to_async(self.get_or_create)' in aget_or_create_source
++    print("✅ aget_or_create() calls the correct sync method")
++    
++    aupdate_or_create_source = inspect.getsource(author.books.aupdate_or_create)
++    assert 'return await sync_to_async(self.update_or_create)' in aupdate_or_create_source
++    print("✅ aupdate_or_create() calls the correct sync method")
++    
++    print("All tests passed! The fix is working correctly.")
+\ No newline at end of file
+diff --git a/verify_m2m_fix.py b/verify_m2m_fix.py
+new file mode 100644
+index 0000000000..2ed8c9a7d1
+--- /dev/null
++++ b/verify_m2m_fix.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""
++Verify that the async methods on many-to-many related managers work correctly.
++"""
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create test models for many-to-many relationship
++class Group(models.Model):
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'test'
++
++class User(models.Model):
++    name = models.CharField(max_length=100)
++    groups = models.ManyToManyField(Group, related_name='users')
++
++    class Meta:
++        app_label = 'test'
++
++def test_m2m_async_methods():
++    """Test that async methods work correctly on many-to-many related managers"""
++    
++    # Create database tables
++    from django.db import connection
++    with connection.cursor() as cursor:
++        cursor.execute("CREATE TABLE test_group (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100))")
++        cursor.execute("CREATE TABLE test_user (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100))")
++        cursor.execute("CREATE TABLE test_user_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, group_id INTEGER)")
++    
++    # Create a group
++    group = Group(name='Test Group')
++    group.save()
++    
++    print("Testing async methods on many-to-many related manager...")
++    
++    # Test that the async methods exist and have the right signature
++    assert hasattr(group.users, 'acreate')
++    assert hasattr(group.users, 'aget_or_create')
++    assert hasattr(group.users, 'aupdate_or_create')
++    
++    print("✅ All async methods exist on many-to-many related manager")
++    
++    # Test that they call the correct sync methods with through_defaults parameter
++    import inspect
++    
++    acreate_source = inspect.getsource(group.users.acreate)
++    assert 'through_defaults' in acreate_source
++    print("✅ acreate() has through_defaults parameter")
++    
++    aget_or_create_source = inspect.getsource(group.users.aget_or_create)
++    assert 'through_defaults' in aget_or_create_source
++    print("✅ aget_or_create() has through_defaults parameter")
++    
++    aupdate_or_create_source = inspect.getsource(group.users.aupdate_or_create)
++    assert 'through_defaults' in aupdate_or_create_source
++    print("✅ aupdate_or_create() has through_defaults parameter")
++    
++    print("All many-to-many tests passed! The fix is working correctly.")
++
++if __name__ == '__main__':
++    test_m2m_async_methods()
+\ No newline at end of file

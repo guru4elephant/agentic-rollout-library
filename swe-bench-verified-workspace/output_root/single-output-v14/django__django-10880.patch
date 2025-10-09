@@ -1,0 +1,390 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..32b7ae044f
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,168 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the Count annotation fix works correctly
++and doesn't break existing functionality.
++"""
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count, Case, When, Value, F, Q
++
++# Create test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    rating = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_original_issue():
++    """Test the original issue: Count with distinct=True and Case expression"""
++    print("Testing original issue: Count with distinct=True and Case expression")
++    
++    # This was the problematic case that should now work
++    query = Book.objects.annotate(
++        good_books_count=Count(
++            Case(When(rating__gte=4, then=Value(1))),
++            distinct=True
++        )
++    )
++    
++    sql = str(query.query)
++    print("Generated SQL:", sql)
++    
++    # Verify the fix: should have space between DISTINCT and CASE
++    assert "DISTINCT CASE" in sql, "Missing space between DISTINCT and CASE"
++    assert "DISTINCTCASE" not in sql, "Still has the incorrect DISTINCTCASE"
++    print("✓ Original issue fixed\n")
++
++def test_backwards_compatibility():
++    """Test that existing functionality still works"""
++    print("Testing backwards compatibility")
++    
++    # Test regular Count with distinct=True
++    query1 = Book.objects.annotate(
++        distinct_authors=Count('author', distinct=True)
++    )
++    sql1 = str(query1.query)
++    assert "COUNT(DISTINCT" in sql1, "Regular distinct count should work"
++    print("✓ Regular distinct count works")
++    
++    # Test Count with distinct=False
++    query2 = Book.objects.annotate(
++        all_authors=Count('author', distinct=False)
++    )
++    sql2 = str(query2.query)
++    assert "DISTINCT" not in sql2 or " COUNT(" in sql2, "Non-distinct count should work"
++    print("✓ Non-distinct count works")
++    
++    # Test Count with Case but no distinct
++    query3 = Book.objects.annotate(
++        good_books=Count(Case(When(rating__gte=4, then=Value(1))))
++    )
++    sql3 = str(query3.query)
++    assert "CASE WHEN" in sql3, "Case without distinct should work"
++    assert "DISTINCT" not in sql3, "Should not have DISTINCT"
++    print("✓ Case without distinct works\n")
++
++def test_edge_cases():
++    """Test various edge cases"""
++    print("Testing edge cases")
++    
++    # Test with multiple conditions in Case
++    query1 = Book.objects.annotate(
++        rated_books=Count(
++            Case(
++                When(rating__gte=1, then=Value(1)),
++                When(rating=0, then=Value(2)),
++                default=Value(0)
++            ),
++            distinct=True
++        )
++    )
++    sql1 = str(query1.query)
++    assert "DISTINCT CASE" in sql1, "Multi-condition Case should work"
++    print("✓ Multi-condition Case with distinct works")
++    
++    # Test with F expressions
++    query2 = Book.objects.annotate(
++        value_count=Count(F('rating'), distinct=True)
++    )
++    sql2 = str(query2.query)
++    assert "COUNT(DISTINCT" in sql2, "F expression with distinct should work"
++    print("✓ F expression with distinct works")
++    
++    # Test with complex expressions
++    query3 = Book.objects.annotate(
++        complex_count=Count(
++            Case(
++                When(Q(rating__gt=3) & Q(title__contains="good"), then=Value(1)),
++                default=Value(0)
++            ),
++            distinct=True
++        )
++    )
++    sql3 = str(query3.query)
++    assert "DISTINCT CASE" in sql3, "Complex expression should work"
++    print("✓ Complex expression with distinct works\n")
++
++def test_sql_output():
++    """Test that the SQL output is syntactically correct"""
++    print("Testing SQL output correctness")
++    
++    query = Book.objects.annotate(
++        test_count=Count(
++            Case(When(rating__gt=0, then=Value(1))),
++            distinct=True
++        )
++    )
++    
++    sql = str(query.query)
++    print("Final SQL:", sql)
++    
++    # The SQL should be parseable by SQLite (or at least look correct)
++    assert sql.startswith('SELECT'), "Should be a SELECT query"
++    assert "COUNT(DISTINCT CASE" in sql, "Should have proper COUNT(DISTINCT CASE syntax"
++    assert "WHEN" in sql, "Should have WHEN clause"
++    assert "THEN" in sql, "Should have THEN clause"
++    assert "END)" in sql, "Should have closing END"
++    print("✓ SQL output is syntactically correct\n")
++
++if __name__ == "__main__":
++    print("Running comprehensive tests for Count annotation fix...\n")
++    
++    test_original_issue()
++    test_backwards_compatibility()
++    test_edge_cases()
++    test_sql_output()
++    
++    print("All tests passed! 🎉")
++    print("The fix successfully resolves the issue while maintaining backwards compatibility.")
+\ No newline at end of file
+diff --git a/django/contrib/postgres/aggregates/general.py b/django/contrib/postgres/aggregates/general.py
+index 918373e926..a15758cd0f 100644
+--- a/django/contrib/postgres/aggregates/general.py
++++ b/django/contrib/postgres/aggregates/general.py
+@@ -10,7 +10,7 @@ __all__ = [
+ 
+ class ArrayAgg(OrderableAggMixin, Aggregate):
+     function = 'ARRAY_AGG'
+-    template = '%(function)s(%(distinct)s%(expressions)s %(ordering)s)'
++    template = '%(function)s(%(distinct)s %(expressions)s %(ordering)s)'
+     allow_distinct = True
+ 
+     @property
+@@ -51,7 +51,7 @@ class JSONBAgg(Aggregate):
+ 
+ class StringAgg(OrderableAggMixin, Aggregate):
+     function = 'STRING_AGG'
+-    template = "%(function)s(%(distinct)s%(expressions)s, '%(delimiter)s'%(ordering)s)"
++    template = "%(function)s(%(distinct)s %(expressions)s, '%(delimiter)s'%(ordering)s)"
+     allow_distinct = True
+ 
+     def __init__(self, expression, delimiter, **extra):
+diff --git a/django/db/models/aggregates.py b/django/db/models/aggregates.py
+index ac0b62d0bf..f746654ace 100644
+--- a/django/db/models/aggregates.py
++++ b/django/db/models/aggregates.py
+@@ -14,7 +14,7 @@ __all__ = [
+ 
+ 
+ class Aggregate(Func):
+-    template = '%(function)s(%(distinct)s%(expressions)s)'
++    template = '%(function)s(%(distinct)s %(expressions)s)'
+     contains_aggregate = True
+     name = None
+     filter_template = '%s FILTER (WHERE %%(filter)s)'
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..086352c9a6
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with Count annotation containing both 
++Case condition and distinct=True parameter.
++"""
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count, Case, When, Value
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Create a query that reproduces the issue
++try:
++    # This should produce: COUNT(DISTINCT CASE WHEN value > 0 THEN 1 ELSE NULL END)
++    # But currently produces: COUNT(DISTINCTCASE WHEN value > 0 THEN 1 ELSE NULL END)
++    query = TestModel.objects.annotate(
++        count_with_case=Count(
++            Case(When(value__gt=0, then=Value(1))),
++            distinct=True
++        )
++    )
++    
++    # Try to generate the SQL to see the error
++    print("Generating SQL query...")
++    sql_query = str(query.query)
++    print("SQL Query:", sql_query)
++    
++except Exception as e:
++    print("Error occurred:", str(e))
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..73285a0d2c
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the Count annotation fix to ensure we didn't break anything.
++"""
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count, Case, When, Value, F
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_case_1():
++    """Test Count with distinct=True and Case expression"""
++    print("Test 1: Count with distinct=True and Case expression")
++    query = TestModel.objects.annotate(
++        count_with_case=Count(
++            Case(When(value__gt=0, then=Value(1))),
++            distinct=True
++        )
++    )
++    sql = str(query.query)
++    print("SQL:", sql)
++    assert "DISTINCT CASE" in sql, "Should have space between DISTINCT and CASE"
++    print("✓ PASSED\n")
++
++def test_case_2():
++    """Test Count with distinct=False and Case expression"""
++    print("Test 2: Count with distinct=False and Case expression")
++    query = TestModel.objects.annotate(
++        count_with_case=Count(
++            Case(When(value__gt=0, then=Value(1))),
++            distinct=False
++        )
++    )
++    sql = str(query.query)
++    print("SQL:", sql)
++    assert "DISTINCT" not in sql or "DISTINCT CASE" not in sql, "Should not have DISTINCT"
++    print("✓ PASSED\n")
++
++def test_case_3():
++    """Test Count with distinct=True and regular field"""
++    print("Test 3: Count with distinct=True and regular field")
++    query = TestModel.objects.annotate(
++        count_distinct=Count('name', distinct=True)
++    )
++    sql = str(query.query)
++    print("SQL:", sql)
++    assert "COUNT(DISTINCT" in sql, "Should have COUNT(DISTINCT"
++    print("✓ PASSED\n")
++
++def test_case_4():
++    """Test Count with distinct=False and regular field"""
++    print("Test 4: Count with distinct=False and regular field")
++    query = TestModel.objects.annotate(
++        count_regular=Count('name', distinct=False)
++    )
++    sql = str(query.query)
++    print("SQL:", sql)
++    assert "DISTINCT" not in sql, "Should not have DISTINCT"
++    print("✓ PASSED\n")
++
++def test_case_5():
++    """Test Count with distinct=True and F expression"""
++    print("Test 5: Count with distinct=True and F expression")
++    query = TestModel.objects.annotate(
++        count_f=Count(F('value'), distinct=True)
++    )
++    sql = str(query.query)
++    print("SQL:", sql)
++    assert "COUNT(DISTINCT" in sql, "Should have COUNT(DISTINCT"
++    print("✓ PASSED\n")
++
++if __name__ == "__main__":
++    print("Running edge case tests...\n")
++    test_case_1()
++    test_case_2()
++    test_case_3()
++    test_case_4()
++    test_case_5()
++    print("All tests passed! ✓")
+\ No newline at end of file

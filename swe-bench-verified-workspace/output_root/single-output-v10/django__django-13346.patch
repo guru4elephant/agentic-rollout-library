@@ -1,0 +1,385 @@
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fafc1beee8..822c625ba7 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -5,6 +5,8 @@ from django.core import checks, exceptions
+ from django.db import NotSupportedError, connections, router
+ from django.db.models import lookups
+ from django.db.models.lookups import PostgresOperatorLookup, Transform
++from django.core.exceptions import EmptyResultSet
++from django.utils.datastructures import OrderedSet
+ from django.utils.translation import gettext_lazy as _
+ 
+ from . import Field
+@@ -496,6 +498,53 @@ KeyTransform.register_lookup(KeyTransformGt)
+ KeyTransform.register_lookup(KeyTransformGte)
+ 
+ 
++class KeyTransformIn(lookups.In):
++    def process_rhs(self, compiler, connection):
++        if self.rhs_is_direct_value():
++            # Remove None from the list as NULL is never equal to anything.
++            try:
++                rhs = OrderedSet(self.rhs)
++                rhs.discard(None)
++            except TypeError:  # Unhashable items in self.rhs
++                rhs = [r for r in self.rhs if r is not None]
++            
++            if not rhs:
++                raise EmptyResultSet
++            
++            # For JSON key transforms, we need to properly handle JSON values
++            sqls, sqls_params = [], []
++            for value in rhs:
++                if connection.vendor == 'oracle':
++                    # Oracle needs special handling with JSON_QUERY/JSON_VALUE
++                    value = json.loads(value)
++                    function = 'JSON_QUERY' if isinstance(value, (list, dict)) else 'JSON_VALUE'
++                    sqls.append("%s('%s', '$.value')" % (
++                        function,
++                        json.dumps({'value': value}),
++                    ))
++                    sqls_params.append(value)
++                elif connection.vendor == 'sqlite':
++                    # SQLite uses JSON_EXTRACT
++                    sqls.append("JSON_EXTRACT(%s, '$')" if value != 'null' else '%s')
++                    sqls_params.append(value)
++                elif connection.vendor == 'mysql':
++                    # MySQL uses JSON_EXTRACT
++                    sqls.append("JSON_EXTRACT(%s, '$')")
++                    sqls_params.append(value)
++                else:
++                    # For other databases, use the default behavior
++                    sqls.append('%s')
++                    sqls_params.append(value)
++            
++            placeholder = '(' + ', '.join(sqls) + ')'
++            return (placeholder, sqls_params)
++        else:
++            return super().process_rhs(compiler, connection)
++
++
++KeyTransform.register_lookup(KeyTransformIn)
++
++
+ class KeyTransformFactory:
+ 
+     def __init__(self, key_name):
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..6bd9e5f6b4
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,131 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.core.management.color import no_style
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a test model
++class OurModel(models.Model):
++    our_field = models.JSONField(default=dict)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_original_issue():
++    """Test the original issue from the GitHub issue"""
++    
++    # We'll test the SQL generation rather than actual database operations
++    # since the issue is in the SQL generation, not execution
++    
++    print("Testing the original GitHub issue...")
++    
++    # Test 1: __in lookup on key transform - SQL generation
++    from django.db.models.sql.query import Query
++    query = Query(OurModel)
++    
++    first_filter = {'our_field__key__in': [0]}
++    query1 = query.clone()
++    query1.add_q(models.Q(**first_filter))
++    compiler1 = query1.get_compiler('default')
++    sql1, params1 = compiler1.as_sql()
++    print(f"first_filter SQL: {sql1}")
++    print(f"first_filter Params: {params1}")
++    
++    # Test 2: Exact lookup on key transform - SQL generation
++    second_filter = {'our_field__key': 0}
++    query2 = query.clone()
++    query2.add_q(models.Q(**second_filter))
++    compiler2 = query2.get_compiler('default')
++    sql2, params2 = compiler2.as_sql()
++    print(f"second_filter SQL: {sql2}")
++    print(f"second_filter Params: {params2}")
++    
++    # The issue: Both should generate similar SQL with JSON_EXTRACT wrapping
++    # Check if both use JSON_EXTRACT for proper JSON comparison
++    if "JSON_EXTRACT(%s, '$')" in sql1 and "JSON_EXTRACT(%s, '$')" in sql2:
++        print("✓ SUCCESS: Both filters use proper JSON comparison")
++        print("The GitHub issue has been FIXED!")
++        return True
++    else:
++        print("✗ FAILURE: Filters use different comparison methods")
++        print("The GitHub issue is NOT fixed")
++        return False
++
++def test_edge_cases():
++    """Test edge cases to make sure our fix is robust"""
++    
++    print("\nTesting edge cases...")
++    
++    from django.db.models.sql.query import Query
++    query = Query(OurModel)
++    
++    # Test with multiple values
++    multi_filter = {'our_field__key__in': [0, 1]}
++    query1 = query.clone()
++    query1.add_q(models.Q(**multi_filter))
++    compiler1 = query1.get_compiler('default')
++    sql1, params1 = compiler1.as_sql()
++    print(f"our_field__key__in=[0, 1] SQL: {sql1}")
++    print(f"our_field__key__in=[0, 1] Params: {params1}")
++    
++    # Test with string values
++    str_filter = {'our_field__key__in': ['value']}
++    query2 = query.clone()
++    query2.add_q(models.Q(**str_filter))
++    compiler2 = query2.get_compiler('default')
++    sql2, params2 = compiler2.as_sql()
++    print(f"our_field__key__in=['value'] SQL: {sql2}")
++    print(f"our_field__key__in=['value'] Params: {params2}")
++    
++    # Test with None values (should be filtered out)
++    none_filter = {'our_field__key__in': [0, None, 1]}
++    query3 = query.clone()
++    query3.add_q(models.Q(**none_filter))
++    compiler3 = query3.get_compiler('default')
++    sql3, params3 = compiler3.as_sql()
++    print(f"our_field__key__in=[0, None, 1] SQL: {sql3}")
++    print(f"our_field__key__in=[0, None, 1] Params: {params3}")
++    
++    # Test empty list
++    try:
++        empty_filter = {'our_field__key__in': []}
++        query4 = query.clone()
++        query4.add_q(models.Q(**empty_filter))
++        compiler4 = query4.get_compiler('default')
++        sql4, params4 = compiler4.as_sql()
++        print(f"our_field__key__in=[] SQL: {sql4}")
++        print(f"our_field__key__in=[] Params: {params4}")
++    except Exception as e:
++        print(f"our_field__key__in=[]: {type(e).__name__} (expected)")
++
++if __name__ == '__main__':
++    success = test_original_issue()
++    test_edge_cases()
++    
++    if success:
++        print("\n🎉 All tests passed! The issue has been successfully fixed.")
++    else:
++        print("\n❌ Tests failed. The issue is not fixed.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..7c0f8c5527
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a test model
++class OurModel(models.Model):
++    our_field = models.JSONField(default=dict)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_json_field_in_lookup():
++    from django.db.models.sql.query import Query
++    
++    # Create a query object to test SQL generation
++    query = Query(OurModel)
++    
++    # Test 1: __in lookup on key transform
++    print("Testing our_field__key__in=[0] query:")
++    query1 = query.clone()
++    query1.add_q(models.Q(**{'our_field__key__in': [0]}))
++    compiler1 = query1.get_compiler('default')
++    sql1, params1 = compiler1.as_sql()
++    print(f"SQL: {sql1}")
++    print(f"Params: {params1}")
++    
++    # Test 2: Exact lookup on key transform  
++    print("\nTesting our_field__key=0 query:")
++    query2 = query.clone()
++    query2.add_q(models.Q(**{'our_field__key': 0}))
++    compiler2 = query2.get_compiler('default')
++    sql2, params2 = compiler2.as_sql()
++    print(f"SQL: {sql2}")
++    print(f"Params: {params2}")
++    
++    # The issue should be visible in the SQL generation
++    # The __in lookup should generate similar SQL to the exact lookup
++
++if __name__ == '__main__':
++    test_json_field_in_lookup()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..6e72daea43
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a test model
++class OurModel(models.Model):
++    our_field = models.JSONField(default=dict)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_json_field_in_lookup_comprehensive():
++    from django.db.models.sql.query import Query
++    
++    # Create a query object to test SQL generation
++    query = Query(OurModel)
++    
++    print("=== Testing SQLite ===")
++    
++    # Test 1: Single value IN lookup
++    print("\nTesting our_field__key__in=[0] query:")
++    query1 = query.clone()
++    query1.add_q(models.Q(**{'our_field__key__in': [0]}))
++    compiler1 = query1.get_compiler('default')
++    sql1, params1 = compiler1.as_sql()
++    print(f"SQL: {sql1}")
++    print(f"Params: {params1}")
++    
++    # Test 2: Multiple values IN lookup
++    print("\nTesting our_field__key__in=[0, 1] query:")
++    query2 = query.clone()
++    query2.add_q(models.Q(**{'our_field__key__in': [0, 1]}))
++    compiler2 = query2.get_compiler('default')
++    sql2, params2 = compiler2.as_sql()
++    print(f"SQL: {sql2}")
++    print(f"Params: {params2}")
++    
++    # Test 3: Exact lookup for comparison
++    print("\nTesting our_field__key=0 query:")
++    query3 = query.clone()
++    query3.add_q(models.Q(**{'our_field__key': 0}))
++    compiler3 = query3.get_compiler('default')
++    sql3, params3 = compiler3.as_sql()
++    print(f"SQL: {sql3}")
++    print(f"Params: {params3}")
++    
++    # Test 4: String values
++    print("\nTesting our_field__key__in=['value'] query:")
++    query4 = query.clone()
++    query4.add_q(models.Q(**{'our_field__key__in': ['value']}))
++    compiler4 = query4.get_compiler('default')
++    sql4, params4 = compiler4.as_sql()
++    print(f"SQL: {sql4}")
++    print(f"Params: {params4}")
++    
++    # Test 5: NULL values (should be filtered out)
++    print("\nTesting our_field__key__in=[0, None, 1] query:")
++    query5 = query.clone()
++    query5.add_q(models.Q(**{'our_field__key__in': [0, None, 1]}))
++    compiler5 = query5.get_compiler('default')
++    sql5, params5 = compiler5.as_sql()
++    print(f"SQL: {sql5}")
++    print(f"Params: {params5}")
++    
++    print("\n=== Testing MySQL (simulated) ===")
++    # For MySQL, we need to simulate the connection
++    from django.db import connections
++    connections['mysql'] = connections['default']
++    connections['mysql'].vendor = 'mysql'
++    
++    print("\nTesting our_field__key__in=[0] query (MySQL):")
++    query6 = query.clone()
++    query6.add_q(models.Q(**{'our_field__key__in': [0]}))
++    compiler6 = query6.get_compiler('mysql')
++    sql6, params6 = compiler6.as_sql()
++    print(f"SQL: {sql6}")
++    print(f"Params: {params6}")
++
++if __name__ == '__main__':
++    test_json_field_in_lookup_comprehensive()
+\ No newline at end of file

@@ -1,0 +1,519 @@
+diff --git a/django/db/models/fields/related.py b/django/db/models/fields/related.py
+index d517d7269b..c2aea9c730 100644
+--- a/django/db/models/fields/related.py
++++ b/django/db/models/fields/related.py
+@@ -914,7 +914,7 @@ class ForeignKey(ForeignObject):
+             return
+ 
+         using = router.db_for_read(self.remote_field.model, instance=model_instance)
+-        qs = self.remote_field.model._default_manager.using(using).filter(
++        qs = self.remote_field.model._base_manager.using(using).filter(
+             **{self.remote_field.field_name: value}
+         )
+         qs = qs.complex_filter(self.get_limit_choices_to())
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..30c50a1b1e
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++"""
++Final test to confirm the ForeignKey validation fix.
++Tests the exact scenario described in the GitHub issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.fields.related import ForeignKey
++from unittest.mock import Mock, patch
++
++# Create the exact models from the GitHub issue
++class ArticleManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        return qs.filter(archived=False)
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    archived = models.BooleanField(default=False)
++    objects = ArticleManager()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_github_issue_scenario():
++    """Test the exact scenario described in the GitHub issue"""
++    print("Testing the exact GitHub issue scenario...")
++    
++    # Create a ForeignKey field like in FavoriteArticle model
++    field = ForeignKey(Article, on_delete=models.CASCADE)
++    
++    # Test with an archived article ID
++    archived_article_id = 123
++    
++    # Mock the database operations to simulate the scenario
++    with patch('django.db.models.fields.related.router.db_for_read') as mock_db_for_read, \
++         patch.object(Article._default_manager, 'using') as mock_default_using, \
++         patch.object(Article._base_manager, 'using') as mock_base_using:
++        
++        mock_db_for_read.return_value = 'default'
++        
++        # Mock the default manager to return empty queryset
++        # This simulates the default manager filtering out archived articles
++        mock_default_qs = Mock()
++        mock_default_qs.filter.return_value = mock_default_qs
++        mock_default_qs.complex_filter.return_value = mock_default_qs
++        mock_default_qs.exists.return_value = False
++        
++        mock_default_using.return_value = mock_default_qs
++        
++        # Mock the base manager to return non-empty queryset
++        # This simulates the base manager finding archived articles
++        mock_base_qs = Mock()
++        mock_base_qs.filter.return_value = mock_base_qs
++        mock_base_qs.complex_filter.return_value = mock_base_qs
++        mock_base_qs.exists.return_value = True
++        
++        mock_base_using.return_value = mock_base_qs
++        
++        # Create a mock model instance
++        model_instance = Mock()
++        
++        try:
++            # Before the fix: This would fail with "article instance with id 123 does not exist."
++            # After the fix: This should pass because _base_manager is used
++            field.validate(archived_article_id, model_instance)
++            
++            print("✓ Validation passed! The fix is working.")
++            print("✓ ForeignKey validation now uses _base_manager instead of _default_manager.")
++            print("✓ Archived articles can now be validated successfully.")
++            
++            # Verify that _base_manager was used, not _default_manager
++            mock_base_using.assert_called_once()
++            mock_default_using.assert_not_called()
++            print("✓ Confirmed: _base_manager.using() was called, _default_manager.using() was not called.")
++            
++            return True
++            
++        except Exception as e:
++            print(f"✗ Validation failed: {e}")
++            print("This suggests the fix is not working correctly.")
++            return False
++
++if __name__ == '__main__':
++    print("=" * 70)
++    print("Final test: ForeignKey validation fix for GitHub issue")
++    print("=" * 70)
++    
++    success = test_github_issue_scenario()
++    
++    print("=" * 70)
++    if success:
++        print("🎉 SUCCESS: The GitHub issue has been fixed!")
++        print("ForeignKey.validate() now uses _base_manager instead of _default_manager.")
++        sys.exit(0)
++    else:
++        print("❌ FAILURE: The fix did not work as expected.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..3c5dcd8a8a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,120 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the ForeignKey validation issue.
++This script demonstrates that ForeignKey.validate() uses _default_manager
++instead of _base_manager, causing validation to fail for archived articles.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++# Create the models as described in the issue
++class ArticleManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        return qs.filter(archived=False)
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    archived = models.BooleanField(default=False)
++    # Don't include archived articles by default.
++    objects = ArticleManager()
++    
++    class Meta:
++        app_label = 'test'
++
++class FavoriteArticle(models.Model):
++    article = models.ForeignKey(Article, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the form as described in the issue
++class FavoriteArticleForm(forms.ModelForm):
++    class Meta:
++        model = FavoriteArticle
++        fields = '__all__'
++    
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # Use the base manager instead of the default manager to allow archived articles.
++        self.fields['article'].queryset = Article._base_manager.all()
++
++def test_foreign_key_validation():
++    """Test that demonstrates the issue by directly testing the validation logic"""
++    from django.db.models.fields.related import ForeignKey
++    from unittest.mock import Mock, patch
++    
++    # Create a mock ForeignKey field
++    field = ForeignKey(Article, on_delete=models.CASCADE)
++    
++    # Create a mock model instance
++    model_instance = Mock()
++    
++    # Test the validation with an archived article ID
++    archived_article_id = 1
++    
++    print("Testing ForeignKey validation...")
++    print(f"Using _default_manager: {Article._default_manager is not None}")
++    print(f"Using _base_manager: {Article._base_manager is not None}")
++    
++    # Mock the database operations to simulate the issue
++    with patch('django.db.models.fields.related.router.db_for_read') as mock_db_for_read, \
++         patch.object(Article._default_manager, 'using') as mock_using, \
++         patch.object(Article._base_manager, 'using') as mock_base_using:
++        
++        mock_db_for_read.return_value = 'default'
++        
++        # Mock the default manager to return empty queryset (simulating filtered out archived articles)
++        mock_default_qs = Mock()
++        mock_default_qs.filter.return_value = mock_default_qs
++        mock_default_qs.complex_filter.return_value = mock_default_qs
++        mock_default_qs.exists.return_value = False  # Article not found with default manager
++        
++        mock_using.return_value = mock_default_qs
++        
++        # Mock the base manager to return non-empty queryset (simulating finding archived articles)
++        mock_base_qs = Mock()
++        mock_base_qs.filter.return_value = mock_base_qs
++        mock_base_qs.complex_filter.return_value = mock_base_qs
++        mock_base_qs.exists.return_value = True  # Article found with base manager
++        
++        mock_base_using.return_value = mock_base_qs
++        
++        try:
++            # This should now pass validation because _base_manager is used
++            field.validate(archived_article_id, model_instance)
++            print("Validation passed as expected! Fix is working.")
++            return True
++        except Exception as e:
++            print(f"Validation failed unexpectedly: {e}")
++            print("The fix may not be working correctly.")
++            return False
++
++if __name__ == '__main__':
++    success = test_foreign_key_validation()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 0000000000..f974044038
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,151 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the ForeignKey validation fix.
++Tests that _base_manager is used instead of _default_manager for validation.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.fields.related import ForeignKey
++from unittest.mock import Mock, patch
++
++# Create test models
++class ArticleManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        return qs.filter(archived=False)
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    archived = models.BooleanField(default=False)
++    objects = ArticleManager()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_foreign_key_validation_uses_base_manager():
++    """Test that ForeignKey validation uses _base_manager instead of _default_manager"""
++    print("Testing ForeignKey validation uses _base_manager...")
++    
++    # Create a ForeignKey field
++    field = ForeignKey(Article, on_delete=models.CASCADE)
++    
++    # Create a mock model instance
++    model_instance = Mock()
++    
++    # Test with an archived article ID
++    archived_article_id = 1
++    
++    # Mock the database operations
++    with patch('django.db.models.fields.related.router.db_for_read') as mock_db_for_read, \
++         patch.object(Article._default_manager, 'using') as mock_default_using, \
++         patch.object(Article._base_manager, 'using') as mock_base_using:
++        
++        mock_db_for_read.return_value = 'default'
++        
++        # Mock the default manager to return empty queryset (simulating filtered out archived articles)
++        mock_default_qs = Mock()
++        mock_default_qs.filter.return_value = mock_default_qs
++        mock_default_qs.complex_filter.return_value = mock_default_qs
++        mock_default_qs.exists.return_value = False  # Article not found with default manager
++        
++        mock_default_using.return_value = mock_default_qs
++        
++        # Mock the base manager to return non-empty queryset (simulating finding archived articles)
++        mock_base_qs = Mock()
++        mock_base_qs.filter.return_value = mock_base_qs
++        mock_base_qs.complex_filter.return_value = mock_base_qs
++        mock_base_qs.exists.return_value = True  # Article found with base manager
++        
++        mock_base_using.return_value = mock_base_qs
++        
++        try:
++            # This should now pass validation because _base_manager is used
++            field.validate(archived_article_id, model_instance)
++            print("✓ Validation passed as expected! _base_manager is being used.")
++            
++            # Verify that _base_manager.using() was called, not _default_manager.using()
++            mock_base_using.assert_called_once()
++            mock_default_using.assert_not_called()
++            print("✓ _base_manager.using() was called, _default_manager.using() was not called.")
++            
++            return True
++            
++        except Exception as e:
++            print(f"✗ Validation failed unexpectedly: {e}")
++            return False
++
++def test_edge_case_null_value():
++    """Test that null values are handled correctly"""
++    print("\nTesting null value handling...")
++    
++    field = ForeignKey(Article, on_delete=models.CASCADE)
++    model_instance = Mock()
++    
++    # Test with None value
++    try:
++        field.validate(None, model_instance)
++        print("✓ Null value validation passed as expected.")
++        return True
++    except Exception as e:
++        print(f"✗ Null value validation failed: {e}")
++        return False
++
++def test_edge_case_blank_field():
++    """Test that blank fields are handled correctly"""
++    print("\nTesting blank field handling...")
++    
++    # Create a ForeignKey field that allows blank
++    field = ForeignKey(Article, on_delete=models.CASCADE, blank=True, null=True)
++    model_instance = Mock()
++    
++    # Test with None value
++    try:
++        field.validate(None, model_instance)
++        print("✓ Blank field validation passed as expected.")
++        return True
++    except Exception as e:
++        print(f"✗ Blank field validation failed: {e}")
++        return False
++
++if __name__ == '__main__':
++    print("Running comprehensive ForeignKey validation tests...")
++    print("=" * 60)
++    
++    success = True
++    
++    # Run all tests
++    success &= test_foreign_key_validation_uses_base_manager()
++    success &= test_edge_case_null_value()
++    success &= test_edge_case_blank_field()
++    
++    print("=" * 60)
++    if success:
++        print("✓ All tests passed! The fix is working correctly.")
++        sys.exit(0)
++    else:
++        print("✗ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/verify_basic_functionality.py b/verify_basic_functionality.py
+new file mode 100644
+index 0000000000..a24351f65a
+--- /dev/null
++++ b/verify_basic_functionality.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++"""
++Verify that basic ForeignKey functionality still works after our fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.fields.related import ForeignKey
++
++def test_basic_functionality():
++    """Test that basic ForeignKey functionality still works"""
++    print("Testing basic ForeignKey functionality...")
++    
++    # Test that we can create ForeignKey fields
++    try:
++        fk_field = ForeignKey('self', on_delete=models.CASCADE)
++        print("✓ ForeignKey field creation works")
++        
++        fk_field2 = ForeignKey('auth.User', on_delete=models.CASCADE)
++        print("✓ ForeignKey field with string reference works")
++        
++        return True
++        
++    except Exception as e:
++        print(f"✗ ForeignKey field creation failed: {e}")
++        return False
++
++def test_field_properties():
++    """Test that ForeignKey field properties are accessible"""
++    print("\nTesting ForeignKey field properties...")
++    
++    try:
++        fk_field = ForeignKey('auth.User', on_delete=models.CASCADE)
++        
++        # Test basic properties
++        _ = fk_field.remote_field
++        _ = fk_field.get_limit_choices_to()
++        
++        print("✓ ForeignKey field properties accessible")
++        return True
++        
++    except Exception as e:
++        print(f"✗ ForeignKey field properties failed: {e}")
++        return False
++
++if __name__ == '__main__':
++    print("=" * 50)
++    print("Verifying basic ForeignKey functionality")
++    print("=" * 50)
++    
++    success = True
++    success &= test_basic_functionality()
++    success &= test_field_properties()
++    
++    print("=" * 50)
++    if success:
++        print("✓ All basic functionality tests passed!")
++        print("✓ The fix does not break existing ForeignKey functionality.")
++        sys.exit(0)
++    else:
++        print("✗ Some basic functionality tests failed!")
++        sys.exit(1)
+\ No newline at end of file

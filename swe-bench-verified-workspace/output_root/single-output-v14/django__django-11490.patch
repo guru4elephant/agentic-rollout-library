@@ -1,0 +1,390 @@
+diff --git a/debug_issue.py b/debug_issue.py
+new file mode 100644
+index 0000000000..cbaa1da66f
+--- /dev/null
++++ b/debug_issue.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class ReservedName(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(ReservedName)
++
++# Create test data
++ReservedName.objects.create(name='a', order=2)
++
++# Test the issue step by step
++qs1 = ReservedName.objects.all()
++print("Original query values_select:", qs1.query.values_select)
++
++# First union with values_list('name', 'order')
++union1 = qs1.union(qs1)
++print("Union query values_select:", union1.query.values_select)
++
++values1 = union1.values_list('name', 'order')
++print("After values_list('name', 'order'):", values1.query.values_select)
++
++result1 = values1.get()
++print("Result 1:", result1)
++
++# Second union with values_list('order') 
++union2 = qs1.union(qs1)
++print("Union query values_select:", union2.query.values_select)
++
++values2 = union2.values_list('order')
++print("After values_list('order'):", values2.query.values_select)
++
++# Let's check what happens during compilation
++print("\nDebugging compilation...")
++compiler = values2.query.get_compiler('default')
++print("Compiler query values_select:", compiler.query.values_select)
++print("Combined queries:", len(compiler.query.combined_queries))
++
++for i, combined_query in enumerate(compiler.query.combined_queries):
++    print(f"Combined query {i} values_select: {combined_query.values_select}")
++
++result2 = values2.get()
++print("Result 2:", result2)
+\ No newline at end of file
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index a44adfc760..dd9f81c847 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -425,7 +425,7 @@ class SQLCompiler:
+                 # If the columns list is limited, then all combined queries
+                 # must have the same columns list. Set the selects defined on
+                 # the query on all combined queries, if not already set.
+-                if not compiler.query.values_select and self.query.values_select:
++                if self.query.values_select and compiler.query.values_select != self.query.values_select:
+                     compiler.query.set_values((
+                         *self.query.extra_select,
+                         *self.query.values_select,
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..f695f36f63
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class ReservedName(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(ReservedName)
++
++# Create test data
++ReservedName.objects.create(name='a', order=2)
++
++# Test the issue
++qs1 = ReservedName.objects.all()
++print("Testing union with values_list('name', 'order'):")
++result1 = qs1.union(qs1).values_list('name', 'order').get()
++print(f"Result: {result1}")
++
++print("\nTesting union with values_list('order'):")
++result2 = qs1.union(qs1).values_list('order').get()
++print(f"Result: {result2}")
++
++print("\nExpected: ('a', 2) for first, (2,) for second")
++print(f"Actual: {result1} for first, {result2} for second")
++print(f"Issue present: {result2 == ('a', 2)}")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..7391a69ad5
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class ReservedName(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(ReservedName)
++
++# Create test data
++ReservedName.objects.create(name='a', order=2)
++ReservedName.objects.create(name='b', order=3)
++
++# Test edge case: One query with values_select, one without
++print("Test edge case: Mixed values_select scenarios")
++qs1 = ReservedName.objects.all().values_list('name', 'order')  # Has values_select
++qs2 = ReservedName.objects.all()  # No values_select
++
++# Union should work and use the values_select from the first query
++result = list(qs1.union(qs2))
++print(f"Union of values_list query with regular query: {result}")
++assert len(result) == 2, f"Expected 2 results, got {len(result)}"
++assert ('a', 2) in result, "Expected ('a', 2) in results"
++assert ('b', 3) in result, "Expected ('b', 3) in results"
++print("✓ Edge case test passed")
++
++# Test edge case: Empty values_select
++print("\nTest edge case: Empty values_select")
++qs3 = ReservedName.objects.all().values_list()  # Empty values_select means all fields
++result2 = list(qs3.union(qs3))
++print(f"Union of empty values_list queries: {result2}")
++assert len(result2) == 2, f"Expected 2 results, got {len(result2)}"
++print("✓ Empty values_select test passed")
++
++print("\nAll edge case tests passed!")
+\ No newline at end of file
+diff --git a/test_existing_functionality.py b/test_existing_functionality.py
+new file mode 100644
+index 0000000000..94e35cfd19
+--- /dev/null
++++ b/test_existing_functionality.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class ReservedName(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(ReservedName)
++
++# Create test data
++ReservedName.objects.create(name='a', order=2)
++
++# Test the existing functionality from the test suite
++qs1 = ReservedName.objects.all()
++reserved_name = qs1.union(qs1).values('name', 'order', 'id').get()
++print(f"values('name', 'order', 'id'): {reserved_name}")
++assert reserved_name['name'] == 'a', f"Expected 'a', got {reserved_name['name']}"
++assert reserved_name['order'] == 2, f"Expected 2, got {reserved_name['order']}"
++
++reserved_name = qs1.union(qs1).values_list('name', 'order', 'id').get()
++print(f"values_list('name', 'order', 'id'): {reserved_name}")
++assert reserved_name[:2] == ('a', 2), f"Expected ('a', 2), got {reserved_name[:2]}"
++
++print("✓ Existing functionality test passed!")
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 0000000000..64e1ec0e6d
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class ReservedName(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(ReservedName)
++
++# Create test data
++ReservedName.objects.create(name='a', order=2)
++
++# Test 1: Original issue - changing values_list columns
++print("Test 1: Changing values_list columns")
++qs1 = ReservedName.objects.all()
++result1 = list(qs1.union(qs1).values_list('name', 'order'))[0]
++result2 = list(qs1.union(qs1).values_list('order'))[0]
++print(f"values_list('name', 'order'): {result1}")
++print(f"values_list('order'): {result2}")
++assert result1 == ('a', 2), f"Expected ('a', 2), got {result1}"
++assert result2 == (2,), f"Expected (2,), got {result2}"
++print("✓ Test 1 passed")
++
++# Test 2: Changing values columns
++print("\nTest 2: Changing values columns")
++result3 = list(qs1.union(qs1).values('name', 'order'))[0]
++result4 = list(qs1.union(qs1).values('order'))[0]
++print(f"values('name', 'order'): {result3}")
++print(f"values('order'): {result4}")
++assert result3 == {'name': 'a', 'order': 2}, f"Expected {{'name': 'a', 'order': 2}}, got {result3}"
++assert result4 == {'order': 2}, f"Expected {{'order': 2}}, got {result4}"
++print("✓ Test 2 passed")
++
++# Test 3: Ensure original functionality still works
++print("\nTest 3: Original functionality")
++result5 = list(qs1.union(qs1).values_list('name', 'order'))[0]
++result6 = list(qs1.union(qs1).values('name', 'order'))[0]
++print(f"Original values_list: {result5}")
++print(f"Original values: {result6}")
++assert result5 == ('a', 2), f"Expected ('a', 2), got {result5}"
++assert result6 == {'name': 'a', 'order': 2}, f"Expected {{'name': 'a', 'order': 2}}, got {result6}"
++print("✓ Test 3 passed")
++
++# Test 4: Test with different combinators (intersection, difference)
++print("\nTest 4: Other combinators")
++result7 = list(qs1.intersection(qs1).values_list('name', 'order'))[0]
++result8 = list(qs1.intersection(qs1).values_list('order'))[0]
++print(f"Intersection values_list('name', 'order'): {result7}")
++print(f"Intersection values_list('order'): {result8}")
++assert result7 == ('a', 2), f"Expected ('a', 2), got {result7}"
++assert result8 == (2,), f"Expected (2,), got {result8}"
++print("✓ Test 4 passed")
++
++print("\nAll tests passed! The fix is working correctly.")
+\ No newline at end of file

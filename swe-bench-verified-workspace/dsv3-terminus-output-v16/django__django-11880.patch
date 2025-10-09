@@ -1,0 +1,230 @@
+diff --git a/django/forms/fields.py b/django/forms/fields.py
+index 03cd8af8d7..4cc3133ca0 100644
+--- a/django/forms/fields.py
++++ b/django/forms/fields.py
+@@ -200,6 +200,7 @@ class Field:
+         memo[id(self)] = result
+         result.widget = copy.deepcopy(self.widget, memo)
+         result.validators = self.validators[:]
++        result.error_messages = copy.deepcopy(self.error_messages, memo)
+         return result
+ 
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..0948728a9e
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the Form Field's __deepcopy__ issue.
++The issue is that error_messages dictionary is not deep copied,
++so all copies share the same dictionary reference.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++    )
++    django.setup()
++
++import copy
++from django.forms import Form, CharField
++
++# Create a form field with custom error messages
++field = CharField(
++    required=True,
++    error_messages={
++        'required': 'This field is required.',
++        'invalid': 'Please enter a valid value.'
++    }
++)
++
++# Create deep copies of the field
++field_copy1 = copy.deepcopy(field)
++field_copy2 = copy.deepcopy(field)
++
++print("Original field error_messages id:", id(field.error_messages))
++print("Copy 1 error_messages id:", id(field_copy1.error_messages))
++print("Copy 2 error_messages id:", id(field_copy2.error_messages))
++
++print("\nAre error_messages objects the same?")
++print("Original == Copy 1:", field.error_messages is field_copy1.error_messages)
++print("Original == Copy 2:", field.error_messages is field_copy2.error_messages)
++print("Copy 1 == Copy 2:", field_copy1.error_messages is field_copy2.error_messages)
++
++# Test modifying error messages in one copy affects others
++print("\nBefore modification:")
++print("Original required message:", field.error_messages['required'])
++print("Copy 1 required message:", field_copy1.error_messages['required'])
++
++# Modify error message in copy 1
++field_copy1.error_messages['required'] = 'MODIFIED: This field is required.'
++
++print("\nAfter modifying Copy 1:")
++print("Original required message:", field.error_messages['required'])
++print("Copy 1 required message:", field_copy1.error_messages['required'])
++print("Copy 2 required message:", field_copy2.error_messages['required'])
++
++# Test with Form instances
++class TestForm(Form):
++    name = CharField(
++        error_messages={'required': 'Name is required'}
++    )
++
++form1 = TestForm()
++form2 = TestForm()
++
++print("\nForm instances test:")
++print("Form 1 name field error_messages id:", id(form1.fields['name'].error_messages))
++print("Form 2 name field error_messages id:", id(form2.fields['name'].error_messages))
++print("Same error_messages object?", form1.fields['name'].error_messages is form2.fields['name'].error_messages)
++
++# Modify error message in form1
++form1.fields['name'].error_messages['required'] = 'MODIFIED: Name is required'
++
++print("\nAfter modifying Form 1:")
++print("Form 1 required message:", form1.fields['name'].error_messages['required'])
++print("Form 2 required message:", form2.fields['name'].error_messages['required'])
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..da2f72b9ea
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the __deepcopy__ fix to ensure it handles various scenarios.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++    )
++    django.setup()
++
++import copy
++from django.forms import CharField, IntegerField
++
++def test_nested_error_messages():
++    """Test that nested structures in error_messages are properly deep copied."""
++    print("=== Testing nested error_messages structures ===")
++    
++    # Create a field with nested error messages
++    field = CharField(
++        error_messages={
++            'required': 'Required',
++            'invalid': {'message': 'Invalid input', 'code': 'invalid'},
++            'complex': [{'type': 'error', 'msg': 'Complex error'}]
++        }
++    )
++    
++    field_copy = copy.deepcopy(field)
++    
++    # Modify nested structures in the copy
++    field_copy.error_messages['invalid']['message'] = 'MODIFIED: Invalid input'
++    field_copy.error_messages['complex'][0]['msg'] = 'MODIFIED: Complex error'
++    
++    # Check that original is unchanged
++    print("Original invalid message:", field.error_messages['invalid']['message'])
++    print("Copy invalid message:", field_copy.error_messages['invalid']['message'])
++    print("Original complex message:", field.error_messages['complex'][0]['msg'])
++    print("Copy complex message:", field_copy.error_messages['complex'][0]['msg'])
++    
++    assert field.error_messages['invalid']['message'] == 'Invalid input'
++    assert field_copy.error_messages['invalid']['message'] == 'MODIFIED: Invalid input'
++    assert field.error_messages['complex'][0]['msg'] == 'Complex error'
++    assert field_copy.error_messages['complex'][0]['msg'] == 'MODIFIED: Complex error'
++    print("✓ Nested structures properly deep copied\n")
++
++def test_empty_error_messages():
++    """Test that empty error_messages dictionaries are handled correctly."""
++    print("=== Testing empty error_messages ===")
++    
++    field = CharField(error_messages={})
++    field_copy = copy.deepcopy(field)
++    
++    # Store original required message for comparison
++    original_required = field.error_messages['required']
++    
++    # Add custom error to copy (overriding the default)
++    field_copy.error_messages['required'] = 'Custom required message'
++    
++    print("Original error_messages:", field.error_messages)
++    print("Copy error_messages:", field_copy.error_messages)
++    
++    # Original should still have default message, copy should have custom
++    assert field.error_messages['required'] == original_required
++    assert field_copy.error_messages['required'] == 'Custom required message'
++    print("✓ Empty error_messages handled correctly\n")
++
++def test_default_error_messages():
++    """Test that fields with default error messages work correctly."""
++    print("=== Testing default error_messages ===")
++    
++    field = CharField()  # Uses default error messages
++    field_copy = copy.deepcopy(field)
++    
++    # Modify copy
++    field_copy.error_messages['required'] = 'Custom required message'
++    
++    print("Original required:", field.error_messages['required'])
++    print("Copy required:", field_copy.error_messages['required'])
++    
++    # Original should still have default message
++    assert 'required' in field.error_messages
++    assert field_copy.error_messages['required'] == 'Custom required message'
++    print("✓ Default error_messages handled correctly\n")
++
++def test_multiple_field_types():
++    """Test that the fix works for different field types."""
++    print("=== Testing multiple field types ===")
++    
++    char_field = CharField(error_messages={'required': 'Char required'})
++    int_field = IntegerField(error_messages={'required': 'Int required'})
++    
++    char_copy = copy.deepcopy(char_field)
++    int_copy = copy.deepcopy(int_field)
++    
++    # Modify copies
++    char_copy.error_messages['required'] = 'MODIFIED: Char required'
++    int_copy.error_messages['required'] = 'MODIFIED: Int required'
++    
++    print("Char original:", char_field.error_messages['required'])
++    print("Char copy:", char_copy.error_messages['required'])
++    print("Int original:", int_field.error_messages['required'])
++    print("Int copy:", int_copy.error_messages['required'])
++    
++    assert char_field.error_messages['required'] == 'Char required'
++    assert char_copy.error_messages['required'] == 'MODIFIED: Char required'
++    assert int_field.error_messages['required'] == 'Int required'
++    assert int_copy.error_messages['required'] == 'MODIFIED: Int required'
++    print("✓ Multiple field types work correctly\n")
++
++if __name__ == '__main__':
++    test_nested_error_messages()
++    test_empty_error_messages()
++    test_default_error_messages()
++    test_multiple_field_types()
++    print("All edge case tests passed! ✅")
+\ No newline at end of file

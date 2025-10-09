@@ -1,0 +1,361 @@
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 000000000..d53e789f0
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++
++import os
++import tempfile
++import shutil
++from pylint.lint.expand_modules import expand_modules
++import re
++
++def create_test_files():
++    """Create test files to debug the issue"""
++    # Create a temporary directory
++    test_dir = tempfile.mkdtemp()
++    print(f"Created test directory: {test_dir}")
++    
++    # Create .a directory with foo.py
++    a_dir = os.path.join(test_dir, ".a")
++    os.makedirs(a_dir)
++    with open(os.path.join(a_dir, "foo.py"), "w") as f:
++        f.write("# import re\n")
++    
++    # Create bar.py in root
++    with open(os.path.join(test_dir, "bar.py"), "w") as f:
++        f.write("# import re\n")
++    
++    return test_dir
++
++def test_expand_modules():
++    test_dir = create_test_files()
++    try:
++        os.chdir(test_dir)
++        
++        print(f"Current directory: {os.getcwd()}")
++        print(f"Test files: {os.listdir('.')}")
++        print(f".a directory: {os.listdir('.a')}")
++        
++        # Test with different ignore patterns
++        ignore_list = []  # --ignore
++        ignore_list_re = [re.compile("^\\.a$")]  # --ignore-patterns
++        ignore_list_paths_re = [re.compile("^\\.a$")]  # --ignore-paths
++        
++        print(f"\nTesting expand_modules with ignore patterns:")
++        print(f"ignore_list: {ignore_list}")
++        print(f"ignore_list_re: {[p.pattern for p in ignore_list_re]}")
++        print(f"ignore_list_paths_re: {[p.pattern for p in ignore_list_paths_re]}")
++        
++        result, errors = expand_modules(
++            ['.a'], ignore_list, ignore_list_re, ignore_list_paths_re
++        )
++        
++        print(f"\nResult: {len(result)} modules")
++        for module in result:
++            print(f"  - {module['name']}: {module['path']}")
++        
++        print(f"Errors: {len(errors)}")
++        
++    finally:
++        shutil.rmtree(test_dir)
++
++if __name__ == "__main__":
++    test_expand_modules()
+\ No newline at end of file
+diff --git a/pylint/lint/pylinter.py b/pylint/lint/pylinter.py
+index 53345a6b1..00bc1fede 100644
+--- a/pylint/lint/pylinter.py
++++ b/pylint/lint/pylinter.py
+@@ -564,18 +564,33 @@ class PyLinter(
+             if not msg.may_be_emitted():
+                 self._msgs_state[msg.msgid] = False
+ 
+-    @staticmethod
+-    def _discover_files(files_or_modules: Sequence[str]) -> Iterator[str]:
++    def _discover_files(self, files_or_modules: Sequence[str]) -> Iterator[str]:
+         """Discover python modules and packages in sub-directory.
+ 
+         Returns iterator of paths to discovered modules and packages.
+         """
++        from pylint.lint.expand_modules import _is_in_ignore_list_re
++        
+         for something in files_or_modules:
++            # Check if the file/directory should be ignored
++            basename = os.path.basename(something)
++            if (basename in self.config.ignore or
++                _is_in_ignore_list_re(basename, self.config.ignore_patterns) or
++                _is_in_ignore_list_re(something, self._ignore_paths)):
++                continue
++                
+             if os.path.isdir(something) and not os.path.isfile(
+                 os.path.join(something, "__init__.py")
+             ):
+                 skip_subtrees: list[str] = []
+                 for root, _, files in os.walk(something):
++                    # Check if the current directory should be ignored
++                    root_basename = os.path.basename(root)
++                    if (root_basename in self.config.ignore or
++                        _is_in_ignore_list_re(root_basename, self.config.ignore_patterns) or
++                        _is_in_ignore_list_re(root, self._ignore_paths)):
++                        continue
++                        
+                     if any(root.startswith(s) for s in skip_subtrees):
+                         # Skip subtree of already discovered package.
+                         continue
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..46949a308
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++
++import os
++import subprocess
++import tempfile
++import shutil
++
++def create_test_files():
++    """Create test files to reproduce the issue"""
++    # Create a temporary directory
++    test_dir = tempfile.mkdtemp()
++    print(f"Created test directory: {test_dir}")
++    
++    # Create .a directory with foo.py
++    a_dir = os.path.join(test_dir, ".a")
++    os.makedirs(a_dir)
++    with open(os.path.join(a_dir, "foo.py"), "w") as f:
++        f.write("# import re\n")
++    
++    # Create bar.py in root
++    with open(os.path.join(test_dir, "bar.py"), "w") as f:
++        f.write("# import re\n")
++    
++    return test_dir
++
++def run_pylint_commands(test_dir):
++    """Run pylint commands to reproduce the issue"""
++    print("\n=== Testing pylint commands ===")
++    
++    # Change to test directory
++    os.chdir(test_dir)
++    
++    # Test 1: Basic recursive mode (should ignore .a by default)
++    print("\n1. pylint --recursive=y .")
++    result1 = subprocess.run(["pylint", "--recursive=y", "."], 
++                           capture_output=True, text=True)
++    print("Exit code:", result1.returncode)
++    print("Output:", result1.stdout)
++    
++    # Test 2: With ignore=.a
++    print("\n2. pylint --recursive=y --ignore=.a .")
++    result2 = subprocess.run(["pylint", "--recursive=y", "--ignore=.a", "."], 
++                           capture_output=True, text=True)
++    print("Exit code:", result2.returncode)
++    print("Output:", result2.stdout)
++    
++    # Test 3: With ignore-paths=.a
++    print("\n3. pylint --recursive=y --ignore-paths=.a .")
++    result3 = subprocess.run(["pylint", "--recursive=y", "--ignore-paths=.a", "."], 
++                           capture_output=True, text=True)
++    print("Exit code:", result3.returncode)
++    print("Output:", result3.stdout)
++    
++    # Test 4: With ignore-patterns="^\.a"
++    print("\n4. pylint --recursive=y --ignore-patterns='^\.a' .")
++    result4 = subprocess.run(["pylint", "--recursive=y", "--ignore-patterns='^\.a'", "."], 
++                           capture_output=True, text=True)
++    print("Exit code:", result4.returncode)
++    print("Output:", result4.stdout)
++
++def main():
++    test_dir = create_test_files()
++    try:
++        run_pylint_commands(test_dir)
++    finally:
++        # Clean up
++        shutil.rmtree(test_dir)
++        print(f"\nCleaned up test directory: {test_dir}")
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 000000000..38b05ad9d
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++
++import os
++import subprocess
++import tempfile
++import shutil
++
++def create_test_files():
++    """Create test files to verify the fix"""
++    # Create a temporary directory
++    test_dir = tempfile.mkdtemp()
++    print(f"Created test directory: {test_dir}")
++    
++    # Create .a directory with foo.py (should be ignored)
++    a_dir = os.path.join(test_dir, ".a")
++    os.makedirs(a_dir)
++    with open(os.path.join(a_dir, "foo.py"), "w") as f:
++        f.write("# import re\n")
++    
++    # Create bar.py in root (should be processed)
++    with open(os.path.join(test_dir, "bar.py"), "w") as f:
++        f.write("# import re\n")
++    
++    # Create normal directory with file (should be processed)
++    normal_dir = os.path.join(test_dir, "normal")
++    os.makedirs(normal_dir)
++    with open(os.path.join(normal_dir, "baz.py"), "w") as f:
++        f.write("# import re\n")
++    
++    return test_dir
++
++def run_pylint_commands(test_dir):
++    """Run pylint commands to verify the fix"""
++    print("\n=== Testing pylint commands ===")
++    
++    # Change to test directory
++    os.chdir(test_dir)
++    
++    # Test 1: Basic recursive mode (should ignore .a by default)
++    print("\n1. pylint --recursive=y .")
++    result1 = subprocess.run(["pylint", "--recursive=y", "."], 
++                           capture_output=True, text=True)
++    print("Exit code:", result1.returncode)
++    print("Output:", result1.stdout)
++    print("Expected: Only bar.py and normal/baz.py should be processed")
++    
++    # Test 2: With ignore=.a (explicit ignore)
++    print("\n2. pylint --recursive=y --ignore=.a .")
++    result2 = subprocess.run(["pylint", "--recursive=y", "--ignore=.a", "."], 
++                           capture_output=True, text=True)
++    print("Exit code:", result2.returncode)
++    print("Output:", result2.stdout)
++    print("Expected: Only bar.py and normal/baz.py should be processed")
++    
++    # Test 3: With ignore-paths=.a
++    print("\n3. pylint --recursive=y --ignore-paths=.a .")
++    result3 = subprocess.run(["pylint", "--recursive=y", "--ignore-paths=.a", "."], 
++                           capture_output=True, text=True)
++    print("Exit code:", result3.returncode)
++    print("Output:", result3.stdout)
++    print("Expected: Only bar.py and normal/baz.py should be processed")
++    
++    # Test 4: With ignore-patterns="^\.a"
++    print("\n4. pylint --recursive=y --ignore-patterns='^\.a' .")
++    result4 = subprocess.run(["pylint", "--recursive=y", "--ignore-patterns='^\.a'", "."], 
++                           capture_output=True, text=True)
++    print("Exit code:", result4.returncode)
++    print("Output:", result4.stdout)
++    print("Expected: Only bar.py and normal/baz.py should be processed")
++
++def main():
++    test_dir = create_test_files()
++    try:
++        run_pylint_commands(test_dir)
++    finally:
++        # Clean up
++        shutil.rmtree(test_dir)
++        print(f"\nCleaned up test directory: {test_dir}")
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test_with_errors.py b/test_with_errors.py
+new file mode 100644
+index 000000000..a1f935645
+--- /dev/null
++++ b/test_with_errors.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++
++import os
++import subprocess
++import tempfile
++import shutil
++
++def create_test_files():
++    """Create test files with actual lint errors"""
++    # Create a temporary directory
++    test_dir = tempfile.mkdtemp()
++    print(f"Created test directory: {test_dir}")
++    
++    # Create .a directory with foo.py (should be ignored)
++    a_dir = os.path.join(test_dir, ".a")
++    os.makedirs(a_dir)
++    with open(os.path.join(a_dir, "foo.py"), "w") as f:
++        f.write("import re  # This should be ignored\n")
++    
++    # Create bar.py in root (should be processed and show errors)
++    with open(os.path.join(test_dir, "bar.py"), "w") as f:
++        f.write("import re  # This should show unused import error\n")
++    
++    # Create normal directory with file (should be processed and show errors)
++    normal_dir = os.path.join(test_dir, "normal")
++    os.makedirs(normal_dir)
++    with open(os.path.join(normal_dir, "baz.py"), "w") as f:
++        f.write("import re  # This should show unused import error\n")
++    
++    return test_dir
++
++def run_pylint_commands(test_dir):
++    """Run pylint commands to verify the fix"""
++    print("\n=== Testing pylint commands ===")
++    
++    # Change to test directory
++    os.chdir(test_dir)
++    
++    # Test 1: Basic recursive mode (should ignore .a by default)
++    print("\n1. pylint --recursive=y .")
++    result1 = subprocess.run(["pylint", "--recursive=y", "."], 
++                           capture_output=True, text=True)
++    print("Exit code:", result1.returncode)
++    print("Output:", result1.stdout)
++    print("Expected: bar.py and normal/baz.py should show errors, .a/foo.py should be ignored")
++    
++    # Test 2: With ignore=.a (explicit ignore)
++    print("\n2. pylint --recursive=y --ignore=.a .")
++    result2 = subprocess.run(["pylint", "--recursive=y", "--ignore=.a", "."], 
++                           capture_output=True, text=True)
++    print("Exit code:", result2.returncode)
++    print("Output:", result2.stdout)
++    print("Expected: bar.py and normal/baz.py should show errors, .a/foo.py should be ignored")
++    
++    # Test 3: With ignore-paths=.a
++    print("\n3. pylint --recursive=y --ignore-paths=.a .")
++    result3 = subprocess.run(["pylint", "--recursive=y", "--ignore-paths=.a", "."], 
++                           capture_output=True, text=True)
++    print("Exit code:", result3.returncode)
++    print("Output:", result3.stdout)
++    print("Expected: bar.py and normal/baz.py should show errors, .a/foo.py should be ignored")
++    
++    # Test 4: With ignore-patterns="^\.a"
++    print("\n4. pylint --recursive=y --ignore-patterns='^\.a' .")
++    result4 = subprocess.run(["pylint", "--recursive=y", "--ignore-patterns='^\.a'", "."], 
++                           capture_output=True, text=True)
++    print("Exit code:", result4.returncode)
++    print("Output:", result4.stdout)
++    print("Expected: bar.py and normal/baz.py should show errors, .a/foo.py should be ignored")
++
++def main():
++    test_dir = create_test_files()
++    try:
++        run_pylint_commands(test_dir)
++    finally:
++        # Clean up
++        shutil.rmtree(test_dir)
++        print(f"\nCleaned up test directory: {test_dir}")
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file

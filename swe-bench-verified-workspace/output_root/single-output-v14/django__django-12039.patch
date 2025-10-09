@@ -1,0 +1,413 @@
+diff --git a/django/db/backends/ddl_references.py b/django/db/backends/ddl_references.py
+index 44e49806f8..21442dda7b 100644
+--- a/django/db/backends/ddl_references.py
++++ b/django/db/backends/ddl_references.py
+@@ -84,11 +84,15 @@ class Columns(TableColumns):
+     def __str__(self):
+         def col_str(column, idx):
+             try:
+-                return self.quote_name(column) + self.col_suffixes[idx]
++                suffix = self.col_suffixes[idx]
++                if suffix:
++                    return self.quote_name(column) + ' ' + suffix
++                else:
++                    return self.quote_name(column)
+             except IndexError:
+                 return self.quote_name(column)
+ 
+-        return ', '.join(col_str(column, idx) for idx, column in enumerate(self.columns))
++        return ', '.join(col_str(column, idx) for idx,  column in enumerate(self.columns))
+ 
+ 
+ class IndexName(TableColumns):
+@@ -114,7 +118,9 @@ class IndexColumns(Columns):
+             # length as self.columns.
+             col = '{} {}'.format(self.quote_name(column), self.opclasses[idx])
+             try:
+-                col = '{} {}'.format(col, self.col_suffixes[idx])
++                suffix = self.col_suffixes[idx]
++                if suffix:
++                    col = '{} {}'.format(col, suffix)
+             except IndexError:
+                 pass
+             return col
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..90047961b7
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,47 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the current directory to the Python path
++sys.path.insert(0, os.getcwd())
++
++from django.db import models
++from django.db.models import Index
++from django.db.backends.ddl_references import Columns
++
++# Create a simple test case
++def test_index_sql_generation():
++    # Test case 1: Index with descending order
++    index_desc = Index(fields=['-name'], name='idx_desc')
++    print("Descending index fields_orders:", index_desc.fields_orders)
++    print("Descending index col_suffixes:", [order[1] for order in index_desc.fields_orders])
++    
++    # Test case 2: Index with ascending order (no explicit ordering)
++    index_asc = Index(fields=['name'], name='idx_asc') 
++    print("Ascending index fields_orders:", index_asc.fields_orders)
++    print("Ascending index col_suffixes:", [order[1] for order in index_asc.fields_orders])
++    
++    # Test case 3: Index with opclasses but no explicit ordering
++    index_opclass = Index(fields=['name'], name='idx_opclass', opclasses=['text_pattern_ops'])
++    print("Opclass index fields_orders:", index_opclass.fields_orders)
++    print("Opclass index col_suffixes:", [order[1] for order in index_opclass.fields_orders])
++    
++    # Test the Columns class directly
++    print("\nTesting Columns class directly:")
++    
++    # Case 1: With DESC suffix
++    columns_desc = Columns('test_table', ['name'], lambda x: f'"{x}"', col_suffixes=['DESC'])
++    print("Columns with DESC:", str(columns_desc))
++    
++    # Case 2: With empty suffix (ascending order)
++    columns_asc = Columns('test_table', ['name'], lambda x: f'"{x}"', col_suffixes=[''])
++    print("Columns with empty suffix:", str(columns_asc))
++    
++    # Case 3: With opclass but no ordering
++    columns_opclass = Columns('test_table', ['name'], lambda x: f'"{x}"', col_suffixes=[''])
++    # Simulate what happens when opclasses are added
++    print("Columns with empty suffix (opclass case):", str(columns_opclass))
++
++if __name__ == "__main__":
++    test_index_sql_generation()
+\ No newline at end of file
+diff --git a/reproduce_issue_detailed.py b/reproduce_issue_detailed.py
+new file mode 100644
+index 0000000000..62d989d1a7
+--- /dev/null
++++ b/reproduce_issue_detailed.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the current directory to the Python path
++sys.path.insert(0, os.getcwd())
++
++from django.db.backends.ddl_references import Columns, IndexColumns
++
++# Test the exact issue described in the GitHub issue
++def test_index_columns_issue():
++    print("=== Testing IndexColumns with opclasses ===")
++    
++    # Simulate the case from the issue: opclasses without explicit ordering
++    # This should result in: "name" text_pattern_ops (without trailing space)
++    index_cols = IndexColumns(
++        table='schema_author',
++        columns=['name'],
++        quote_name=lambda x: f'"{x}"',
++        col_suffixes=[''],  # Empty string for ascending order
++        opclasses=['text_pattern_ops']
++    )
++    
++    result = str(index_cols)
++    print(f"Result: '{result}'")
++    print(f"Expected: '\"name\" text_pattern_ops'")
++    print(f"Has trailing space: {result.endswith(' ')}")
++    print(f"Length: {len(result)}")
++    
++    print("\n=== Testing with DESC order ===")
++    # This should work correctly: "name" text_pattern_ops DESC
++    index_cols_desc = IndexColumns(
++        table='schema_author',
++        columns=['name'],
++        quote_name=lambda x: f'"{x}"',
++        col_suffixes=['DESC'],  # DESC for descending order
++        opclasses=['text_pattern_ops']
++    )
++    
++    result_desc = str(index_cols_desc)
++    print(f"Result: '{result_desc}'")
++    print(f"Expected: '\"name\" text_pattern_ops DESC'")
++    
++    print("\n=== Testing regular Columns (no opclasses) ===")
++    # This should work correctly: "name" DESC
++    cols_desc = Columns(
++        table='schema_author',
++        columns=['name'],
++        quote_name=lambda x: f'"{x}"',
++        col_suffixes=['DESC']
++    )
++    
++    result_cols = str(cols_desc)
++    print(f"Result: '{result_cols}'")
++    print(f"Expected: '\"name\" DESC'")
++    
++    # This should work correctly: "name" (no suffix)
++    cols_asc = Columns(
++        table='schema_author',
++        columns=['name'],
++        quote_name=lambda x: f'"{x}"',
++        col_suffixes=['']
++    )
++    
++    result_cols_asc = str(cols_asc)
++    print(f"Result: '{result_cols_asc}'")
++    print(f"Expected: '\"name\"'")
++
++if __name__ == "__main__":
++    test_index_columns_issue()
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 0000000000..dea9d2d364
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the current directory to the Python path
++sys.path.insert(0, os.getcwd())
++
++from django.db.backends.ddl_references import Columns, IndexColumns
++
++def test_comprehensive_scenarios():
++    """Test all the scenarios mentioned in the GitHub issue"""
++    
++    def quote_name(name):
++        return f'"{name}"'
++    
++    print("=== Comprehensive Test of the Fix ===")
++    
++    # Test 1: Regular Columns with DESC suffix (should have space)
++    print("\n1. Columns with DESC suffix:")
++    cols_desc = Columns('table', ['name'], quote_name, col_suffixes=['DESC'])
++    result = str(cols_desc)
++    expected = '"name" DESC'
++    print(f"   Result: {result}")
++    print(f"   Expected: {expected}")
++    print(f"   ✓ Correct: {result == expected}")
++    
++    # Test 2: Regular Columns with empty suffix (should not have extra space)
++    print("\n2. Columns with empty suffix (ascending order):")
++    cols_asc = Columns('table', ['name'], quote_name, col_suffixes=[''])
++    result = str(cols_asc)
++    expected = '"name"'
++    print(f"   Result: {result}")
++    print(f"   Expected: {expected}")
++    print(f"   ✓ Correct: {result == expected}")
++    
++    # Test 3: IndexColumns with opclasses and empty suffix (should not have trailing space)
++    print("\n3. IndexColumns with opclasses and empty suffix (main issue):")
++    idx_cols = IndexColumns('table', ['name'], quote_name, col_suffixes=[''], opclasses=['text_pattern_ops'])
++    result = str(idx_cols)
++    expected = '"name" text_pattern_ops'
++    print(f"   Result: '{result}'")
++    print(f"   Expected: '{expected}'")
++    print(f"   ✓ Correct: {result == expected}")
++    print(f"   ✓ No trailing space: {not result.endswith(' ')}")
++    
++    # Test 4: IndexColumns with opclasses and DESC suffix (should have space before DESC)
++    print("\n4. IndexColumns with opclasses and DESC suffix:")
++    idx_cols_desc = IndexColumns('table', ['name'], quote_name, col_suffixes=['DESC'], opclasses=['text_pattern_ops'])
++    result = str(idx_cols_desc)
++    expected = '"name" text_pattern_ops DESC'
++    print(f"   Result: {result}")
++    print(f"   Expected: {expected}")
++    print(f"   ✓ Correct: {result == expected}")
++    
++    # Test 5: Multiple columns with mixed suffixes
++    print("\n5. Multiple columns with mixed suffixes:")
++    cols_multi = Columns('table', ['col1', 'col2', 'col3'], quote_name, col_suffixes=['', 'DESC', ''])
++    result = str(cols_multi)
++    expected = '"col1", "col2" DESC, "col3"'
++    print(f"   Result: {result}")
++    print(f"   Expected: {expected}")
++    print(f"   ✓ Correct: {result == expected}")
++    
++    # Test 6: Multiple IndexColumns with mixed scenarios
++    print("\n6. Multiple IndexColumns with mixed scenarios:")
++    idx_cols_multi = IndexColumns('table', ['col1', 'col2'], quote_name, 
++                                 col_suffixes=['', 'DESC'], 
++                                 opclasses=['text_pattern_ops', 'varchar_pattern_ops'])
++    result = str(idx_cols_multi)
++    expected = '"col1" text_pattern_ops, "col2" varchar_pattern_ops DESC'
++    print(f"   Result: {result}")
++    print(f"   Expected: {expected}")
++    print(f"   ✓ Correct: {result == expected}")
++    
++    # Test 7: Edge case - empty col_suffixes list
++    print("\n7. Edge case - empty col_suffixes list:")
++    cols_empty = Columns('table', ['name'], quote_name, col_suffixes=[])
++    result = str(cols_empty)
++    expected = '"name"'
++    print(f"   Result: {result}")
++    print(f"   Expected: {expected}")
++    print(f"   ✓ Correct: {result == expected}")
++    
++    print("\n=== All tests completed ===")
++
++if __name__ == "__main__":
++    test_comprehensive_scenarios()
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..374fc9e9cf
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the current directory to the Python path
++sys.path.insert(0, os.getcwd())
++
++from django.db import models
++from django.db.models import Index
++from django.db.backends.ddl_references import Columns, IndexColumns
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++
++# Mock a simple schema editor for testing
++class MockSchemaEditor:
++    def quote_name(self, name):
++        return f'"{name}"'
++
++# Create test cases from the GitHub issue
++def test_github_issue_scenarios():
++    schema_editor = MockSchemaEditor()
++    
++    print("=== Test Case 1: Index with descending order ===")
++    print("Index(fields=['-name'], name='idx')")
++    print("Expected: CREATE INDEX \"idx\" ON \"schema_author\" (\"name\" DESC)")
++    
++    index1 = Index(fields=['-name'], name='idx')
++    columns1 = Columns('schema_author', ['name'], schema_editor.quote_name, col_suffixes=['DESC'])
++    result1 = str(columns1)
++    print(f"Result: CREATE INDEX \"idx\" ON \"schema_author\" ({result1})")
++    expected1 = '"name" DESC'
++    print(f"Correct: {result1 == expected1}")
++    
++    print("\n=== Test Case 2: Index with opclasses without explicit ordering ===")
++    print("Index(fields=['name'], name='idx', opclasses=['text_pattern_ops'])")
++    print("Expected: CREATE INDEX \"idx\" ON \"schema_author\" (\"name\" text_pattern_ops)")
++    
++    index2 = Index(fields=['name'], name='idx', opclasses=['text_pattern_ops'])
++    columns2 = IndexColumns('schema_author', ['name'], schema_editor.quote_name, col_suffixes=[''], opclasses=['text_pattern_ops'])
++    result2 = str(columns2)
++    print(f"Result: CREATE INDEX \"idx\" ON \"schema_author\" ({result2})")
++    expected2 = '"name" text_pattern_ops'
++    print(f"Correct: {result2 == expected2}")
++    print(f"No trailing space: {not result2.endswith(' ')}")
++    
++    print("\n=== Test Case 3: Index with opclasses and descending order ===")
++    print("Index(fields=['-name'], name='idx', opclasses=['text_pattern_ops'])")
++    print("Expected: CREATE INDEX \"idx\" ON \"schema_author\" (\"name\" text_pattern_ops DESC)")
++    
++    index3 = Index(fields=['-name'], name='idx', opclasses=['text_pattern_ops'])
++    columns3 = IndexColumns('schema_author', ['name'], schema_editor.quote_name, col_suffixes=['DESC'], opclasses=['text_pattern_ops'])
++    result3 = str(columns3)
++    print(f"Result: CREATE INDEX \"idx\" ON \"schema_author\" ({result3})")
++    expected3 = '"name" text_pattern_ops DESC'
++    print(f"Correct: {result3 == expected3}")
++    
++    print("\n=== Test Case 4: Multiple columns ===")
++    print("Index(fields=['name', '-age'], name='idx_multi')")
++    print("Expected: CREATE INDEX \"idx_multi\" ON \"schema_author\" (\"name\", \"age\" DESC)")
++    
++    index4 = Index(fields=['name', '-age'], name='idx_multi')
++    columns4 = Columns('schema_author', ['name', 'age'], schema_editor.quote_name, col_suffixes=['', 'DESC'])
++    result4 = str(columns4)
++    print(f"Result: CREATE INDEX \"idx_multi\" ON \"schema_author\" ({result4})")
++    expected4 = '"name", "age" DESC'
++    print(f"Correct: {result4 == expected4}")
++
++if __name__ == "__main__":
++    test_github_issue_scenarios()
+\ No newline at end of file
+diff --git a/test_github_issue_exact.py b/test_github_issue_exact.py
+new file mode 100644
+index 0000000000..c86c32fa07
+--- /dev/null
++++ b/test_github_issue_exact.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the current directory to the Python path
++sys.path.insert(0, os.getcwd())
++
++from django.db import models
++from django.db.models import Index
++from django.db.backends.ddl_references import Columns, IndexColumns
++
++def test_github_issue_exact():
++    """Test the exact scenarios described in the GitHub issue"""
++    
++    def quote_name(name):
++        return f'"{name}"'
++    
++    print("=== Testing Exact GitHub Issue Scenarios ===")
++    
++    # Scenario 1: Index with descending order
++    print("\n1. Index with descending order:")
++    print("   index = Index(fields=['-name'], name='idx')")
++    print("   Expected: CREATE INDEX \"idx\" ON \"schema_author\" (\"name\" DESC)")
++    
++    # Simulate what happens in create_sql method
++    index = Index(fields=['-name'], name='idx')
++    col_suffixes = [order[1] for order in index.fields_orders]  # This would be ['DESC']
++    columns = Columns('schema_author', ['name'], quote_name, col_suffixes=col_suffixes)
++    result = str(columns)
++    expected = '"name" DESC'
++    print(f"   Result: CREATE INDEX \"idx\" ON \"schema_author\" ({result})")
++    print(f"   ✓ Correct: {result == expected}")
++    
++    # Scenario 2: Index with opclasses without explicit ordering (the main issue)
++    print("\n2. Index with opclasses without explicit ordering (MAIN ISSUE):")
++    print("   index = Index(fields=['name'], name='idx', opclasses=['text_pattern_ops'])")
++    print("   Expected: CREATE INDEX \"idx\" ON \"schema_author\" (\"name\" text_pattern_ops)")
++    
++    index2 = Index(fields=['name'], name='idx', opclasses=['text_pattern_ops'])
++    col_suffixes2 = [order[1] for order in index2.fields_orders]  # This would be ['']
++    columns2 = IndexColumns('schema_author', ['name'], quote_name, 
++                           col_suffixes=col_suffixes2, 
++                           opclasses=index2.opclasses)
++    result2 = str(columns2)
++    expected2 = '"name" text_pattern_ops'
++    print(f"   Result: CREATE INDEX \"idx\" ON \"schema_author\" ({result2})")
++    print(f"   ✓ Correct: {result2 == expected2}")
++    print(f"   ✓ No trailing space: {not result2.endswith(' ')}")
++    
++    # Scenario 3: Index with opclasses and descending order
++    print("\n3. Index with opclasses and descending order:")
++    print("   index = Index(fields=['-name'], name='idx', opclasses=['text_pattern_ops'])")
++    print("   Expected: CREATE INDEX \"idx\" ON \"schema_author\" (\"name\" text_pattern_ops DESC)")
++    
++    index3 = Index(fields=['-name'], name='idx', opclasses=['text_pattern_ops'])
++    col_suffixes3 = [order[1] for order in index3.fields_orders]  # This would be ['DESC']
++    columns3 = IndexColumns('schema_author', ['name'], quote_name, 
++                           col_suffixes=col_suffixes3, 
++                           opclasses=index3.opclasses)
++    result3 = str(columns3)
++    expected3 = '"name" text_pattern_ops DESC'
++    print(f"   Result: CREATE INDEX \"idx\" ON \"schema_author\" ({result3})")
++    print(f"   ✓ Correct: {result3 == expected3}")
++    
++    print("\n=== GitHub Issue Scenarios Completed ===")
++    print("All the whitespace issues described in the GitHub issue have been fixed!")
++
++if __name__ == "__main__":
++    test_github_issue_exact()
+\ No newline at end of file

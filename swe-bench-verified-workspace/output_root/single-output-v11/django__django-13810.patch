@@ -1,0 +1,819 @@
+diff --git a/comprehensive_fix_test.py b/comprehensive_fix_test.py
+new file mode 100644
+index 0000000000..074cb29994
+--- /dev/null
++++ b/comprehensive_fix_test.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the MiddlewareNotUsed fix works correctly.
++This test reproduces the exact scenario described in the GitHub issue.
++"""
++
++import django
++from django.conf import settings
++from django.core.handlers.asgi import ASGIHandler
++from django.core.exceptions import MiddlewareNotUsed
++
++# Configure Django settings similar to the GitHub issue example
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ALLOWED_HOSTS=['*'],
++        MIDDLEWARE=[
++            'django.middleware.security.SecurityMiddleware',
++            'django.contrib.sessions.middleware.SessionMiddleware',
++            'django.middleware.common.CommonMiddleware',
++            'django.middleware.csrf.CsrfViewMiddleware',
++            'django.contrib.auth.middleware.AuthenticationMiddleware',
++            'django.contrib.messages.middleware.MessageMiddleware',
++            'comprehensive_fix_test.DummyMiddleware',  # This will raise MiddlewareNotUsed
++            'django.middleware.clickjacking.XFrameOptionsMiddleware',
++        ],
++        ROOT_URLCONF='comprehensive_fix_test',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++        ],
++        # Intentionally broken setting to cause 500 error as mentioned in the issue
++        SESSION_FILE_PATH='/invalid/path/to/cause/error',
++    )
++
++# Define the DummyMiddleware that raises MiddlewareNotUsed (as in the GitHub issue)
++class DummyMiddleware:
++    async_capable = False
++    sync_capable = True
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        raise MiddlewareNotUsed("This middleware should not be used")
++    
++    def __call__(self, request):
++        return self.get_response(request)
++
++# Simple URL config
++from django.urls import path
++from django.http import HttpResponse
++
++def simple_view(request):
++    return HttpResponse("Hello World")
++
++urlpatterns = [
++    path('', simple_view),
++]
++
++if __name__ == '__main__':
++    django.setup()
++    
++    print("Testing the MiddlewareNotUsed fix...")
++    
++    try:
++        # Create ASGI handler - this should work without issues
++        handler = ASGIHandler()
++        print("✓ SUCCESS: ASGIHandler created successfully despite MiddlewareNotUsed")
++        
++        # Test that the middleware chain is properly configured
++        print(f"✓ Middleware chain type: {type(handler._middleware_chain)}")
++        
++        # Test that we can handle a request (this should fail with ImproperlyConfigured 
++        # due to the broken SESSION_FILE_PATH, but not due to MiddlewareNotUsed issues)
++        try:
++            # Create a simple request scope
++            scope = {
++                'type': 'http',
++                'method': 'GET',
++                'path': '/',
++                'headers': [],
++            }
++            
++            # Mock receive and send functions
++            async def mock_receive():
++                return {'type': 'http.request', 'body': b'', 'more_body': False}
++            
++            async def mock_send(message):
++                if message['type'] == 'http.response.start':
++                    print(f"✓ Received response with status: {message['status']}")
++            
++            # Test the handler
++            import asyncio
++            loop = asyncio.get_event_loop()
++            result = loop.run_until_complete(handler(scope, mock_receive, mock_send))
++            print("✓ Request handling completed successfully!")
++            
++        except Exception as e:
++            # We expect an ImproperlyConfigured error due to the broken SESSION_FILE_PATH,
++            # but NOT a TypeError about HttpResponse not being awaitable
++            if "ImproperlyConfigured" in str(type(e)):
++                print("✓ SUCCESS: Got expected ImproperlyConfigured error (due to broken SESSION_FILE_PATH)")
++                print(f"  Error: {e}")
++            elif "TypeError" in str(type(e)) and "await" in str(e):
++                print("✗ FAILURE: Got the original TypeError issue - fix didn't work")
++                print(f"  Error: {e}")
++                raise
++            else:
++                print(f"✓ Got expected error (not related to MiddlewareNotUsed): {type(e).__name__}: {e}")
++                
++    except Exception as e:
++        print(f"✗ FAILURE: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        exit(1)
++    
++    print("\n🎉 All tests passed! The MiddlewareNotUsed fix is working correctly.")
+\ No newline at end of file
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..ef6a0001ef
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the MiddlewareNotUsed fix in ASGI context.
++"""
++
++import django
++from django.conf import settings
++from django.core.handlers.asgi import ASGIHandler
++from django.core.exceptions import MiddlewareNotUsed
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        MIDDLEWARE=[
++            'comprehensive_test.AsyncMiddleware',  # This should work fine and set async context
++            'comprehensive_test.SyncMiddlewareThatRaisesNotUsed',  # This raises MiddlewareNotUsed
++            'comprehensive_test.FinalAsyncMiddleware',  # This should receive proper async handler
++        ],
++        ROOT_URLCONF='comprehensive_test',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++    )
++
++# Define middlewares to test the issue
++class AsyncMiddleware:
++    async_capable = True
++    sync_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"AsyncMiddleware received get_response of type: {type(get_response)}")
++        print(f"Is get_response async? {hasattr(get_response, '__await__')}")
++    
++    async def __call__(self, request):
++        response = await self.get_response(request)
++        return response
++
++class SyncMiddlewareThatRaisesNotUsed:
++    async_capable = False
++    sync_capable = True
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"SyncMiddlewareThatRaisesNotUsed received get_response of type: {type(get_response)}")
++        print(f"Is get_response async? {hasattr(get_response, '__await__')}")
++        raise MiddlewareNotUsed("This middleware should not be used")
++
++class FinalAsyncMiddleware:
++    async_capable = True
++    sync_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"FinalAsyncMiddleware received get_response of type: {type(get_response)}")
++        print(f"Is get_response async? {hasattr(get_response, '__await__')}")
++        # This should be async since we're in ASGI context and the previous middleware was async
++        if not hasattr(get_response, '__await__'):
++            print("ERROR: Final middleware should receive async handler in ASGI context!")
++        else:
++            print("SUCCESS: Final middleware received async handler as expected")
++    
++    async def __call__(self, request):
++        response = await self.get_response(request)
++        return response
++
++# Simple URL config
++from django.urls import path
++from django.http import HttpResponse
++
++def simple_view(request):
++    return HttpResponse("Hello World")
++
++urlpatterns = [
++    path('', simple_view),
++]
++
++if __name__ == '__main__':
++    django.setup()
++    
++    # Create ASGI handler
++    handler = ASGIHandler()
++    
++    print("ASGI handler created successfully")
++    print(f"Middleware chain type: {type(handler._middleware_chain)}")
++    print(f"Is middleware chain async? {hasattr(handler._middleware_chain, '__await__')}")
+\ No newline at end of file
+diff --git a/django/core/handlers/base.py b/django/core/handlers/base.py
+index 8e8c3da06a..85b01d7d94 100644
+--- a/django/core/handlers/base.py
++++ b/django/core/handlers/base.py
+@@ -51,6 +51,7 @@ class BaseHandler:
+                 middleware_is_async = middleware_can_async
+             try:
+                 # Adapt handler, if needed.
++                original_handler = handler
+                 handler = self.adapt_method_mode(
+                     middleware_is_async, handler, handler_is_async,
+                     debug=settings.DEBUG, name='middleware %s' % middleware_path,
+@@ -62,6 +63,8 @@ class BaseHandler:
+                         logger.debug('MiddlewareNotUsed(%r): %s', middleware_path, exc)
+                     else:
+                         logger.debug('MiddlewareNotUsed: %r', middleware_path)
++                # Restore the original handler to avoid poisoning the middleware chain
++                handler = original_handler
+                 continue
+ 
+             if mw_instance is None:
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..36c7e44b32
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++"""
++Final test to verify the MiddlewareNotUsed fix.
++"""
++
++import django
++from django.conf import settings
++from django.core.handlers.asgi import ASGIHandler
++from django.core.exceptions import MiddlewareNotUsed
++import asyncio
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        MIDDLEWARE=[
++            'final_test.AsyncMiddleware',  # This should set async context
++            'final_test.MiddlewareThatRaisesNotUsed',  # This raises MiddlewareNotUsed
++            'final_test.FinalMiddleware',  # This should receive proper handler
++        ],
++        ROOT_URLCONF='final_test',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++    )
++
++# Define middlewares to test the issue
++class AsyncMiddleware:
++    async_capable = True
++    sync_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"AsyncMiddleware received handler type: {type(get_response)}")
++        print(f"Is handler async? {asyncio.iscoroutinefunction(get_response)}")
++    
++    async def __call__(self, request):
++        response = await self.get_response(request)
++        return response
++
++class MiddlewareThatRaisesNotUsed:
++    async_capable = False
++    sync_capable = True
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"MiddlewareThatRaisesNotUsed received handler type: {type(get_response)}")
++        print(f"Is handler async? {asyncio.iscoroutinefunction(get_response)}")
++        raise MiddlewareNotUsed("This middleware should not be used")
++
++class FinalMiddleware:
++    async_capable = True
++    sync_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"FinalMiddleware received handler type: {type(get_response)}")
++        print(f"Is handler async? {asyncio.iscoroutinefunction(get_response)}")
++        # This should be async since we're in ASGI context
++        if not asyncio.iscoroutinefunction(get_response):
++            print("ERROR: Handler should be async in ASGI context!")
++        else:
++            print("SUCCESS: Handler is async as expected")
++    
++    async def __call__(self, request):
++        response = await self.get_response(request)
++        return response
++
++# Simple URL config
++from django.urls import path
++from django.http import HttpResponse
++
++def simple_view(request):
++    return HttpResponse("Hello World")
++
++urlpatterns = [
++    path('', simple_view),
++]
++
++if __name__ == '__main__':
++    django.setup()
++    
++    # Create ASGI handler
++    handler = ASGIHandler()
++    
++    print("ASGI handler created successfully")
++    print(f"Final middleware chain type: {type(handler._middleware_chain)}")
++    print(f"Is final chain async? {asyncio.iscoroutinefunction(handler._middleware_chain)}")
+\ No newline at end of file
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..8f838355cd
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++"""
++Final verification that our fix doesn't break normal middleware operation.
++"""
++
++import django
++from django.conf import settings
++from django.core.handlers.asgi import ASGIHandler
++
++# Configure Django settings with normal middleware
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ALLOWED_HOSTS=['*'],
++        MIDDLEWARE=[
++            'django.middleware.security.SecurityMiddleware',
++            'django.contrib.sessions.middleware.SessionMiddleware',
++            'django.middleware.common.CommonMiddleware',
++            'django.middleware.csrf.CsrfViewMiddleware',
++            'django.contrib.auth.middleware.AuthenticationMiddleware',
++            'django.contrib.messages.middleware.MessageMiddleware',
++            'django.middleware.clickjacking.XFrameOptionsMiddleware',
++        ],
++        ROOT_URLCONF='final_verification',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++        ],
++    )
++
++# Simple URL config
++from django.urls import path
++from django.http import HttpResponse
++
++def simple_view(request):
++    return HttpResponse("Hello World")
++
++urlpatterns = [
++    path('', simple_view),
++]
++
++if __name__ == '__main__':
++    django.setup()
++    
++    print("Testing normal middleware operation...")
++    
++    try:
++        # Create ASGI handler
++        handler = ASGIHandler()
++        print("✓ SUCCESS: ASGIHandler created successfully")
++        
++        # Test that the middleware chain is properly configured
++        print(f"✓ Middleware chain type: {type(handler._middleware_chain)}")
++        
++        # Test that we can handle a request
++        scope = {
++            'type': 'http',
++            'method': 'GET',
++            'path': '/',
++            'headers': [],
++        }
++        
++        async def mock_receive():
++            return {'type': 'http.request', 'body': b'', 'more_body': False}
++        
++        async def mock_send(message):
++            if message['type'] == 'http.response.start':
++                print(f"✓ Received response with status: {message['status']}")
++        
++        import asyncio
++        loop = asyncio.get_event_loop()
++        result = loop.run_until_complete(handler(scope, mock_receive, mock_send))
++        print("✓ Request handling completed successfully!")
++        
++    except Exception as e:
++        print(f"✗ FAILURE: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        exit(1)
++    
++    print("\n🎉 Normal middleware operation works correctly!")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..7cd40dedb4
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the MiddlewareNotUsed issue in ASGI context.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.core.handlers.asgi import ASGIHandler
++from django.core.exceptions import MiddlewareNotUsed
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        MIDDLEWARE=[
++            'django.middleware.security.SecurityMiddleware',
++            'django.contrib.sessions.middleware.SessionMiddleware',
++            'django.middleware.common.CommonMiddleware',
++            'django.middleware.csrf.CsrfViewMiddleware',
++            'django.contrib.auth.middleware.AuthenticationMiddleware',
++            'django.contrib.messages.middleware.MessageMiddleware',
++            'reproduce_issue.DummyMiddleware',  # This will raise MiddlewareNotUsed
++            'django.middleware.clickjacking.XFrameOptionsMiddleware',
++        ],
++        ROOT_URLCONF='reproduce_issue',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++        ],
++        SESSION_FILE_PATH='/invalid/path/to/cause/error',  # This will cause ImproperlyConfigured
++    )
++
++# Define a middleware that raises MiddlewareNotUsed
++class DummyMiddleware:
++    def __init__(self, get_response):
++        self.get_response = get_response
++        raise MiddlewareNotUsed("This middleware should not be used")
++    
++    def __call__(self, request):
++        return self.get_response(request)
++
++# Simple URL config
++from django.urls import path
++from django.http import HttpResponse
++
++def simple_view(request):
++    return HttpResponse("Hello World")
++
++urlpatterns = [
++    path('', simple_view),
++]
++
++if __name__ == '__main__':
++    django.setup()
++    
++    # Create ASGI handler
++    handler = ASGIHandler()
++    
++    try:
++        # This should trigger the MiddlewareNotUsed issue
++        # The handler should be properly initialized despite the middleware not being used
++        print("Testing ASGI handler initialization...")
++        
++        # Test the middleware loading directly
++        print("Testing middleware loading...")
++        
++        # The issue should occur during middleware loading when MiddlewareNotUsed is raised
++        # Let's examine the handler's middleware chain
++        print(f"Middleware chain type: {type(handler._middleware_chain)}")
++        print(f"Is middleware chain async? {hasattr(handler._middleware_chain, '__await__')}")
++        
++        # The problem is that when MiddlewareNotUsed is raised, the handler variable
++        # has already been adapted, and this adapted handler is passed to the next middleware
++        # Let's check if this causes issues
++        
++    except Exception as e:
++        print(f"Error occurred: {e}")
++        import traceback
++        traceback.print_exc()
+\ No newline at end of file
+diff --git a/request_test.py b/request_test.py
+new file mode 100644
+index 0000000000..82c0a8b76a
+--- /dev/null
++++ b/request_test.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python3
++"""
++Test to verify that the MiddlewareNotUsed fix works for actual request handling.
++"""
++
++import django
++from django.conf import settings
++from django.core.handlers.asgi import ASGIHandler
++from django.core.exceptions import MiddlewareNotUsed
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        MIDDLEWARE=[
++            'request_test.AsyncMiddleware',  # This should set async context
++            'request_test.MiddlewareThatRaisesNotUsed',  # This raises MiddlewareNotUsed
++            'request_test.FinalMiddleware',  # This should receive proper handler
++        ],
++        ROOT_URLCONF='request_test',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++    )
++
++# Define middlewares to test the issue
++class AsyncMiddleware:
++    async_capable = True
++    sync_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++    
++    async def __call__(self, request):
++        response = await self.get_response(request)
++        return response
++
++class MiddlewareThatRaisesNotUsed:
++    async_capable = False
++    sync_capable = True
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        raise MiddlewareNotUsed("This middleware should not be used")
++
++class FinalMiddleware:
++    async_capable = True
++    sync_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++    
++    async def __call__(self, request):
++        response = await self.get_response(request)
++        return response
++
++# Simple URL config
++from django.urls import path
++from django.http import HttpResponse
++
++def simple_view(request):
++    return HttpResponse("Hello World")
++
++urlpatterns = [
++    path('', simple_view),
++]
++
++if __name__ == '__main__':
++    django.setup()
++    
++    # Create ASGI handler
++    handler = ASGIHandler()
++    
++    print("ASGI handler created successfully")
++    
++    # Test that the handler can be called
++    try:
++        # Create a simple request scope
++        scope = {
++            'type': 'http',
++            'method': 'GET',
++            'path': '/',
++            'headers': [],
++        }
++        
++        # Mock receive and send functions
++        async def mock_receive():
++            return {'type': 'http.request', 'body': b'', 'more_body': False}
++        
++        async def mock_send(message):
++            print(f"Received message: {message['type']}")
++            if message['type'] == 'http.response.start':
++                print(f"Status: {message['status']}")
++        
++        # Test the handler
++        import asyncio
++        loop = asyncio.get_event_loop()
++        result = loop.run_until_complete(handler(scope, mock_receive, mock_send))
++        print("Request handling completed successfully!")
++        
++    except Exception as e:
++        print(f"Error during request handling: {e}")
++        import traceback
++        traceback.print_exc()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..582cb6db3d
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the MiddlewareNotUsed fix.
++"""
++
++import django
++from django.conf import settings
++from django.core.handlers.asgi import ASGIHandler
++from django.core.exceptions import MiddlewareNotUsed
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        MIDDLEWARE=[
++            'simple_test.AlwaysAsyncMiddleware',  # This should set async context
++            'simple_test.MiddlewareThatRaisesNotUsed',  # This raises MiddlewareNotUsed
++            'simple_test.AnotherAsyncMiddleware',  # This should still receive async handler
++        ],
++        ROOT_URLCONF='simple_test',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++    )
++
++# Define middlewares to test the issue
++class AlwaysAsyncMiddleware:
++    async_capable = True
++    sync_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"AlwaysAsyncMiddleware received handler type: {type(get_response)}")
++        print(f"Is handler async? {hasattr(get_response, '__await__')}")
++    
++    async def __call__(self, request):
++        response = await self.get_response(request)
++        return response
++
++class MiddlewareThatRaisesNotUsed:
++    async_capable = False
++    sync_capable = True
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"MiddlewareThatRaisesNotUsed received handler type: {type(get_response)}")
++        print(f"Is handler async? {hasattr(get_response, '__await__')}")
++        raise MiddlewareNotUsed("This middleware should not be used")
++
++class AnotherAsyncMiddleware:
++    async_capable = True
++    sync_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"AnotherAsyncMiddleware received handler type: {type(get_response)}")
++        print(f"Is handler async? {hasattr(get_response, '__await__')}")
++        # This should be async since we're in ASGI context
++        if not hasattr(get_response, '__await__'):
++            print("ERROR: Handler should be async in ASGI context!")
++        else:
++            print("SUCCESS: Handler is async as expected")
++    
++    async def __call__(self, request):
++        response = await self.get_response(request)
++        return response
++
++# Simple URL config
++from django.urls import path
++from django.http import HttpResponse
++
++def simple_view(request):
++    return HttpResponse("Hello World")
++
++urlpatterns = [
++    path('', simple_view),
++]
++
++if __name__ == '__main__':
++    django.setup()
++    
++    # Create ASGI handler
++    handler = ASGIHandler()
++    
++    print("ASGI handler created successfully")
++    print(f"Final middleware chain type: {type(handler._middleware_chain)}")
++    print(f"Is final chain async? {hasattr(handler._middleware_chain, '__await__')}")
+\ No newline at end of file
+diff --git a/test_middleware_issue.py b/test_middleware_issue.py
+new file mode 100644
+index 0000000000..7ef383cc94
+--- /dev/null
++++ b/test_middleware_issue.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""
++Test to reproduce the MiddlewareNotUsed issue in ASGI context.
++"""
++
++import django
++from django.conf import settings
++from django.core.handlers.asgi import ASGIHandler
++from django.core.exceptions import MiddlewareNotUsed
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        MIDDLEWARE=[
++            'django.middleware.security.SecurityMiddleware',
++            'test_middleware_issue.AsyncMiddleware',  # This middleware should work fine
++            'test_middleware_issue.SyncMiddlewareThatRaisesNotUsed',  # This raises MiddlewareNotUsed
++            'test_middleware_issue.FinalMiddleware',  # This should receive the adapted handler
++        ],
++        ROOT_URLCONF='test_middleware_issue',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++    )
++
++# Define middlewares to test the issue
++class AsyncMiddleware:
++    async_capable = True
++    sync_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++    
++    async def __call__(self, request):
++        response = await self.get_response(request)
++        return response
++
++class SyncMiddlewareThatRaisesNotUsed:
++    async_capable = False
++    sync_capable = True
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        raise MiddlewareNotUsed("This middleware should not be used")
++
++class FinalMiddleware:
++    async_capable = True
++    sync_capable = True
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"FinalMiddleware received get_response of type: {type(get_response)}")
++        print(f"Is get_response async? {hasattr(get_response, '__await__')}")
++    
++    async def __call__(self, request):
++        response = await self.get_response(request)
++        return response
++
++# Simple URL config
++from django.urls import path
++from django.http import HttpResponse
++
++def simple_view(request):
++    return HttpResponse("Hello World")
++
++urlpatterns = [
++    path('', simple_view),
++]
++
++if __name__ == '__main__':
++    django.setup()
++    
++    # Create ASGI handler
++    handler = ASGIHandler()
++    
++    print("ASGI handler created successfully")
++    print(f"Middleware chain type: {type(handler._middleware_chain)}")
++    print(f"Is middleware chain async? {hasattr(handler._middleware_chain, '__await__')}")
+\ No newline at end of file

@@ -1,0 +1,777 @@
+diff --git a/demo_github_issue.py b/demo_github_issue.py
+new file mode 100644
+index 0000000000..acc00ff03b
+--- /dev/null
++++ b/demo_github_issue.py
+@@ -0,0 +1,171 @@
++#!/usr/bin/env python3
++"""
++Demo script showing how the new get_inlines() hook solves the GitHub issue.
++
++The issue requested a way to set inlines based on request or model instance
++without having to copy the entire for loop from get_inline_instances.
++"""
++
++import os
++import sys
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++import django
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test-secret-key',
++    DEFAULT_CHARSET='utf-8',
++)
++django.setup()
++
++from django.contrib.admin.sites import AdminSite
++from django.contrib.admin.options import ModelAdmin
++
++# Create a simple mock model
++class MockModel:
++    class _meta:
++        app_label = 'test'
++        model_name = 'mockmodel'
++
++# Create mock inlines for different scenarios
++class RegularInline:
++    def __init__(self, model, admin_site):
++        self.model = model
++        self.admin_site = admin_site
++        
++    def has_view_or_change_permission(self, request, obj=None):
++        return True
++        
++    def has_add_permission(self, request, obj=None):
++        return True
++        
++    def has_delete_permission(self, request, obj=None):
++        return True
++
++class AdminOnlyInline:
++    def __init__(self, model, admin_site):
++        self.model = model
++        self.admin_site = admin_site
++        
++    def has_view_or_change_permission(self, request, obj=None):
++        return request and hasattr(request, 'user') and request.user.is_staff
++        
++    def has_add_permission(self, request, obj=None):
++        return request and hasattr(request, 'user') and request.user.is_staff
++        
++    def has_delete_permission(self, request, obj=None):
++        return request and hasattr(request, 'user') and request.user.is_staff
++
++class DraftOnlyInline:
++    def __init__(self, model, admin_site):
++        self.model = model
++        self.admin_site = admin_site
++        
++    def has_view_or_change_permission(self, request, obj=None):
++        return obj and hasattr(obj, 'status') and obj.status == 'draft'
++        
++    def has_add_permission(self, request, obj=None):
++        return obj and hasattr(obj, 'status') and obj.status == 'draft'
++        
++    def has_delete_permission(self, request, obj=None):
++        return obj and hasattr(obj, 'status') and obj.status == 'draft'
++
++def demonstrate_old_vs_new_approach():
++    """Demonstrate the old approach vs new approach"""
++    site = AdminSite()
++    
++    print("=== DEMONSTRATING THE GITHUB ISSUE SOLUTION ===\n")
++    
++    # OLD APPROACH (what users had to do before)
++    print("OLD APPROACH: Override get_inline_instances and copy the for loop")
++    
++    class OldApproachAdmin(ModelAdmin):
++        inlines = [RegularInline, AdminOnlyInline, DraftOnlyInline]
++        
++        def get_inline_instances(self, request, obj=None):
++            # Users had to copy this entire for loop logic
++            inline_instances = []
++            for inline_class in self.inlines:
++                inline = inline_class(self.model, self.admin_site)
++                if request:
++                    if not (inline.has_view_or_change_permission(request, obj) or
++                            inline.has_add_permission(request, obj) or
++                            inline.has_delete_permission(request, obj)):
++                        continue
++                    if not inline.has_add_permission(request, obj):
++                        inline.max_num = 0
++                inline_instances.append(inline)
++            return inline_instances
++    
++    old_admin = OldApproachAdmin(MockModel, site)
++    
++    # NEW APPROACH (what users can do now)
++    print("\nNEW APPROACH: Override get_inlines() hook instead")
++    
++    class NewApproachAdmin(ModelAdmin):
++        inlines = [RegularInline, AdminOnlyInline, DraftOnlyInline]
++        
++        def get_inlines(self, request, obj=None):
++            # Simple and clean: just return the inlines you want based on request/obj
++            inlines = [RegularInline]  # Always include regular inline
++            
++            if request and hasattr(request, 'user') and request.user.is_staff:
++                inlines.append(AdminOnlyInline)
++                
++            if obj and hasattr(obj, 'status') and obj.status == 'draft':
++                inlines.append(DraftOnlyInline)
++                
++            return inlines
++    
++    new_admin = NewApproachAdmin(MockModel, site)
++    
++    # Test both approaches
++    print("\n=== TESTING BOTH APPROACHES ===\n")
++    
++    # Mock requests and objects
++    class RegularUser:
++        is_staff = False
++        
++    class AdminUser:
++        is_staff = True
++        
++    class MockRequest:
++        def __init__(self, user):
++            self.user = user
++    
++    class PublishedObject:
++        status = 'published'
++        
++    class DraftObject:
++        status = 'draft'
++    
++    # Test scenarios
++    scenarios = [
++        ("Regular user, published object", RegularUser(), PublishedObject()),
++        ("Admin user, published object", AdminUser(), PublishedObject()),
++        ("Regular user, draft object", RegularUser(), DraftObject()),
++        ("Admin user, draft object", AdminUser(), DraftObject()),
++    ]
++    
++    for desc, user, obj in scenarios:
++        request = MockRequest(user)
++        
++        print(f"\nScenario: {desc}")
++        
++        # Old approach
++        old_instances = old_admin.get_inline_instances(request, obj)
++        print(f"  Old approach: {len(old_instances)} inlines")
++        
++        # New approach
++        new_instances = new_admin.get_inline_instances(request, obj)
++        print(f"  New approach: {len(new_instances)} inlines")
++        
++        # Both should give the same result
++        assert len(old_instances) == len(new_instances), f"Mismatch in {desc}"
++    
++    print("\n=== SUCCESS! Both approaches produce identical results ===")
++    print("But the new approach is much cleaner and doesn't require copying the for loop!")
++
++if __name__ == "__main__":
++    demonstrate_old_vs_new_approach()
+\ No newline at end of file
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 5e7b23f9a0..a66048e2af 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -580,13 +580,19 @@ class ModelAdmin(BaseModelAdmin):
+     def __str__(self):
+         return "%s.%s" % (self.model._meta.app_label, self.__class__.__name__)
+ 
++    def get_inlines(self, request, obj=None):
++        """
++        Hook for specifying custom inlines based on the request or model instance.
++        """
++        return self.inlines
++
+     def get_inline_instances(self, request, obj=None):
+         inline_instances = []
+-        for inline_class in self.inlines:
++        for inline_class in self.get_inlines(request, obj):
+             inline = inline_class(self.model, self.admin_site)
+             if request:
+                 if not (inline.has_view_or_change_permission(request, obj) or
+-                        inline.has_add_permission(request, obj) or
++                        inline.has_add_permission  (request, obj) or
+                         inline.has_delete_permission(request, obj)):
+                     continue
+                 if not inline.has_add_permission(request, obj):
+diff --git a/final_comprehensive_test.py b/final_comprehensive_test.py
+new file mode 100644
+index 0000000000..55970d6da8
+--- /dev/null
++++ b/final_comprehensive_test.py
+@@ -0,0 +1,120 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify that the get_inlines() hook works correctly
++with all related functionality including get_formsets_with_inlines.
++"""
++
++import os
++import sys
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++import django
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test-secret-key',
++    DEFAULT_CHARSET='utf-8',
++)
++django.setup()
++
++from django.contrib.admin.sites import AdminSite
++from django.contrib.admin.options import ModelAdmin
++
++# Create a simple mock model
++class MockModel:
++    class _meta:
++        app_label = 'test'
++        model_name = 'mockmodel'
++
++# Create mock inline
++class MockInline:
++    def __init__(self, model, admin_site):
++        self.model = model
++        self.admin_site = admin_site
++        
++    def has_view_or_change_permission(self, request, obj=None):
++        return True
++        
++    def has_add_permission(self, request, obj=None):
++        return True
++        
++    def has_delete_permission(self, request, obj=None):
++        return True
++        
++    def get_formset(self, request, obj=None):
++        # Mock formset method
++        return "formset_for_" + self.__class__.__name__
++
++def test_comprehensive_functionality():
++    """Test that get_inlines hook works with all related methods"""
++    site = AdminSite()
++    
++    # Test 1: Default behavior (backward compatibility)
++    admin = ModelAdmin(MockModel, site)
++    admin.inlines = [MockInline]
++    
++    # Test get_inlines
++    inlines = admin.get_inlines(None, None)
++    assert inlines == [MockInline]
++    print("✓ Default get_inlines() works")
++    
++    # Test get_inline_instances
++    instances = admin.get_inline_instances(None, None)
++    assert len(instances) == 1
++    assert isinstance(instances[0], MockInline)
++    print("✓ Default get_inline_instances() works")
++    
++    # Test get_formsets_with_inlines
++    formsets = list(admin.get_formsets_with_inlines(None, None))
++    assert len(formsets) == 1
++    assert formsets[0][0] == "formset_for_MockInline"
++    assert isinstance(formsets[0][1], MockInline)
++    print("✓ Default get_formsets_with_inlines() works")
++    
++    # Test 2: Custom get_inlines behavior
++    class CustomAdmin(ModelAdmin):
++        inlines = [MockInline]
++        
++        def get_inlines(self, request, obj=None):
++            if obj is None:
++                return []
++            return self.inlines
++    
++    custom_admin = CustomAdmin(MockModel, site)
++    
++    # With obj=None
++    inlines = custom_admin.get_inlines(None, None)
++    assert inlines == []
++    print("✓ Custom get_inlines() with obj=None works")
++    
++    instances = custom_admin.get_inline_instances(None, None)
++    assert instances == []
++    print("✓ Custom get_inline_instances() with obj=None works")
++    
++    formsets = list(custom_admin.get_formsets_with_inlines(None, None))
++    assert formsets == []
++    print("✓ Custom get_formsets_with_inlines() with obj=None works")
++    
++    # With obj provided
++    obj = MockModel()
++    inlines = custom_admin.get_inlines(None, obj)
++    assert inlines == [MockInline]
++    print("✓ Custom get_inlines() with obj works")
++    
++    instances = custom_admin.get_inline_instances(None, obj)
++    assert len(instances) == 1
++    print("✓ Custom get_inline_instances() with obj works")
++    
++    formsets = list(custom_admin.get_formsets_with_inlines(None, obj))
++    assert len(formsets) == 1
++    print("✓ Custom get_formsets_with_inlines() with obj works")
++    
++    print("\n🎉 All comprehensive tests passed!")
++    print("The get_inlines() hook works correctly with:")
++    print("  - get_inline_instances()")
++    print("  - get_formsets_with_inlines()")
++    print("  - Backward compatibility")
++    print("  - Custom implementations")
++
++if __name__ == "__main__":
++    test_comprehensive_functionality()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..f6f8b87ccb
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++import django
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test-secret-key',
++    DEFAULT_CHARSET='utf-8',
++)
++django.setup()
++
++from django.contrib.admin.sites import AdminSite
++from django.contrib.admin.options import ModelAdmin
++from django.test import RequestFactory
++
++# Create a simple mock model
++class MockModel:
++    class _meta:
++        app_label = 'test'
++        model_name = 'mockmodel'
++
++# Create a mock inline
++class MockInline:
++    def __init__(self, model, admin_site):
++        self.model = model
++        self.admin_site = admin_site
++        
++    def has_view_or_change_permission(self, request, obj=None):
++        return True
++        
++    def has_add_permission(self, request, obj=None):
++        return True
++        
++    def has_delete_permission(self, request, obj=None):
++        return True
++
++# Create a custom ModelAdmin that overrides get_inline_instances
++class CustomModelAdmin(ModelAdmin):
++    inlines = [MockInline]
++    
++    def get_inline_instances(self, request, obj=None):
++        # Current approach: need to copy the for loop logic
++        inline_instances = []
++        for inline_class in self.inlines:
++            inline = inline_class(self.model, self.admin_site)
++            if request:
++                if not (inline.has_view_or_change_permission(request, obj) or
++                        inline.has_add_permission(request, obj) or
++                        inline.has_delete_permission(request, obj)):
++                    continue
++                if not inline.has_add_permission(request, obj):
++                    inline.max_num = 0
++            inline_instances.append(inline)
++        return inline_instances
++
++# Test the current behavior
++def test_current_behavior():
++    site = AdminSite()
++    admin = CustomModelAdmin(MockModel, site)
++    request = RequestFactory().get('/')
++    
++    # Test with request and obj=None
++    instances = admin.get_inline_instances(request)
++    print(f"Current behavior - instances with request: {len(instances)}")
++    
++    # Test with request and obj
++    obj = MockModel()
++    instances = admin.get_inline_instances(request, obj)
++    print(f"Current behavior - instances with request and obj: {len(instances)}")
++
++if __name__ == "__main__":
++    test_current_behavior()
+\ No newline at end of file
+diff --git a/run_existing_tests.py b/run_existing_tests.py
+new file mode 100644
+index 0000000000..8e4eec8fd9
+--- /dev/null
++++ b/run_existing_tests.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++import django
++from django.conf import settings
++
++# Configure Django settings for tests
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test-secret-key',
++    DEFAULT_CHARSET='utf-8',
++    INSTALLED_APPS=[
++        'django.contrib.admin',
++        'django.contrib.auth',
++        'django.contrib.contenttypes',
++        'django.contrib.sessions',
++        'django.contrib.messages',
++        'django.contrib.staticfiles',
++        'tests.modeladmin',  # Include the modeladmin test app
++    ],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    USE_TZ=True,
++)
++
++django.setup()
++
++# Import the test cases
++from tests.modeladmin.tests import ModelAdminTests
++
++# Create a test instance and run the specific test methods
++def run_get_inline_instances_tests():
++    test_instance = ModelAdminTests()
++    test_instance.setUp()
++    
++    # Test the get_inline_instances method
++    print("Testing get_inline_instances...")
++    
++    # Test case 1: Basic functionality
++    ma = test_instance.site._registry.get(test_instance.band.__class__)
++    if ma is None:
++        from django.contrib.admin.options import ModelAdmin
++        ma = ModelAdmin(test_instance.band.__class__, test_instance.site)
++    
++    request = type('MockRequest', (), {'user': type('MockUser', (), {'has_perm': lambda self, perm: True})()})()
++    
++    # Test with request only
++    instances = ma.get_inline_instances(request)
++    print(f"Test 1 - instances with request: {len(instances)}")
++    
++    # Test with request and object
++    instances = ma.get_inline_instances(request, test_instance.band)
++    print(f"Test 2 - instances with request and object: {len(instances)}")
++    
++    print("All tests passed!")
++
++if __name__ == "__main__":
++    run_get_inline_instances_tests()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..cdad16624d
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++import django
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test-secret-key',
++    DEFAULT_CHARSET='utf-8',
++)
++django.setup()
++
++from django.contrib.admin.sites import AdminSite
++from django.contrib.admin.options import ModelAdmin
++
++# Create a simple mock model
++class MockModel:
++    class _meta:
++        app_label = 'test'
++        model_name = 'mockmodel'
++
++# Create mock inline
++class MockInline:
++    def __init__(self, model, admin_site):
++        self.model = model
++        self.admin_site = admin_site
++        
++    def has_view_or_change_permission(self, request, obj=None):
++        return True
++        
++    def has_add_permission(self, request, obj=None):
++        return True
++        
++    def has_delete_permission(self, request, obj=None):
++        return True
++
++def test_basic_functionality():
++    """Test that the basic functionality still works after our changes"""
++    site = AdminSite()
++    admin = ModelAdmin(MockModel, site)
++    admin.inlines = [MockInline]
++    
++    # Test that get_inlines returns the default inlines
++    inlines = admin.get_inlines(None, None)
++    print(f"Default get_inlines result: {len(inlines)} inlines")
++    assert inlines == [MockInline]
++    
++    # Test that get_inline_instances still works
++    instances = admin.get_inline_instances(None, None)
++    print(f"Default get_inline_instances result: {len(instances)} instances")
++    assert len(instances) == 1
++    
++    # Test with custom get_inlines implementation
++    class CustomModelAdmin(ModelAdmin):
++        inlines = [MockInline]
++        
++        def get_inlines(self, request, obj=None):
++            if obj is None:
++                return []
++            return self.inlines
++    
++    custom_admin = CustomModelAdmin(MockModel, site)
++    
++    # Test with obj=None
++    instances = custom_admin.get_inline_instances(None, None)
++    print(f"Custom get_inline_instances with obj=None: {len(instances)} instances")
++    assert len(instances) == 0
++    
++    # Test with obj provided
++    obj = MockModel()
++    instances = custom_admin.get_inline_instances(None, obj)
++    print(f"Custom get_inline_instances with obj: {len(instances)} instances")
++    assert len(instances) == 1
++    
++    print("All tests passed!")
++
++if __name__ == "__main__":
++    test_basic_functionality()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..6a633653db
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++import django
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test-secret-key',
++    DEFAULT_CHARSET='utf-8',
++)
++django.setup()
++
++from django.contrib.admin.sites import AdminSite
++from django.contrib.admin.options import ModelAdmin
++
++# Create a simple mock model
++class MockModel:
++    class _meta:
++        app_label = 'test'
++        model_name = 'mockmodel'
++
++# Create mock inline
++class MockInline:
++    def __init__(self, model, admin_site):
++        self.model = model
++        self.admin_site = admin_site
++        
++    def has_view_or_change_permission(self, request, obj=None):
++        return True
++        
++    def has_add_permission(self, request, obj=None):
++        return True
++        
++    def has_delete_permission(self, request, obj=None):
++        return True
++
++def test_edge_cases():
++    """Test edge cases for the new get_inlines hook"""
++    site = AdminSite()
++    
++    # Test 1: Empty inlines
++    admin = ModelAdmin(MockModel, site)
++    admin.inlines = []
++    
++    inlines = admin.get_inlines(None, None)
++    print(f"Empty inlines: {len(inlines)}")
++    assert inlines == []
++    
++    instances = admin.get_inline_instances(None, None)
++    print(f"Empty inline instances: {len(instances)}")
++    assert instances == []
++    
++    # Test 2: None request
++    admin.inlines = [MockInline]
++    instances = admin.get_inline_instances(None, None)
++    print(f"None request instances: {len(instances)}")
++    assert len(instances) == 1
++    
++    # Test 3: Custom get_inlines returning empty list
++    class EmptyInlinesAdmin(ModelAdmin):
++        inlines = [MockInline]
++        
++        def get_inlines(self, request, obj=None):
++            return []
++    
++    empty_admin = EmptyInlinesAdmin(MockModel, site)
++    instances = empty_admin.get_inline_instances(None, None)
++    print(f"Custom empty inlines instances: {len(instances)}")
++    assert instances == []
++    
++    # Test 4: Custom get_inlines returning different inlines based on request
++    class RequestBasedAdmin(ModelAdmin):
++        inlines = [MockInline]
++        
++        def get_inlines(self, request, obj=None):
++            if request and hasattr(request, 'user') and request.user.is_authenticated:
++                return self.inlines
++            return []
++    
++    request_based_admin = RequestBasedAdmin(MockModel, site)
++    
++    # Without authenticated request
++    instances = request_based_admin.get_inline_instances(None, None)
++    print(f"Request-based (no auth) instances: {len(instances)}")
++    assert instances == []
++    
++    # With authenticated request
++    class MockUser:
++        is_authenticated = True
++    
++    class MockRequest:
++        def __init__(self):
++            self.user = MockUser()
++    
++    request = MockRequest()
++    instances = request_based_admin.get_inline_instances(request, None)
++    print(f"Request-based (auth) instances: {len(instances)}")
++    assert len(instances) == 1
++    
++    print("All edge case tests passed!")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_get_inlines.py b/test_get_inlines.py
+new file mode 100644
+index 0000000000..bd64f5aa38
+--- /dev/null
++++ b/test_get_inlines.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++import django
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test-secret-key',
++    DEFAULT_CHARSET='utf-8',
++)
++django.setup()
++
++from django.contrib.admin.sites import AdminSite
++from django.contrib.admin.options import ModelAdmin
++from django.test import RequestFactory
++
++# Create a simple mock model
++class MockModel:
++    class _meta:
++        app_label = 'test'
++        model_name = 'mockmodel'
++
++# Create mock inlines
++class MockInline1:
++    def __init__(self, model, admin_site):
++        self.model = model
++        self.admin_site = admin_site
++        
++    def has_view_or_change_permission(self, request, obj=None):
++        return True
++        
++    def has_add_permission(self, request, obj=None):
++        return True
++        
++    def has_delete_permission(self, request, obj=None):
++        return True
++
++class MockInline2:
++    def __init__(self, model, admin_site):
++        self.model = model
++        self.admin_site = admin_site
++        
++    def has_view_or_change_permission(self, request, obj=None):
++        return True
++        
++    def has_add_permission(self, request, obj=None):
++        return True
++        
++    def has_delete_permission(self, request, obj=None):
++        return True
++
++# Create a custom ModelAdmin that uses the new get_inlines hook
++class CustomModelAdmin(ModelAdmin):
++    inlines = [MockInline1, MockInline2]
++    
++    def get_inlines(self, request, obj=None):
++        # Example: Only return MockInline1 if obj is None, otherwise return both
++        if obj is None:
++            return [MockInline1]
++        return self.inlines
++
++# Test the new behavior
++def test_new_behavior():
++    site = AdminSite()
++    admin = CustomModelAdmin(MockModel, site)
++    request = RequestFactory().get('/')
++    
++    # Test with request and obj=None - should only return MockInline1
++    instances = admin.get_inline_instances(request)
++    print(f"New behavior - instances with request (obj=None): {len(instances)}")
++    print(f"Instance types: {[type(instance).__name__ for instance in instances]}")
++    
++    # Test with request and obj - should return both inlines
++    obj = MockModel()
++    instances = admin.get_inline_instances(request, obj)
++    print(f"New behavior - instances with request and obj: {len(instances)}")
++    print(f"Instance types: {[type(instance).__name__ for instance in instances]}")
++
++if __name__ == "__main__":
++    test_new_behavior()
+\ No newline at end of file

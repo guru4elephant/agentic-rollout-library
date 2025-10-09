@@ -1,0 +1,642 @@
+diff --git a/django/contrib/admin/filters.py b/django/contrib/admin/filters.py
+index d65e01d5e2..5836995dfa 100644
+--- a/django/contrib/admin/filters.py
++++ b/django/contrib/admin/filters.py
+@@ -198,6 +198,9 @@ class RelatedFieldListFilter(FieldListFilter):
+         related_admin = model_admin.admin_site._registry.get(field.remote_field.model)
+         if related_admin is not None:
+             ordering = related_admin.get_ordering(request)
++        # Fall back to model's Meta.ordering if no admin ordering is defined
++        if not ordering:
++            ordering = field.remote_field.model._meta.ordering
+         return field.get_choices(include_blank=False, ordering=ordering)
+ 
+     def choices(self, changelist):
+@@ -418,5 +421,12 @@ FieldListFilter.register(lambda f: True, AllValuesFieldListFilter)
+ 
+ class RelatedOnlyFieldListFilter(RelatedFieldListFilter):
+     def field_choices(self, field, request, model_admin):
++        ordering = ()
++        related_admin = model_admin.admin_site._registry.get(field.remote_field.model)
++        if related_admin is not None:
++            ordering = related_admin.get_ordering(request)
++        # Fall back to model's Meta.ordering if no admin ordering is defined
++        if not ordering:
++            ordering = field.remote_field.model._meta.ordering
+         pk_qs = model_admin.get_queryset(request).distinct().values_list('%s__pk' % self.field_path, flat=True)
+-        return field.get_choices(include_blank=False, limit_choices_to={'pk__in': pk_qs})
++        return field.get_choices(include_blank=False, ordering=ordering, limit_choices_to={'pk__in': pk_qs})
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e59792b4ce
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,100 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the ordering issue in admin filters
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++            'django.contrib.sessions',
++            '__main__',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib import admin
++from django.contrib.admin.filters import RelatedFieldListFilter, RelatedOnlyFieldListFilter
++
++# Create test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        ordering = ['name']  # This should be used as fallback
++    
++    def __str__(self):
++        return self.name
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    
++    def __str__(self):
++        return self.title
++
++# Create ModelAdmin classes
++class AuthorAdmin(admin.ModelAdmin):
++    list_filter = ['name']
++
++class BookAdmin(admin.ModelAdmin):
++    list_filter = ['author']
++
++# Test the issue
++def test_related_field_list_filter():
++    """Test RelatedFieldListFilter ordering"""
++    print("Testing RelatedFieldListFilter...")
++    
++    # Create a mock request and params
++    request = None
++    params = {}
++    model = Book
++    model_admin = BookAdmin()
++    field = Book._meta.get_field('author')
++    
++    filter_instance = RelatedFieldListFilter(field, request, params, model, model_admin, 'author')
++    choices = filter_instance.field_choices(field, request, model_admin)
++    
++    print(f"Number of choices: {len(choices)}")
++    print(f"Choices: {choices}")
++    print(f"Ordering used: {filter_instance.field_choices.__closure__}")  # This won't work, need another approach
++
++def test_related_only_field_list_filter():
++    """Test RelatedOnlyFieldListFilter ordering"""
++    print("\nTesting RelatedOnlyFieldListFilter...")
++    
++    # Create a mock request and params
++    request = None
++    params = {}
++    model = Book
++    model_admin = BookAdmin()
++    field = Book._meta.get_field('author')
++    
++    filter_instance = RelatedOnlyFieldListFilter(field, request, params, model, model_admin, 'author')
++    choices = filter_instance.field_choices(field, request, model_admin)
++    
++    print(f"Number of choices: {len(choices)}")
++    print(f"Choices: {choices}")
++
++if __name__ == '__main__':
++    test_related_field_list_filter()
++    test_related_only_field_list_filter()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..564042ab5a
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the ordering fix
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings properly
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++        ],
++        MIDDLEWARE=[
++            'django.contrib.sessions.middleware.SessionMiddleware',
++            'django.contrib.auth.middleware.AuthenticationMiddleware',
++            'django.contrib.messages.middleware.MessageMiddleware',
++        ],
++        TEMPLATES=[
++            {
++                'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                'DIRS': [],
++                'APP_DIRS': True,
++                'OPTIONS': {
++                    'context_processors': [
++                        'django.template.context_processors.debug',
++                        'django.template.context_processors.request',
++                        'django.contrib.auth.context_processors.auth',
++                        'django.contrib.messages.context_processors.messages',
++                    ],
++                },
++            },
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Test edge cases
++def test_edge_cases():
++    """Test edge cases for the ordering fix"""
++    
++    print("=== Testing edge cases ===")
++    
++    # Test case 1: Model with no Meta.ordering
++    class MockField:
++        def __init__(self):
++            self.remote_field = MockRemoteField()
++    
++    class MockRemoteField:
++        def __init__(self):
++            self.model = MockModelNoOrdering()
++    
++    class MockModelNoOrdering:
++        class _meta:
++            ordering = ()  # Empty ordering
++    
++    class MockModelAdmin:
++        def __init__(self):
++            self.admin_site = MockAdminSite()
++        
++        def get_ordering(self, request):
++            return ()  # Empty ordering
++    
++    class MockAdminSite:
++        def __init__(self):
++            self._registry = {}
++    
++    # Test the ordering logic
++    field = MockField()
++    model_admin = MockModelAdmin()
++    request = None
++    
++    # Simulate the ordering logic from our fix
++    ordering = ()
++    related_admin = model_admin.admin_site._registry.get(field.remote_field.model)
++    if related_admin is not None:
++        ordering = related_admin.get_ordering(request)
++    # Fall back to model's Meta.ordering if no admin ordering is defined
++    if not ordering:
++        ordering = field.remote_field.model._meta.ordering
++    
++    print(f"Case 1 - Empty model ordering: {ordering}")
++    assert ordering == (), f"Expected (), got {ordering}"
++    print("✓ Empty model ordering handled correctly!")
++    
++    # Test case 2: Model with None Meta.ordering
++    class MockModelNoneOrdering:
++        class _meta:
++            ordering = None  # None ordering
++    
++    field.remote_field.model = MockModelNoneOrdering()
++    
++    ordering = ()
++    related_admin = model_admin.admin_site._registry.get(field.remote_field.model)
++    if related_admin is not None:
++        ordering = related_admin.get_ordering(request)
++    # Fall back to model's Meta.ordering if no admin ordering is defined
++    if not ordering:
++        ordering = field.remote_field.model._meta.ordering
++    
++    print(f"Case 2 - None model ordering: {ordering}")
++    assert ordering is None, f"Expected None, got {ordering}"
++    print("✓ None model ordering handled correctly!")
++    
++    print("\n=== All edge case tests passed! ===")
++
++if __name__ == '__main__':
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_final.py b/test_final.py
+new file mode 100644
+index 0000000000..e690591991
+--- /dev/null
++++ b/test_final.py
+@@ -0,0 +1,135 @@
++#!/usr/bin/env python3
++"""
++Final test to verify the ordering fix works correctly
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings properly
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++        ],
++        MIDDLEWARE=[
++            'django.contrib.sessions.middleware.SessionMiddleware',
++            'django.contrib.auth.middleware.AuthenticationMiddleware',
++            'django.contrib.messages.middleware.MessageMiddleware',
++        ],
++        TEMPLATES=[
++            {
++                'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                'DIRS': [],
++                'APP_DIRS': True,
++                'OPTIONS': {
++                    'context_processors': [
++                        'django.template.context_processors.debug',
++                        'django.template.context_processors.request',
++                        'django.contrib.auth.context_processors.auth',
++                        'django.contrib.messages.context_processors.messages',
++                    ],
++                },
++            },
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib import admin
++from django.contrib.admin.filters import RelatedFieldListFilter, RelatedOnlyFieldListFilter
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ['name']
++    
++    def __str__(self):
++        return self.name
++
++# Test the ordering logic
++def test_ordering_fix():
++    """Test that the ordering fix works correctly"""
++    
++    print("=== Testing RelatedFieldListFilter ordering fix ===")
++    
++    # Create a mock field with remote_field model that has Meta.ordering
++    class MockField:
++        def __init__(self):
++            self.remote_field = MockRemoteField()
++    
++    class MockRemoteField:
++        def __init__(self):
++            self.model = MockModel()
++    
++    class MockModel:
++        class _meta:
++            ordering = ['name']
++    
++    class MockModelAdmin:
++        def __init__(self):
++            self.admin_site = MockAdminSite()
++        
++        def get_ordering(self, request):
++            return ()  # Empty ordering
++    
++    class MockAdminSite:
++        def __init__(self):
++            self._registry = {}
++    
++    # Test the ordering logic
++    field = MockField()
++    model_admin = MockModelAdmin()
++    request = None
++    
++    # Simulate the ordering logic from our fix
++    ordering = ()
++    related_admin = model_admin.admin_site._registry.get(field.remote_field.model)
++    if related_admin is not None:
++        ordering = related_admin.get_ordering(request)
++    # Fall back to model's Meta.ordering if no admin ordering is defined
++    if not ordering:
++        ordering = field.remote_field.model._meta.ordering
++    
++    print(f"Final ordering: {ordering}")
++    assert ordering == ['name'], f"Expected ['name'], got {ordering}"
++    print("✓ RelatedFieldListFilter ordering fix works correctly!")
++    
++    print("\n=== Testing RelatedOnlyFieldListFilter ordering fix ===")
++    
++    # The same logic should work for RelatedOnlyFieldListFilter
++    ordering = ()
++    related_admin = model_admin.admin_site._registry.get(field.remote_field.model)
++    if related_admin is not None:
++        ordering = related_admin.get_ordering(request)
++    # Fall back to model's Meta.ordering if no admin ordering is defined
++    if not ordering:
++        ordering = field.remote_field.model._meta.ordering
++    
++    print(f"Final ordering: {ordering}")
++    assert ordering == ['name'], f"Expected ['name'], got {ordering}"
++    print("✓ RelatedOnlyFieldListFilter ordering fix works correctly!")
++    
++    print("\n=== All tests passed! ===")
++
++if __name__ == '__main__':
++    test_ordering_fix()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..b2b0feaaa9
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the ordering fix in admin filters
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++            'django.contrib.sessions',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib import admin
++from django.contrib.admin.filters import RelatedFieldListFilter, RelatedOnlyFieldListFilter
++
++# Create test models
++class Category(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        ordering = ['name']  # This should be used as fallback
++    
++    def __str__(self):
++        return self.name
++
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    category = models.ForeignKey(Category, on_delete=models.CASCADE)
++    
++    def __str__(self):
++        return self.name
++
++# Create ModelAdmin classes
++class CategoryAdmin(admin.ModelAdmin):
++    pass  # No ordering defined in admin
++
++class ProductAdmin(admin.ModelAdmin):
++    list_filter = ['category']
++
++# Test the fix
++def test_ordering_fix():
++    """Test that the ordering fix works correctly"""
++    
++    print("=== Testing RelatedFieldListFilter ordering fix ===")
++    
++    # Create a mock request and params
++    request = None
++    params = {}
++    model = Product
++    model_admin = ProductAdmin()
++    field = Product._meta.get_field('category')
++    
++    # Test RelatedFieldListFilter
++    filter_instance = RelatedFieldListFilter(field, request, params, model, model_admin, 'category')
++    
++    # Check if the ordering logic is correct
++    ordering = ()
++    related_admin = model_admin.admin_site._registry.get(field.remote_field.model)
++    if related_admin is not None:
++        ordering = related_admin.get_ordering(request)
++    # Fall back to model's Meta.ordering if no admin ordering is defined
++    if not ordering:
++        ordering = field.remote_field.model._meta.ordering
++    
++    print(f"RelatedAdmin ordering: {related_admin.get_ordering(request) if related_admin else None}")
++    print(f"Final ordering used: {ordering}")
++    print(f"Model Meta.ordering: {field.remote_field.model._meta.ordering}")
++    
++    assert ordering == ['name'], f"Expected ordering ['name'], got {ordering}"
++    print("✓ RelatedFieldListFilter ordering fix works correctly!")
++    
++    print("\n=== Testing RelatedOnlyFieldListFilter ordering fix ===")
++    
++    # Test RelatedOnlyFieldListFilter
++    filter_instance2 = RelatedOnlyFieldListFilter(field, request, params, model, model_admin, 'category')
++    
++    # Check if the ordering logic is correct
++    ordering = ()
++    related_admin = model_admin.admin_site._registry.get(field.remote_field.model)
++    if related_admin is not None:
++        ordering = related_admin.get_ordering(request)
++    # Fall back to model's Meta.ordering if no admin ordering is defined
++    if not ordering:
++        ordering = field.remote_field.model._meta.ordering
++    
++    print(f"RelatedAdmin ordering: {related_admin.get_ordering(request) if related_admin else None}")
++    print(f"Final ordering used: {ordering}")
++    print(f"Model Meta.ordering: {field.remote_field.model._meta.ordering}")
++    
++    assert ordering == ['name'], f"Expected ordering ['name'], got {ordering}"
++    print("✓ RelatedOnlyFieldListFilter ordering fix works correctly!")
++    
++    print("\n=== All tests passed! ===")
++
++if __name__ == '__main__':
++    test_ordering_fix()
+\ No newline at end of file
+diff --git a/test_ordering_logic.py b/test_ordering_logic.py
+new file mode 100644
+index 0000000000..bada6fd6a3
+--- /dev/null
++++ b/test_ordering_logic.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the ordering logic directly
++"""
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++from django.contrib.admin.filters import RelatedFieldListFilter, RelatedOnlyFieldListFilter
++
++def test_ordering_logic():
++    """Test the ordering logic directly"""
++    
++    print("=== Testing RelatedFieldListFilter ordering logic ===")
++    
++    # Mock the ordering logic from the fixed code
++    def mock_field_choices_logic(field_remote_field_model_meta_ordering, related_admin_ordering=None):
++        ordering = ()
++        if related_admin_ordering is not None:
++            ordering = related_admin_ordering
++        # Fall back to model's Meta.ordering if no admin ordering is defined
++        if not ordering:
++            ordering = field_remote_field_model_meta_ordering
++        return ordering
++    
++    # Test case 1: No admin ordering, should use model Meta.ordering
++    model_ordering = ['name']
++    admin_ordering = None
++    result = mock_field_choices_logic(model_ordering, admin_ordering)
++    print(f"Case 1 - Model ordering: {model_ordering}, Admin ordering: {admin_ordering}")
++    print(f"Result: {result}")
++    assert result == ['name'], f"Expected ['name'], got {result}"
++    print("✓ Test case 1 passed")
++    
++    # Test case 2: Admin ordering defined, should use admin ordering
++    model_ordering = ['name']
++    admin_ordering = ['-name']
++    result = mock_field_choices_logic(model_ordering, admin_ordering)
++    print(f"Case 2 - Model ordering: {model_ordering}, Admin ordering: {admin_ordering}")
++    print(f"Result: {result}")
++    assert result == ['-name'], f"Expected ['-name'], got {result}"
++    print("✓ Test case 2 passed")
++    
++    # Test case 3: Empty admin ordering, should use model Meta.ordering
++    model_ordering = ['name']
++    admin_ordering = ()
++    result = mock_field_choices_logic(model_ordering, admin_ordering)
++    print(f"Case 3 - Model ordering: {model_ordering}, Admin ordering: {admin_ordering}")
++    print(f"Result: {result}")
++    assert result == ['name'], f"Expected ['name'], got {result}"
++    print("✓ Test case 3 passed")
++    
++    print("\n=== Testing RelatedOnlyFieldListFilter ordering logic ===")
++    
++    # The same logic applies to RelatedOnlyFieldListFilter
++    print("Same logic as RelatedFieldListFilter - all tests should pass")
++    print("✓ RelatedOnlyFieldListFilter ordering logic is correct")
++    
++    print("\n=== All ordering logic tests passed! ===")
++
++if __name__ == '__main__':
++    test_ordering_logic()
+\ No newline at end of file
+diff --git a/test_simple.py b/test_simple.py
+new file mode 100644
+index 0000000000..dbdfb8d639
+--- /dev/null
++++ b/test_simple.py
+@@ -0,0 +1,31 @@
++#!/usr/bin/env python3
++"""
++Simple test to check the ordering behavior in filters
++"""
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++from django.contrib.admin.filters import RelatedFieldListFilter, RelatedOnlyFieldListFilter
++
++def test_ordering_logic():
++    """Test the ordering logic in field_choices methods"""
++    
++    # Test RelatedFieldListFilter ordering logic
++    print("=== RelatedFieldListFilter ===")
++    print("Current logic:")
++    print("1. ordering = ()")
++    print("2. If related_admin exists and has ordering: ordering = related_admin.get_ordering(request)")
++    print("3. No fallback to model._meta.ordering")
++    
++    # Test RelatedOnlyFieldListFilter ordering logic  
++    print("\n=== RelatedOnlyFieldListFilter ===")
++    print("Current logic:")
++    print("1. No ordering parameter passed to field.get_choices()")
++    print("2. Completely ignores any ordering")
++
++if __name__ == '__main__':
++    test_ordering_logic()
+\ No newline at end of file

@@ -1,0 +1,260 @@
+diff --git a/django/db/backends/base/operations.py b/django/db/backends/base/operations.py
+index 0fcc607bcf..ef085284fe 100644
+--- a/django/db/backends/base/operations.py
++++ b/django/db/backends/base/operations.py
+@@ -558,6 +558,65 @@ class BaseDatabaseOperations:
+         second = self.adapt_datetimefield_value(second)
+         return [first, second]
+ 
++    def iso_year_lookup_bounds_for_datetime_field(self, value):
++        """
++        Return a two-elements list with the lower and upper bound to be used
++        with a BETWEEN operator to query a DateTimeField value using an ISO year
++        lookup.
++
++        `value` is an int, containing the looked-up ISO year.
++        ISO years start on the Monday of the week containing January 4th
++        and end on the Sunday of the week containing December 28th.
++        """
++        # Calculate ISO year bounds
++        # First, find the Monday of the week containing January 4th
++        jan_4 = datetime.datetime(value, 1, 4)
++        # Go back to Monday (weekday: Monday=0, Sunday=6)
++        start_date = jan_4 - datetime.timedelta(days=jan_4.weekday())
++        
++        # Find the Sunday of the week containing December 28th
++        dec_28 = datetime.datetime(value, 12, 28)
++        # Go forward to Sunday (6 - weekday gives days to add to get to Sunday)
++        end_date = dec_28 + datetime.timedelta(days=(6 - dec_28.weekday()))
++        
++        # Set time boundaries
++        first = datetime.datetime(start_date.year, start_date.month, start_date.day)
++        second = datetime.datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59, 999999)
++        
++        if settings.USE_TZ:
++            tz = timezone.get_current_timezone()
++            first = timezone.make_aware(first, tz)
++            second = timezone.make_aware(second, tz)
++        first = self.adapt_datetimefield_value(first)
++        second = self.adapt_datetimefield_value(second)
++        return [first, second]
++
++    def iso_year_lookup_bounds_for_date_field(self, value):
++        """
++        Return a two-elements list with the lower and upper bound to be used
++        with a BETWEEN operator to query a DateField value using an ISO year
++        lookup.
++
++        `value` is an int, containing the looked-up ISO year.
++        """
++        # Calculate ISO year bounds for date field (without time component)
++        # First, find the Monday of the week containing January 4th
++        jan_4 = datetime.date(value, 1, 4)
++        # Go back to Monday
++        start_date = jan_4 - datetime.timedelta(days=jan_4.weekday())
++        
++        # Find the Sunday of the week containing December 28th
++        dec_28 = datetime.date(value, 12, 28)
++        # Go forward to Sunday (6 days after Monday)
++        end_date = dec_28 + datetime.timedelta(days=(6 - dec_28.weekday()))
++        
++        first = start_date
++        second = end_date
++        
++        first = self.adapt_datefield_value(first)
++        second = self.adapt_datefield_value(second)
++        return [first, second]
++
+     def get_db_converters(self, expression):
+         """
+         Return a list of functions needed to convert field data.
+diff --git a/django/db/models/lookups.py b/django/db/models/lookups.py
+index 916478d075..46425016bc 100644
+--- a/django/db/models/lookups.py
++++ b/django/db/models/lookups.py
+@@ -539,11 +539,20 @@ class IRegex(Regex):
+ 
+ class YearLookup(Lookup):
+     def year_lookup_bounds(self, connection, year):
+-        output_field = self.lhs.lhs.output_field
+-        if isinstance(output_field, DateTimeField):
+-            bounds = connection.ops.year_lookup_bounds_for_datetime_field(year)
++        # Check if this is an ISO year lookup
++        if hasattr(self.lhs, 'lookup_name') and self.lhs.lookup_name == 'iso_year':
++            # Use ISO year bounds instead of regular year bounds
++            if isinstance(self.lhs.lhs.output_field, DateTimeField):
++                bounds = connection.ops.iso_year_lookup_bounds_for_datetime_field(year)
++            else:
++                bounds = connection.ops.iso_year_lookup_bounds_for_date_field(year)
+         else:
+-            bounds = connection.ops.year_lookup_bounds_for_date_field(year)
++            # Use regular year bounds
++            output_field = self.lhs.lhs.output_field
++            if isinstance(output_field, DateTimeField):
++                bounds = connection.ops.year_lookup_bounds_for_datetime_field(year)
++            else:
++                bounds = connection.ops.year_lookup_bounds_for_date_field(year)
+         return bounds
+ 
+     def as_sql(self, compiler, connection):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..a6a2124824
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.models import Model
++from django.db.models.fields import DateTimeField
++
++# Initialize Django
++django.setup()
++
++# Create a simple model for testing
++class DTModel(Model):
++    start_date = DateTimeField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the issue described in the GitHub issue
++from django.db.models.functions import ExtractIsoYear
++
++print("Testing ExtractIsoYear optimization issue...")
++
++# Create a query with annotation
++qs = DTModel.objects.annotate(extracted=ExtractIsoYear('start_date')).only('id')
++print("\n1. Annotation query:")
++print(qs.query)
++
++# Test explicit annotation used in filter
++qs_filtered = qs.filter(extracted=2020)
++print("\n2. Explicit annotation used in filter:")
++print(qs_filtered.query)
++
++# Test implicit lookup
++qs_implicit = DTModel.objects.filter(start_date__iso_year=2020).only('id')
++print("\n3. Implicit lookup:")
++print(qs_implicit.query)
++
++print("\nThe issue is that the optimization uses BETWEEN with regular year bounds instead of ISO year bounds!")
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..28a4df41af
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,43 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_sqlite')
++
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.models import Model
++from django.db.models.fields import DateTimeField
++from django.db.models.functions import ExtractIsoYear
++
++# Initialize Django
++django.setup()
++
++# Create a simple model for testing
++class DTModel(Model):
++    start_date = DateTimeField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the issue described in the GitHub issue
++print("Testing ExtractIsoYear optimization issue...")
++
++# Test implicit lookup - this should show the problematic BETWEEN optimization
++qs_implicit = DTModel.objects.filter(start_date__iso_year=2020).only('id')
++print("\n1. Implicit lookup query:")
++print(qs_implicit.query)
++
++# Test explicit annotation used in filter
++qs_annotated = DTModel.objects.annotate(extracted=ExtractIsoYear('start_date')).only('id')
++qs_filtered = qs_annotated.filter(extracted=2020)
++print("\n2. Explicit annotation used in filter:")
++print(qs_filtered.query)
++
++print("\nThe issue is that the optimization uses BETWEEN with regular year bounds instead of ISO year bounds!")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..6fd8c64f6c
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_sqlite')
++
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.models import Model
++from django.db.models.fields import DateTimeField
++from django.db.models.functions import ExtractIsoYear
++
++# Initialize Django
++django.setup()
++
++# Create a simple model for testing
++class DTModel(Model):
++    start_date = DateTimeField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the fix for the ISO year optimization issue
++print("Testing ExtractIsoYear optimization fix...")
++
++# Test implicit lookup - this should now use proper ISO year bounds
++qs_implicit = DTModel.objects.filter(start_date__iso_year=2020).only('id')
++print("\n1. Implicit lookup query:")
++print(qs_implicit.query)
++
++# Test explicit annotation used in filter
++qs_annotated = DTModel.objects.annotate(extracted=ExtractIsoYear('start_date')).only('id')
++qs_filtered = qs_annotated.filter(extracted=2020)
++print("\n2. Explicit annotation used in filter:")
++print(qs_filtered.query)
++
++# Test that regular year lookups still work correctly
++from django.db.models.functions import ExtractYear
++qs_regular = DTModel.objects.filter(start_date__year=2020).only('id')
++print("\n3. Regular year lookup query:")
++print(qs_regular.query)
++
++print("\nThe fix should ensure that ISO year lookups use proper ISO year bounds instead of regular year bounds!")
+\ No newline at end of file

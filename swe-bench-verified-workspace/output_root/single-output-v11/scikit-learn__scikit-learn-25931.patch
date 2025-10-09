@@ -1,0 +1,190 @@
+diff --git a/debug_feature_names.py b/debug_feature_names.py
+new file mode 100644
+index 000000000..17388fd32
+--- /dev/null
++++ b/debug_feature_names.py
+@@ -0,0 +1,17 @@
++from sklearn.ensemble import IsolationForest
++import pandas as pd
++
++X = pd.DataFrame({"a": [-1.1, 0.3, 0.5, 100]})
++clf = IsolationForest(random_state=0, contamination=0.05)
++
++# Let's check what happens during fit
++print("Before fit:")
++print(f"hasattr feature_names_in_: {hasattr(clf, 'feature_names_in_')}")
++
++# Fit the model
++clf.fit(X)
++
++print("After fit:")
++print(f"hasattr feature_names_in_: {hasattr(clf, 'feature_names_in_')}")
++if hasattr(clf, 'feature_names_in_'):
++    print(f"feature_names_in_: {clf.feature_names_in_}")
+\ No newline at end of file
+diff --git a/debug_fit_process.py b/debug_fit_process.py
+new file mode 100644
+index 000000000..0f3c58530
+--- /dev/null
++++ b/debug_fit_process.py
+@@ -0,0 +1,31 @@
++from sklearn.ensemble import IsolationForest
++import pandas as pd
++import numpy as np
++
++# Let's patch the _check_feature_names method to see what's happening
++from sklearn.base import BaseEstimator
++
++original_check_feature_names = BaseEstimator._check_feature_names
++
++def debug_check_feature_names(self, X, *, reset):
++    print(f"\n_check_feature_names called:")
++    print(f"  reset: {reset}")
++    print(f"  X type: {type(X)}")
++    if hasattr(X, 'columns'):
++        print(f"  X columns: {X.columns.tolist()}")
++    print(f"  hasattr self.feature_names_in_: {hasattr(self, 'feature_names_in_')}")
++    if hasattr(self, 'feature_names_in_'):
++        print(f"  self.feature_names_in_: {self.feature_names_in_}")
++    
++    # Call the original method
++    return original_check_feature_names(self, X, reset=reset)
++
++# Monkey patch for debugging
++BaseEstimator._check_feature_names = debug_check_feature_names
++
++X = pd.DataFrame({"a": [-1.1, 0.3, 0.5, 100]})
++clf = IsolationForest(random_state=0, contamination=0.05)
++clf.fit(X)
++
++# Restore original method
++BaseEstimator._check_feature_names = original_check_feature_names
+\ No newline at end of file
+diff --git a/debug_timing.py b/debug_timing.py
+new file mode 100644
+index 000000000..2259fb46d
+--- /dev/null
++++ b/debug_timing.py
+@@ -0,0 +1,16 @@
++from sklearn.ensemble import IsolationForest
++import pandas as pd
++import warnings
++
++X = pd.DataFrame({"a": [-1.1, 0.3, 0.5, 100]})
++clf = IsolationForest(random_state=0, contamination=0.05)
++
++# Capture warnings to see exactly when they occur
++with warnings.catch_warnings(record=True) as w:
++    warnings.simplefilter("always")
++    clf.fit(X)
++    print(f"Number of warnings: {len(w)}")
++    for warning in w:
++        print(f"Warning: {warning.message}")
++        print(f"Line: {warning.lineno}")
++        print(f"File: {warning.filename}")
+\ No newline at end of file
+diff --git a/debug_validate_data.py b/debug_validate_data.py
+new file mode 100644
+index 000000000..ad4268134
+--- /dev/null
++++ b/debug_validate_data.py
+@@ -0,0 +1,24 @@
++from sklearn.ensemble import IsolationForest
++import pandas as pd
++import numpy as np
++
++X = pd.DataFrame({"a": [-1.1, 0.3, 0.5, 100]})
++clf = IsolationForest(random_state=0, contamination=0.05)
++
++# Let's manually trace what happens in _validate_data
++print("Original X type:", type(X))
++print("Original X columns:", X.columns)
++print("Original X feature names:", X.columns.tolist())
++
++# Simulate what happens in the first _validate_data call
++X_validated = clf._validate_data(X, accept_sparse=["csc"], dtype=np.float32)
++print("After first _validate_data:")
++print("X_validated type:", type(X_validated))
++print("hasattr feature_names_in_:", hasattr(clf, 'feature_names_in_'))
++if hasattr(clf, 'feature_names_in_'):
++    print("feature_names_in_:", clf.feature_names_in_)
++
++# Now simulate what happens in score_samples
++print("\nSimulating score_samples call:")
++score = clf.score_samples(X)
++print("Score computed successfully")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..1e7eb0074
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,5 @@
++from sklearn.ensemble import IsolationForest
++import pandas as pd
++
++X = pd.DataFrame({"a": [-1.1, 0.3, 0.5, 100]})
++clf = IsolationForest(random_state=0, contamination=0.05).fit(X)
+\ No newline at end of file
+diff --git a/sklearn/ensemble/_iforest.py b/sklearn/ensemble/_iforest.py
+index 4d6c1c3f0..d8187d186 100644
+--- a/sklearn/ensemble/_iforest.py
++++ b/sklearn/ensemble/_iforest.py
+@@ -345,7 +345,31 @@ class IsolationForest(OutlierMixin, BaseBagging):
+             return self
+ 
+         # else, define offset_ wrt contamination parameter
+-        self.offset_ = np.percentile(self.score_samples(X), 100.0 * self.contamination)
++        # Compute scores directly to avoid feature names validation during fit
++        n_samples = X.shape[0]
++        depths = np.zeros(n_samples, order="f")
++        
++        average_path_length_max_samples = _average_path_length([self._max_samples])
++        
++        for tree_idx, (tree, features) in enumerate(
++            zip(self.estimators_, self.estimators_features_)
++        ):
++            leaves_index = tree.apply(X[:, features], check_input=False)
++            depths += (
++                self._decision_path_lengths[tree_idx][leaves_index]
++                + self._average_path_length_per_tree[tree_idx][leaves_index]
++                - 1.0
++            )
++        
++        denominator = len(self.estimators_) * average_path_length_max_samples
++        scores = 2 ** (
++            # For a single training sample, denominator and depth are 0.
++            # Therefore, we set the score manually to 1.
++            -np.divide(
++                depths, denominator, out=np.ones_like(depths), where=denominator != 0
++            )
++        )
++        self.offset_ = np.percentile(-scores, 100.0 * self.contamination)
+ 
+         return self
+ 
+diff --git a/test_default_contamination.py b/test_default_contamination.py
+new file mode 100644
+index 000000000..b0f01e825
+--- /dev/null
++++ b/test_default_contamination.py
+@@ -0,0 +1,18 @@
++from sklearn.ensemble import IsolationForest
++import pandas as pd
++
++# Test with default contamination ("auto")
++X = pd.DataFrame({"a": [-1.1, 0.3, 0.5, 100]})
++clf = IsolationForest(random_state=0).fit(X)
++print("Default contamination test passed")
++
++# Test with contamination as float
++X = pd.DataFrame({"a": [-1.1, 0.3, 0.5, 100]})
++clf = IsolationForest(random_state=0, contamination=0.05).fit(X)
++print("Float contamination test passed")
++
++# Test with numpy array (should not have feature names)
++import numpy as np
++X_np = np.array([[-1.1], [0.3], [0.5], [100]])
++clf = IsolationForest(random_state=0, contamination=0.05).fit(X_np)
++print("Numpy array test passed")
+\ No newline at end of file

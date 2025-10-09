@@ -1,0 +1,259 @@
+diff --git a/django/contrib/auth/backends.py b/django/contrib/auth/backends.py
+index f4b1722757..a3765ae0f1 100644
+--- a/django/contrib/auth/backends.py
++++ b/django/contrib/auth/backends.py
+@@ -39,6 +39,8 @@ class ModelBackend(BaseBackend):
+     def authenticate(self, request, username=None, password=None, **kwargs):
+         if username is None:
+             username = kwargs.get(UserModel.USERNAME_FIELD)
++        if username is None or password is None:
++            return
+         try:
+             user = UserModel._default_manager.get_by_natural_key(username)
+         except UserModel.DoesNotExist:
+diff --git a/edge_case_test.py b/edge_case_test.py
+new file mode 100644
+index 0000000000..0f98102b23
+--- /dev/null
++++ b/edge_case_test.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the ModelBackend.authenticate() fix
++"""
++
++# Let's simulate the logic without importing Django
++def simulate_authenticate(username=None, password=None, **kwargs):
++    """
++    Simulate the fixed ModelBackend.authenticate() logic
++    """
++    USERNAME_FIELD = 'username'  # Simulate UserModel.USERNAME_FIELD
++    
++    print(f"Input: username={repr(username)}, password={repr(password)}, kwargs={kwargs}")
++    
++    # Step 1: Get username from kwargs if it's None
++    if username is None:
++        username = kwargs.get(USERNAME_FIELD)
++        print(f"After getting from kwargs: username={repr(username)}")
++    
++    # Step 2: Early return condition (the fix)
++    if username is None or password is None:
++        print("EARLY RETURN: username or password is None")
++        return None
++    
++    # Step 3: Normal authentication flow
++    print("PROCEEDING WITH AUTHENTICATION")
++    # Simulate database query and password checking
++    return "user_object"  # Simulate successful authentication
++
++# Test cases
++test_cases = [
++    # Main issue: both username and password are None
++    ("Both None", None, None, {}),
++    
++    # Edge case: username None but in kwargs
++    ("Username in kwargs", None, "password", {"username": "testuser"}),
++    
++    # Edge case: empty string username
++    ("Empty username", "", "password", {}),
++    
++    # Edge case: empty string password  
++    ("Empty password", "testuser", "", {}),
++    
++    # Normal case
++    ("Normal", "testuser", "password", {}),
++    
++    # Edge case: username None, not in kwargs
++    ("Username None, not in kwargs", None, "password", {}),
++]
++
++for name, username, password, kwargs in test_cases:
++    print(f"\n=== {name} ===")
++    result = simulate_authenticate(username, password, **kwargs)
++    print(f"Result: {result}")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..d7f27d9b98
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where ModelBackend.authenticate() 
++makes unnecessary database queries when username is None
++"""
++
++# Let's directly examine the authenticate method logic
++def simulate_authenticate(username=None, password=None, **kwargs):
++    """
++    Simulate the ModelBackend.authenticate() method logic
++    """
++    from django.contrib.auth import get_user_model
++    UserModel = get_user_model()
++    
++    print(f"Input - username: {repr(username)}, password: {repr(password)}, kwargs: {kwargs}")
++    
++    # Step 1: Check if username is None and try to get from kwargs
++    if username is None:
++        username = kwargs.get(UserModel.USERNAME_FIELD)
++        print(f"After getting from kwargs - username: {repr(username)}")
++    
++    # Step 2: Check if we should proceed with authentication
++    print(f"About to make database query with username: {repr(username)}")
++    
++    # Step 3: This is where the database query would happen
++    if username is None:
++        print("PROBLEM: Making database query with username=None!")
++        # Simulate the database query that would happen
++        print("Simulating: UserModel._default_manager.get_by_natural_key(None)")
++        print("This would attempt to query database with username IS NULL")
++        return None
++    else:
++        print("No issue: Username is not None, proceeding with normal authentication")
++        return None
++
++if __name__ == "__main__":
++    print("=== Testing authenticate with username=None, password=None ===")
++    simulate_authenticate(username=None, password=None)
++    
++    print("\n=== Testing authenticate with username='test', password='pass' ===")
++    simulate_authenticate(username='test', password='pass')
++    
++    print("\n=== Testing authenticate with only kwargs (like other backends) ===")
++    simulate_authenticate(username=None, password=None, email='test@example.com')
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..7426e4a48e
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the fix for ModelBackend.authenticate()
++"""
++
++import django
++from django.conf import settings
++
++# Configure minimal Django settings without database
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++
++def test_early_return():
++    """Test that authenticate returns early when username or password is None"""
++    backend = ModelBackend()
++    
++    # Mock the database method to track if it's called
++    original_method = backend.UserModel._default_manager.get_by_natural_key
++    db_called = False
++    
++    def mock_get_by_natural_key(username):
++        nonlocal db_called
++        db_called = True
++        print(f"Database query attempted with username: {repr(username)}")
++        # Simulate user not found
++        from django.contrib.auth.models import User
++        raise User.DoesNotExist()
++    
++    # Replace the method temporarily
++    backend.UserModel._default_manager.get_by_natural_key = mock_get_by_natural_key
++    
++    try:
++        # Test cases that should NOT call the database
++        test_cases = [
++            (None, None),
++            (None, 'password'),
++            ('username', None),
++        ]
++        
++        for i, (username, password) in enumerate(test_cases, 1):
++            db_called = False
++            result = backend.authenticate(None, username=username, password=password)
++            print(f"Test {i}: username={repr(username)}, password={repr(password)} -> result={result}, db_called={db_called}")
++            
++            if db_called:
++                print(f"  FAIL: Database was called when it shouldn't be!")
++                return False
++            else:
++                print(f"  PASS: No database query was made")
++        
++        print("\nAll tests passed! The fix is working correctly.")
++        return True
++        
++    finally:
++        # Restore original method
++        backend.UserModel._default_manager.get_by_natural_key = original_method
++
++if __name__ == "__main__":
++    test_early_return()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..70a531a34f
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for ModelBackend.authenticate()
++"""
++
++import django
++from django.conf import settings
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        AUTH_USER_MODEL='auth.User',
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++
++def test_authenticate_none_username_password():
++    """Test that authenticate returns None when username and password are None"""
++    backend = ModelBackend()
++    
++    # Test case 1: Both username and password are None
++    result1 = backend.authenticate(None, username=None, password=None)
++    print(f"Test 1 - username=None, password=None: result={result1}")
++    assert result1 is None, "Should return None when both username and password are None"
++    
++    # Test case 2: Username is None but password is provided
++    result2 = backend.authenticate(None, username=None, password='testpass')
++    print(f"Test 2 - username=None, password='testpass': result={result2}")
++    assert result2 is None, "Should return None when username is None"
++    
++    # Test case 3: Password is None but username is provided
++    result3 = backend.authenticate(None, username='testuser', password=None)
++    print(f"Test 3 - username='testuser', password=None: result={result3}")
++    assert result3 is None, "Should return None when password is None"
++    
++    # Test case 4: Both username and password are provided (normal case)
++    result4 = backend.authenticate(None, username='testuser', password='testpass')
++    print(f"Test 4 - username='testuser', password='testpass': result={result4}")
++    # This should attempt authentication but return None since user doesn't exist
++    
++    print("All tests passed!")
++
++if __name__ == "__main__":
++    test_authenticate_none_username_password()
+\ No newline at end of file

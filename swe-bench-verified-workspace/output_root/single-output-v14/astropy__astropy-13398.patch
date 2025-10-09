@@ -1,0 +1,432 @@
+diff --git a/astropy/coordinates/builtin_frames/intermediate_rotation_transforms.py b/astropy/coordinates/builtin_frames/intermediate_rotation_transforms.py
+index a15248c38d..ce4aef2680 100644
+--- a/astropy/coordinates/builtin_frames/intermediate_rotation_transforms.py
++++ b/astropy/coordinates/builtin_frames/intermediate_rotation_transforms.py
+@@ -8,20 +8,110 @@ rotations without aberration corrections or offsets.
+ import numpy as np
+ import erfa
+ 
++from astropy import units as u
+ from astropy.coordinates.baseframe import frame_transform_graph
+ from astropy.coordinates.transformations import FunctionTransformWithFiniteDifference
+-from astropy.coordinates.matrix_utilities import matrix_transpose
++from astropy.coordinates.matrix_utilities import matrix_transpose, rotation_matrix
+ 
+ from .icrs import ICRS
+ from .gcrs import GCRS, PrecessedGeocentric
+ from .cirs import CIRS
+ from .itrs import ITRS
+ from .equatorial import TEME, TETE
+-from .utils import get_polar_motion, get_jd12, EARTH_CENTER
++from .altaz import AltAz
++from .hadec import HADec
++from .utils import get_polar_motion, get_jd12, EARTH_CENTER, PIOVER2
+ 
+ # # first define helper functions
+ 
+ 
++def itrs_to_observed_mat(observed_frame):
++    """
++    Create transformation matrix from ITRS to observed frame (AltAz or HADec).
++    
++    Parameters
++    ----------
++    observed_frame : `~astropy.coordinates.AltAz` or `~astropy.coordinates.HADec`
++        The target observed frame with location information.
++    
++    Returns
++    -------
++    mat : `~numpy.ndarray`
++        3x3 transformation matrix
++    """
++    lon, lat, height = observed_frame.location.to_geodetic('WGS84')
++    elong = lon.to_value(u.radian)
++
++    if isinstance(observed_frame, AltAz):
++        # form ITRS to AltAz matrix
++        elat = lat.to_value(u.radian)
++        # AltAz frame is left handed
++        minus_x = np.eye(3)
++        minus_x[0][0] = -1.0
++        mat = (minus_x
++               @ rotation_matrix(PIOVER2 - elat, 'y', unit=u.radian)
++               @ rotation_matrix(elong, 'z', unit=u.radian))
++
++    else:
++        # form ITRS to HADec matrix
++        # HADec frame is left handed
++        minus_y = np.eye(3)
++        minus_y[1][1] = -1.0
++        mat = (minus_y
++               @ rotation_matrix(elong, 'z', unit=u.radian))
++    return mat
++
++
++@frame_transform_graph.transform(FunctionTransformWithFiniteDifference, ITRS, AltAz)
++@frame_transform_graph.transform(FunctionTransformWithFiniteDifference, ITRS, HADec)
++def itrs_to_observed(itrs_coo, observed_frame):
++    """
++    Transform from ITRS to observed frame (AltAz or HADec).
++    
++    This transform treats ITRS coordinates as time invariant and stays entirely
++    within the ITRS, avoiding the issues with geocentric vs topocentric aberration
++    that occur when going through ICRS.
++    """
++    # Trying to synchronize the obstimes here makes no sense. In fact,
++    # it's a real gotcha as doing an ITRS->ITRS transform references 
++    # ITRS coordinates, which should be tied to the Earth, to the SSB.
++    # Instead, we treat ITRS coordinates as time invariant here.
++
++    # form the Topocentric ITRS position
++    topocentric_itrs_repr = (itrs_coo.cartesian
++                             - observed_frame.location.get_itrs().cartesian)
++    rep = topocentric_itrs_repr.transform(itrs_to_observed_mat(observed_frame))
++    return observed_frame.realize_frame(rep)
++
++
++@frame_transform_graph.transform(FunctionTransformWithFiniteDifference, AltAz, ITRS)
++@frame_transform_graph.transform(FunctionTransformWithFiniteDifference, HADec, ITRS)
++def observed_to_itrs(observed_coo, itrs_frame):
++    """
++    Transform from observed frame (AltAz or HADec) to ITRS.
++    
++    This transform stays entirely within the ITRS, avoiding the issues with
++    geocentric vs topocentric aberration that occur when going through ICRS.
++    """
++                                              
++    # form the Topocentric ITRS position
++    topocentric_itrs_repr = observed_coo.cartesian.transform(matrix_transpose(
++                            itrs_to_observed_mat(observed_coo)))
++    
++    # Scale the topocentric vector by the distance
++    # observed_coo.cartesian is a unit vector, so we need to scale it by the distance
++    if hasattr(observed_coo, 'distance') and observed_coo.distance is not None:
++        topocentric_itrs_repr = topocentric_itrs_repr * observed_coo.distance
++    else:
++        # If no distance is specified, assume unit distance
++        topocentric_itrs_repr = topocentric_itrs_repr * 1.0
++    
++    # form the Geocentric ITRS position
++    location_itrs = observed_coo.location.get_itrs().cartesian
++    rep = topocentric_itrs_repr + location_itrs
++    return itrs_frame.realize_frame(rep)
++
++
+ def teme_to_itrs_mat(time):
+     # Sidereal time, rotates from ITRS to mean equinox
+     # Use 1982 model for consistency with Vallado et al (2006)
+diff --git a/check_composite.py b/check_composite.py
+new file mode 100644
+index 0000000000..c0cfc5182f
+--- /dev/null
++++ b/check_composite.py
+@@ -0,0 +1,20 @@
++#!/usr/bin/env python3
++
++from astropy.coordinates import ITRS, AltAz, HADec, frame_transform_graph
++
++# Check what the composite transforms consist of
++print("ITRS -> AltAz transform steps:")
++transform = frame_transform_graph.get_transform(ITRS, AltAz)
++print(f"  Transform steps: {transform.transforms}")
++
++print("\nITRS -> HADec transform steps:")
++transform = frame_transform_graph.get_transform(ITRS, HADec)
++print(f"  Transform steps: {transform.transforms}")
++
++print("\nAltAz -> ITRS transform steps:")
++transform = frame_transform_graph.get_transform(AltAz, ITRS)
++print(f"  Transform steps: {transform.transforms}")
++
++print("\nHADec -> ITRS transform steps:")
++transform = frame_transform_graph.get_transform(HADec, ITRS)
++print(f"  Transform steps: {transform.transforms}")
+\ No newline at end of file
+diff --git a/check_transforms.py b/check_transforms.py
+new file mode 100644
+index 0000000000..13b70be55d
+--- /dev/null
++++ b/check_transforms.py
+@@ -0,0 +1,24 @@
++#!/usr/bin/env python3
++
++from astropy.coordinates import ITRS, AltAz, HADec, frame_transform_graph
++
++# Check if there are direct transformations between ITRS and AltAz/HADec
++print("Available transformations from ITRS:")
++for transform in frame_transform_graph.get_transform(ITRS, AltAz):
++    print(f"  ITRS -> AltAz: {transform}")
++
++for transform in frame_transform_graph.get_transform(ITRS, HADec):
++    print(f"  ITRS -> HADec: {transform}")
++
++print("\nAvailable transformations to ITRS:")
++for transform in frame_transform_graph.get_transform(AltAz, ITRS):
++    print(f"  AltAz -> ITRS: {transform}")
++
++for transform in frame_transform_graph.get_transform(HADec, ITRS):
++    print(f"  HADec -> ITRS: {transform}")
++
++# Check what transformations are available for ITRS
++print("\nAll transformations involving ITRS:")
++for frame1, frame2 in frame_transform_graph._graph:
++    if ITRS in (frame1, frame2):
++        print(f"  {frame1.__name__} <-> {frame2.__name__}")
+\ No newline at end of file
+diff --git a/debug_representation.py b/debug_representation.py
+new file mode 100644
+index 0000000000..1d2848fefb
+--- /dev/null
++++ b/debug_representation.py
+@@ -0,0 +1,37 @@
++#!/usr/bin/env python3
++
++import numpy as np
++from astropy import units as u
++from astropy.coordinates import ITRS, AltAz, HADec, EarthLocation
++from astropy.time import Time
++
++# Create a test location and time
++location = EarthLocation(lat=40.0*u.deg, lon=-105.0*u.deg, height=1600*u.m)
++obstime = Time('2023-01-01T00:00:00')
++
++# Create an AltAz coordinate
++altaz_test = AltAz(az=45*u.deg, alt=30*u.deg, location=location, obstime=obstime)
++print("AltAz coordinate:", altaz_test)
++print("AltAz representation type:", type(altaz_test.data))
++print("AltAz has distance:", hasattr(altaz_test, 'distance'))
++if hasattr(altaz_test, 'distance'):
++    print("AltAz distance:", altaz_test.distance)
++    print("AltAz distance type:", type(altaz_test.distance))
++
++# Check the cartesian representation
++print("AltAz cartesian:", altaz_test.cartesian)
++print("AltAz cartesian type:", type(altaz_test.cartesian))
++print("AltAz cartesian units:", altaz_test.cartesian.x.unit)
++
++# Get location ITRS
++location_itrs = altaz_test.location.get_itrs().cartesian
++print("Location ITRS:", location_itrs)
++print("Location ITRS type:", type(location_itrs))
++print("Location ITRS units:", location_itrs.x.unit)
++
++# Test the addition
++try:
++    result = altaz_test.cartesian + location_itrs
++    print("Addition successful:", result)
++except Exception as e:
++    print("Addition failed:", e)
+\ No newline at end of file
+diff --git a/debug_transform.py b/debug_transform.py
+new file mode 100644
+index 0000000000..58797030af
+--- /dev/null
++++ b/debug_transform.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++
++import numpy as np
++from astropy import units as u
++from astropy.coordinates import ITRS, AltAz, HADec, EarthLocation
++from astropy.time import Time
++from astropy.coordinates.matrix_utilities import matrix_transpose, rotation_matrix
++from astropy.coordinates.builtin_frames.utils import PIOVER2
++
++def itrs_to_observed_mat(observed_frame):
++    """
++    Create transformation matrix from ITRS to observed frame (AltAz or HADec).
++    """
++    lon, lat, height = observed_frame.location.to_geodetic('WGS84')
++    elong = lon.to_value(u.radian)
++
++    if isinstance(observed_frame, AltAz):
++        # form ITRS to AltAz matrix
++        elat = lat.to_value(u.radian)
++        # AltAz frame is left handed
++        minus_x = np.eye(3)
++        minus_x[0][0] = -1.0
++        mat = (minus_x
++               @ rotation_matrix(PIOVER2 - elat, 'y', unit=u.radian)
++               @ rotation_matrix(elong, 'z', unit=u.radian))
++
++    else:
++        # form ITRS to HADec matrix
++        # HADec frame is left handed
++        minus_y = np.eye(3)
++        minus_y[1][1] = -1.0
++        mat = (minus_y
++               @ rotation_matrix(elong, 'z', unit=u.radian))
++    return mat
++
++# Create a test location and time
++location = EarthLocation(lat=40.0*u.deg, lon=-105.0*u.deg, height=1600*u.m)
++obstime = Time('2023-01-01T00:00:00')
++
++# Create an AltAz coordinate
++altaz_test = AltAz(az=45*u.deg, alt=30*u.deg, location=location, obstime=obstime)
++print("AltAz coordinate:", altaz_test)
++print("AltAz cartesian:", altaz_test.cartesian)
++print("AltAz distance:", altaz_test.distance)
++
++# Test the transformation step by step
++mat = itrs_to_observed_mat(altaz_test)
++print("Transformation matrix:", mat)
++
++# Transform the cartesian representation
++topocentric_itrs_repr = altaz_test.cartesian.transform(matrix_transpose(mat))
++print("Topocentric ITRS repr:", topocentric_itrs_repr)
++print("Topocentric ITRS repr units:", topocentric_itrs_repr.x.unit)
++
++# Scale by distance
++scaled_repr = topocentric_itrs_repr * altaz_test.distance
++print("Scaled repr:", scaled_repr)
++print("Scaled repr units:", scaled_repr.x.unit)
++
++# Get location ITRS
++location_itrs = altaz_test.location.get_itrs().cartesian
++print("Location ITRS:", location_itrs)
++print("Location ITRS units:", location_itrs.x.unit)
++
++# Try to add them
++try:
++    result = scaled_repr + location_itrs
++    print("Addition successful:", result)
++except Exception as e:
++    print("Addition failed:", e)
+\ No newline at end of file
+diff --git a/debug_units.py b/debug_units.py
+new file mode 100644
+index 0000000000..de79a86c0f
+--- /dev/null
++++ b/debug_units.py
+@@ -0,0 +1,24 @@
++#!/usr/bin/env python3
++
++import numpy as np
++from astropy import units as u
++from astropy.coordinates import ITRS, AltAz, HADec, EarthLocation
++from astropy.time import Time
++
++# Create a test location and time
++location = EarthLocation(lat=40.0*u.deg, lon=-105.0*u.deg, height=1600*u.m)
++obstime = Time('2023-01-01T00:00:00')
++
++# Create an AltAz coordinate
++altaz_test = AltAz(az=45*u.deg, alt=30*u.deg, location=location, obstime=obstime)
++print("AltAz coordinate:", altaz_test)
++print("AltAz cartesian:", altaz_test.cartesian)
++print("AltAz cartesian units:", altaz_test.cartesian.x.unit)
++
++# Get location ITRS
++location_itrs = altaz_test.location.get_itrs().cartesian
++print("Location ITRS:", location_itrs)
++print("Location ITRS units:", location_itrs.x.unit)
++
++# Check if units are compatible
++print("Units compatible?", altaz_test.cartesian.x.unit == location_itrs.x.unit)
+\ No newline at end of file
+diff --git a/pyproject.toml b/pyproject.toml
+index 7a3b85fc92..83f08ed124 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,5 +1,5 @@
+ [build-system]
+-requires = ["setuptools",
++requires = ["setuptools==68.0.0",
+             "setuptools_scm>=6.2",
+             "wheel",
+             "cython==0.29.30",
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e42cead7fc
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++
++import numpy as np
++from astropy import units as u
++from astropy.coordinates import ITRS, AltAz, HADec, EarthLocation
++from astropy.time import Time
++
++# Create a test location and time
++location = EarthLocation(lat=40.0*u.deg, lon=-105.0*u.deg, height=1600*u.m)
++obstime = Time('2023-01-01T00:00:00')
++
++# Create an ITRS coordinate (e.g., a satellite position)
++# This represents a point 1000 km above the observer
++itrs_coord = ITRS(x=location.x + 1000*u.km, 
++                  y=location.y + 1000*u.km, 
++                  z=location.z + 1000*u.km,
++                  obstime=obstime)
++
++print("ITRS coordinate:", itrs_coord)
++
++# Try to transform to AltAz using current transformations
++try:
++    altaz_coord = itrs_coord.transform_to(AltAz(location=location, obstime=obstime))
++    print("AltAz coordinate:", altaz_coord)
++except Exception as e:
++    print("Error transforming ITRS to AltAz:", e)
++
++# Try to transform to HADec using current transformations
++try:
++    hadec_coord = itrs_coord.transform_to(HADec(location=location, obstime=obstime))
++    print("HADec coordinate:", hadec_coord)
++except Exception as e:
++    print("Error transforming ITRS to HADec:", e)
++
++# Test the reverse transformations
++altaz_test = AltAz(az=45*u.deg, alt=30*u.deg, location=location, obstime=obstime)
++try:
++    itrs_from_altaz = altaz_test.transform_to(ITRS(obstime=obstime))
++    print("ITRS from AltAz:", itrs_from_altaz)
++except Exception as e:
++    print("Error transforming AltAz to ITRS:", e)
++
++hadec_test = HADec(ha=1*u.hourangle, dec=30*u.deg, location=location, obstime=obstime)
++try:
++    itrs_from_hadec = hadec_test.transform_to(ITRS(obstime=obstime))
++    print("ITRS from HADec:", itrs_from_hadec)
++except Exception as e:
++    print("Error transforming HADec to ITRS:", e)
+\ No newline at end of file
+diff --git a/simple_check.py b/simple_check.py
+new file mode 100644
+index 0000000000..b90386b18d
+--- /dev/null
++++ b/simple_check.py
+@@ -0,0 +1,32 @@
++#!/usr/bin/env python3
++
++from astropy.coordinates import ITRS, AltAz, HADec, frame_transform_graph
++
++# Check if there are direct transformations between ITRS and AltAz/HADec
++print("Checking ITRS -> AltAz transform:")
++try:
++    transform = frame_transform_graph.get_transform(ITRS, AltAz)
++    print(f"  Found: {transform}")
++except Exception as e:
++    print(f"  Error: {e}")
++
++print("\nChecking ITRS -> HADec transform:")
++try:
++    transform = frame_transform_graph.get_transform(ITRS, HADec)
++    print(f"  Found: {transform}")
++except Exception as e:
++    print(f"  Error: {e}")
++
++print("\nChecking AltAz -> ITRS transform:")
++try:
++    transform = frame_transform_graph.get_transform(AltAz, ITRS)
++    print(f"  Found: {transform}")
++except Exception as e:
++    print(f"  Error: {e}")
++
++print("\nChecking HADec -> ITRS transform:")
++try:
++    transform = frame_transform_graph.get_transform(HADec, ITRS)
++    print(f"  Found: {transform}")
++except Exception as e:
++    print(f"  Error: {e}")
+\ No newline at end of file

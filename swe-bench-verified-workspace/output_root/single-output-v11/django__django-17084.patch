@@ -1,0 +1,918 @@
+diff --git a/django/db/models/aggregates.py b/django/db/models/aggregates.py
+index a778cd413b..d978ded88e 100644
+--- a/django/db/models/aggregates.py
++++ b/django/db/models/aggregates.py
+@@ -77,7 +77,7 @@ class Aggregate(Func):
+             # returning self.filter and including that in this loop.
+             expressions = super(Aggregate, c).get_source_expressions()
+             for index, expr in enumerate(expressions):
+-                if expr.contains_aggregate:
++                if expr.contains_aggregate and not getattr(expr, 'contains_over_clause', False):
+                     before_resolved = self.get_source_expressions()[index]
+                     name = (
+                         before_resolved.name
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..c0cf517e58
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with aggregates over window functions in Django 4.2
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.postgresql',
++                'NAME': 'test_db',
++                'USER': 'test_user',
++                'PASSWORD': 'test_password',
++                'HOST': 'localhost',
++                'PORT': '5432',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Window
++from django.db.models.functions import Coalesce
++
++# Create a simple test model
++class TestModel(models.Model):
++    date = models.DateField()
++    DJR = models.FloatField()
++
++    class Meta:
++        app_label = 'test_app'
++
++# Create the queryset as described in the issue
++try:
++    # This should work fine
++    queryset = TestModel.objects.all()
++    queryset = queryset.annotate(
++        cumul_DJR=Coalesce(Window(Sum("DJR"), order_by=F("date").asc()), 0.0)
++    )
++    print("Window annotation created successfully")
++    
++    # This should fail with the grouping error
++    aggregate = queryset.aggregate(
++        DJR_total=Sum("DJR"),
++        cumul_DJR_total=Sum("cumul_DJR")
++    )
++    print("Aggregate created successfully:", aggregate)
++    
++except Exception as e:
++    print(f"Error occurred: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/reproduce_issue_simple.py b/reproduce_issue_simple.py
+new file mode 100644
+index 0000000000..939065e712
+--- /dev/null
++++ b/reproduce_issue_simple.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with aggregates over window functions in Django 4.2
++This script focuses on the SQL generation without requiring a database connection.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings without database
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.dummy',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Window
++from django.db.models.functions import Coalesce
++from django.db.models.sql import Query
++from django.db import connection
++
++# Create a simple test model
++class TestModel(models.Model):
++    date = models.DateField()
++    DJR = models.FloatField()
++
++    class Meta:
++        app_label = 'test_app'
++
++def test_sql_generation():
++    """Test the SQL generation for aggregates over window functions"""
++    
++    # Create the queryset as described in the issue
++    queryset = TestModel.objects.all()
++    
++    # This should work fine - creating window annotation
++    queryset = queryset.annotate(
++        cumul_DJR=Coalesce(Window(Sum("DJR"), order_by=F("date").asc()), 0.0)
++    )
++    print("Window annotation created successfully")
++    
++    # Try to generate SQL for the aggregate query
++    # This should fail with the grouping error
++    try:
++        # Create a new query for aggregation
++        aggregate_query = queryset.query.clone()
++        aggregate_query.clear_select_clause()
++        aggregate_query.clear_ordering()
++        
++        # Add the aggregate expressions
++        aggregate_query.add_annotation(Sum("DJR"), 'DJR_total', select=True)
++        aggregate_query.add_annotation(Sum("cumul_DJR"), 'cumul_DJR_total', select=True)
++        
++        # Try to compile the SQL
++        compiler = aggregate_query.get_compiler(using='default')
++        sql, params = compiler.as_sql()
++        
++        print("SQL generated successfully:")
++        print(sql)
++        print("Params:", params)
++        
++    except Exception as e:
++        print(f"Error occurred during SQL generation: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_sql_generation()
+\ No newline at end of file
+diff --git a/test_core_issue.py b/test_core_issue.py
+new file mode 100644
+index 0000000000..25ada4917b
+--- /dev/null
++++ b/test_core_issue.py
+@@ -0,0 +1,131 @@
++#!/usr/bin/env python3
++"""
++Test the core issue: aggregate over window function validation
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Window
++from django.db.models.functions import Coalesce
++from django.core.exceptions import FieldError
++from django.db.models.sql.query import Query
++
++def test_core_issue():
++    """Test the core issue: aggregate validation with window functions"""
++    
++    print("Testing the core issue: aggregate over window function validation...")
++    
++    # Create a simple model for testing
++    class TestModel(models.Model):
++        date = models.DateField()
++        DJR = models.FloatField()
++        
++        class Meta:
++            app_label = 'test_app_core'
++    
++    # Create a query object
++    query = Query(TestModel)
++    
++    # Create the window expression with aggregate (this is what should be allowed)
++    window_expr = Window(Sum("DJR"), order_by=F("date").asc())
++    
++    # Create an aggregate that uses the window expression
++    aggregate = Sum(window_expr)
++    
++    # This should work with our fix - no FieldError should be raised
++    try:
++        resolved = aggregate.resolve_expression(query=query)
++        print("✓ Aggregate over window function resolved successfully")
++        print(f"  Resolved expression: {type(resolved)}")
++        print(f"  Source expressions: {[type(expr) for expr in resolved.get_source_expressions()]}")
++        
++        # Check that the window expression contains an aggregate but has contains_over_clause
++        source_exprs = resolved.get_source_expressions()
++        if len(source_exprs) > 0:
++            window_expr = source_exprs[0]
++            print(f"  Window expression contains_aggregate: {window_expr.contains_aggregate}")
++            print(f"  Window expression contains_over_clause: {getattr(window_expr, 'contains_over_clause', False)}")
++        
++        return True
++        
++    except FieldError as e:
++        if "is an aggregate" in str(e):
++            print(f"✗ The original issue still exists: {e}")
++            return False
++        else:
++            print(f"✗ Different FieldError occurred: {e}")
++            return False
++            
++    except Exception as e:
++        print(f"✗ Unexpected error: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++def test_regular_aggregate_still_fails():
++    """Test that regular aggregate over aggregate still fails"""
++    
++    print("Testing that regular aggregate over aggregate still fails...")
++    
++    class TestModel(models.Model):
++        date = models.DateField()
++        DJR = models.FloatField()
++        
++        class Meta:
++            app_label = 'test_app_core2'
++    
++    query = Query(TestModel)
++    
++    # Create an aggregate that uses another aggregate (should fail)
++    aggregate = Sum(Sum("DJR"))
++    
++    try:
++        aggregate.resolve_expression(query=query)
++        print("✗ Regular aggregate validation failed - should have raised an error")
++        return False
++        
++    except FieldError as e:
++        if "is an aggregate" in str(e):
++            print("✓ Regular aggregate validation works correctly")
++            print(f"  Error message: {e}")
++            return True
++        else:
++            print(f"✗ Different FieldError occurred: {e}")
++            return False
++            
++    except Exception as e:
++        print(f"✗ Unexpected error: {type(e).__name__}: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("Testing the core issue...")
++    print()
++    
++    success1 = test_core_issue()
++    print()
++    success2 = test_regular_aggregate_still_fails()
++    
++    print()
++    if success1 and success2:
++        print("✓ The core issue has been fixed! Aggregates over window functions now work correctly, while regular aggregate validation still works.")
++    else:
++        print("✗ The issue is not fully fixed. Please check the implementation.")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..129dbdc8a6
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,152 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the aggregates over window functions fix
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Window, Avg, Count
++from django.db.models.functions import Coalesce
++from django.core.exceptions import FieldError
++from django.db.models.sql.query import Query
++
++def test_different_aggregate_types():
++    """Test different aggregate types with window functions"""
++    
++    print("Testing different aggregate types with window functions...")
++    
++    class TestModel(models.Model):
++        date = models.DateField()
++        DJR = models.FloatField()
++        count = models.IntegerField()
++        
++        class Meta:
++            app_label = 'test_app_edge'
++    
++    query = Query(TestModel)
++    
++    # Test Sum with window
++    sum_window = Window(Sum("DJR"), order_by=F("date").asc())
++    sum_aggregate = Sum(sum_window)
++    
++    try:
++        resolved = sum_aggregate.resolve_expression(query=query)
++        print("✓ Sum over window function resolved successfully")
++    except Exception as e:
++        print(f"✗ Sum over window failed: {e}")
++        return False
++    
++    # Test Avg with window
++    avg_window = Window(Avg("DJR"), order_by=F("date").asc())
++    avg_aggregate = Avg(avg_window)
++    
++    try:
++        resolved = avg_aggregate.resolve_expression(query=query)
++        print("✓ Avg over window function resolved successfully")
++    except Exception as e:
++        print(f"✗ Avg over window failed: {e}")
++        return False
++    
++    # Test Count with window
++    count_window = Window(Count("count"), order_by=F("date").asc())
++    count_aggregate = Count(count_window)
++    
++    try:
++        resolved = count_aggregate.resolve_expression(query=query)
++        print("✓ Count over window function resolved successfully")
++    except Exception as e:
++        print(f"✗ Count over window failed: {e}")
++        return False
++    
++    return True
++
++def test_nested_aggregates():
++    """Test that nested aggregates still fail appropriately"""
++    
++    print("Testing nested aggregates (should still fail)...")
++    
++    class TestModel(models.Model):
++        date = models.DateField()
++        DJR = models.FloatField()
++        
++        class Meta:
++            app_label = 'test_app_edge2'
++    
++    query = Query(TestModel)
++    
++    # Test aggregate over aggregate (should fail)
++    aggregate = Sum(Sum("DJR"))
++    
++    try:
++        aggregate.resolve_expression(query=query)
++        print("✗ Nested aggregates should fail but didn't")
++        return False
++    except FieldError as e:
++        print("✓ Nested aggregates correctly failed")
++        return True
++    except Exception as e:
++        print(f"✗ Unexpected error: {e}")
++        return False
++
++def test_window_without_aggregate():
++    """Test window functions that don't contain aggregates"""
++    
++    print("Testing window functions without aggregates...")
++    
++    class TestModel(models.Model):
++        date = models.DateField()
++        DJR = models.FloatField()
++        
++        class Meta:
++            app_label = 'test_app_edge3'
++    
++    query = Query(TestModel)
++    
++    # Test window function that doesn't contain aggregate
++    # This should work fine since it doesn't contain an aggregate
++    from django.db.models.functions.window import RowNumber
++    window_expr = RowNumber()
++    aggregate = Sum(window_expr)
++    
++    try:
++        resolved = aggregate.resolve_expression(query=query)
++        print("✓ Aggregate over non-aggregate window function resolved successfully")
++        return True
++    except Exception as e:
++        print(f"✗ Aggregate over non-aggregate window failed: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("Running edge case tests for aggregates over window functions fix...")
++    print()
++    
++    success1 = test_different_aggregate_types()
++    print()
++    success2 = test_nested_aggregates()
++    print()
++    success3 = test_window_without_aggregate()
++    
++    print()
++    if success1 and success2 and success3:
++        print("✓ All edge case tests passed! The fix is robust.")
++    else:
++        print("✗ Some edge case tests failed. Please check the implementation.")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..57cd8f5716
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for aggregates over window functions
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Window
++from django.db.models.functions import Coalesce
++from django.core.exceptions import FieldError
++
++# Create a simple test model
++class TestModel(models.Model):
++    date = models.DateField()
++    DJR = models.FloatField()
++
++    class Meta:
++        app_label = 'test_app'
++
++def test_aggregate_over_window():
++    """Test that aggregates over window functions work correctly"""
++    
++    print("Testing aggregate over window function...")
++    
++    # Create the queryset as described in the issue
++    queryset = TestModel.objects.all()
++    
++    # This should work fine - creating window annotation
++    queryset = queryset.annotate(
++        cumul_DJR=Coalesce(Window(Sum("DJR"), order_by=F("date").asc()), 0.0)
++    )
++    print("✓ Window annotation created successfully")
++    
++    # This should now work with our fix
++    try:
++        aggregate = queryset.aggregate(
++            DJR_total=Sum("DJR"),
++            cumul_DJR_total=Sum("cumul_DJR")
++        )
++        print("✓ Aggregate over window function created successfully")
++        print(f"Aggregate result: {aggregate}")
++        return True
++        
++    except Exception as e:
++        print(f"✗ Error occurred: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++def test_regular_aggregate_validation():
++    """Test that regular aggregate validation still works"""
++    
++    print("Testing regular aggregate validation...")
++    
++    queryset = TestModel.objects.all()
++    
++    # This should still fail - aggregate over aggregate
++    try:
++        queryset.aggregate(
++            DJR_total=Sum(Sum("DJR"))
++        )
++        print("✗ Regular aggregate validation failed - should have raised an error")
++        return False
++        
++    except FieldError as e:
++        print("✓ Regular aggregate validation works correctly")
++        print(f"Error message: {e}")
++        return True
++        
++    except Exception as e:
++        print(f"✗ Unexpected error: {type(e).__name__}: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("Running tests for aggregates over window functions fix...")
++    print()
++    
++    success1 = test_aggregate_over_window()
++    print()
++    success2 = test_regular_aggregate_validation()
++    
++    print()
++    if success1 and success2:
++        print("✓ All tests passed! The fix is working correctly.")
++    else:
++        print("✗ Some tests failed. Please check the implementation.")
+\ No newline at end of file
+diff --git a/test_fix_focused.py b/test_fix_focused.py
+new file mode 100644
+index 0000000000..6a1d0916f4
+--- /dev/null
++++ b/test_fix_focused.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python3
++"""
++Focused test to verify the fix for aggregates over window functions
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Window
++from django.db.models.functions import Coalesce
++from django.core.exceptions import FieldError
++from django.db.models.sql.query import Query
++
++def test_aggregate_over_window():
++    """Test that aggregates over window functions work correctly"""
++    
++    print("Testing aggregate over window function...")
++    
++    # Create a simple model for testing
++    class TestModel(models.Model):
++        date = models.DateField()
++        DJR = models.FloatField()
++        
++        class Meta:
++            app_label = 'test_app'
++    
++    # Create a query object
++    query = Query(TestModel)
++    
++    # Create the window expression
++    window_expr = Window(Sum("DJR"), order_by=F("date").asc())
++    
++    # Create an aggregate that uses the window expression
++    aggregate = Sum(window_expr)
++    
++    # This should work with our fix - no FieldError should be raised
++    try:
++        resolved = aggregate.resolve_expression(query=query)
++        print("✓ Aggregate over window function resolved successfully")
++        print(f"Resolved expression type: {type(resolved)}")
++        return True
++        
++    except FieldError as e:
++        print(f"✗ FieldError occurred: {e}")
++        return False
++        
++    except Exception as e:
++        print(f"✗ Unexpected error: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++def test_regular_aggregate_validation():
++    """Test that regular aggregate validation still works"""
++    
++    print("Testing regular aggregate validation...")
++    
++    # Create a simple model for testing
++    class TestModel(models.Model):
++        date = models.DateField()
++        DJR = models.FloatField()
++        
++        class Meta:
++            app_label = 'test_app'
++    
++    # Create a query object
++    query = Query(TestModel)
++    
++    # Create an aggregate that uses another aggregate (should fail)
++    aggregate = Sum(Sum("DJR"))
++    
++    # This should still fail - aggregate over aggregate
++    try:
++        aggregate.resolve_expression(query=query)
++        print("✗ Regular aggregate validation failed - should have raised an error")
++        return False
++        
++    except FieldError as e:
++        print("✓ Regular aggregate validation works correctly")
++        print(f"Error message: {e}")
++        return True
++        
++    except Exception as e:
++        print(f"✗ Unexpected error: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    print("Running focused tests for aggregates over window functions fix...")
++    print()
++    
++    success1 = test_aggregate_over_window()
++    print()
++    success2 = test_regular_aggregate_validation()
++    
++    print()
++    if success1 and success2:
++        print("✓ All tests passed! The fix is working correctly.")
++    else:
++        print("✗ Some tests failed. Please check the implementation.")
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..8289cea027
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,100 @@
++#!/usr/bin/env python3
++"""
++Test the exact scenario described in the GitHub issue
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Window
++from django.db.models.functions import Coalesce
++from django.core.exceptions import FieldError
++from django.db.models.sql.query import Query
++
++def test_github_issue_scenario():
++    """Test the exact scenario from the GitHub issue"""
++    
++    print("Testing the exact GitHub issue scenario...")
++    
++    # Create a simple model for testing
++    class TestModel(models.Model):
++        date = models.DateField()
++        DJR = models.FloatField()
++        
++        class Meta:
++            app_label = 'test_app_github'
++    
++    # Create a query object
++    query = Query(TestModel)
++    
++    # Reproduce the exact code from the GitHub issue
++    queryset = TestModel.objects.all()
++    queryset = queryset.annotate(
++        cumul_DJR=Coalesce(Window(Sum("DJR"), order_by=F("date").asc()), 0.0)
++    )
++    
++    print("✓ Window annotation created successfully")
++    
++    # Try to create the aggregate as described in the issue
++    # This should work with our fix
++    try:
++        # Create a new query for the aggregate
++        aggregate_query = query.clone()
++        
++        # Add the aggregate expressions
++        aggregate_query.add_annotation(Sum("DJR"), 'DJR_total', select=True)
++        aggregate_query.add_annotation(Sum("cumul_DJR"), 'cumul_DJR_total', select=True)
++        
++        # Resolve the expressions - this is where the error would occur
++        DJR_total_expr = Sum("DJR").resolve_expression(aggregate_query)
++        cumul_DJR_total_expr = Sum("cumul_DJR").resolve_expression(aggregate_query)
++        
++        print("✓ Aggregate expressions resolved successfully")
++        print(f"  DJR_total expression: {type(DJR_total_expr)}")
++        print(f"  cumul_DJR_total expression: {type(cumul_DJR_total_expr)}")
++        
++        return True
++        
++    except FieldError as e:
++        if "aggregate function calls cannot contain window function calls" in str(e) or "is an aggregate" in str(e):
++            print(f"✗ The original issue still exists: {e}")
++            return False
++        else:
++            print(f"✗ Different FieldError occurred: {e}")
++            return False
++            
++    except Exception as e:
++        print(f"✗ Unexpected error: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    print("Testing the exact GitHub issue scenario...")
++    print()
++    
++    success = test_github_issue_scenario()
++    
++    print()
++    if success:
++        print("✓ The GitHub issue has been fixed! Aggregates over window functions now work correctly.")
++    else:
++        print("✗ The GitHub issue is not fixed. Please check the implementation.")
+\ No newline at end of file
+diff --git a/test_resolve_expression.py b/test_resolve_expression.py
+new file mode 100644
+index 0000000000..63e5b5facb
+--- /dev/null
++++ b/test_resolve_expression.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for aggregates over window functions
++by directly testing the resolve_expression method
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Window
++from django.db.models.functions import Coalesce
++from django.core.exceptions import FieldError
++
++def test_aggregate_over_window_resolve():
++    """Test that aggregates over window functions work in resolve_expression"""
++    
++    print("Testing aggregate over window function in resolve_expression...")
++    
++    # Create a window expression with an aggregate
++    window_expr = Window(Sum("DJR"), order_by=F("date").asc())
++    
++    # Create an aggregate that uses the window expression
++    aggregate = Sum(window_expr)
++    
++    # This should work with our fix - no FieldError should be raised
++    try:
++        resolved = aggregate.resolve_expression()
++        print("✓ Aggregate over window function resolved successfully")
++        print(f"Resolved expression: {resolved}")
++        return True
++        
++    except FieldError as e:
++        print(f"✗ FieldError occurred: {e}")
++        return False
++        
++    except Exception as e:
++        print(f"✗ Unexpected error: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++def test_regular_aggregate_validation():
++    """Test that regular aggregate validation still works"""
++    
++    print("Testing regular aggregate validation...")
++    
++    # Create an aggregate that uses another aggregate (should fail)
++    aggregate = Sum(Sum("DJR"))
++    
++    # This should still fail - aggregate over aggregate
++    try:
++        aggregate.resolve_expression()
++        print("✗ Regular aggregate validation failed - should have raised an error")
++        return False
++        
++    except FieldError as e:
++        print("✓ Regular aggregate validation works correctly")
++        print(f"Error message: {e}")
++        return True
++        
++    except Exception as e:
++        print(f"✗ Unexpected error: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    print("Running tests for aggregates over window functions fix...")
++    print()
++    
++    success1 = test_aggregate_over_window_resolve()
++    print()
++    success2 = test_regular_aggregate_validation()
++    
++    print()
++    if success1 and success2:
++        print("✓ All tests passed! The fix is working correctly.")
++    else:
++        print("✗ Some tests failed. Please check the implementation.")
+\ No newline at end of file

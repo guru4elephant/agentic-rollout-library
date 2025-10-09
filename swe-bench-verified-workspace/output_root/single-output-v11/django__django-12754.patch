@@ -1,0 +1,707 @@
+diff --git a/django/db/migrations/autodetector.py b/django/db/migrations/autodetector.py
+index 30616c0172..e1abef0999 100644
+--- a/django/db/migrations/autodetector.py
++++ b/django/db/migrations/autodetector.py
+@@ -162,10 +162,12 @@ class MigrationAutodetector:
+         # Prepare lists of fields and generate through model map
+         self._prepare_field_lists()
+         self._generate_through_model_map()
++        
++        # Detect field movement from parent to child classes to avoid field clashes
++        self._detect_field_movement_to_subclasses()
+ 
+         # Generate non-rename model operations
+         self.generate_deleted_models()
+-        self.generate_created_models()
+         self.generate_deleted_proxies()
+         self.generate_created_proxies()
+         self.generate_altered_options()
+@@ -179,7 +181,7 @@ class MigrationAutodetector:
+         # Generate index removal operations before field is removed
+         self.generate_removed_constraints()
+         self.generate_removed_indexes()
+-        # Generate field operations
++        # Generate field operations - removed fields first to avoid clashes
+         self.generate_renamed_fields()
+         self.generate_removed_fields()
+         self.generate_added_fields()
+@@ -188,6 +190,9 @@ class MigrationAutodetector:
+         self.generate_altered_index_together()
+         self.generate_added_indexes()
+         self.generate_added_constraints()
++        
++        # Generate created models last to ensure removed fields are processed first
++        self.generate_created_models()
+         self.generate_altered_db_table()
+         self.generate_altered_order_with_respect_to()
+ 
+@@ -236,6 +241,37 @@ class MigrationAutodetector:
+                     )
+                     self.through_users[through_key] = (app_label, old_model_name, field_name)
+ 
++    def _detect_field_movement_to_subclasses(self):
++        """
++        Detect when fields are being moved from parent classes to subclasses
++        to avoid field clashes during migration.
++        """
++        self.field_movement_to_subclasses = {}
++        
++        # Find fields that are being removed from parent classes
++        removed_fields = self.old_field_keys - self.new_field_keys
++        
++        # Find fields that are being added to subclasses
++        added_fields = self.new_field_keys - self.old_field_keys
++        
++        for removed_app, removed_model, removed_field in removed_fields:
++            # Check if this field is being added to a subclass
++            for added_app, added_model, added_field in added_fields:
++                if removed_field == added_field:
++                    # Check if the added model is a subclass of the removed model
++                    try:
++                        added_model_obj = self.new_apps.get_model(added_app, added_model)
++                        removed_model_obj = self.old_apps.get_model(removed_app, removed_model)
++                        
++                        if issubclass(added_model_obj, removed_model_obj):
++                            # This is a field being moved from parent to child
++                            self.field_movement_to_subclasses[(removed_app, removed_model, removed_field)] = (
++                                added_app, added_model, added_field
++                            )
++                    except (LookupError, AttributeError):
++                        # If models don't exist or other issues, skip
++                        continue
++
+     @staticmethod
+     def _resolve_dependency(dependency):
+         """
+@@ -888,6 +924,18 @@ class MigrationAutodetector:
+             self._generate_removed_field(app_label, model_name, field_name)
+ 
+     def _generate_removed_field(self, app_label, model_name, field_name):
++        # Check if this field is being moved to a subclass
++        movement_info = self.field_movement_to_subclasses.get((app_label, model_name, field_name))
++        dependencies = [
++            (app_label, model_name, field_name, "order_wrt_unset"),
++            (app_label, model_name, field_name, "foo_together_change"),
++        ]
++        
++        if movement_info:
++            # This field is being moved to a subclass, add dependency on the subclass creation
++            subclass_app, subclass_model, _ = movement_info
++            dependencies.append((subclass_app, subclass_model, None, True))
++        
+         self.add_operation(
+             app_label,
+             operations.RemoveField(
+@@ -897,10 +945,7 @@ class MigrationAutodetector:
+             # We might need to depend on the removal of an
+             # order_with_respect_to or index/unique_together operation;
+             # this is safely ignored if there isn't one
+-            dependencies=[
+-                (app_label, model_name, field_name, "order_wrt_unset"),
+-                (app_label, model_name, field_name, "foo_together_change"),
+-            ],
++            dependencies=dependencies,
+         )
+ 
+     def generate_altered_fields(self):
+diff --git a/manual_reproduce.py b/manual_reproduce.py
+new file mode 100644
+index 0000000000..9d12a7500d
+--- /dev/null
++++ b/manual_reproduce.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/env python
++import os
++import sys
++import tempfile
++import shutil
++from django.conf import settings
++from django.db import models, connection
++from django.core.management import execute_from_command_line
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'test_app',
++        ],
++        USE_TZ=True,
++    )
++
++# Create a temporary directory for the test app
++temp_dir = tempfile.mkdtemp()
++app_dir = os.path.join(temp_dir, 'test_app')
++os.makedirs(app_dir)
++
++# Create __init__.py files
++with open(os.path.join(temp_dir, '__init__.py'), 'w') as f:
++    f.write('')
++with open(os.path.join(app_dir, '__init__.py'), 'w') as f:
++    f.write('')
++
++# Create initial models.py (version 1)
++initial_models = '''
++from django.db import models
++
++class Readable(models.Model):
++    title = models.CharField(max_length=200)
++    
++    class Meta:
++        app_label = 'test_app'
++'''
++
++with open(os.path.join(app_dir, 'models.py'), 'w') as f:
++    f.write(initial_models)
++
++# Create apps.py
++apps_content = '''
++from django.apps import AppConfig
++
++class TestAppConfig(AppConfig):
++    name = 'test_app'
++'''
++
++with open(os.path.join(app_dir, 'apps.py'), 'w') as f:
++    f.write(apps_content)
++
++# Create migrations directory
++migrations_dir = os.path.join(app_dir, 'migrations')
++os.makedirs(migrations_dir)
++with open(os.path.join(migrations_dir, '__init__.py'), 'w') as f:
++    f.write('')
++
++# Create initial migration first
++initial_migration = '''
++# Generated by Django A.B on YYYY-MM-DD HH:MM
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++
++    initial = True
++
++    operations = [
++        migrations.CreateModel(
++            name='Readable',
++            fields=[
++                ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
++                ('title', models.CharField(max_length=200)),
++            ],
++        ),
++    ]
++'''
++
++with open(os.path.join(migrations_dir, '0001_initial.py'), 'w') as f:
++    f.write(initial_migration)
++
++# Create the problematic migration manually
++problematic_migration = '''
++# Generated by Django A.B on YYYY-MM-DD HH:MM
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('test_app', '0001_initial'),
++    ]
++
++    operations = [
++        migrations.CreateModel(
++            name='Book',
++            fields=[
++                ('readable_ptr', models.OneToOneField(auto_created=True, on_delete=models.deletion.CASCADE, parent_link=True, primary_key=True, serialize=False, to='test_app.Readable')),
++                ('title', models.CharField(max_length=200)),
++            ],
++            bases=('test_app.readable',),
++        ),
++        migrations.RemoveField(
++            model_name='readable',
++            name='title',
++        ),
++    ]
++'''
++
++with open(os.path.join(migrations_dir, '0002_move_field_to_subclass.py'), 'w') as f:
++    f.write(problematic_migration)
++
++# Add the temp directory to Python path
++sys.path.insert(0, temp_dir)
++
++try:
++    # Apply initial migration
++    execute_from_command_line(['manage.py', 'migrate', 'test_app', '0001'])
++    
++    # Now try to apply the problematic migration
++    execute_from_command_line(['manage.py', 'migrate', 'test_app', '0002'])
++    
++except Exception as e:
++    print(f"Error occurred: {e}")
++    import traceback
++    traceback.print_exc()
++finally:
++    # Clean up
++    shutil.rmtree(temp_dir)
++    if temp_dir in sys.path:
++        sys.path.remove(temp_dir)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..4f3b5dbbe2
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,101 @@
++#!/usr/bin/env python
++import os
++import sys
++import tempfile
++import shutil
++from django.conf import settings
++from django.db import models, connection
++from django.core.management import execute_from_command_line
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'test_app',
++        ],
++        USE_TZ=True,
++    )
++
++# Create a temporary directory for the test app
++temp_dir = tempfile.mkdtemp()
++app_dir = os.path.join(temp_dir, 'test_app')
++os.makedirs(app_dir)
++
++# Create __init__.py files
++with open(os.path.join(temp_dir, '__init__.py'), 'w') as f:
++    f.write('')
++with open(os.path.join(app_dir, '__init__.py'), 'w') as f:
++    f.write('')
++
++# Create initial models.py (version 1)
++initial_models = '''
++from django.db import models
++
++class Readable(models.Model):
++    title = models.CharField(max_length=200)
++    
++    class Meta:
++        app_label = 'test_app'
++'''
++
++with open(os.path.join(app_dir, 'models.py'), 'w') as f:
++    f.write(initial_models)
++
++# Create apps.py
++apps_content = '''
++from django.apps import AppConfig
++
++class TestAppConfig(AppConfig):
++    name = 'test_app'
++'''
++
++with open(os.path.join(app_dir, 'apps.py'), 'w') as f:
++    f.write(apps_content)
++
++# Add the temp directory to Python path
++sys.path.insert(0, temp_dir)
++
++try:
++    # Create initial migration
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'makemigrations', 'test_app'])
++    
++    # Now update models.py to the problematic version (version 2)
++    updated_models = '''
++from django.db import models
++
++class Readable(models.Model):
++    pass
++
++class Book(Readable):
++    title = models.CharField(max_length=200)
++    
++    class Meta:
++        app_label = 'test_app'
++'''
++
++    with open(os.path.join(app_dir, 'models.py'), 'w') as f:
++        f.write(updated_models)
++    
++    # Create the migration that should cause the issue
++    execute_from_command_line(['manage.py', 'makemigrations', 'test_app', '--name', 'move_field_to_subclass'])
++    
++    # Try to apply the migration (this should fail with the reported error)
++    execute_from_command_line(['manage.py', 'migrate', 'test_app'])
++    
++except Exception as e:
++    print(f"Error occurred: {e}")
++    import traceback
++    traceback.print_exc()
++finally:
++    # Clean up
++    shutil.rmtree(temp_dir)
++    if temp_dir in sys.path:
++        sys.path.remove(temp_dir)
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..1fa4f0b40f
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,104 @@
++#!/usr/bin/env python
++import os
++import sys
++import tempfile
++import shutil
++from django.conf import settings
++from django.db import models, connection
++from django.core.management import execute_from_command_line
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'test_app',
++        ],
++        USE_TZ=True,
++    )
++
++# Create a temporary directory for the test app
++temp_dir = tempfile.mkdtemp()
++app_dir = os.path.join(temp_dir, 'test_app')
++os.makedirs(app_dir)
++
++# Create __init__.py files
++with open(os.path.join(temp_dir, '__init__.py'), 'w') as f:
++    f.write('')
++with open(os.path.join(app_dir, '__init__.py'), 'w') as f:
++    f.write('')
++
++# Create initial models.py (version 1)
++initial_models = '''
++from django.db import models
++
++class Readable(models.Model):
++    title = models.CharField(max_length=200)
++    
++    class Meta:
++        app_label = 'test_app'
++'''
++
++with open(os.path.join(app_dir, 'models.py'), 'w') as f:
++    f.write(initial_models)
++
++# Create apps.py
++apps_content = '''
++from django.apps import AppConfig
++
++class TestAppConfig(AppConfig):
++    name = 'test_app'
++'''
++
++with open(os.path.join(app_dir, 'apps.py'), 'w') as f:
++    f.write(apps_content)
++
++# Add the temp directory to Python path
++sys.path.insert(0, temp_dir)
++
++try:
++    # Create initial migration
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'makemigrations', 'test_app'])
++    
++    # Apply initial migration
++    execute_from_command_line(['manage.py', 'migrate', 'test_app'])
++    
++    # Now update models.py to the problematic version (version 2)
++    updated_models = '''
++from django.db import models
++
++class Readable(models.Model):
++    pass
++
++class Book(Readable):
++    title = models.CharField(max_length=200)
++    
++    class Meta:
++        app_label = 'test_app'
++'''
++
++    with open(os.path.join(app_dir, 'models.py'), 'w') as f:
++        f.write(updated_models)
++    
++    # Create the migration that should cause the issue
++    execute_from_command_line(['manage.py', 'makemigrations', 'test_app', '--name', 'move_field_to_subclass'])
++    
++    # Try to apply the migration (this should fail with the reported error)
++    execute_from_command_line(['manage.py', 'migrate', 'test_app'])
++    
++except Exception as e:
++    print(f"Error occurred: {e}")
++    import traceback
++    traceback.print_exc()
++finally:
++    # Clean up
++    shutil.rmtree(temp_dir)
++    if temp_dir in sys.path:
++        sys.path.remove(temp_dir)
+\ No newline at end of file
+diff --git a/test_autodetector.py b/test_autodetector.py
+new file mode 100644
+index 0000000000..6631a1f5d5
+--- /dev/null
++++ b/test_autodetector.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python
++import os
++import sys
++import tempfile
++import shutil
++from django.conf import settings
++from django.db import models, connection
++from django.core.management import execute_from_command_line
++from django.db.migrations.autodetector import MigrationAutodetector
++from django.db.migrations.state import ProjectState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'test_app',
++        ],
++        USE_TZ=True,
++    )
++
++# Create a temporary directory for the test app
++temp_dir = tempfile.mkdtemp()
++app_dir = os.path.join(temp_dir, 'test_app')
++os.makedirs(app_dir)
++
++# Create __init__.py files
++with open(os.path.join(temp_dir, '__init__.py'), 'w') as f:
++    f.write('')
++with open(os.path.join(app_dir, '__init__.py'), 'w') as f:
++    f.write('')
++
++# Create initial models.py (version 1)
++initial_models = '''
++from django.db import models
++
++class Readable(models.Model):
++    title = models.CharField(max_length=200)
++    
++    class Meta:
++        app_label = 'test_app'
++'''
++
++with open(os.path.join(app_dir, 'models.py'), 'w') as f:
++    f.write(initial_models)
++
++# Create apps.py
++apps_content = '''
++from django.apps import AppConfig
++
++class TestAppConfig(AppConfig):
++    name = 'test_app'
++'''
++
++with open(os.path.join(app_dir, 'apps.py'), 'w') as f:
++    f.write(apps_content)
++
++# Add the temp directory to Python path
++sys.path.insert(0, temp_dir)
++
++try:
++    # Create initial migration
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'makemigrations', 'test_app'])
++    
++    # Apply initial migration
++    execute_from_command_line(['manage.py', 'migrate', 'test_app'])
++    
++    # Now update models.py to the problematic version (version 2)
++    updated_models = '''
++from django.db import models
++
++class Readable(models.Model):
++    pass
++
++class Book(Readable):
++    title = models.CharField(max_length=200)
++    
++    class Meta:
++        app_label = 'test_app'
++'''
++
++    with open(os.path.join(app_dir, 'models.py'), 'w') as f:
++        f.write(updated_models)
++    
++    # Create the migration that should cause the issue
++    execute_from_command_line(['manage.py', 'makemigrations', 'test_app', '--name', 'move_field_to_subclass', '--dry-run'])
++    
++except Exception as e:
++    print(f"Error occurred: {e}")
++    import traceback
++    traceback.print_exc()
++finally:
++    # Clean up
++    shutil.rmtree(temp_dir)
++    if temp_dir in sys.path:
++        sys.path.remove(temp_dir)
+\ No newline at end of file
+diff --git a/test_direct.py b/test_direct.py
+new file mode 100644
+index 0000000000..8a9784ed1e
+--- /dev/null
++++ b/test_direct.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python
++import os
++import sys
++import tempfile
++import shutil
++from django.conf import settings
++from django.db import models, connection
++from django.db.migrations.autodetector import MigrationAutodetector
++from django.db.migrations.state import ProjectState
++from django.db.migrations.loader import MigrationLoader
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'test_app',
++        ],
++        USE_TZ=True,
++    )
++
++# Create a temporary directory for the test app
++temp_dir = tempfile.mkdtemp()
++app_dir = os.path.join(temp_dir, 'test_app')
++os.makedirs(app_dir)
++
++# Create __init__.py files
++with open(os.path.join(temp_dir, '__init__.py'), 'w') as f:
++    f.write('')
++with open(os.path.join(app_dir, '__init__.py'), 'w') as f:
++    f.write('')
++
++# Create initial models.py (version 1)
++initial_models = '''
++from django.db import models
++
++class Readable(models.Model):
++    title = models.CharField(max_length=200)
++    
++    class Meta:
++        app_label = 'test_app'
++'''
++
++with open(os.path.join(app_dir, 'models.py'), 'w') as f:
++    f.write(initial_models)
++
++# Create apps.py
++apps_content = '''
++from django.apps import AppConfig
++
++class TestAppConfig(AppConfig):
++    name = 'test_app'
++'''
++
++with open(os.path.join(app_dir, 'apps.py'), 'w') as f:
++    f.write(apps_content)
++
++# Add the temp directory to Python path
++sys.path.insert(0, temp_dir)
++
++try:
++    # Create initial state
++    from django.db.migrations.state import ProjectState, ModelState
++    from django.db.migrations.autodetector import MigrationAutodetector
++    
++    # Create from_state with initial models
++    from_state = ProjectState()
++    from_state.add_model(ModelState(
++        'test_app', 'Readable', [],
++        {'title': models.CharField(max_length=200)},
++        'django.db.models.base.Model',
++        {},
++        {}
++    ))
++    
++    # Create to_state with updated models
++    to_state = ProjectState()
++    to_state.add_model(ModelState(
++        'test_app', 'Readable', [],
++        {},
++        'django.db.models.base.Model',
++        {},
++        {}
++    ))
++    to_state.add_model(ModelState(
++        'test_app', 'Book', [],
++        {'title': models.CharField(max_length=200)},
++        'test_app.Readable',
++        {},
++        {}
++    ))
++    
++    # Create autodetector
++    autodetector = MigrationAutodetector(from_state, to_state)
++    changes = autodetector.changes(None)
++    
++    print("Generated operations:")
++    for app_label, migrations in changes.items():
++        for migration in migrations:
++            for operation in migration.operations:
++                print(f"  {operation}")
++    
++except Exception as e:
++    print(f"Error occurred: {e}")
++    import traceback
++    traceback.print_exc()
++finally:
++    # Clean up
++    shutil.rmtree(temp_dir)
++    if temp_dir in sys.path:
++        sys.path.remove(temp_dir)
+\ No newline at end of file

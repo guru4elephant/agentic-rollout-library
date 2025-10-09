@@ -1,0 +1,245 @@
+diff --git a/django/db/backends/sqlite3/base.py b/django/db/backends/sqlite3/base.py
+index 2eeaf98c0d..f575a61c53 100644
+--- a/django/db/backends/sqlite3/base.py
++++ b/django/db/backends/sqlite3/base.py
+@@ -327,18 +327,18 @@ class DatabaseWrapper(BaseDatabaseWrapper):
+                     violations = cursor.execute('PRAGMA foreign_key_check').fetchall()
+                 else:
+                     violations = chain.from_iterable(
+-                        cursor.execute('PRAGMA foreign_key_check(%s)' % table_name).fetchall()
++                        cursor.execute('PRAGMA foreign_key_check("%s")' % table_name).fetchall()
+                         for table_name in table_names
+                     )
+                 # See https://www.sqlite.org/pragma.html#pragma_foreign_key_check
+                 for table_name, rowid, referenced_table_name, foreign_key_index in violations:
+                     foreign_key = cursor.execute(
+-                        'PRAGMA foreign_key_list(%s)' % table_name
++                        'PRAGMA foreign_key_list("%s")' % table_name
+                     ).fetchall()[foreign_key_index]
+                     column_name, referenced_column_name = foreign_key[3:5]
+                     primary_key_column_name = self.introspection.get_primary_key_column(cursor, table_name)
+                     primary_key_value, bad_value = cursor.execute(
+-                        'SELECT %s, %s FROM %s WHERE rowid = %%s' % (
++                        'SELECT %s, %s FROM "%s" WHERE rowid = %%s' % (
+                             primary_key_column_name, column_name, table_name
+                         ),
+                         (rowid,),
+@@ -363,10 +363,10 @@ class DatabaseWrapper(BaseDatabaseWrapper):
+                     for column_name, referenced_table_name, referenced_column_name in key_columns:
+                         cursor.execute(
+                             """
+-                            SELECT REFERRING.`%s`, REFERRING.`%s` FROM `%s` as REFERRING
+-                            LEFT JOIN `%s` as REFERRED
+-                            ON (REFERRING.`%s` = REFERRED.`%s`)
+-                            WHERE REFERRING.`%s` IS NOT NULL AND REFERRED.`%s` IS NULL
++                            SELECT REFERRING."%s", REFERRING."%s" FROM "%s" as REFERRING
++                            LEFT JOIN "%s" as REFERRED
++                            ON (REFERRING."%s" = REFERRED."%s")
++                            WHERE REFERRING."%s" IS NOT NULL AND REFERRED."%s" IS NULL
+                             """
+                             % (
+                                 primary_key_column_name, column_name, table_name,
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..4ea3dab1b1
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the SQLite loaddata crash issue when table names are SQL keywords.
++"""
++
++import os
++import tempfile
++import django
++from django.conf import settings
++from django.db import connection, models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_check_constraints_issue():
++    """Test the check_constraints issue with SQL keyword table names"""
++    print("Testing check_constraints with table name 'order' (SQL keyword)...")
++    
++    # Create a table with a SQL keyword as name
++    with connection.cursor() as cursor:
++        cursor.execute('CREATE TABLE "order" (id INTEGER PRIMARY KEY, name TEXT)')
++    
++    try:
++        # This should trigger the issue in check_constraints
++        connection.check_constraints(table_names=['order'])
++        print("SUCCESS: check_constraints completed without error")
++    except Exception as e:
++        print(f"ERROR: {e}")
++        print("This reproduces the issue described in the GitHub issue")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    test_check_constraints_issue()
+\ No newline at end of file
+diff --git a/test_comprehensive_fix.py b/test_comprehensive_fix.py
+new file mode 100644
+index 0000000000..1fb585a8c7
+--- /dev/null
++++ b/test_comprehensive_fix.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the SQLite fix works for various SQL keywords.
++"""
++
++import os
++import tempfile
++import django
++from django.conf import settings
++from django.db import connection, models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_sql_keywords():
++    """Test check_constraints with various SQL keywords as table names"""
++    sql_keywords = ['order', 'select', 'table', 'where', 'group', 'index']
++    
++    for keyword in sql_keywords:
++        print(f"Testing with table name '{keyword}'...")
++        
++        # Create a table with a SQL keyword as name
++        with connection.cursor() as cursor:
++            cursor.execute(f'CREATE TABLE "{keyword}" (id INTEGER PRIMARY KEY, name TEXT)')
++        
++        try:
++            # This should work without errors after the fix
++            connection.check_constraints(table_names=[keyword])
++            print(f"SUCCESS: check_constraints completed for table '{keyword}'")
++        except Exception as e:
++            print(f"ERROR with '{keyword}': {e}")
++            return False
++    
++    return True
++
++def test_multiple_tables():
++    """Test check_constraints with multiple SQL keyword table names"""
++    print("Testing with multiple SQL keyword table names...")
++    
++    # Use tables that were already created in the previous test
++    try:
++        # Test with multiple table names
++        connection.check_constraints(table_names=['order', 'select', 'table'])
++        print("SUCCESS: check_constraints completed with multiple SQL keyword tables")
++    except Exception as e:
++        print(f"ERROR with multiple tables: {e}")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    success1 = test_sql_keywords()
++    success2 = test_multiple_tables()
++    
++    if success1 and success2:
++        print("\nALL TESTS PASSED: The fix successfully handles SQL keywords as table names!")
++    else:
++        print("\nSOME TESTS FAILED: The fix may need additional work.")
+\ No newline at end of file
+diff --git a/test_loaddata_scenario.py b/test_loaddata_scenario.py
+new file mode 100644
+index 0000000000..ea9af68994
+--- /dev/null
++++ b/test_loaddata_scenario.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++"""
++Test to simulate the exact loaddata scenario described in the GitHub issue.
++"""
++
++import os
++import tempfile
++import django
++from django.conf import settings
++from django.db import connection
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_loaddata_scenario():
++    """Test the exact scenario from the GitHub issue"""
++    print("Testing loaddata scenario with table name 'order'...")
++    
++    # Create the table with SQL keyword name (simulating what Django would do)
++    with connection.cursor() as cursor:
++        cursor.execute('CREATE TABLE "order" (id INTEGER PRIMARY KEY, name TEXT)')
++    
++    # Simulate the foreign key check that happens during loaddata
++    # This is what was failing before the fix
++    try:
++        connection.check_constraints(table_names=['order'])
++        print("SUCCESS: Foreign key constraint checking works for table 'order'")
++        return True
++    except Exception as e:
++        print(f"ERROR: Foreign key constraint checking failed: {e}")
++        return False
++
++if __name__ == '__main__':
++    success = test_loaddata_scenario()
++    if success:
++        print("\nThe GitHub issue has been FIXED!")
++        print("loaddata will now work correctly with SQL keyword table names.")
++    else:
++        print("\nThe GitHub issue is NOT fixed.")
+\ No newline at end of file

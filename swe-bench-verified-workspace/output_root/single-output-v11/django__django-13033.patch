@@ -1,0 +1,794 @@
+diff --git a/debug_condition.py b/debug_condition.py
+new file mode 100644
+index 0000000000..991bf98e19
+--- /dev/null
++++ b/debug_condition.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++
++import sys
++sys.path.insert(0, './django')
++
++def debug_condition():
++    """Debug the condition in find_ordering_name"""
++    
++    # Simulate the problematic case: ordering by 'record__root_id'
++    name = "record__root_id"
++    field_attname = "root_id"  # This is what field.attname would be
++    
++    print(f"name: {name}")
++    print(f"field.attname: {field_attname}")
++    print(f"field.attname != name: {field_attname != name}")
++    print(f"name != 'pk': {name != 'pk'}")
++    
++    # The current condition:
++    condition = field_attname != name and name != 'pk'
++    print(f"Current condition result: {condition}")
++    
++    # My proposed additional condition:
++    pieces = name.split('__')
++    last_piece = pieces[-1]
++    print(f"pieces: {pieces}")
++    print(f"last_piece: {last_piece}")
++    print(f"last_piece == field_attname: {last_piece == field_attname}")
++    
++    # New condition would be:
++    new_condition = condition and last_piece != field_attname
++    print(f"New condition result: {new_condition}")
++    
++    print("\nNow test the working case: ordering by 'record__root__id'")
++    name2 = "record__root__id"
++    field_attname2 = "id"  # This is what field.attname would be for the id field
++    
++    print(f"name: {name2}")
++    print(f"field.attname: {field_attname2}")
++    print(f"field.attname != name: {field_attname2 != name2}")
++    print(f"name != 'pk': {name2 != 'pk'}")
++    
++    pieces2 = name2.split('__')
++    last_piece2 = pieces2[-1]
++    print(f"pieces: {pieces2}")
++    print(f"last_piece: {last_piece2}")
++    print(f"last_piece == field_attname: {last_piece2 == field_attname2}")
++    
++    condition2 = field_attname2 != name2 and name2 != 'pk'
++    new_condition2 = condition2 and last_piece2 != field_attname2
++    print(f"New condition result: {new_condition2}")
++
++if __name__ == "__main__":
++    debug_condition()
+\ No newline at end of file
+diff --git a/debug_ordering.py b/debug_ordering.py
+new file mode 100644
+index 0000000000..29f079f2be
+--- /dev/null
++++ b/debug_ordering.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++
++import sys
++sys.path.insert(0, './django')
++
++# Let's examine the issue by looking at the field resolution
++from django.db.models.sql.compiler import SQLCompiler
++from django.db.models.sql.query import Query
++from django.db.models import F
++
++# Create a simple test to understand what happens
++class MockModel:
++    def __init__(self, name, ordering=None):
++        self.name = name
++        self._meta = MockMeta(ordering)
++        
++class MockMeta:
++    def __init__(self, ordering=None):
++        self.ordering = ordering
++        self.model = self
++        
++    def get_field(self, name):
++        # Mock field resolution
++        if name == 'root':
++            return MockField('root', is_relation=True, attname='root_id')
++        elif name == 'root_id':
++            return MockField('root_id', is_relation=False, attname='root_id')
++        elif name == 'record':
++            return MockField('record', is_relation=True, attname='record_id')
++        elif name == 'record_id':
++            return MockField('record_id', is_relation=False, attname='record_id')
++        elif name == 'oneval':
++            return MockField('oneval', is_relation=False, attname='oneval')
++        elif name == 'id':
++            return MockField('id', is_relation=False, attname='id')
++        return None
++
++class MockField:
++    def __init__(self, name, is_relation, attname):
++        self.name = name
++        self.is_relation = is_relation
++        self.attname = attname
++        
++    def get_path_info(self, filtered_relation=None):
++        # Mock path info for relations
++        if self.name == 'root':
++            return [MockPathInfo()]
++        return []
++        
++class MockPathInfo:
++    def __init__(self):
++        self.join_field = MockField('root', True, 'root_id')
++        self.to_opts = MockMeta(('-id',))
++
++# Test the field resolution
++OneModel = MockModel("OneModel", ordering=('-id',))
++TwoModel = MockModel("TwoModel")
++
++# Test what happens with different ordering patterns
++print("Testing field resolution:")
++
++# Test case 1: record__root_id (the problematic case)
++pieces1 = ['record', 'root_id']
++print(f"\nPieces for 'record__root_id': {pieces1}")
++
++# Test case 2: record__root__id (the working case)  
++pieces2 = ['record', 'root', 'id']
++print(f"Pieces for 'record__root__id': {pieces2}")
++
++# The issue is that both cases get processed similarly, but the first case
++# should not trigger the default ordering logic since we're ordering by
++# the foreign key field directly, not through the relation
+\ No newline at end of file
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index abbb1e37cb..a2b85423d8 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -727,7 +727,9 @@ class SQLCompiler:
+         # If we get to this point and the field is a relation to another model,
+         # append the default ordering for that model unless it is the pk
+         # shortcut or the attribute name of the field that is specified.
+-        if field.is_relation and opts.ordering and getattr(field, 'attname', None) != name and name != 'pk':
++        # Also exclude cases where we're ordering by the foreign key field directly
++        # (e.g., 'record__root_id') rather than through the relation (e.g., 'record__root__id')
++        if field.is_relation and opts.ordering and getattr(field, 'attname', None) != name and name != 'pk' and not self._is_ordering_by_foreign_key_directly(pieces, field):
+             # Firstly, avoid infinite loops.
+             already_seen = already_seen or set()
+             join_tuple = tuple(getattr(self.query.alias_map[j], 'join_cols', None) for j in joins)
+@@ -748,6 +750,23 @@ class SQLCompiler:
+         targets, alias, _ = self.query.trim_joins(targets, joins, path)
+         return [(OrderBy(transform_function(t, alias), descending=descending), False) for t in targets]
+ 
++    def _is_ordering_by_foreign_key_directly(self, pieces, field):
++        """
++        Check if we're ordering by a foreign key field directly (e.g., 'record__root_id')
++        rather than through the relation (e.g., 'record__root__id').
++        
++        This is specifically for cases where we're ordering by the database column name
++        (attname) of a relation field, which should not trigger the default ordering
++        of the related model.
++        """
++        # Only consider cases where we have multiple pieces (e.g., 'record__root_id')
++        if len(pieces) <= 1:
++            return False
++            
++        # Check if the last piece matches the field's attname and the field is a relation
++        # This indicates we're ordering by the foreign key column directly
++        return pieces[-1] == field.attname and field.is_relation
++
+     def _setup_joins(self, pieces, opts, alias):
+         """
+         Helper method for get_order_by() and get_distinct().
+diff --git a/reproduce_exact_issue.py b/reproduce_exact_issue.py
+new file mode 100644
+index 0000000000..05a7885b47
+--- /dev/null
++++ b/reproduce_exact_issue.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, './django')
++
++# Minimal Django setup
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++try:
++    import django
++    from django.conf import settings
++    
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            DATABASES={
++                'default': {
++                    'ENGINE': 'django.db.backends.sqlite3',
++                    'NAME': ':memory:',
++                }
++            },
++            INSTALLED_APPS=[],
++            SECRET_KEY='test-secret-key',
++            USE_TZ=True,
++        )
++    
++    django.setup()
++    
++    from django.db import models
++    
++    # Define the exact models from the issue
++    class OneModel(models.Model):
++        class Meta:
++            ordering = ("-id",)
++        
++        id = models.BigAutoField(primary_key=True)
++        root = models.ForeignKey("OneModel", on_delete=models.CASCADE, null=True)
++        oneval = models.BigIntegerField(null=True)
++    
++    class TwoModel(models.Model):
++        id = models.BigAutoField(primary_key=True)
++        record = models.ForeignKey(OneModel, on_delete=models.CASCADE)
++        twoval = models.BigIntegerField(null=True)
++    
++    # Test the exact queries from the issue
++    print("=== Testing the exact issue ===")
++    
++    # Test case 1: order_by("record__root_id") - problematic
++    print("\n1. order_by('record__root_id'):")
++    qs1 = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++    qs1 = qs1.order_by("record__root_id")
++    print("SQL:", qs1.query)
++    print("Expected: Should have ASC order and single JOIN")
++    
++    # Test case 2: order_by("record__root__id") - working
++    print("\n2. order_by('record__root__id'):")
++    qs2 = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++    qs2 = qs2.order_by("record__root__id")
++    print("SQL:", qs2.query)
++    print("Expected: Should have ASC order and single JOIN")
++    
++    # Test case 3: order_by("-record__root_id") - problematic
++    print("\n3. order_by('-record__root_id'):")
++    qs3 = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++    qs3 = qs3.order_by("-record__root_id")
++    print("SQL:", qs3.query)
++    print("Expected: Should have DESC order and single JOIN")
++    
++    # Test case 4: annotate workaround - working
++    print("\n4. annotate workaround:")
++    qs4 = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++    qs4 = qs4.annotate(root_id=models.F("record__root_id"))
++    qs4 = qs4.order_by("root_id")
++    print("SQL:", qs4.query)
++    print("Expected: Should have ASC order and single JOIN")
++    
++except Exception as e:
++    print("Error:", e)
++    print("This might be due to Django setup issues")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..f02d60f7d6
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, './django')
++
++# Import Django components directly
++from django.db import models
++from django.db.models import F
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++# Define the models from the issue
++class OneModel(models.Model):
++    class Meta:
++        ordering = ("-id",)
++    
++    id = models.BigAutoField(primary_key=True)
++    root = models.ForeignKey("OneModel", on_delete=models.CASCADE, null=True)
++    oneval = models.BigIntegerField(null=True)
++
++class TwoModel(models.Model):
++    id = models.BigAutoField(primary_key=True)
++    record = models.ForeignKey(OneModel, on_delete=models.CASCADE)
++    twoval = models.BigIntegerField(null=True)
++
++# Test the queries
++from django.db import connection
++from django.db.models import F
++
++print("=== Testing the issue ===")
++
++# Create test case 1: order_by("record__root_id")
++print("\n1. Testing order_by('record__root_id'):")
++qs1 = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++qs1 = qs1.order_by("record__root_id")
++print("SQL Query:")
++print(qs1.query)
++print("Expected: Should have ASC order and single JOIN")
++
++# Create test case 2: order_by("record__root__id") 
++print("\n2. Testing order_by('record__root__id'):")
++qs2 = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++qs2 = qs2.order_by("record__root__id")
++print("SQL Query:")
++print(qs2.query)
++print("Expected: Should have ASC order and single JOIN")
++
++# Create test case 3: order_by("-record__root_id")
++print("\n3. Testing order_by('-record__root_id'):")
++qs3 = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++qs3 = qs3.order_by("-record__root_id")
++print("SQL Query:")
++print(qs3.query)
++print("Expected: Should have DESC order and single JOIN")
++
++# Create test case 4: Using annotate workaround
++print("\n4. Testing annotate workaround:")
++qs4 = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++qs4 = qs4.annotate(root_id=F("record__root_id"))
++qs4 = qs4.order_by("root_id")
++print("SQL Query:")
++print(qs4.query)
++print("Expected: Should have ASC order and single JOIN")
++
++print("\n=== End of tests ===")
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..5e49e5cd53
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python3
++
++import sys
++sys.path.insert(0, './django')
++
++# Import the query generation components directly
++from django.db.models.sql.query import Query
++from django.db.models.sql.compiler import SQLCompiler
++from django.db.models import F
++
++# Mock model setup for testing
++class MockModel:
++    def __init__(self, name):
++        self.name = name
++        
++    def __str__(self):
++        return self.name
++
++# Create mock models
++OneModel = MockModel("OneModel")
++TwoModel = MockModel("TwoModel")
++
++# Create a query object
++query = Query(TwoModel)
++query.add_filter(('record__oneval__in', [1, 2, 3]))
++query.order_by = ['record__root_id']
++
++# Try to generate SQL
++compiler = SQLCompiler(query, connection=None)
++try:
++    sql, params = compiler.as_sql()
++    print("Generated SQL:", sql)
++    print("Parameters:", params)
++except Exception as e:
++    print("Error:", e)
++    print("This approach might not work, let's try a different method")
++
++# Let's look at the actual query generation code
++print("\n=== Exploring query generation ===")
+\ No newline at end of file
+diff --git a/test_comprehensive_fix.py b/test_comprehensive_fix.py
+new file mode 100644
+index 0000000000..e1be9d0e32
+--- /dev/null
++++ b/test_comprehensive_fix.py
+@@ -0,0 +1,104 @@
++#!/usr/bin/env python3
++
++import sys
++sys.path.insert(0, './django')
++
++from django.db.models.sql.compiler import SQLCompiler
++from django.db.models.sql.query import Query
++from django.db.models.constants import LOOKUP_SEP
++
++# Create a mock query and compiler to test the ordering logic
++class MockQuery:
++    def __init__(self):
++        self.alias_map = {}
++        self.annotation_select = {}
++        self.annotations = {}
++        self.extra = {}
++        self.extra_select = {}
++        self.default_ordering = True
++        
++    def get_meta(self):
++        return MockMeta()
++        
++    def setup_joins(self, pieces, opts, alias):
++        # Mock setup_joins for different scenarios
++        
++        if pieces == ['record', 'root_id']:
++            # This simulates ordering by 'record__root_id'
++            field = MockField('root', is_relation=True, attname='root_id')
++            targets = [field]
++            opts = MockMeta(('-id',))
++            joins = ['join1']
++            path = ['path1']
++            transform_function = lambda x, y: x
++            return field, targets, opts, joins, path, transform_function
++            
++        elif pieces == ['record', 'root', 'id']:
++            # This simulates ordering by 'record__root__id'
++            field = MockField('id', is_relation=False, attname='id')
++            targets = [field]
++            opts = MockMeta(('-id',))
++            joins = ['join1', 'join2']
++            path = ['path1', 'path2']
++            transform_function = lambda x, y: x
++            return field, targets, opts, joins, path, transform_function
++            
++        elif pieces == ['record', 'oneval']:
++            # This simulates ordering by 'record__oneval'
++            field = MockField('oneval', is_relation=False, attname='oneval')
++            targets = [field]
++            opts = MockMeta(('-id',))
++            joins = ['join1']
++            path = ['path1']
++            transform_function = lambda x, y: x
++            return field, targets, opts, joins, path, transform_function
++            
++    def trim_joins(self, targets, joins, path):
++        return targets, joins[-1], None
++
++class MockMeta:
++    def __init__(self, ordering=None):
++        self.ordering = ordering
++        
++class MockField:
++    def __init__(self, name, is_relation, attname):
++        self.name = name
++        self.is_relation = is_relation
++        self.attname = attname
++
++def test_find_ordering_name():
++    """Test the find_ordering_name method with different ordering patterns"""
++    
++    compiler = SQLCompiler(MockQuery(), None, None)
++    
++    print("Testing find_ordering_name with different patterns:")
++    
++    # Test case 1: ordering by foreign key directly (record__root_id)
++    print("\n1. Testing 'record__root_id':")
++    try:
++        result = compiler.find_ordering_name('record__root_id', MockMeta(), None, 'ASC')
++        print(f"Result length: {len(result)}")
++        print(f"Expected: Should not include default ordering, result length should be small")
++    except Exception as e:
++        print(f"Error: {e}")
++    
++    # Test case 2: ordering through relation (record__root__id)
++    print("\n2. Testing 'record__root__id':")
++    try:
++        result = compiler.find_ordering_name('record__root__id', MockMeta(), None, 'ASC')
++        print(f"Result length: {len(result)}")
++        print(f"Expected: Should include default ordering, result length might be larger")
++    except Exception as e:
++        print(f"Error: {e}")
++    
++    # Test case 3: ordering by non-relation field (record__oneval)
++    print("\n3. Testing 'record__oneval':")
++    try:
++        result = compiler.find_ordering_name('record__oneval', MockMeta(), None, 'ASC')
++        print(f"Result length: {len(result)}")
++        print(f"Expected: Should not include default ordering, result length should be small")
++    except Exception as e:
++        print(f"Error: {e}")
++
++if __name__ == "__main__":
++    test_find_ordering_name()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..9d24d939fa
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++
++import sys
++sys.path.insert(0, './django')
++
++# Test the fix by examining the ordering logic directly
++from django.db.models.sql.compiler import SQLCompiler
++from django.db.models.sql.query import Query
++from django.db.models.constants import LOOKUP_SEP
++
++# Create a mock query object to test the ordering logic
++class MockQuery:
++    def __init__(self):
++        self.alias_map = {}
++        self.annotation_select = {}
++        self.annotations = {}
++        self.extra = {}
++        self.extra_select = {}
++        self.default_ordering = True
++        
++    def get_meta(self):
++        return MockMeta()
++        
++    def setup_joins(self, pieces, opts, alias):
++        # Mock setup_joins for our test case
++        if pieces == ['record', 'root_id']:
++            # This simulates ordering by 'record__root_id'
++            field = MockField('root', is_relation=True, attname='root_id')
++            targets = [field]
++            opts = MockMeta(('-id',))
++            joins = ['join1']
++            path = ['path1']
++            transform_function = lambda x, y: x
++            return field, targets, opts, joins, path, transform_function
++        elif pieces == ['record', 'root', 'id']:
++            # This simulates ordering by 'record__root__id'
++            field = MockField('id', is_relation=False, attname='id')
++            targets = [field]
++            opts = MockMeta(('-id',))
++            joins = ['join1', 'join2']
++            path = ['path1', 'path2']
++            transform_function = lambda x, y: x
++            return field, targets, opts, joins, path, transform_function
++            
++class MockMeta:
++    def __init__(self, ordering=None):
++        self.ordering = ordering
++        
++class MockField:
++    def __init__(self, name, is_relation, attname):
++        self.name = name
++        self.is_relation = is_relation
++        self.attname = attname
++
++# Test the find_ordering_name method
++compiler = SQLCompiler(MockQuery(), None, None)
++
++print("Testing the fix:")
++
++# Test case 1: record__root_id (should NOT trigger default ordering)
++print("\n1. Testing 'record__root_id':")
++try:
++    result1 = compiler.find_ordering_name('record__root_id', MockMeta(), None, 'ASC')
++    print("Result:", result1)
++    print("Length:", len(result1))
++    print("Expected: Should not include default ordering (-id)")
++except Exception as e:
++    print("Error:", e)
++
++# Test case 2: record__root__id (should trigger default ordering)
++print("\n2. Testing 'record__root__id':")
++try:
++    result2 = compiler.find_ordering_name('record__root__id', MockMeta(), None, 'ASC')
++    print("Result:", result2)
++    print("Length:", len(result2))
++    print("Expected: Should include default ordering (-id)")
++except Exception as e:
++    print("Error:", e)
++
++print("\n=== Test completed ===")
+\ No newline at end of file
+diff --git a/test_fix_logic.py b/test_fix_logic.py
+new file mode 100644
+index 0000000000..7fa0204671
+--- /dev/null
++++ b/test_fix_logic.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++
++import sys
++sys.path.insert(0, './django')
++
++from django.db.models.sql.compiler import SQLCompiler
++
++def test_helper_method():
++    """Test the _is_ordering_by_foreign_key_directly method"""
++    
++    compiler = SQLCompiler(None, None, None)
++    
++    # Test case 1: ordering by foreign key directly (record__root_id)
++    pieces1 = ['record', 'root_id']
++    field1 = type('MockField', (), {'attname': 'root_id', 'is_relation': True})()
++    result1 = compiler._is_ordering_by_foreign_key_directly(pieces1, field1)
++    print(f"Test case 1 (record__root_id): {result1} - Expected: True")
++    
++    # Test case 2: ordering through relation (record__root__id)
++    pieces2 = ['record', 'root', 'id']
++    field2 = type('MockField', (), {'attname': 'id', 'is_relation': False})()
++    result2 = compiler._is_ordering_by_foreign_key_directly(pieces2, field2)
++    print(f"Test case 2 (record__root__id): {result2} - Expected: False")
++    
++    # Test case 3: ordering by non-foreign key field (record__oneval)
++    pieces3 = ['record', 'oneval']
++    field3 = type('MockField', (), {'attname': 'oneval', 'is_relation': False})()
++    result3 = compiler._is_ordering_by_foreign_key_directly(pieces3, field3)
++    print(f"Test case 3 (record__oneval): {result3} - Expected: False")
++    
++    # Test case 4: single piece (root_id)
++    pieces4 = ['root_id']
++    field4 = type('MockField', (), {'attname': 'root_id', 'is_relation': True})()
++    result4 = compiler._is_ordering_by_foreign_key_directly(pieces4, field4)
++    print(f"Test case 4 (root_id): {result4} - Expected: False")
++    
++    # Test case 5: non-relation field with matching attname
++    pieces5 = ['record', 'some_field']
++    field5 = type('MockField', (), {'attname': 'some_field', 'is_relation': False})()
++    result5 = compiler._is_ordering_by_foreign_key_directly(pieces5, field5)
++    print(f"Test case 5 (record__some_field): {result5} - Expected: False")
++
++if __name__ == "__main__":
++    test_helper_method()
+\ No newline at end of file
+diff --git a/test_logic.py b/test_logic.py
+new file mode 100644
+index 0000000000..f15d2e7dc3
+--- /dev/null
++++ b/test_logic.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++
++import sys
++sys.path.insert(0, './django')
++
++# Test the specific logic change
++from django.db.models.sql.compiler import SQLCompiler
++from django.db.models.constants import LOOKUP_SEP
++
++def test_ordering_logic():
++    """Test the specific logic change in find_ordering_name"""
++    
++    # Create a mock compiler with minimal setup
++    compiler = SQLCompiler(None, None, None)
++    
++    # Test case 1: ordering by foreign key field directly (record__root_id)
++    name1 = "record__root_id"
++    pieces1 = name1.split(LOOKUP_SEP)
++    print(f"Test case 1: {name1}")
++    print(f"Pieces: {pieces1}")
++    print(f"Last piece: {pieces1[-1]}")
++    
++    # Simulate what happens in the method
++    # The field.attname would be 'root_id' for a foreign key field
++    field_attname = "root_id"
++    print(f"Field attname: {field_attname}")
++    print(f"Should skip default ordering: {pieces1[-1] == field_attname}")
++    
++    # Test case 2: ordering through relation (record__root__id)
++    name2 = "record__root__id"  
++    pieces2 = name2.split(LOOKUP_SEP)
++    print(f"\nTest case 2: {name2}")
++    print(f"Pieces: {pieces2}")
++    print(f"Last piece: {pieces2[-1]}")
++    
++    # The field.attname would be 'id' for the id field
++    field_attname2 = "id"
++    print(f"Field attname: {field_attname2}")
++    print(f"Should skip default ordering: {pieces2[-1] == field_attname2}")
++    
++    # Test case 3: ordering by non-foreign key field (record__oneval)
++    name3 = "record__oneval"
++    pieces3 = name3.split(LOOKUP_SEP)
++    print(f"\nTest case 3: {name3}")
++    print(f"Pieces: {pieces3}")
++    print(f"Last piece: {pieces3[-1]}")
++    
++    # The field.attname would be 'oneval' for the oneval field
++    field_attname3 = "oneval"
++    print(f"Field attname: {field_attname3}")
++    print(f"Should skip default ordering: {pieces3[-1] == field_attname3}")
++
++if __name__ == "__main__":
++    test_ordering_logic()
+\ No newline at end of file
+diff --git a/test_self_referencing_ordering.py b/test_self_referencing_ordering.py
+new file mode 100644
+index 0000000000..5a05d287a5
+--- /dev/null
++++ b/test_self_referencing_ordering.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, './django')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++django.setup()
++
++from django.db import models
++from django.test import TestCase
++from django.db.models import F
++
++# Define the models from the issue
++class OneModel(models.Model):
++    class Meta:
++        ordering = ("-id",)
++    
++    id = models.BigAutoField(primary_key=True)
++    root = models.ForeignKey("OneModel", on_delete=models.CASCADE, null=True)
++    oneval = models.BigIntegerField(null=True)
++
++class TwoModel(models.Model):
++    id = models.BigAutoField(primary_key=True)
++    record = models.ForeignKey(OneModel, on_delete=models.CASCADE)
++    twoval = models.BigIntegerField(null=True)
++
++class SelfReferencingOrderingTest(TestCase):
++    
++    def test_order_by_foreign_key_id_directly(self):
++        """Test ordering by foreign key field directly (record__root_id)"""
++        qs = TwoModel.objects.filter(record__oneval__in=[1, 2, 3])
++        qs = qs.order_by("record__root_id")
++        
++        # The SQL should have ASC order and not include the default ordering
++        sql = str(qs.query)
++        print("SQL for record__root_id:", sql)
++        
++        # Should not contain DESC (default ordering from OneModel)
++        self.assertNotIn("DESC", sql)
++        # Should contain ASC (explicit ordering)
++        self.assertIn("ASC", sql)
++        # Should not have unnecessary joins
++        self.assertEqual(sql.count("JOIN"), 1)  # Only the INNER JOIN for the filter
++
++    def test_order_by_through_relation(self):
++        """Test ordering through relation (record__root__id)"""
++        qs = TwoModel.objects.filter(record__oneval__in=[1, 2, 3])
++        qs = qs.order_by("record__root__id")
++        
++        # The SQL should have ASC order
++        sql = str(qs.query)
++        print("SQL for record__root__id:", sql)
++        
++        # Should contain ASC (explicit ordering)
++        self.assertIn("ASC", sql)
++        # Should not have unnecessary joins
++        self.assertEqual(sql.count("JOIN"), 1)  # Only the INNER JOIN for the filter
++
++    def test_order_by_foreign_key_id_desc(self):
++        """Test ordering by foreign key field directly in descending order"""
++        qs = TwoModel.objects.filter(record__oneval__in=[1, 2, 3])
++        qs = qs.order_by("-record__root_id")
++        
++        # The SQL should have DESC order
++        sql = str(qs.query)
++        print("SQL for -record__root_id:", sql)
++        
++        # Should contain DESC (explicit ordering)
++        self.assertIn("DESC", sql)
++        # Should not have unnecessary joins
++        self.assertEqual(sql.count("JOIN"), 1)  # Only the INNER JOIN for the filter
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file

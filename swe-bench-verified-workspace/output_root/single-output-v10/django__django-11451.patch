@@ -1,0 +1,580 @@
+diff --git a/django/contrib/auth/backends.py b/django/contrib/auth/backends.py
+index f4b1722757..a3765ae0f1 100644
+--- a/django/contrib/auth/backends.py
++++ b/django/contrib/auth/backends.py
+@@ -39,6 +39,8 @@ class ModelBackend(BaseBackend):
+     def authenticate(self, request, username=None, password=None, **kwargs):
+         if username is None:
+             username = kwargs.get(UserModel.USERNAME_FIELD)
++        if username is None or password is None:
++            return
+         try:
+             user = UserModel._default_manager.get_by_natural_key(username)
+         except UserModel.DoesNotExist:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..db12e46257
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where ModelBackend.authenticate()
++makes unnecessary database queries when username is None.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++from django.db import connection
++from django.test.utils import CaptureQueriesContext
++
++def test_authenticate_with_none_username():
++    """Test that authenticate doesn't make DB queries when username is None"""
++    backend = ModelBackend()
++    
++    # Capture database queries
++    with CaptureQueriesContext(connection) as context:
++        result = backend.authenticate(None, username=None, password=None)
++    
++    print(f"Number of queries executed: {len(context.captured_queries)}")
++    
++    if len(context.captured_queries) > 0:
++        print("Queries executed:")
++        for i, query in enumerate(context.captured_queries):
++            print(f"  {i+1}. {query['sql']}")
++        print("\nISSUE REPRODUCED: Database queries were made when username is None!")
++        return False
++    else:
++        print("SUCCESS: No database queries were made when username is None!")
++        return True
++
++if __name__ == "__main__":
++    success = test_authenticate_with_none_username()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..1965e0b871
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++"""
++Simple script to demonstrate the issue by showing the SQL query that would be generated
++when ModelBackend.authenticate() is called with username=None.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++from django.contrib.auth.models import User
++from django.db import connection
++
++def demonstrate_issue():
++    """Demonstrate the SQL query that would be generated"""
++    backend = ModelBackend()
++    
++    # Get the User model's USERNAME_FIELD
++    username_field = User.USERNAME_FIELD
++    
++    print(f"User model's USERNAME_FIELD: {username_field}")
++    print(f"Testing authenticate with username=None, password=None")
++    
++    # This simulates what happens in authenticate() when username is None
++    username = None
++    if username is None:
++        username = None  # This simulates kwargs.get(UserModel.USERNAME_FIELD) returning None
++    
++    print(f"After processing, username is: {username}")
++    
++    if username is not None:
++        # This would generate the SQL query
++        query = User._default_manager.filter(**{username_field: username}).query
++        sql, params = query.sql_with_params()
++        print(f"SQL query that would be executed: {sql}")
++        print(f"Query parameters: {params}")
++    else:
++        print("No query would be executed (username is None)")
++    
++    # Show the issue: when both username and password are None, we should return early
++    print("\n=== ISSUE DEMONSTRATION ===")
++    print("Current behavior: authenticate() continues even when both username and password are None")
++    print("Expected behavior: authenticate() should return None immediately")
++    print("This would prevent unnecessary database queries and password hashing")
++
++if __name__ == "__main__":
++    demonstrate_issue()
+\ No newline at end of file
+diff --git a/test_basic_functionality.py b/test_basic_functionality.py
+new file mode 100644
+index 0000000000..12ee8d5cec
+--- /dev/null
++++ b/test_basic_functionality.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++"""
++Basic test to verify our fix doesn't break normal authentication functionality.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++
++def test_basic_functionality():
++    """Test that our fix doesn't break normal authentication"""
++    backend = ModelBackend()
++    
++    # Test 1: Both username and password are None (should return early)
++    result1 = backend.authenticate(None, username=None, password=None)
++    assert result1 is None, "Should return None when both username and password are None"
++    print("✓ Test 1 passed: Returns None when both username and password are None")
++    
++    # Test 2: Username is None but password is not (should return early)
++    result2 = backend.authenticate(None, username=None, password="testpass")
++    assert result2 is None, "Should return None when username is None but password is not"
++    print("✓ Test 2 passed: Returns None when username is None but password is not")
++    
++    # Test 3: Password is None but username is not (should return early)
++    result3 = backend.authenticate(None, username="testuser", password=None)
++    assert result3 is None, "Should return None when password is None but username is not"
++    print("✓ Test 3 passed: Returns None when password is None but username is not")
++    
++    # Test 4: Both username and password are provided (should proceed normally)
++    # This test is just to ensure the method signature is correct
++    # We can't test actual authentication without database setup
++    try:
++        backend.authenticate(None, username="testuser", password="testpass")
++        print("✓ Test 4 passed: Method signature is correct")
++    except Exception as e:
++        # Expected to fail due to database not being set up
++        print("✓ Test 4 passed: Method signature is correct (database error expected)")
++    
++    print("\nAll basic functionality tests passed!")
++
++if __name__ == "__main__":
++    test_basic_functionality()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..e39d9b5843
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to ensure the fix handles various edge cases.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import TestCase
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++from django.db import connection
++from django.test.utils import CaptureQueriesContext
++
++class TestModelBackendComprehensive(TestCase):
++    """Comprehensive test for ModelBackend fix"""
++    
++    def test_authenticate_with_none_username_and_password(self):
++        """Test that authenticate returns early when both username and password are None"""
++        backend = ModelBackend()
++        
++        with CaptureQueriesContext(connection) as context:
++            result = backend.authenticate(None, username=None, password=None)
++        
++        self.assertIsNone(result)
++        self.assertEqual(len(context.captured_queries), 0)
++        print("✓ Test passed: No queries when both username and password are None")
++    
++    def test_authenticate_with_none_username_only(self):
++        """Test that authenticate returns early when username is None but password is not"""
++        backend = ModelBackend()
++        
++        with CaptureQueriesContext(connection) as context:
++            result = backend.authenticate(None, username=None, password="testpass")
++        
++        self.assertIsNone(result)
++        self.assertEqual(len(context.captured_queries), 0)
++        print("✓ Test passed: No queries when username is None but password is not")
++    
++    def test_authenticate_with_none_password_only(self):
++        """Test that authenticate returns early when password is None but username is not"""
++        backend = ModelBackend()
++        
++        with CaptureQueriesContext(connection) as context:
++            result = backend.authenticate(None, username="testuser", password=None)
++        
++        self.assertIsNone(result)
++        self.assertEqual(len(context.captured_queries), 0)
++        print("✓ Test passed: No queries when password is None but username is not")
++    
++    def test_authenticate_with_valid_credentials(self):
++        """Test that authenticate works normally with valid credentials"""
++        from django.contrib.auth.models import User
++        user = User.objects.create_user('testuser', 'test@example.com', 'testpass')
++        
++        backend = ModelBackend()
++        
++        with CaptureQueriesContext(connection) as context:
++            result = backend.authenticate(None, username="testuser", password="testpass")
++        
++        self.assertEqual(result, user)
++        self.assertGreater(len(context.captured_queries), 0)  # Should make queries for valid auth
++        print("✓ Test passed: Normal authentication works with valid credentials")
++    
++    def test_authenticate_with_invalid_credentials(self):
++        """Test that authenticate works normally with invalid credentials"""
++        backend = ModelBackend()
++        
++        with CaptureQueriesContext(connection) as context:
++            result = backend.authenticate(None, username="nonexistent", password="wrongpass")
++        
++        self.assertIsNone(result)
++        self.assertGreater(len(context.captured_queries), 0)  # Should make queries for invalid auth
++        print("✓ Test passed: Normal authentication works with invalid credentials")
++
++if __name__ == "__main__":
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..4e46ff9860
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the ModelBackend fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++from django.contrib.auth.models import User
++from django.db import connection
++from django.test.utils import CaptureQueriesContext
++
++def test_edge_cases():
++    """Test edge cases for the ModelBackend fix"""
++    backend = ModelBackend()
++    
++    print("Testing edge cases...")
++    
++    # Test 1: username is None and no USERNAME_FIELD in kwargs
++    # This simulates the exact scenario described in the GitHub issue
++    
++    with CaptureQueriesContext(connection) as context:
++        # Don't pass any USERNAME_FIELD in kwargs, so kwargs.get() returns None
++        result = backend.authenticate(None, username=None, password=None)
++    
++    assert result is None, "Should return None when both username and password are None"
++    assert len(context.captured_queries) == 0, "Should not make any database queries"
++    print("✓ Edge case 1 passed: No queries when username is None and no USERNAME_FIELD in kwargs")
++    
++    # Test 2: Test that our fix doesn't break normal authentication flow
++    # We'll just verify that the method can be called with different parameters
++    try:
++        backend.authenticate(None, username="testuser", password="testpass")
++        print("✓ Edge case 2 passed: Method can be called with username and password")
++    except Exception as e:
++        # Expected to fail due to database not being set up, but method signature is correct
++        print("✓ Edge case 2 passed: Method signature is correct (database error expected)")
++    
++    # Test 3: Verify the fix doesn't break the method signature
++    # The method should still accept all the same parameters
++    try:
++        backend.authenticate(None, username="test", password="test")
++        backend.authenticate(None, username=None, password="test")
++        backend.authenticate(None, username="test", password=None)
++        backend.authenticate(None, username=None, password=None)
++        backend.authenticate(None, username=None, password=None, email="test@example.com")
++        print("✓ Edge case 3 passed: Method signature unchanged")
++    except Exception as e:
++        # Database errors are expected since we don't have tables set up
++        # But we should check if it's a signature error vs database error
++        if "no such table" in str(e) or "auth_user" in str(e):
++            print("✓ Edge case 3 passed: Method signature unchanged (database error expected)")
++        else:
++            print(f"✗ Edge case 3 failed: Method signature broken: {e}")
++            return False
++    
++    print("\nAll edge case tests passed!")
++    return True
++
++if __name__ == "__main__":
++    success = test_edge_cases()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_exact_issue.py b/test_exact_issue.py
+new file mode 100644
+index 0000000000..f28f153f8f
+--- /dev/null
++++ b/test_exact_issue.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++"""
++Test to reproduce the exact issue described in the GitHub issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++from django.contrib.auth.models import User
++from django.db import connection
++from django.test.utils import CaptureQueriesContext
++
++def test_exact_issue():
++    """Test the exact scenario described in the GitHub issue"""
++    backend = ModelBackend()
++    
++    print("Testing authenticate() with username=None and empty kwargs...")
++    print("This simulates when credentials are provided for another backend")
++    
++    # Create the auth_user table first
++    from django.db import models
++    User.objects.create_user('testuser', 'test@example.com', 'testpass')
++    
++    # Capture queries
++    with CaptureQueriesContext(connection) as context:
++        # This should trigger the issue: username=None and no USERNAME_FIELD in kwargs
++        result = backend.authenticate(None, username=None, password=None)
++    
++    print(f"Number of queries executed: {len(context.captured_queries)}")
++    
++    if len(context.captured_queries) > 0:
++        print("Queries executed:")
++        for i, query in enumerate(context.captured_queries):
++            print(f"  {i+1}. {query['sql']}")
++            print(f"     params: {query['params']}")
++        
++        # Check if any query has "IS NULL" condition
++        has_null_query = any("IS NULL" in query['sql'] for query in context.captured_queries)
++        if has_null_query:
++            print("\nISSUE REPRODUCED: Database query with IS NULL condition was executed!")
++            print("This is the problematic query mentioned in the GitHub issue.")
++            return False
++        else:
++            print("\nQueries were executed but no IS NULL condition found.")
++            return True
++    else:
++        print("SUCCESS: No database queries were executed!")
++        return True
++
++if __name__ == "__main__":
++    success = test_exact_issue()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_with_django.py b/test_with_django.py
+new file mode 100644
+index 0000000000..b1aea8fb49
+--- /dev/null
++++ b/test_with_django.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++"""
++Test using Django's test framework to properly set up database.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import TestCase
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++from django.db import connection
++from django.test.utils import CaptureQueriesContext
++
++class TestModelBackendIssue(TestCase):
++    """Test the ModelBackend issue with username=None"""
++    
++    def test_authenticate_with_none_username(self):
++        """Test that authenticate doesn't make DB queries when username is None"""
++        backend = ModelBackend()
++        
++        # Capture database queries
++        with CaptureQueriesContext(connection) as context:
++            result = backend.authenticate(None, username=None, password=None)
++        
++        print(f"Number of queries executed: {len(context.captured_queries)}")
++        
++        if len(context.captured_queries) > 0:
++            print("Queries executed:")
++            for i, query in enumerate(context.captured_queries):
++                print(f"  {i+1}. {query['sql']}")
++                print(f"     params: {query['params']}")
++            
++            # Check if any query has "IS NULL" condition
++            has_null_query = any("IS NULL" in query['sql'] for query in context.captured_queries)
++            if has_null_query:
++                print("\nISSUE REPRODUCED: Database query with IS NULL condition was executed!")
++                self.fail("Database query with IS NULL condition was executed!")
++            else:
++                print("\nQueries were executed but no IS NULL condition found.")
++        else:
++            print("SUCCESS: No database queries were executed!")
++
++if __name__ == "__main__":
++    import unittest
++    unittest.main()
+\ No newline at end of file

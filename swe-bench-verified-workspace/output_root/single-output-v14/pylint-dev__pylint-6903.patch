@@ -1,0 +1,248 @@
+diff --git a/pylint/lint/run.py b/pylint/lint/run.py
+index a7e5d5574..dcc86f5b4 100644
+--- a/pylint/lint/run.py
++++ b/pylint/lint/run.py
+@@ -53,11 +53,15 @@ def _query_cpu() -> int | None:
+             cpu_period = int(file.read().rstrip())
+         # Divide quota by period and you should get num of allotted CPU to the container, rounded down if fractional.
+         avail_cpu = int(cpu_quota / cpu_period)
++        # Ensure we never return 0, as multiprocessing requires at least 1 CPU
++        avail_cpu = max(avail_cpu, 1)
+     elif Path("/sys/fs/cgroup/cpu/cpu.shares").is_file():
+         with open("/sys/fs/cgroup/cpu/cpu.shares", encoding="utf-8") as file:
+             cpu_shares = int(file.read().rstrip())
+         # For AWS, gives correct value * 1024.
+         avail_cpu = int(cpu_shares / 1024)
++        # Ensure we never return 0, as multiprocessing requires at least 1 CPU
++        avail_cpu = max(avail_cpu, 1)
+     return avail_cpu
+ 
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..391a46bc6
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++"""Script to reproduce the Kubernetes pod issue with pylint --jobs=0"""
++
++import os
++import sys
++from pathlib import Path
++from unittest.mock import patch
++
++# Add the testbed pylint to the path
++sys.path.insert(0, '/testbed')
++
++from pylint.lint.run import _query_cpu, _cpu_count
++
++def test_query_cpu_kubernetes_scenario():
++    """Test the scenario described in the GitHub issue"""
++    
++    # Mock the Kubernetes environment described in the issue
++    # /sys/fs/cgroup/cpu/cpu.cfs_quota_us = -1 (not used)
++    # /sys/fs/cgroup/cpu/cpu.cfs_period_us = 100000 (not used)
++    # /sys/fs/cgroup/cpu/cpu.shares = 2
++    
++    def mock_open(file_path, *args, **kwargs):
++        if file_path == "/sys/fs/cgroup/cpu/cpu.cfs_quota_us":
++            from io import StringIO
++            return StringIO("-1\n")
++        elif file_path == "/sys/fs/cgroup/cpu/cpu.cfs_period_us":
++            from io import StringIO
++            return StringIO("100000\n")
++        elif file_path == "/sys/fs/cgroup/cpu/cpu.shares":
++            from io import StringIO
++            return StringIO("2\n")
++        raise FileNotFoundError(f"File not found: {file_path}")
++    
++    # Mock the file reading and file existence checks
++    with patch('builtins.open', side_effect=mock_open):
++        with patch('pathlib.Path.is_file', side_effect=lambda self: str(self) in [
++            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
++            "/sys/fs/cgroup/cpu/cpu.cfs_period_us", 
++            "/sys/fs/cgroup/cpu/cpu.shares"
++        ]):
++            result = _query_cpu()
++            print(f"_query_cpu() returned: {result}")
++            
++            # This should return 0 in the Kubernetes scenario
++            if result == 0:
++                print("BUG REPRODUCED: _query_cpu() returns 0")
++                return True
++            else:
++                print("No bug reproduced")
++                return False
++
++def test_cpu_count_with_zero():
++    """Test _cpu_count() when _query_cpu() returns 0"""
++    
++    with patch('pylint.lint.run._query_cpu', return_value=0):
++        with patch('os.sched_getaffinity', return_value={0, 1}) if hasattr(os, 'sched_getaffinity') else patch.dict('os.__dict__', {'sched_getaffinity': lambda x: {0, 1}}):
++            with patch('multiprocessing.cpu_count', return_value=4) if 'multiprocessing' in globals() else None:
++                result = _cpu_count()
++                print(f"_cpu_count() returned: {result}")
++                
++                if result == 0:
++                    print("BUG REPRODUCED: _cpu_count() returns 0")
++                    return True
++                else:
++                    print("No bug reproduced")
++                    return False
++
++if __name__ == "__main__":
++    print("Testing Kubernetes scenario...")
++    bug_reproduced = test_query_cpu_kubernetes_scenario()
++    
++    print("\nTesting _cpu_count with zero...")
++    bug_reproduced_2 = test_cpu_count_with_zero()
++    
++    if bug_reproduced or bug_reproduced_2:
++        print("\n✅ Bug successfully reproduced!")
++        sys.exit(1)
++    else:
++        print("\n❌ Could not reproduce the bug")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 000000000..958ee6d1c
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++"""Simple script to reproduce the Kubernetes pod issue with pylint --jobs=0"""
++
++import sys
++sys.path.insert(0, '/testbed')
++
++# Let's directly test the logic from _query_cpu function
++def test_query_cpu_logic():
++    """Test the specific logic that causes the issue"""
++    
++    # Simulate the Kubernetes scenario from the issue:
++    # cpu_quota = -1 (from /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
++    # cpu_period = 100000 (not used since cpu_quota == -1)
++    # cpu_shares = 2 (from /sys/fs/cgroup/cpu/cpu.shares)
++    
++    cpu_quota, avail_cpu = None, None
++    
++    # Simulate the first condition: cpu_quota is -1
++    cpu_quota = -1
++    
++    # This condition fails because cpu_quota == -1
++    # if cpu_quota and cpu_quota != -1: ... 
++    # So it goes to the elif branch
++    
++    # Simulate the second condition: cpu.shares exists
++    cpu_shares = 2
++    
++    # This is the problematic calculation from line 60:
++    # avail_cpu = int(cpu_shares / 1024)
++    avail_cpu = int(cpu_shares / 1024)
++    
++    print(f"cpu_shares: {cpu_shares}")
++    print(f"cpu_shares / 1024: {cpu_shares / 1024}")
++    print(f"int(cpu_shares / 1024): {avail_cpu}")
++    
++    return avail_cpu
++
++if __name__ == "__main__":
++    result = test_query_cpu_logic()
++    print(f"\nResult: {result}")
++    
++    if result == 0:
++        print("✅ BUG REPRODUCED: _query_cpu() logic returns 0")
++        print("This would cause multiprocessing.Pool to fail with ValueError")
++        sys.exit(1)
++    else:
++        print("❌ Could not reproduce the bug")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 000000000..0ed492795
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++"""Test script to verify the fix for the Kubernetes pod issue"""
++
++import sys
++import os
++sys.path.insert(0, '/testbed')
++
++from pylint.lint.run import _query_cpu, _cpu_count
++from unittest.mock import patch
++
++def test_query_cpu_fix():
++    """Test that _query_cpu() never returns 0"""
++    
++    # Test case 1: cpu_shares = 2 (Kubernetes scenario)
++    def mock_scenario_1(file_path, *args, **kwargs):
++        if file_path == "/sys/fs/cgroup/cpu/cpu.cfs_quota_us":
++            from io import StringIO
++            return StringIO("-1\n")
++        elif file_path == "/sys/fs/cgroup/cpu/cpu.shares":
++            from io import StringIO
++            return StringIO("2\n")
++        raise FileNotFoundError(f"File not found: {file_path}")
++    
++    with patch('builtins.open', side_effect=mock_scenario_1):
++        with patch('pathlib.Path.is_file', return_value=True):
++            result = _query_cpu()
++            print(f"Scenario 1 (cpu_shares=2): _query_cpu() = {result}")
++            assert result >= 1, f"Expected at least 1, got {result}"
++    
++    # Test case 2: cpu_quota = 50000, cpu_period = 100000 (should return 0.5 -> 0 -> fixed to 1)
++    def mock_scenario_2(file_path, *args, **kwargs):
++        if file_path == "/sys/fs/cgroup/cpu/cpu.cfs_quota_us":
++            from io import StringIO
++            return StringIO("50000\n")
++        elif file_path == "/sys/fs/cgroup/cpu/cpu.cfs_period_us":
++            from io import StringIO
++            return StringIO("100000\n")
++        raise FileNotFoundError(f"File not found: {file_path}")
++    
++    with patch('builtins.open', side_effect=mock_scenario_2):
++        with patch('pathlib.Path.is_file', return_value=True):
++            result = _query_cpu()
++            print(f"Scenario 2 (cpu_quota=50000, cpu_period=100000): _query_cpu() = {result}")
++            assert result >= 1, f"Expected at least 1, got {result}"
++    
++    # Test case 3: Normal scenario should still work
++    def mock_scenario_3(file_path, *args, **kwargs):
++        if file_path == "/sys/fs/cgroup/cpu/cpu.cfs_quota_us":
++            from io import StringIO
++            return StringIO("200000\n")
++        elif file_path == "/sys/fs/cgroup/cpu/cpu.cfs_period_us":
++            from io import StringIO
++            return StringIO("100000\n")
++        raise FileNotFoundError(f"File not found: {file_path}")
++    
++    with patch('builtins.open', side_effect=mock_scenario_3):
++        with patch('pathlib.Path.is_file', return_value=True):
++            result = _query_cpu()
++            print(f"Scenario 3 (cpu_quota=200000, cpu_period=100000): _query_cpu() = {result}")
++            assert result == 2, f"Expected 2, got {result}"
++    
++    print("✅ All _query_cpu() tests passed!")
++
++def test_cpu_count_fix():
++    """Test that _cpu_count() never returns 0"""
++    
++    # Test with _query_cpu returning 0 (should be fixed to at least 1)
++    with patch('pylint.lint.run._query_cpu', return_value=0):
++        with patch('os.sched_getaffinity', return_value={0, 1, 2}) if hasattr(os, 'sched_getaffinity') else patch.dict('os.__dict__', {'sched_getaffinity': lambda x: {0, 1, 2}}):
++            result = _cpu_count()
++            print(f"_cpu_count() with _query_cpu()=0: {result}")
++            assert result >= 1, f"Expected at least 1, got {result}"
++    
++    print("✅ _cpu_count() test passed!")
++
++if __name__ == "__main__":
++    test_query_cpu_fix()
++    test_cpu_count_fix()
++    print("\n🎉 All tests passed! The fix is working correctly.")
+\ No newline at end of file

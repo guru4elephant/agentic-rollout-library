@@ -1,0 +1,535 @@
+diff --git a/django/db/models/fields/related.py b/django/db/models/fields/related.py
+index d517d7269b..c2aea9c730 100644
+--- a/django/db/models/fields/related.py
++++ b/django/db/models/fields/related.py
+@@ -914,7 +914,7 @@ class ForeignKey(ForeignObject):
+             return
+ 
+         using = router.db_for_read(self.remote_field.model, instance=model_instance)
+-        qs = self.remote_field.model._default_manager.using(using).filter(
++        qs = self.remote_field.model._base_manager.using(using).filter(
+             **{self.remote_field.field_name: value}
+         )
+         qs = qs.complex_filter(self.get_limit_choices_to())
+diff --git a/final_test_issue_scenario.py b/final_test_issue_scenario.py
+new file mode 100644
+index 0000000000..22987b594a
+--- /dev/null
++++ b/final_test_issue_scenario.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++# Exact reproduction of the issue scenario
++class ArticleManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        return qs.filter(archived=False)
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    archived = models.BooleanField(default=False)
++    # Don't include archived articles by default.
++    objects = ArticleManager()
++    
++    class Meta:
++        app_label = 'test_final'
++
++class FavoriteArticle(models.Model):
++    article = models.ForeignKey(Article, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_final'
++
++# The form that allows users to pick a favorite article including archived articles.
++class FavoriteArticleForm(forms.ModelForm):
++    class Meta:
++        model = FavoriteArticle
++        fields = '__all__'
++    
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # Use the base manager instead of the default manager to allow archived articles.
++        self.fields['article'].queryset = Article._base_manager.all()
++
++def test_exact_issue_scenario():
++    """Test the exact scenario described in the GitHub issue"""
++    print("=== Testing Exact GitHub Issue Scenario ===")
++    
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Article)
++        schema_editor.create_model(FavoriteArticle)
++    
++    # Create an archived article (this should work now)
++    archived_article = Article.objects.create(title="Archived Article", archived=True)
++    print(f"Created archived article with id {archived_article.id}")
++    
++    # The form should now validate as True when a user selects an archived article
++    form_data = {'article': archived_article.id}
++    form = FavoriteArticleForm(data=form_data)
++    
++    print(f"Form is valid: {form.is_valid()}")
++    
++    if form.is_valid():
++        print("✓ SUCCESS: The form validates correctly!")
++        print("✓ The ForeignKey validation now uses _base_manager instead of _default_manager")
++        favorite = form.save()
++        print(f"✓ Successfully created FavoriteArticle with archived article: {favorite.article_id}")
++        return True
++    else:
++        print("✗ FAILED: The form still does not validate")
++        print(f"Form errors: {form.errors}")
++        return False
++
++if __name__ == '__main__':
++    success = test_exact_issue_scenario()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..57b7d248c2
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++# Create the models as described in the issue
++class ArticleManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        return qs.filter(archived=False)
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    archived = models.BooleanField(default=False)
++    # Don't include archived articles by default.
++    objects = ArticleManager()
++    
++    class Meta:
++        app_label = 'test'
++
++class FavoriteArticle(models.Model):
++    article = models.ForeignKey(Article, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the form as described in the issue
++class FavoriteArticleForm(forms.ModelForm):
++    class Meta:
++        model = FavoriteArticle
++        fields = '__all__'
++    
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # Use the base manager instead of the default manager to allow archived articles.
++        self.fields['article'].queryset = Article._base_manager.all()
++
++# Test the issue
++def test_foreign_key_validation():
++    # Create the database tables
++    from django.db import connection
++    from django.db import models
++    
++    # Create tables using Django's schema editor
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Article)
++        schema_editor.create_model(FavoriteArticle)
++    
++    # Create an archived article
++    archived_article = Article.objects.create(title="Archived Article", archived=True)
++    print(f"Created archived article with ID: {archived_article.id}")
++    
++    # Try to create a FavoriteArticle with the archived article using the form
++    form_data = {'article': archived_article.id}
++    form = FavoriteArticleForm(data=form_data)
++    
++    print(f"Form is valid: {form.is_valid()}")
++    if not form.is_valid():
++        print(f"Form errors: {form.errors}")
++        print("This demonstrates the issue - the form should be valid but isn't")
++        return False
++    else:
++        print("Form is valid - issue may be fixed")
++        return True
++
++if __name__ == '__main__':
++    success = test_foreign_key_validation()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 0000000000..5312d9561e
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,226 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++# Test 1: Original issue reproduction
++class ArticleManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        return qs.filter(archived=False)
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    archived = models.BooleanField(default=False)
++    objects = ArticleManager()
++    
++    class Meta:
++        app_label = 'test1'
++
++class FavoriteArticle(models.Model):
++    article = models.ForeignKey(Article, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test1'
++
++class FavoriteArticleForm(forms.ModelForm):
++    class Meta:
++        model = FavoriteArticle
++        fields = '__all__'
++    
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.fields['article'].queryset = Article._base_manager.all()
++
++# Test 2: Edge case with multiple managers
++class SpecialArticleManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        return qs.filter(special=True)
++
++class Article2(models.Model):
++    title = models.CharField(max_length=100)
++    archived = models.BooleanField(default=False)
++    special = models.BooleanField(default=False)
++    objects = ArticleManager()  # Default manager filters out archived
++    special_objects = SpecialArticleManager()  # Special manager filters for special
++    
++    class Meta:
++        app_label = 'test2'
++
++class FavoriteArticle2(models.Model):
++    article = models.ForeignKey(Article2, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test2'
++
++class FavoriteArticleForm2(forms.ModelForm):
++    class Meta:
++        model = FavoriteArticle2
++        fields = '__all__'
++    
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.fields['article'].queryset = Article2._base_manager.all()
++
++def test_original_issue():
++    """Test the original issue from the GitHub report"""
++    print("=== Testing Original Issue ===")
++    
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Article)
++        schema_editor.create_model(FavoriteArticle)
++    
++    # Create an archived article
++    archived_article = Article.objects.create(title="Archived Article", archived=True)
++    print(f"Created archived article with ID: {archived_article.id}")
++    
++    # Test that default manager doesn't see archived articles
++    default_count = Article.objects.count()
++    base_count = Article._base_manager.count()
++    print(f"Default manager count: {default_count}")
++    print(f"Base manager count: {base_count}")
++    
++    # Try to create a FavoriteArticle with the archived article using the form
++    form_data = {'article': archived_article.id}
++    form = FavoriteArticleForm(data=form_data)
++    
++    print(f"Form is valid: {form.is_valid()}")
++    if not form.is_valid():
++        print(f"Form errors: {form.errors}")
++        return False
++    else:
++        print("✓ Form validation passed - issue is fixed!")
++        return True
++
++def test_edge_case_multiple_managers():
++    """Test edge case with multiple managers"""
++    print("\n=== Testing Edge Case: Multiple Managers ===")
++    
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Article2)
++        schema_editor.create_model(FavoriteArticle2)
++    
++    # Create different types of articles
++    normal_article = Article2.objects.create(title="Normal Article", archived=False, special=False)
++    archived_article = Article2.objects.create(title="Archived Article", archived=True, special=False)
++    special_article = Article2.objects.create(title="Special Article", archived=False, special=True)
++    archived_special_article = Article2.objects.create(title="Archived Special Article", archived=True, special=True)
++    
++    print(f"Created articles with IDs: {[normal_article.id, archived_article.id, special_article.id, archived_special_article.id]}")
++    
++    # Test different manager counts
++    print(f"Default manager count: {Article2.objects.count()}")
++    print(f"Special manager count: {Article2.special_objects.count()}")
++    print(f"Base manager count: {Article2._base_manager.count()}")
++    
++    # Test form validation with different article types
++    test_cases = [
++        ("Normal article", normal_article.id, True),
++        ("Archived article", archived_article.id, True),
++        ("Special article", special_article.id, True),
++        ("Archived special article", archived_special_article.id, True),
++    ]
++    
++    all_passed = True
++    for desc, article_id, should_pass in test_cases:
++        form_data = {'article': article_id}
++        form = FavoriteArticleForm2(data=form_data)
++        is_valid = form.is_valid()
++        
++        print(f"{desc}: Form valid={is_valid} (expected={should_pass})")
++        if is_valid != should_pass:
++            print(f"  ERROR: Expected {should_pass} but got {is_valid}")
++            if not is_valid:
++                print(f"  Errors: {form.errors}")
++            all_passed = False
++    
++    return all_passed
++
++def test_regular_articles_still_work():
++    """Test that regular (non-archived) articles still work"""
++    print("\n=== Testing Regular Articles Still Work ===")
++    
++    # Use a different app_label to avoid table conflicts
++    class Article3(models.Model):
++        title = models.CharField(max_length=100)
++        archived = models.BooleanField(default=False)
++        objects = ArticleManager()
++        
++        class Meta:
++            app_label = 'test3'
++    
++    class FavoriteArticle3(models.Model):
++        article = models.ForeignKey(Article3, on_delete=models.CASCADE)
++        
++        class Meta:
++            app_label = 'test3'
++    
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Article3)
++        schema_editor.create_model(FavoriteArticle3)
++    
++    # Create a regular article
++    regular_article = Article3.objects.create(title="Regular Article", archived=False)
++    print(f"Created regular article with ID: {regular_article.id}")
++    
++    # Test form validation - need to create a simple form for this test
++    form_data = {'article': regular_article.id}
++    # Create a simple form instance for testing
++    from django.forms import ModelForm
++    class TestForm(ModelForm):
++        class Meta:
++            model = FavoriteArticle3
++            fields = '__all__'
++    form = TestForm(data=form_data)
++    
++    print(f"Form is valid: {form.is_valid()}")
++    if not form.is_valid():
++        print(f"Form errors: {form.errors}")
++        return False
++    else:
++        print("✓ Regular articles still work correctly!")
++        return True
++
++if __name__ == '__main__':
++    results = []
++    
++    results.append(test_original_issue())
++    results.append(test_edge_case_multiple_managers())
++    results.append(test_regular_articles_still_work())
++    
++    print(f"\n=== Summary ===")
++    print(f"All tests passed: {all(results)}")
++    
++    if all(results):
++        print("✓ All tests passed! The fix is working correctly.")
++        sys.exit(0)
++    else:
++        print("✗ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_form_rendering.py b/test_form_rendering.py
+new file mode 100644
+index 0000000000..de891e27d4
+--- /dev/null
++++ b/test_form_rendering.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++# Test that form rendering still works correctly
++class ArticleManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        return qs.filter(archived=False)
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    archived = models.BooleanField(default=False)
++    objects = ArticleManager()
++    
++    class Meta:
++        app_label = 'test_form'
++
++class FavoriteArticle(models.Model):
++    article = models.ForeignKey(Article, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_form'
++
++def test_form_rendering():
++    """Test that form rendering works correctly with default manager"""
++    print("=== Testing Form Rendering ===")
++    
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Article)
++        schema_editor.create_model(FavoriteArticle)
++    
++    # Create articles - one regular, one archived
++    regular_article = Article.objects.create(title="Regular Article", archived=False)
++    archived_article = Article._base_manager.create(title="Archived Article", archived=True)
++    
++    print(f"Created regular article ID: {regular_article.id}")
++    print(f"Created archived article ID: {archived_article.id}")
++    
++    # Test default form (should use default manager)
++    form = forms.modelform_factory(FavoriteArticle, fields='__all__')()
++    
++    # Check that the form field queryset only includes non-archived articles
++    article_choices = form.fields['article'].queryset
++    print(f"Form field queryset count: {article_choices.count()}")
++    print(f"Form field includes regular article: {article_choices.filter(id=regular_article.id).exists()}")
++    print(f"Form field includes archived article: {article_choices.filter(id=archived_article.id).exists()}")
++    
++    # The form should only show non-archived articles (default manager behavior)
++    if article_choices.count() == 1 and article_choices.filter(id=regular_article.id).exists():
++        print("✓ Form rendering works correctly - only shows non-archived articles")
++        return True
++    else:
++        print("✗ Form rendering is broken!")
++        return False
++
++if __name__ == '__main__':
++    success = test_form_rendering()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

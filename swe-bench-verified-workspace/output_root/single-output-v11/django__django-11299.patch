@@ -1,0 +1,375 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index b99f03cd88..d69c24419b 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1338,7 +1338,7 @@ class Query(BaseExpression):
+             if isinstance(child, Node):
+                 child_clause, needed_inner = self._add_q(
+                     child, used_aliases, branch_negated,
+-                    current_negated, allow_joins, split_subq)
++                    current_negated, allow_joins, split_subq, simple_col)
+                 joinpromoter.add_votes(needed_inner)
+             else:
+                 child_clause, needed_inner = self.build_filter(
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..0cf8636fe9
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations import Migration
++from django.db.migrations.operations import CreateModel, AddConstraint
++from django.db.migrations.state import ProjectState
++from django.db.backends.sqlite3.schema import DatabaseSchemaEditor
++
++# Create the test model
++class TestConstraint(models.Model):
++    field_1 = models.IntegerField(blank=True, null=True)
++    flag = models.BooleanField(blank=False, null=False)
++    
++    class Meta:
++        app_label = 'testapp'
++        constraints = [
++            models.CheckConstraint(
++                check=models.Q(flag__exact=True, field_1__isnull=False) | models.Q(flag__exact=False),
++                name='field_1_has_value_if_flag_set'
++            ),
++        ]
++
++# Create a migration operation
++def test_constraint_sql():
++    # Create a project state
++    project_state = ProjectState()
++    
++    # Create model state manually since we don't have a proper app registry
++    from django.db.migrations.state import ModelState
++    model_state = ModelState(
++        app_label='testapp',
++        name='TestConstraint',
++        fields=[
++            ('id', models.AutoField(primary_key=True)),
++            ('field_1', models.IntegerField(blank=True, null=True)),
++            ('flag', models.BooleanField()),
++        ],
++        options={
++            'constraints': [
++                models.CheckConstraint(
++                    check=models.Q(flag__exact=True, field_1__isnull=False) | models.Q(flag__exact=False),
++                    name='field_1_has_value_if_flag_set'
++                ),
++            ]
++        },
++        bases=(models.Model,),
++    )
++    project_state.add_model(model_state)
++    
++    # Create the constraint from the model state
++    model = project_state.apps.get_model('testapp', 'TestConstraint')
++    constraint = model._meta.constraints[0]
++    
++    # Get schema editor
++    from django.db import connection
++    schema_editor = DatabaseSchemaEditor(connection)
++    
++    # Generate the SQL
++    sql = constraint.create_sql(model, schema_editor)
++    print("Generated SQL:")
++    print(sql)
++    
++    # Check if the SQL contains fully qualified column names
++    sql_str = str(sql)
++    print("Checking for fully qualified column names...")
++    if 'testapp_testconstraint"."field_1' in sql_str:
++        print("ERROR: field_1 is fully qualified!")
++        return False
++    elif 'testapp_testconstraint"."flag' in sql_str:
++        print("ERROR: flag is fully qualified!")
++        return False
++    else:
++        print("SUCCESS: No fully qualified column names!")
++        return True
++
++if __name__ == '__main__':
++    result = test_constraint_sql()
++    sys.exit(0 if result else 1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..82b609f7f7
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.constraints import CheckConstraint
++
++def test_check_constraint_edge_cases():
++    print("Testing CheckConstraint edge cases...")
++    
++    # Create a mock model
++    class TestModel(models.Model):
++        field_1 = models.IntegerField(blank=True, null=True)
++        field_2 = models.IntegerField(blank=True, null=True)
++        flag = models.BooleanField()
++        
++        class Meta:
++            app_label = 'testapp'
++    
++    from django.db import connection
++    from django.db.backends.sqlite3.schema import DatabaseSchemaEditor
++    schema_editor = DatabaseSchemaEditor(connection)
++    
++    # Test case 1: Simple OR
++    constraint1 = CheckConstraint(
++        check=models.Q(field_1__gt=0) | models.Q(field_2__lt=10),
++        name='test_or_simple'
++    )
++    sql1 = constraint1.create_sql(TestModel, schema_editor)
++    print("Test 1 - Simple OR:")
++    print(sql1)
++    
++    # Test case 2: Nested OR with AND
++    constraint2 = CheckConstraint(
++        check=(models.Q(field_1__gt=0, field_2__lt=10) | models.Q(flag=True)),
++        name='test_nested_or_and'
++    )
++    sql2 = constraint2.create_sql(TestModel, schema_editor)
++    print("Test 2 - Nested OR with AND:")
++    print(sql2)
++    
++    # Test case 3: Complex nested expressions
++    constraint3 = CheckConstraint(
++        check=(models.Q(field_1__gt=0) | models.Q(field_2__lt=10)) & models.Q(flag=True),
++        name='test_complex_nested'
++    )
++    sql3 = constraint3.create_sql(TestModel, schema_editor)
++    print("Test 3 - Complex nested:")
++    print(sql3)
++    
++    # Test case 4: Multiple OR conditions
++    constraint4 = CheckConstraint(
++        check=models.Q(field_1__gt=0) | models.Q(field_2__lt=10) | models.Q(flag=True),
++        name='test_multiple_or'
++    )
++    sql4 = constraint4.create_sql(TestModel, schema_editor)
++    print("Test 4 - Multiple OR:")
++    print(sql4)
++    
++    # Check all SQL for fully qualified column names
++    test_cases = [sql1, sql2, sql3, sql4]
++    all_passed = True
++    
++    for i, sql in enumerate(test_cases, 1):
++        sql_str = str(sql)
++        if 'testapp_testmodel"."' in sql_str:
++            print(f"ERROR: Test {i} contains fully qualified column names!")
++            all_passed = False
++        else:
++            print(f"SUCCESS: Test {i} has no fully qualified column names!")
++    
++    return all_passed
++
++if __name__ == '__main__':
++    result = test_check_constraint_edge_cases()
++    print("Overall test result:", "PASSED" if result else "FAILED")
++    exit(0 if result else 1)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..b04ad836eb
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.constraints import CheckConstraint
++
++# Test the exact case from the issue
++def test_check_constraint_or_operator():
++    print("Testing CheckConstraint with OR operator...")
++    
++    # Create the constraint from the issue
++    constraint = CheckConstraint(
++        check=models.Q(flag__exact=True, field_1__isnull=False) | models.Q(flag__exact=False),
++        name='field_1_has_value_if_flag_set'
++    )
++    
++    # Create a mock model
++    class TestModel(models.Model):
++        field_1 = models.IntegerField(blank=True, null=True)
++        flag = models.BooleanField()
++        
++        class Meta:
++            app_label = 'testapp'
++    
++    # Test the SQL generation
++    from django.db import connection
++    from django.db.backends.sqlite3.schema import DatabaseSchemaEditor
++    schema_editor = DatabaseSchemaEditor(connection)
++    
++    sql = constraint.create_sql(TestModel, schema_editor)
++    print("Generated SQL:")
++    print(sql)
++    
++    # Check if the SQL contains fully qualified column names
++    sql_str = str(sql)
++    if 'testapp_testmodel"."field_1' in sql_str or 'testapp_testmodel"."flag' in sql_str:
++        print("ERROR: SQL contains fully qualified column names!")
++        return False
++    else:
++        print("SUCCESS: No fully qualified column names!")
++        return True
++
++if __name__ == '__main__':
++    result = test_check_constraint_or_operator()
++    print("Test result:", "PASSED" if result else "FAILED")
++    exit(0 if result else 1)
+\ No newline at end of file
+diff --git a/test_regular_queries.py b/test_regular_queries.py
+new file mode 100644
+index 0000000000..4dee14dfce
+--- /dev/null
++++ b/test_regular_queries.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.sql.query import Query
++
++def test_regular_queries():
++    print("Testing regular queries (should still have fully qualified column names)...")
++    
++    # Create a mock model
++    class TestModel(models.Model):
++        field_1 = models.IntegerField(blank=True, null=True)
++        flag = models.BooleanField()
++        
++        class Meta:
++            app_label = 'testapp'
++    
++    # Test regular query building using add_q (not build_where)
++    query = Query(model=TestModel)
++    
++    # Use add_q which is the normal query path
++    query.add_q(models.Q(field_1__gt=0, flag=True))
++    
++    # Get the SQL
++    from django.db import connection
++    compiler = query.get_compiler(connection=connection)
++    sql, params = query.where.as_sql(compiler, connection)
++    sql = sql % tuple(params)
++    
++    print("Regular query SQL:")
++    print(sql)
++    
++    # Regular queries should still have fully qualified column names
++    if 'testapp_testmodel"."field_1' in sql and 'testapp_testmodel"."flag' in sql:
++        print("SUCCESS: Regular queries still have fully qualified column names!")
++        return True
++    else:
++        print("ERROR: Regular queries should have fully qualified column names!")
++        return False
++
++if __name__ == '__main__':
++    result = test_regular_queries()
++    print("Test result:", "PASSED" if result else "FAILED")
++    exit(0 if result else 1)
+\ No newline at end of file

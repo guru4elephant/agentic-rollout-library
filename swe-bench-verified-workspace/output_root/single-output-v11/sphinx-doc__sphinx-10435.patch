@@ -1,0 +1,192 @@
+diff --git a/debug_transformation.py b/debug_transformation.py
+new file mode 100644
+index 000000000..921fd6b1c
+--- /dev/null
++++ b/debug_transformation.py
+@@ -0,0 +1,37 @@
++#!/usr/bin/env python3
++"""
++Debug script to understand the Pygments transformation in LaTeX writer.
++"""
++
++from sphinx.highlighting import PygmentsBridge
++
++def debug_pygments_transformation():
++    # Simulate what happens in the LaTeX writer
++    node_content = 'def foo(1 + 2 + None + "abc"): pass'
++    lang = 'python'
++    opts = {}
++    
++    # Step 1: Get Pygments output
++    highlighter = PygmentsBridge('latex')
++    hlcode = highlighter.highlight_block(node_content, lang, opts=opts)
++    print(f"Original Pygments output:\n{repr(hlcode)}")
++    print(f"Original Pygments output (formatted):\n{hlcode}")
++    
++    # Step 2: Replace begin Verbatim
++    hlcode = hlcode.replace(r'\begin{Verbatim}[commandchars=\\\{\}]',
++                            r'\sphinxcode{\sphinxupquote{')
++    print(f"\nAfter replacing begin Verbatim:\n{repr(hlcode)}")
++    print(f"After replacing begin Verbatim (formatted):\n{hlcode}")
++    
++    # Step 3: Strip end Verbatim
++    hlcode = hlcode.rstrip()[:-14]  # strip \end{Verbatim}
++    print(f"\nAfter stripping end Verbatim:\n{repr(hlcode)}")
++    print(f"After stripping end Verbatim (formatted):\n{hlcode}")
++    
++    # Step 4: What gets appended to body
++    body_content = hlcode + '}}'
++    print(f"\nFinal content that would be in body:\n{repr(body_content)}")
++    print(f"Final content that would be in body (formatted):\n{body_content}")
++
++if __name__ == "__main__":
++    debug_pygments_transformation()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..9dae90fdb
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the LaTeX inline code highlighting whitespace issue.
++"""
++
++import tempfile
++import os
++from pathlib import Path
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++def test_latex_inline_code_whitespace():
++    """Test that reproduces the whitespace issue in LaTeX output."""
++    
++    # Create a temporary directory for the test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = Path(tmpdir) / "source"
++        outdir = Path(tmpdir) / "output"
++        doctreedir = Path(tmpdir) / "doctrees"
++        
++        # Create source directory
++        srcdir.mkdir()
++        
++        # Create conf.py
++        conf_content = '''
++extensions = []
++master_doc = 'index'
++latex_elements = {
++    'papersize': 'a4paper',
++    'pointsize': '10pt',
++}
++'''
++        (srcdir / "conf.py").write_text(conf_content)
++        
++        # Create index.rst with the problematic content
++        index_content = '''
++Test Document
++=============
++
++.. role:: python(code)
++   :language: python
++   :class: highlight
++
++Inline :python:`def foo(1 + 2 + None + "abc"): pass` code block
++
++.. code-block:: python
++
++   def foo(1 + 2 + None + "abc"): pass
++'''
++        (srcdir / "index.rst").write_text(index_content)
++        
++        # Build LaTeX output
++        with docutils_namespace():
++            app = Sphinx(
++                srcdir=str(srcdir),
++                confdir=str(srcdir),
++                outdir=str(outdir),
++                doctreedir=str(doctreedir),
++                buildername='latex'
++            )
++            
++            # Add debug info to see what nodes are created
++            def debug_literal_visit(app, doctree, fromdocname):
++                from docutils import nodes
++                for node in doctree.traverse(nodes.literal):
++                    print(f"Literal node: classes={node.get('classes', [])}, attributes={dict(node.attributes)}")
++            
++            # Add debug info to see Pygments output
++            def debug_pygments_output(app):
++                from sphinx.highlighting import PygmentsBridge
++                node_content = 'def foo(1 + 2 + None + "abc"): pass'
++                lang = 'python'
++                opts = {}
++                highlighter = PygmentsBridge('latex')
++                hlcode = highlighter.highlight_block(node_content, lang, opts=opts)
++                print(f"Pygments output: {repr(hlcode)}")
++            
++            app.connect('doctree-resolved', debug_literal_visit)
++            debug_pygments_output(app)
++            app.build()
++        
++        # Check the generated LaTeX files
++        latex_files = list(outdir.glob("*.tex"))
++        if latex_files:
++            latex_file = latex_files[0]  # Use the first .tex file found
++            content = latex_file.read_text()
++            print(f"Generated LaTeX content from {latex_file.name}:")
++            print(content)
++            
++            # Look for the problematic pattern
++            if r'\sphinxcode{\sphinxupquote{' in content:
++                print("\nFound sphinxcode pattern in LaTeX output")
++                # Check if there's extra whitespace/line breaks
++                lines = content.split('\n')
++                for i, line in enumerate(lines):
++                    if r'\sphinxcode{\sphinxupquote{' in line:
++                        print(f"Line {i}: {line.strip()}")
++                        # Check next line for closing }}
++                        if i + 1 < len(lines) and '}}' in lines[i + 1]:
++                            print(f"Line {i + 1}: {lines[i + 1].strip()}")
++                            print("PROBLEM DETECTED: Extra whitespace between opening and closing braces!")
++                            return True
++            
++            print("No problematic pattern found or pattern looks correct")
++            return False
++        else:
++            print("No LaTeX files generated")
++            return False
++
++if __name__ == "__main__":
++    issue_detected = test_latex_inline_code_whitespace()
++    if issue_detected:
++        print("\n✓ Issue reproduced successfully!")
++    else:
++        print("\n✗ Could not reproduce the issue")
+\ No newline at end of file
+diff --git a/sphinx/writers/latex.py b/sphinx/writers/latex.py
+index e0c7d56f8..644e7c874 100644
+--- a/sphinx/writers/latex.py
++++ b/sphinx/writers/latex.py
+@@ -1713,6 +1713,8 @@ class LaTeXTranslator(SphinxTranslator):
+                                 r'\sphinxcode{\sphinxupquote{')
+         # get consistent trailer
+         hlcode = hlcode.rstrip()[:-14]  # strip \end{Verbatim}
++        # Remove newlines to avoid extra whitespace in LaTeX output
++        hlcode = hlcode.replace('\n', '')
+         self.body.append(hlcode)
+         self.body.append('}}')
+         raise nodes.SkipNode
+diff --git a/tox.ini b/tox.ini
+index 105a02597..90ada0821 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -29,7 +29,7 @@ setenv =
+     PYTHONWARNINGS = all
+     PYTEST_ADDOPTS = {env:PYTEST_ADDOPTS:} --color yes
+ commands=
+-    python -X dev -X warn_default_encoding -m pytest --durations 25 {posargs}
++    python -X dev -X warn_default_encoding -m pytest -rA --durations 25 {posargs}
+ 
+ [testenv:du-latest]
+ commands =

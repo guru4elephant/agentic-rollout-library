@@ -1,0 +1,186 @@
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 192d9fad94..b7bc0cfaeb 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -630,6 +630,10 @@ def modelform_factory(
+     # creating needs to inherit from the parent's inner meta.
+     bases = (form.Meta,) if hasattr(form, "Meta") else ()
+     Meta = type("Meta", bases, attrs)
++    # If no explicit formfield_callback is provided, but the original form
++    # has a formfield_callback in its Meta, use that one
++    if not formfield_callback and hasattr(form, "Meta") and hasattr(form.Meta, "formfield_callback"):
++        formfield_callback = form.Meta.formfield_callback
+     if formfield_callback:
+         Meta.formfield_callback = staticmethod(formfield_callback)
+     # Give this new form class a reasonable name.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..856ab42e92
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the formfield_callback issue in modelform_factory.
++"""
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++    django.setup()
++
++from django import forms
++from django.db import models
++
++# Create a simple model
++class MyModel(models.Model):
++    active = models.BooleanField()
++    name = models.CharField(max_length=64, blank=True, null=True)
++
++    class Meta:
++        app_label = 'test'
++
++# Create a formfield_callback function
++def all_required(field, **kwargs):
++    formfield = field.formfield(**kwargs)
++    formfield.required = True
++    return formfield
++
++# Create a ModelForm with formfield_callback in Meta
++class MyForm(forms.ModelForm):
++    formfield_callback = all_required
++    
++    class Meta:
++        model = MyModel
++        formfield_callback = all_required
++        fields = ['active', 'name']
++
++# Test the issue
++print("=== Testing MyForm ===")
++form = MyForm()
++print("active field required:", form.fields['active'].required)
++print("name field required:", form.fields['name'].required)
++
++print("\n=== Testing FactoryForm (should have same behavior) ===")
++FactoryForm = forms.modelform_factory(MyModel, form=MyForm)
++factory_form = FactoryForm()
++print("active field required:", factory_form.fields['active'].required)
++print("name field required:", factory_form.fields['name'].required)
++
++# Expected: Both should have required=True for both fields
++# Actual: MyForm has required=True, FactoryForm has required=False
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..19938aacf4
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the formfield_callback fix in modelform_factory.
++"""
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++    django.setup()
++
++from django import forms
++from django.db import models
++
++# Create a simple model
++class MyModel(models.Model):
++    active = models.BooleanField()
++    name = models.CharField(max_length=64, blank=True, null=True)
++
++    class Meta:
++        app_label = 'test'
++
++# Create formfield_callback functions
++def all_required(field, **kwargs):
++    formfield = field.formfield(**kwargs)
++    formfield.required = True
++    return formfield
++
++def make_optional(field, **kwargs):
++    formfield = field.formfield(**kwargs)
++    formfield.required = False
++    return formfield
++
++print("=== Test Case 1: Form with formfield_callback in Meta ===")
++class MyForm(forms.ModelForm):
++    class Meta:
++        model = MyModel
++        formfield_callback = all_required
++        fields = ['active', 'name']
++
++form = MyForm()
++factory_form = forms.modelform_factory(MyModel, form=MyForm)()
++print("Original form - active required:", form.fields['active'].required)
++print("Factory form - active required:", factory_form.fields['active'].required)
++print("SUCCESS" if form.fields['active'].required == factory_form.fields['active'].required else "FAILED")
++
++print("\n=== Test Case 2: Explicit formfield_callback parameter should override Meta ===")
++factory_form_override = forms.modelform_factory(MyModel, form=MyForm, formfield_callback=make_optional)()
++print("Override form - active required:", factory_form_override.fields['active'].required)
++print("SUCCESS" if not factory_form_override.fields['active'].required else "FAILED")
++
++print("\n=== Test Case 3: Form without formfield_callback in Meta ===")
++class MyFormNoCallback(forms.ModelForm):
++    class Meta:
++        model = MyModel
++        fields = ['active', 'name']
++
++form_no_callback = MyFormNoCallback()
++factory_form_no_callback = forms.modelform_factory(MyModel, form=MyFormNoCallback)()
++print("Original form - active required:", form_no_callback.fields['active'].required)
++print("Factory form - active required:", factory_form_no_callback.fields['active'].required)
++print("SUCCESS" if form_no_callback.fields['active'].required == factory_form_no_callback.fields['active'].required else "FAILED")
++
++print("\n=== Test Case 4: Form with formfield_callback as class attribute ===")
++class MyFormClassAttr(forms.ModelForm):
++    formfield_callback = all_required
++    
++    class Meta:
++        model = MyModel
++        fields = ['active', 'name']
++
++form_class_attr = MyFormClassAttr()
++factory_form_class_attr = forms.modelform_factory(MyModel, form=MyFormClassAttr)()
++print("Original form - active required:", form_class_attr.fields['active'].required)
++print("Factory form - active required:", factory_form_class_attr.fields['active'].required)
++print("SUCCESS" if form_class_attr.fields['active'].required == factory_form_class_attr.fields['active'].required else "FAILED")
+\ No newline at end of file

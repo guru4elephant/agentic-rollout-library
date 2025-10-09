@@ -1,0 +1,242 @@
+diff --git a/django/db/backends/sqlite3/base.py b/django/db/backends/sqlite3/base.py
+index 2eeaf98c0d..d23822c641 100644
+--- a/django/db/backends/sqlite3/base.py
++++ b/django/db/backends/sqlite3/base.py
+@@ -327,19 +327,19 @@ class DatabaseWrapper(BaseDatabaseWrapper):
+                     violations = cursor.execute('PRAGMA foreign_key_check').fetchall()
+                 else:
+                     violations = chain.from_iterable(
+-                        cursor.execute('PRAGMA foreign_key_check(%s)' % table_name).fetchall()
++                        cursor.execute('PRAGMA foreign_key_check(%s)' % self.ops.quote_name(table_name)).fetchall()
+                         for table_name in table_names
+                     )
+                 # See https://www.sqlite.org/pragma.html#pragma_foreign_key_check
+                 for table_name, rowid, referenced_table_name, foreign_key_index in violations:
+                     foreign_key = cursor.execute(
+-                        'PRAGMA foreign_key_list(%s)' % table_name
++                        'PRAGMA foreign_key_list(%s)' % self.ops.quote_name(table_name)
+                     ).fetchall()[foreign_key_index]
+                     column_name, referenced_column_name = foreign_key[3:5]
+                     primary_key_column_name = self.introspection.get_primary_key_column(cursor, table_name)
+                     primary_key_value, bad_value = cursor.execute(
+                         'SELECT %s, %s FROM %s WHERE rowid = %%s' % (
+-                            primary_key_column_name, column_name, table_name
++                            self.ops.quote_name(primary_key_column_name), self.ops.quote_name(column_name), self.ops.quote_name(table_name)
+                         ),
+                         (rowid,),
+                     ).fetchone()
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..8cb19e1602
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,41 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++
++# Create a table with a SQL keyword as name
++with connection.cursor() as cursor:
++    cursor.execute('CREATE TABLE "order" (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100))')
++
++# Simulate the check_constraints method call that happens during loaddata
++# This is where the actual bug occurs
++try:
++    # This should trigger the foreign key check with the table name "order"
++    connection.check_constraints(table_names=['order'])
++    print("SUCCESS: check_constraints completed without error")
++except Exception as e:
++    print(f"ERROR: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..fec011b2d9
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++
++# Test with various SQL keywords as table names
++sql_keywords = ['order', 'select', 'table', 'where', 'group', 'from']
++
++for keyword in sql_keywords:
++    try:
++        # Create a table with a SQL keyword as name
++        with connection.cursor() as cursor:
++            cursor.execute(f'CREATE TABLE "{keyword}" (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100))')
++        
++        # Test the check_constraints method with the table name
++        connection.check_constraints(table_names=[keyword])
++        print(f"SUCCESS: check_constraints completed for table '{keyword}'")
++        
++    except Exception as e:
++        print(f"ERROR with table '{keyword}': {e}")
++        import traceback
++        traceback.print_exc()
++
++# Test with table names containing special characters
++special_names = ['my-table', 'table with spaces', 'table"with"quotes']
++
++for name in special_names:
++    try:
++        # Create a table with special characters in name
++        with connection.cursor() as cursor:
++            cursor.execute(f'CREATE TABLE "{name}" (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100))')
++        
++        # Test the check_constraints method with the table name
++        connection.check_constraints(table_names=[name])
++        print(f"SUCCESS: check_constraints completed for table '{name}'")
++        
++    except Exception as e:
++        print(f"ERROR with table '{name}': {e}")
++        import traceback
++        traceback.print_exc()
++
++print("All tests completed!")
+\ No newline at end of file
+diff --git a/test_fixture.json b/test_fixture.json
+new file mode 100644
+index 0000000000..1e0c15c00b
+--- /dev/null
++++ b/test_fixture.json
+@@ -0,0 +1 @@
++[{"model": "test.order", "pk": 1, "fields": {"name": "Test Order"}}]
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..d59339a332
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""
++Test script that reproduces the exact issue described in the GitHub issue:
++loaddata crashes on SQLite when table names are SQL keywords.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++
++def test_original_issue():
++    """Test the exact scenario from the GitHub issue"""
++    print("Testing the original issue scenario...")
++    
++    # Create a table named 'order' (SQL keyword)
++    with connection.cursor() as cursor:
++        cursor.execute('CREATE TABLE "order" (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100))')
++    
++    # This should trigger the foreign key check with the table name "order"
++    # The original issue was that this would fail with:
++    # "sqlite3.OperationalError: near "order": syntax error"
++    try:
++        connection.check_constraints(table_names=['order'])
++        print("SUCCESS: The original issue has been fixed!")
++        print("check_constraints() with table name 'order' works correctly")
++        return True
++    except Exception as e:
++        print(f"FAILED: The issue still exists: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++def test_multiple_keywords():
++    """Test with multiple SQL keywords"""
++    print("\nTesting with multiple SQL keywords...")
++    
++    keywords = ['select', 'table', 'where', 'group', 'from']
++    
++    for keyword in keywords:
++        try:
++            with connection.cursor() as cursor:
++                cursor.execute(f'CREATE TABLE "{keyword}" (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100))')
++            
++            connection.check_constraints(table_names=[keyword])
++            print(f"SUCCESS: Table '{keyword}' works correctly")
++        except Exception as e:
++            print(f"FAILED: Table '{keyword}' failed: {e}")
++            return False
++    
++    return True
++
++if __name__ == "__main__":
++    success1 = test_original_issue()
++    success2 = test_multiple_keywords()
++    
++    if success1 and success2:
++        print("\n✅ All tests passed! The issue has been successfully fixed.")
++    else:
++        print("\n❌ Some tests failed. The issue may not be completely resolved.")
+\ No newline at end of file

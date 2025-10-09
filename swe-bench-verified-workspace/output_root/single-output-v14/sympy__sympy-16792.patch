@@ -1,0 +1,175 @@
+diff --git a/debug_args.py b/debug_args.py
+new file mode 100644
+index 0000000000..eaf3525cb0
+--- /dev/null
++++ b/debug_args.py
+@@ -0,0 +1,27 @@
++from sympy.utilities.autowrap import autowrap
++from sympy import MatrixSymbol
++from sympy.utilities.codegen import CCodeGen
++
++# Create a MatrixSymbol
++x = MatrixSymbol('x', 2, 1)
++print(f"x type: {type(x)}")
++print(f"x shape: {x.shape}")
++
++# Create code generator
++code_gen = CCodeGen()
++
++# Test with expression that uses x
++expr_with_x = x[0,0]
++routine_with_x = code_gen.routine('test_with_x', expr_with_x, (x,))
++print(f"\nWith x in expression:")
++print(f"Arguments: {routine_with_x.arguments}")
++for arg in routine_with_x.arguments:
++    print(f"  {arg.name}: dimensions={arg.dimensions}")
++
++# Test with expression that doesn't use x
++expr_without_x = 1.0
++routine_without_x = code_gen.routine('test_without_x', expr_without_x, (x,))
++print(f"\nWithout x in expression:")
++print(f"Arguments: {routine_without_x.arguments}")
++for arg in routine_without_x.arguments:
++    print(f"  {arg.name}: dimensions={arg.dimensions}")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..bcf0cae633
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,27 @@
++from sympy.utilities.autowrap import autowrap
++from sympy import MatrixSymbol
++import numpy as np
++
++# Test case 1: Array argument doesn't appear in expression (should fail)
++print("Test case 1: Array argument doesn't appear in expression")
++x = MatrixSymbol('x', 2, 1)
++expr = 1.0
++f = autowrap(expr, args=(x,), backend='cython')
++
++try:
++    result = f(np.array([[1.0, 2.0]]))
++    print(f"Result: {result}")
++except Exception as e:
++    print(f"Error: {e}")
++
++# Test case 2: Array argument appears in expression (should work)
++print("\nTest case 2: Array argument appears in expression")
++x = MatrixSymbol('x', 2, 1)
++expr = x[0,0]
++f2 = autowrap(expr, args=(x,), backend='cython')
++
++try:
++    result = f2(np.array([[1.0, 2.0]]))
++    print(f"Result: {result}")
++except Exception as e:
++    print(f"Error: {e}")
+\ No newline at end of file
+diff --git a/sympy/utilities/codegen.py b/sympy/utilities/codegen.py
+index f0befb2bd7..8f3d9c28d7 100644
+--- a/sympy/utilities/codegen.py
++++ b/sympy/utilities/codegen.py
+@@ -739,7 +739,14 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+                 try:
+                     new_args.append(name_arg_dict[symbol])
+                 except KeyError:
+-                    new_args.append(InputArgument(symbol))
++                    # If symbol is a MatrixSymbol, preserve its dimensions
++                    if hasattr(symbol, 'shape'):
++                        dims = []
++                        for dim in symbol.shape:
++                            dims.append((0, dim - 1))
++                        new_args.append(InputArgument(symbol, dimensions=dims))
++                    else:
++                        new_args.append(InputArgument(symbol))
+             arg_list = new_args
+ 
+         return Routine(name, arg_list, return_val, local_vars, global_vars)
+diff --git a/test_c_signature.py b/test_c_signature.py
+new file mode 100644
+index 0000000000..1e48a30f93
+--- /dev/null
++++ b/test_c_signature.py
+@@ -0,0 +1,32 @@
++from sympy.utilities.autowrap import autowrap
++from sympy import MatrixSymbol
++import tempfile
++import os
++
++# Test that the C function signature is correct when array arguments don't appear
++x = MatrixSymbol('x', 2, 1)
++expr = 1.0  # Constant expression that doesn't use x
++
++# Create a temporary directory to inspect the generated files
++with tempfile.TemporaryDirectory() as tempdir:
++    f = autowrap(expr, args=(x,), backend='cython', tempdir=tempdir)
++    
++    # Read the generated C file to check the function signature
++    c_file_path = os.path.join(tempdir, 'autofunc.c')
++    if os.path.exists(c_file_path):
++        with open(c_file_path, 'r') as c_file:
++            c_code = c_file.read()
++            print("Generated C code:")
++            print("=" * 50)
++            print(c_code)
++            print("=" * 50)
++            
++            # Check if the function signature is correct
++            if 'double autofunc(double *x)' in c_code:
++                print("✓ Function signature is correct: double autofunc(double *x)")
++            elif 'double autofunc(double x)' in c_code:
++                print("✗ Function signature is incorrect: double autofunc(double x)")
++            else:
++                print("? Function signature not found or unexpected format")
++    else:
++        print("C file not found at:", c_file_path)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..97d6625f3d
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,41 @@
++from sympy.utilities.autowrap import autowrap
++from sympy import MatrixSymbol, Symbol
++import numpy as np
++
++print("Testing edge cases for autowrap with cython backend")
++
++# Test case 1: Multiple MatrixSymbol arguments, some not used
++print("\n1. Multiple MatrixSymbol arguments, some not used")
++x = MatrixSymbol('x', 2, 1)
++y = MatrixSymbol('y', 3, 2)
++expr = x[0,0]  # Only uses x, not y
++f = autowrap(expr, args=(x, y), backend='cython')
++result = f(np.array([[1.0]]), np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]))
++print(f"Result: {result}")
++
++# Test case 2: Mixed MatrixSymbol and regular Symbol
++print("\n2. Mixed MatrixSymbol and regular Symbol")
++x = MatrixSymbol('x', 2, 1)
++a = Symbol('a')
++expr = a  # Only uses a, not x
++f = autowrap(expr, args=(x, a), backend='cython')
++result = f(np.array([[1.0, 2.0]]), 5.0)
++print(f"Result: {result}")
++
++# Test case 3: 2D MatrixSymbol not used
++print("\n3. 2D MatrixSymbol not used")
++x = MatrixSymbol('x', 2, 3)
++expr = 42.0  # Constant expression
++f = autowrap(expr, args=(x,), backend='cython')
++result = f(np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
++print(f"Result: {result}")
++
++# Test case 4: Regular Symbol not used (should still work)
++print("\n4. Regular Symbol not used")
++a = Symbol('a')
++expr = 7.0  # Constant expression
++f = autowrap(expr, args=(a,), backend='cython')
++result = f(10.0)
++print(f"Result: {result}")
++
++print("\nAll tests completed successfully!")
+\ No newline at end of file

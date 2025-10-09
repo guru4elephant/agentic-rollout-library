@@ -1,0 +1,606 @@
+diff --git a/debug_multiple_categories.py b/debug_multiple_categories.py
+new file mode 100644
+index 0000000000..c12f9be23f
+--- /dev/null
++++ b/debug_multiple_categories.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Prefetch
++
++# Create simple test models
++class Category(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class Post(models.Model):
++    title = models.CharField(max_length=100)
++    category = models.ForeignKey(Category, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Category)
++    schema_editor.create_model(Post)
++
++# Create test data for multiple categories
++print("Creating multiple categories...")
++for i in range(2):
++    category = Category.objects.create(name=f"Category {i}")
++    for j in range(3):
++        Post.objects.create(title=f"Post {i}-{j}", category=category)
++
++print("Categories in database:", Category.objects.count())
++print("Posts in database:", Post.objects.count())
++
++print("\nTesting multiple categories with slice...")
++categories = Category.objects.prefetch_related(Prefetch(
++    'post_set',
++    queryset=Post.objects.all()[:2],  # Get first 2 posts per category
++    to_attr='example_posts',
++))
++
++result = list(categories)
++print(f"Result length: {len(result)}")
++for i, category in enumerate(result):
++    print(f"Category {i}: {len(category.example_posts)} posts")
++    for post in category.example_posts:
++        print(f"  - {post.title} (category: {post.category.name})")
+\ No newline at end of file
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 0000000000..24508bdefd
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Prefetch
++
++# Create simple test models
++class Category(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class Post(models.Model):
++    title = models.CharField(max_length=100)
++    category = models.ForeignKey(Category, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Category)
++    schema_editor.create_model(Post)
++
++# Create test data
++category = Category.objects.create(name="Test Category")
++for i in range(5):
++    Post.objects.create(title=f"Post {i}", category=category)
++
++print("Testing basic slice...")
++categories = Category.objects.prefetch_related(Prefetch(
++    'post_set',
++    queryset=Post.objects.all()[:3],
++    to_attr='example_posts',
++))
++
++result = list(categories)
++print(f"Result length: {len(result)}")
++if result:
++    print(f"First category example_posts length: {len(result[0].example_posts)}")
++    for post in result[0].example_posts:
++        print(f"  - {post.title}")
++
++print("\nTesting offset slice...")
++categories = Category.objects.prefetch_related(Prefetch(
++    'post_set',
++    queryset=Post.objects.all()[1:4],  # Skip first, get next 3
++    to_attr='example_posts',
++))
++
++result = list(categories)
++print(f"Result length: {len(result)}")
++if result:
++    print(f"First category example_posts length: {len(result[0].example_posts)}")
++    for post in result[0].example_posts:
++        print(f"  - {post.title}")
++
++print("\nTesting regular prefetch (no slice)...")
++categories = Category.objects.prefetch_related(Prefetch(
++    'post_set',
++    queryset=Post.objects.all(),  # No slice
++    to_attr='example_posts',
++))
++
++result = list(categories)
++print(f"Result length: {len(result)}")
++if result:
++    print(f"First category example_posts length: {len(result[0].example_posts)}")
++    for post in result[0].example_posts:
++        print(f"  - {post.title}")
+\ No newline at end of file
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index b192df4fbf..dc79e696ef 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -719,7 +719,25 @@ def create_reverse_many_to_one_manager(superclass, rel):
+             instance_attr = self.field.get_foreign_related_value
+             instances_dict = {instance_attr(inst): inst for inst in instances}
+             query = {"%s__in" % self.field.name: instances}
+-            queryset = queryset.filter(**query)
++
++            # Check if the queryset is sliced (has limits/offsets)
++            if queryset.query.is_sliced:
++                # For sliced querysets, we need to first apply the filters,
++                # then apply the slice to the filtered results
++                filtered_queryset = queryset.model.objects.filter(**query)
++                # Apply the same slicing as the original queryset
++                low_mark = queryset.query.low_mark
++                high_mark = queryset.query.high_mark
++                if low_mark is not None and high_mark is not None:
++                    filtered_queryset = filtered_queryset[low_mark:high_mark]
++                elif low_mark is not None:
++                    filtered_queryset = filtered_queryset[low_mark:]
++                elif high_mark is not None:
++                    filtered_queryset = filtered_queryset[:high_mark]
++                queryset = filtered_queryset
++            else:
++                # For regular querysets, apply the filter normally
++                queryset = queryset.filter(**query)
+ 
+             # Since we just bypassed this class' get_queryset(), we must manage
+             # the reverse relation manually.
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..3f4d346788
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,131 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Prefetch
++
++# Create simple test models
++class Category(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class Post(models.Model):
++    title = models.CharField(max_length=100)
++    category = models.ForeignKey(Category, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Category)
++    schema_editor.create_model(Post)
++
++def test_github_issue():
++    """Test the exact scenario described in the GitHub issue"""
++    print("Testing GitHub issue scenario...")
++    
++    # Create test data
++    category = Category.objects.create(name="Test Category")
++    for i in range(5):
++        Post.objects.create(title=f"Post {i}", category=category)
++    
++    # This is the exact code from the GitHub issue that should work now
++    try:
++        categories = Category.objects.prefetch_related(Prefetch(
++            'post_set',
++            queryset=Post.objects.all()[:3],  # This slice was causing the error
++            to_attr='example_posts',
++        ))
++        
++        # Force evaluation to trigger the prefetch
++        result = list(categories)
++        
++        print("✓ SUCCESS: No 'Cannot filter a query once a slice has been taken' error!")
++        print(f"  - Found {len(result)} categories")
++        if result:
++            print(f"  - First category has {len(result[0].example_posts)} example posts")
++            for post in result[0].example_posts:
++                print(f"    - {post.title}")
++        
++        return True
++        
++    except Exception as e:
++        print(f"✗ FAILED: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++def test_various_slices():
++    """Test various slice scenarios"""
++    print("\nTesting various slice scenarios...")
++    
++    # Create test data
++    category = Category.objects.create(name="Test Category")
++    for i in range(10):
++        Post.objects.create(title=f"Post {i}", category=category)
++    
++    test_cases = [
++        ("[:3]", Post.objects.all()[:3]),
++        ("[3:6]", Post.objects.all()[3:6]),
++        ("[5:]", Post.objects.all()[5:]),
++        ("[7:10]", Post.objects.all()[7:10]),
++    ]
++    
++    all_passed = True
++    for name, sliced_queryset in test_cases:
++        try:
++            categories = Category.objects.prefetch_related(Prefetch(
++                'post_set',
++                queryset=sliced_queryset,
++                to_attr='example_posts',
++            ))
++            
++            result = list(categories)
++            print(f"✓ {name}: Success - {len(result[0].example_posts)} posts")
++            all_passed = all_passed and True
++            
++        except Exception as e:
++            print(f"✗ {name}: Failed - {type(e).__name__}: {e}")
++            all_passed = False
++    
++    return all_passed
++
++if __name__ == "__main__":
++    success1 = test_github_issue()
++    success2 = test_various_slices()
++    
++    print(f"\n=== Final Result ===")
++    if success1 and success2:
++        print("✓ All tests passed! The GitHub issue is fixed.")
++        sys.exit(0)
++    else:
++        print("✗ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..48e7a8b670
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Prefetch
++
++# Create simple test models
++class Category(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class Post(models.Model):
++    title = models.CharField(max_length=100)
++    category = models.ForeignKey(Category, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Category)
++    schema_editor.create_model(Post)
++
++# Try to reproduce the issue
++try:
++    # Create some test data
++    category = Category.objects.create(name="Test Category")
++    for i in range(5):
++        Post.objects.create(title=f"Post {i}", category=category)
++    
++    # This should trigger the error
++    categories = Category.objects.prefetch_related(Prefetch(
++        'post_set',
++        queryset=Post.objects.all()[:3],  # This slice should cause the issue
++        to_attr='example_posts',
++    ))
++    
++    # Force evaluation to trigger the prefetch
++    list(categories)
++    
++    print("SUCCESS: No error occurred!")
++    
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..a43de2369d
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,167 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Prefetch
++
++# Create simple test models
++class Category(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class Post(models.Model):
++    title = models.CharField(max_length=100)
++    category = models.ForeignKey(Category, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Category)
++    schema_editor.create_model(Post)
++
++def test_case(name, test_func):
++    print(f"\n=== Testing {name} ===")
++    try:
++        test_func()
++        print("✓ SUCCESS")
++        return True
++    except Exception as e:
++        print(f"✗ FAILED: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++# Test cases
++def test_basic_slice():
++    """Test basic slicing with prefetch"""
++    category = Category.objects.create(name="Test Category")
++    for i in range(5):
++        Post.objects.create(title=f"Post {i}", category=category)
++    
++    categories = Category.objects.prefetch_related(Prefetch(
++        'post_set',
++        queryset=Post.objects.all()[:3],
++        to_attr='example_posts',
++    ))
++    
++    result = list(categories)
++    assert len(result) == 1
++    assert len(result[0].example_posts) == 3
++
++def test_offset_slice():
++    """Test slicing with offset"""
++    category = Category.objects.create(name="Test Category")
++    for i in range(5):
++        Post.objects.create(title=f"Post {i}", category=category)
++    
++    categories = Category.objects.prefetch_related(Prefetch(
++        'post_set',
++        queryset=Post.objects.all()[1:4],  # Skip first, get next 3
++        to_attr='example_posts',
++    ))
++    
++    result = list(categories)
++    assert len(result) == 1
++    assert len(result[0].example_posts) == 3
++    assert result[0].example_posts[0].title == "Post 1"
++
++def test_multiple_categories():
++    """Test with multiple categories"""
++    for i in range(2):
++        category = Category.objects.create(name=f"Category {i}")
++        for j in range(3):
++            Post.objects.create(title=f"Post {i}-{j}", category=category)
++    
++    categories = Category.objects.prefetch_related(Prefetch(
++        'post_set',
++        queryset=Post.objects.all()[:2],  # Get first 2 posts per category
++        to_attr='example_posts',
++    ))
++    
++    result = list(categories)
++    assert len(result) == 2
++    for category in result:
++        assert len(category.example_posts) == 2
++
++def test_no_slice():
++    """Test that regular prefetch still works"""
++    category = Category.objects.create(name="Test Category")
++    for i in range(3):
++        Post.objects.create(title=f"Post {i}", category=category)
++    
++    categories = Category.objects.prefetch_related(Prefetch(
++        'post_set',
++        queryset=Post.objects.all(),  # No slice
++        to_attr='example_posts',
++    ))
++    
++    result = list(categories)
++    assert len(result) == 1
++    assert len(result[0].example_posts) == 3
++
++def test_empty_slice():
++    """Test empty slice"""
++    category = Category.objects.create(name="Test Category")
++    for i in range(3):
++        Post.objects.create(title=f"Post {i}", category=category)
++    
++    categories = Category.objects.prefetch_related(Prefetch(
++        'post_set',
++        queryset=Post.objects.all()[5:10],  # Empty slice
++        to_attr='example_posts',
++    ))
++    
++    result = list(categories)
++    assert len(result) == 1
++    assert len(result[0].example_posts) == 0
++
++# Run all tests
++test_cases = [
++    ("Basic slice", test_basic_slice),
++    ("Offset slice", test_offset_slice),
++    ("Multiple categories", test_multiple_categories),
++    ("No slice (regular prefetch)", test_no_slice),
++    ("Empty slice", test_empty_slice),
++]
++
++all_passed = True
++for name, test_func in test_cases:
++    passed = test_case(name, test_func)
++    all_passed = all_passed and passed
++
++print(f"\n=== Overall Result ===")
++if all_passed:
++    print("✓ All tests passed!")
++else:
++    print("✗ Some tests failed!")
++    
++sys.exit(0 if all_passed else 1)
+\ No newline at end of file

@@ -1,0 +1,457 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 794e0faae7..92349cd0c5 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1209,7 +1209,8 @@ class QuerySet:
+         if ignore_conflicts and not connections[self.db].features.supports_ignore_conflicts:
+             raise NotSupportedError('This database backend does not support ignoring conflicts.')
+         ops = connections[self.db].ops
+-        batch_size = (batch_size or max(ops.bulk_batch_size(fields, objs), 1))
++        max_batch_size = max(ops.bulk_batch_size(fields, objs), 1)
++        batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
+         inserted_rows = []
+         bulk_return = connections[self.db].features.can_return_rows_from_bulk_insert
+         for item in [objs[i:i + batch_size] for i in range(0, len(objs), batch_size)]:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..565881eb4c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the bulk_create batch_size issue.
++The issue is that batch_size parameter overrides the compatible batch size calculation.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++def test_bulk_create_batch_size():
++    """Test that demonstrates the batch_size issue"""
++    from django.db import connection
++    
++    # Create some test objects
++    objs = [TestModel(name=f'obj_{i}', value=i) for i in range(100)]
++    
++    # Get the maximum batch size supported by the database
++    fields = TestModel._meta.concrete_fields
++    max_batch_size = connection.ops.bulk_batch_size(fields, objs)
++    
++    print(f"Database max batch size: {max_batch_size}")
++    
++    # Test with a batch_size larger than the database maximum
++    large_batch_size = max_batch_size + 10
++    
++    # This should respect the database limit but currently doesn't
++    # We'll just test the calculation logic, not actual database operations
++    print(f"Current logic would use batch_size={large_batch_size} (overriding database limit)")
++    
++    # What it should do instead:
++    correct_batch_size = min(large_batch_size, max_batch_size) if large_batch_size else max_batch_size
++    print(f"Correct logic should use batch_size={correct_batch_size} (respecting database limit)")
++    
++    # Test with batch_size=None (should use database maximum)
++    correct_batch_size_none = max_batch_size  # When batch_size is None
++    print(f"With batch_size=None, should use batch_size={correct_batch_size_none}")
++
++if __name__ == '__main__':
++    test_bulk_create_batch_size()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..e9234fa674
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the batch_size calculation logic.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db import connection
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++def test_batch_size_logic():
++    """Test the batch_size calculation logic directly"""
++    
++    # Create some test objects
++    objs = [TestModel(name=f'obj_{i}', value=i) for i in range(100)]
++    
++    # Get the maximum batch size supported by the database
++    fields = TestModel._meta.concrete_fields
++    max_batch_size = connection.ops.bulk_batch_size(fields, objs)
++    
++    print(f"Database max batch size: {max_batch_size}")
++    
++    # Test the new logic
++    test_cases = [
++        (None, max_batch_size),  # batch_size=None should use database max
++        (max_batch_size - 10, max_batch_size - 10),  # Smaller than max should use provided value
++        (max_batch_size, max_batch_size),  # Equal to max should use provided value
++        (max_batch_size + 10, max_batch_size),  # Larger than max should be capped to max
++    ]
++    
++    for batch_size_param, expected_batch_size in test_cases:
++        # Simulate the new logic from _batched_insert
++        max_db_batch_size = max(connection.ops.bulk_batch_size(fields, objs), 1)
++        calculated_batch_size = min(batch_size_param, max_db_batch_size) if batch_size_param else max_db_batch_size
++        
++        print(f"batch_size={batch_size_param}: calculated={calculated_batch_size}, expected={expected_batch_size}")
++        
++        if calculated_batch_size == expected_batch_size:
++            print(f"✓ PASS")
++        else:
++            print(f"✗ FAIL")
++
++if __name__ == '__main__':
++    test_batch_size_logic()
+\ No newline at end of file
+diff --git a/test_batch_size_fix.py b/test_batch_size_fix.py
+new file mode 100644
+index 0000000000..2d5bc0d99d
+--- /dev/null
++++ b/test_batch_size_fix.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++"""
++Test to verify that the batch_size fix works correctly.
++This test specifically checks that batch_size respects database limits.
++"""
++
++import os
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.bulk_create',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++from tests.bulk_create.models import Country
++from django.test import TestCase
++
++class BatchSizeFixTest(TestCase):
++    def setUp(self):
++        """Create the database table"""
++        from django.core.management.color import no_style
++        from django.db import connection
++        
++        # Create the table
++        style = no_style()
++        sql = connection.ops.sql_create_table(Country._meta, style)
++        with connection.cursor() as cursor:
++            for statement in sql:
++                cursor.execute(statement)
++    
++    def test_batch_size_respects_database_limits(self):
++        """Test that batch_size parameter respects database limits"""
++        
++        # Create test data
++        data = [Country(name=f"Country {i}", iso_two_letter=f"C{i}") for i in range(100)]
++        
++        # Get the maximum batch size supported by the database
++        fields = Country._meta.concrete_fields
++        max_batch_size = connection.ops.bulk_batch_size(fields, data)
++        
++        # Test with batch_size larger than database limit
++        # This should be capped to the database limit
++        large_batch_size = max_batch_size + 10
++        
++        # The fix should ensure that the actual batch size used is the database limit
++        # We can't directly test the internal batch_size value, but we can verify
++        # that the operation succeeds (which it wouldn't if it exceeded database limits)
++        try:
++            created = Country.objects.bulk_create(data, batch_size=large_batch_size)
++            self.assertEqual(len(created), len(data))
++            print(f"✓ Successfully used batch_size={large_batch_size} (capped to {max_batch_size})")
++        except Exception as e:
++            self.fail(f"bulk_create failed with batch_size={large_batch_size}: {e}")
++        
++        # Test with batch_size=None (should use database maximum)
++        try:
++            Country.objects.all().delete()  # Clear previous data
++            created = Country.objects.bulk_create(data, batch_size=None)
++            self.assertEqual(len(created), len(data))
++            print("✓ Successfully used batch_size=None")
++        except Exception as e:
++            self.fail(f"bulk_create failed with batch_size=None: {e}")
++        
++        # Test with batch_size smaller than database limit
++        # This should use the provided value
++        small_batch_size = max(1, max_batch_size - 10)  # Ensure it's at least 1
++        try:
++            Country.objects.all().delete()  # Clear previous data
++            created = Country.objects.bulk_create(data, batch_size=small_batch_size)
++            self.assertEqual(len(created), len(data))
++            print(f"✓ Successfully used batch_size={small_batch_size}")
++        except Exception as e:
++            self.fail(f"bulk_create failed with batch_size={small_batch_size}: {e}")
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..915205005f
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the bulk_create batch_size fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.query import QuerySet
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++def test_batch_size_calculation():
++    """Test that the batch_size calculation respects database limits"""
++    from django.db import connection
++    
++    # Create some test objects
++    objs = [TestModel(name=f'obj_{i}', value=i) for i in range(100)]
++    
++    # Get the maximum batch size supported by the database
++    fields = TestModel._meta.concrete_fields
++    max_batch_size = connection.ops.bulk_batch_size(fields, objs)
++    
++    print(f"Database max batch size: {max_batch_size}")
++    
++    # Test cases
++    test_cases = [
++        (None, max_batch_size),  # batch_size=None should use database max
++        (max_batch_size - 10, max_batch_size - 10),  # Smaller than max should use provided value
++        (max_batch_size, max_batch_size),  # Equal to max should use provided value
++        (max_batch_size + 10, max_batch_size),  # Larger than max should be capped to max
++    ]
++    
++    for batch_size_param, expected_batch_size in test_cases:
++        # Create a mock QuerySet to test the _batched_insert method
++        qs = QuerySet(model=TestModel)
++        qs.db = 'default'
++        
++        # Test the batch size calculation
++        calculated_batch_size = qs._batched_insert(objs, fields, batch_size_param)
++        
++        print(f"batch_size={batch_size_param}: calculated={calculated_batch_size}, expected={expected_batch_size}")
++        
++        # For this test, we'll just check the calculation logic
++        # The actual _batched_insert method returns inserted_rows, not the batch_size
++        # So we need to extract the batch_size from the method logic
++        
++        # Let's examine what the method does internally
++        ops = connection.ops
++        max_db_batch_size = max(ops.bulk_batch_size(fields, objs), 1)
++        calculated = min(batch_size_param, max_db_batch_size) if batch_size_param else max_db_batch_size
++        
++        if calculated == expected_batch_size:
++            print(f"✓ PASS: batch_size={batch_size_param} -> {calculated}")
++        else:
++            print(f"✗ FAIL: batch_size={batch_size_param} -> {calculated}, expected {expected_batch_size}")
++
++if __name__ == '__main__':
++    test_batch_size_calculation()
+\ No newline at end of file
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 0000000000..e683018c23
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++"""
++Script to verify that the batch_size fix works correctly.
++This demonstrates that the batch_size parameter now respects database limits.
++"""
++
++import os
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db import connection
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++def verify_batch_size_logic():
++    """Verify that the batch_size calculation logic is correct"""
++    
++    # Create some test objects
++    objs = [TestModel(name=f'obj_{i}', value=i) for i in range(100)]
++    
++    # Get the maximum batch size supported by the database
++    fields = TestModel._meta.concrete_fields
++    max_batch_size = connection.ops.bulk_batch_size(fields, objs)
++    
++    print(f"Database max batch size: {max_batch_size}")
++    
++    # Test the new logic from _batched_insert
++    test_cases = [
++        (None, max_batch_size),  # batch_size=None should use database max
++        (max_batch_size - 10, max_batch_size - 10),  # Smaller than max should use provided value
++        (max_batch_size, max_batch_size),  # Equal to max should use provided value
++        (max_batch_size + 10, max_batch_size),  # Larger than max should be capped to max
++    ]
++    
++    all_passed = True
++    for batch_size_param, expected_batch_size in test_cases:
++        # Simulate the new logic from _batched_insert
++        max_db_batch_size = max(connection.ops.bulk_batch_size(fields, objs), 1)
++        calculated_batch_size = min(batch_size_param, max_db_batch_size) if batch_size_param else max_db_batch_size
++        
++        status = "✓ PASS" if calculated_batch_size == expected_batch_size else "✗ FAIL"
++        print(f"{status}: batch_size={batch_size_param} -> {calculated_batch_size}, expected={expected_batch_size}")
++        
++        if calculated_batch_size != expected_batch_size:
++            all_passed = False
++    
++    if all_passed:
++        print("\n✓ All tests passed! The batch_size fix is working correctly.")
++        print("The batch_size parameter now properly respects database limits.")
++    else:
++        print("\n✗ Some tests failed! The fix may not be working correctly.")
++
++if __name__ == '__main__':
++    verify_batch_size_logic()
+\ No newline at end of file

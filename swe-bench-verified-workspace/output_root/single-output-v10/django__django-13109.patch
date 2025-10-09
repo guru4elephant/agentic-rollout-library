@@ -1,0 +1,619 @@
+diff --git a/django/db/models/fields/related.py b/django/db/models/fields/related.py
+index d517d7269b..c2aea9c730 100644
+--- a/django/db/models/fields/related.py
++++ b/django/db/models/fields/related.py
+@@ -914,7 +914,7 @@ class ForeignKey(ForeignObject):
+             return
+ 
+         using = router.db_for_read(self.remote_field.model, instance=model_instance)
+-        qs = self.remote_field.model._default_manager.using(using).filter(
++        qs = self.remote_field.model._base_manager.using(using).filter(
+             **{self.remote_field.field_name: value}
+         )
+         qs = qs.complex_filter(self.get_limit_choices_to())
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..ed7c667929
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,180 @@
++#!/usr/bin/env python3
++"""
++Final verification that the ForeignKey validation fix works correctly
++and doesn't break existing functionality.
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++def test_original_issue():
++    """Test the exact scenario described in the GitHub issue"""
++    print("Testing original GitHub issue scenario...")
++    
++    # Define the exact models from the issue
++    class ArticleManager(models.Manager):
++        def get_queryset(self):
++            qs = super().get_queryset()
++            return qs.filter(archived=False)
++
++    class Article(models.Model):
++        title = models.CharField(max_length=100)
++        archived = models.BooleanField(default=False)
++        objects = ArticleManager()
++
++        class Meta:
++            app_label = 'test'
++
++    class FavoriteArticles(models.Model):
++        article = models.ForeignKey(Article, on_delete=models.CASCADE)
++
++        class Meta:
++            app_label = 'test'
++
++    # Create database tables
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Article)
++        schema_editor.create_model(FavoriteArticles)
++    
++    # Create test data
++    Article._base_manager.create(title="Active Article", archived=False)
++    archived_article = Article._base_manager.create(title="Archived Article", archived=True)
++    
++    # Test that the archived article exists in base manager but not default manager
++    base_count = Article._base_manager.count()
++    default_count = Article.objects.count()
++    
++    print(f"Base manager articles: {base_count}")
++    print(f"Default manager articles: {default_count}")
++    
++    # Test ForeignKey validation with archived article
++    favorite = FavoriteArticles(article=archived_article)
++    try:
++        favorite.full_clean()
++        print("✓ ForeignKey validation passed for archived article")
++        return True
++    except Exception as e:
++        print(f"✗ ForeignKey validation failed: {e}")
++        return False
++
++def test_backwards_compatibility():
++    """Test that normal ForeignKey validation still works"""
++    print("\nTesting backwards compatibility...")
++    
++    class NormalModel(models.Model):
++        name = models.CharField(max_length=100)
++
++        class Meta:
++            app_label = 'test'
++
++    class RelatedNormal(models.Model):
++        normal = models.ForeignKey(NormalModel, on_delete=models.CASCADE)
++
++        class Meta:
++            app_label = 'test'
++
++    # Create database tables
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(NormalModel)
++        schema_editor.create_model(RelatedNormal)
++    
++    # Create test instance
++    normal_instance = NormalModel.objects.create(name="Test")
++    
++    # Test normal validation
++    related_instance = RelatedNormal(normal=normal_instance)
++    try:
++        related_instance.full_clean()
++        print("✓ Normal ForeignKey validation works")
++        return True
++    except Exception as e:
++        print(f"✗ Normal ForeignKey validation failed: {e}")
++        return False
++
++def test_invalid_foreign_key():
++    """Test that invalid foreign keys still fail validation"""
++    print("\nTesting invalid foreign key validation...")
++    
++    class SimpleModel(models.Model):
++        name = models.CharField(max_length=100)
++
++        class Meta:
++            app_label = 'test'
++
++    class RelatedSimple(models.Model):
++        simple = models.ForeignKey(SimpleModel, on_delete=models.CASCADE)
++
++        class Meta:
++            app_label = 'test'
++
++    # Create database tables
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SimpleModel)
++        schema_editor.create_model(RelatedSimple)
++    
++    # Test with non-existent foreign key
++    related_instance = RelatedSimple(simple_id=999)  # Non-existent ID
++    try:
++        related_instance.full_clean()
++        print("✗ Validation should have failed for non-existent foreign key")
++        return False
++    except Exception as e:
++        print("✓ Validation correctly failed for non-existent foreign key")
++        return True
++
++if __name__ == '__main__':
++    print("Running final verification tests...")
++    
++    test1_result = test_original_issue()
++    test2_result = test_backwards_compatibility()
++    test3_result = test_invalid_foreign_key()
++    
++    print(f"\nTest Results:")
++    print(f"  Original issue scenario: {'PASS' if test1_result else 'FAIL'}")
++    print(f"  Backwards compatibility: {'PASS' if test2_result else 'FAIL'}")
++    print(f"  Invalid foreign key: {'PASS' if test3_result else 'FAIL'}")
++    
++    overall_result = test1_result and test2_result and test3_result
++    print(f"\nOverall result: {'PASS' if overall_result else 'FAIL'}")
++    
++    if overall_result:
++        print("\n✅ All tests passed! The ForeignKey validation fix is working correctly.")
++        print("✅ The change from _default_manager to _base_manager resolves the issue")
++        print("✅ while maintaining backwards compatibility.")
++    else:
++        print("\n❌ Some tests failed. Please review the implementation.")
++    
++    sys.exit(0 if overall_result else 1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..c4f662a1eb
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the ForeignKey validation issue described in the GitHub issue.
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++from django.db import models
++from django import forms
++
++# Configure minimal settings if needed
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Define the models as described in the issue
++class ArticleManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        return qs.filter(archived=False)
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    archived = models.BooleanField(default=False)
++    # Don't include archived articles by default.
++    objects = ArticleManager()
++
++    class Meta:
++        app_label = 'test'
++
++class FavoriteArticles(models.Model):
++    article = models.ForeignKey(Article, on_delete=models.CASCADE)
++
++    class Meta:
++        app_label = 'test'
++
++# Create the form as described in the issue
++class FavoriteArticlesForm(forms.ModelForm):
++    class Meta:
++        model = FavoriteArticles
++        fields = '__all__'
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # Use the base manager instead of the default manager to allow archived articles.
++        self.fields['article'].queryset = Article._base_manager.all()
++
++def test_issue():
++    # Create database tables using Django's schema creation
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Article)
++        schema_editor.create_model(FavoriteArticles)
++    
++    # Create test data
++    Article._base_manager.create(title="Active Article", archived=False)
++    archived_article = Article._base_manager.create(title="Archived Article", archived=True)
++    
++    print("Created articles:")
++    print(f"  - Active article: ID {Article._base_manager.get(title='Active Article').id}")
++    print(f"  - Archived article: ID {archived_article.id}")
++    
++    # Test the form with archived article
++    form_data = {'article': archived_article.id}
++    form = FavoriteArticlesForm(data=form_data)
++    
++    print(f"\nForm validation result: {form.is_valid()}")
++    if not form.is_valid():
++        print(f"Form errors: {form.errors}")
++    
++    # This should validate successfully but currently fails due to the bug
++    
++    return form.is_valid()
++
++if __name__ == '__main__':
++    result = test_issue()
++    print(f"\nTest result: {'PASS' if result else 'FAIL'}")
++    sys.exit(0 if result else 1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..d781a4ed14
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,133 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the ForeignKey validation fix.
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++from django.db import models
++from django import forms
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Test case 1: Multiple managers with different filters
++class MultiFilterManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        return qs.filter(active=True, archived=False)
++
++class MultiFilterModel(models.Model):
++    name = models.CharField(max_length=100)
++    active = models.BooleanField(default=True)
++    archived = models.BooleanField(default=False)
++    objects = MultiFilterManager()
++
++    class Meta:
++        app_label = 'test'
++
++class RelatedToMultiFilter(models.Model):
++    multi = models.ForeignKey(MultiFilterModel, on_delete=models.CASCADE)
++
++    class Meta:
++        app_label = 'test'
++
++def test_multiple_filters():
++    """Test with multiple filter conditions in default manager"""
++    print("Testing multiple filter conditions...")
++    
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(MultiFilterModel)
++        schema_editor.create_model(RelatedToMultiFilter)
++    
++    # Create instances that should be excluded by default manager
++    instance1 = MultiFilterModel._base_manager.create(name="Active and not archived", active=True, archived=False)
++    instance2 = MultiFilterModel._base_manager.create(name="Inactive and not archived", active=False, archived=False)
++    instance3 = MultiFilterModel._base_manager.create(name="Active and archived", active=True, archived=True)
++    instance4 = MultiFilterModel._base_manager.create(name="Inactive and archived", active=False, archived=True)
++    
++    print(f"Default manager count: {MultiFilterModel.objects.count()}")
++    print(f"Base manager count: {MultiFilterModel._base_manager.count()}")
++    
++    # Test validation with instance that should be excluded by default manager
++    related_instance = RelatedToMultiFilter(multi=instance3)  # Active but archived
++    try:
++        related_instance.full_clean()
++        print("✓ Validation passed for instance excluded by default manager")
++        return True
++    except Exception as e:
++        print(f"✗ Validation failed: {e}")
++        return False
++
++# Test case 2: Non-existent foreign key
++def test_nonexistent_foreign_key():
++    """Test that validation still fails for non-existent foreign keys"""
++    print("\nTesting non-existent foreign key validation...")
++    
++    class SimpleModel(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test'
++    
++    class RelatedSimple(models.Model):
++        simple = models.ForeignKey(SimpleModel, on_delete=models.CASCADE)
++        
++        class Meta:
++            app_label = 'test'
++    
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SimpleModel)
++        schema_editor.create_model(RelatedSimple)
++    
++    # Try to validate with non-existent foreign key
++    related_instance = RelatedSimple(simple_id=999)  # Non-existent ID
++    try:
++        related_instance.full_clean()
++        print("✗ Validation should have failed for non-existent foreign key")
++        return False
++    except Exception as e:
++        print("✓ Validation correctly failed for non-existent foreign key")
++        return True
++
++if __name__ == '__main__':
++    print("Running edge case tests for ForeignKey validation fix...")
++    
++    test1_result = test_multiple_filters()
++    test2_result = test_nonexistent_foreign_key()
++    
++    print(f"\nTest Results:")
++    print(f"  Multiple filter conditions: {'PASS' if test1_result else 'FAIL'}")
++    print(f"  Non-existent foreign key: {'PASS' if test2_result else 'FAIL'}")
++    
++    overall_result = test1_result and test2_result
++    print(f"\nOverall result: {'PASS' if overall_result else 'FAIL'}")
++    sys.exit(0 if overall_result else 1)
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 0000000000..1163c99c88
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,163 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the ForeignKey validation fix works correctly
++and doesn't break existing functionality.
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++from django.db import models
++from django import forms
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Define the models as described in the issue
++class ArticleManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        return qs.filter(archived=False)
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    archived = models.BooleanField(default=False)
++    # Don't include archived articles by default.
++    objects = ArticleManager()
++
++    class Meta:
++        app_label = 'test'
++
++class FavoriteArticles(models.Model):
++    article = models.ForeignKey(Article, on_delete=models.CASCADE)
++
++    class Meta:
++        app_label = 'test'
++
++# Create the form as described in the issue
++class FavoriteArticlesForm(forms.ModelForm):
++    class Meta:
++        model = FavoriteArticles
++        fields = '__all__'
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # Use the base manager instead of the default manager to allow archived articles.
++        self.fields['article'].queryset = Article._base_manager.all()
++
++def test_archived_article_validation():
++    """Test that archived articles can be validated with base manager"""
++    print("Testing archived article validation...")
++    
++    # Create database tables using Django's schema creation
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Article)
++        schema_editor.create_model(FavoriteArticles)
++    
++    # Create test data
++    Article._base_manager.create(title="Active Article", archived=False)
++    archived_article = Article._base_manager.create(title="Archived Article", archived=True)
++    
++    print("Created articles:")
++    print(f"  - Active article: ID {Article._base_manager.get(title='Active Article').id}")
++    print(f"  - Archived article: ID {archived_article.id}")
++    
++    # Test the form with archived article
++    form_data = {'article': archived_article.id}
++    form = FavoriteArticlesForm(data=form_data)
++    
++    print(f"\nForm validation result: {form.is_valid()}")
++    if not form.is_valid():
++        print(f"Form errors: {form.errors}")
++        return False
++    
++    # Test that default manager still excludes archived articles
++    print("\nTesting default manager behavior...")
++    active_articles = Article.objects.all()
++    print(f"Default manager articles count: {active_articles.count()}")
++    
++    # Test that base manager includes all articles
++    all_articles = Article._base_manager.all()
++    print(f"Base manager articles count: {all_articles.count()}")
++    
++    # Test form with active article (should work with both managers)
++    form_data_active = {'article': Article.objects.get(title='Active Article').id}
++    form_active = FavoriteArticlesForm(data=form_data_active)
++    print(f"\nForm validation with active article: {form_active.is_valid()}")
++    
++    return form.is_valid() and form_active.is_valid()
++
++def test_regular_foreignkey_validation():
++    """Test that regular ForeignKey validation still works"""
++    print("\nTesting regular ForeignKey validation...")
++    
++    class RegularModel(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test'
++    
++    class RelatedModel(models.Model):
++        regular = models.ForeignKey(RegularModel, on_delete=models.CASCADE)
++        
++        class Meta:
++            app_label = 'test'
++    
++    # Create database tables
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(RegularModel)
++        schema_editor.create_model(RelatedModel)
++    
++    # Create test data
++    regular_instance = RegularModel.objects.create(name="Test")
++    
++    # Test validation with valid foreign key
++    related_instance = RelatedModel(regular=regular_instance)
++    try:
++        related_instance.full_clean()
++        print("✓ Regular ForeignKey validation works")
++        return True
++    except Exception as e:
++        print(f"✗ Regular ForeignKey validation failed: {e}")
++        return False
++
++if __name__ == '__main__':
++    print("Running comprehensive tests for ForeignKey validation fix...")
++    
++    test1_result = test_archived_article_validation()
++    test2_result = test_regular_foreignkey_validation()
++    
++    print(f"\nTest Results:")
++    print(f"  Archived article validation: {'PASS' if test1_result else 'FAIL'}")
++    print(f"  Regular ForeignKey validation: {'PASS' if test2_result else 'FAIL'}")
++    
++    overall_result = test1_result and test2_result
++    print(f"\nOverall result: {'PASS' if overall_result else 'FAIL'}")
++    sys.exit(0 if overall_result else 1)
+\ No newline at end of file

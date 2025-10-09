@@ -1,0 +1,576 @@
+diff --git a/django/db/backends/postgresql/client.py b/django/db/backends/postgresql/client.py
+index 4c9bd63546..3b5ddafaca 100644
+--- a/django/db/backends/postgresql/client.py
++++ b/django/db/backends/postgresql/client.py
+@@ -32,9 +32,9 @@ class DatabaseClient(BaseDatabaseClient):
+             args += ["-h", host]
+         if port:
+             args += ["-p", str(port)]
++        args.extend(parameters)
+         if dbname:
+             args += [dbname]
+-        args.extend(parameters)
+ 
+         env = {}
+         if passwd:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..3d20952c4e
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the PostgreSQL dbshell issue with additional parameters.
++The issue is that psql expects all options to come before the database name,
++but currently Django adds the database name first and then the parameters.
++"""
++
++import os
++import sys
++import tempfile
++from unittest.mock import patch, MagicMock
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Mock Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Mock minimal Django settings
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.postgresql',
++                'NAME': 'test_db',
++                'USER': 'test_user',
++                'PASSWORD': 'test_pass',
++                'HOST': 'localhost',
++                'PORT': '5432',
++            }
++        }
++    )
++
++from django.db.backends.postgresql.client import DatabaseClient
++
++def test_postgresql_client_args():
++    """Test that PostgreSQL client args are constructed in correct order."""
++    
++    # Test settings
++    settings_dict = {
++        'NAME': 'test_db',
++        'USER': 'test_user',
++        'HOST': 'localhost',
++        'PORT': '5432',
++        'OPTIONS': {}
++    }
++    
++    # Test parameters that should be passed to psql
++    parameters = ['-c', 'SELECT version();']
++    
++    # Get the command args using the class method directly
++    args, env = DatabaseClient.settings_to_cmd_args_env(settings_dict, parameters)
++    
++    print("Generated command args:", args)
++    print("Environment:", env)
++    
++    # Check if database name comes before or after parameters
++    dbname_index = args.index('test_db') if 'test_db' in args else -1
++    param_index = -1
++    for i, arg in enumerate(args):
++        if arg in parameters:
++            param_index = i
++            break
++    
++    print(f"Database name index: {dbname_index}")
++    print(f"First parameter index: {param_index}")
++    
++    if dbname_index != -1 and param_index != -1:
++        if dbname_index < param_index:
++            print("❌ ISSUE: Database name comes before parameters (incorrect for psql)")
++            return False
++        else:
++            print("✅ CORRECT: Parameters come before database name")
++            return True
++    else:
++        print("⚠️  Could not find both database name and parameters in args")
++        return False
++
++if __name__ == '__main__':
++    print("Testing PostgreSQL client argument ordering...")
++    success = test_postgresql_client_args()
++    if not success:
++        print("\nThe issue is reproduced!")
++        sys.exit(1)
++    else:
++        print("\nNo issue found!")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/run_postgresql_test.py b/run_postgresql_test.py
+new file mode 100644
+index 0000000000..a459e84c98
+--- /dev/null
++++ b/run_postgresql_test.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""
++Run the PostgreSQL dbshell tests to verify the fix doesn't break existing functionality.
++"""
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Set up Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++from tests.dbshell.test_postgresql import PostgreSqlDbshellCommandTestCase
++
++def run_tests():
++    """Run the PostgreSQL dbshell tests."""
++    test_case = PostgreSqlDbshellCommandTestCase()
++    
++    # Test basic functionality
++    try:
++        result = test_case.settings_to_cmd_args_env({
++            "NAME": "dbname",
++            "USER": "someuser",
++            "PASSWORD": "somepassword",
++            "HOST": "somehost",
++            "PORT": "444",
++        })
++        print("✓ Basic test passed")
++    except Exception as e:
++        print(f"✗ Basic test failed: {e}")
++        return False
++    
++    # Test parameters (the main fix)
++    try:
++        result = test_case.settings_to_cmd_args_env({"NAME": "dbname"}, ["--help"])
++        expected = (["psql", "--help", "dbname"], None)
++        if result == expected:
++            print("✓ Parameters test passed")
++        else:
++            print(f"✗ Parameters test failed. Expected {expected}, got {result}")
++            return False
++    except Exception as e:
++        print(f"✗ Parameters test failed: {e}")
++        return False
++    
++    # Test no password
++    try:
++        result = test_case.settings_to_cmd_args_env({
++            "NAME": "dbname",
++            "USER": "someuser",
++            "HOST": "somehost",
++            "PORT": "444",
++        })
++        expected = (["psql", "-U", "someuser", "-h", "somehost", "-p", "444", "dbname"], None)
++        if result == expected:
++            print("✓ No password test passed")
++        else:
++            print(f"✗ No password test failed. Expected {expected}, got {result}")
++            return False
++    except Exception as e:
++        print(f"✗ No password test failed: {e}")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    print("Running PostgreSQL dbshell tests...")
++    success = run_tests()
++    
++    if success:
++        print("\n🎉 All tests passed!")
++        sys.exit(0)
++    else:
++        print("\n❌ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..42ac8017af
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for the PostgreSQL dbshell fix.
++Tests various scenarios including edge cases.
++"""
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++from django.db.backends.postgresql.client import DatabaseClient
++
++def test_scenarios():
++    """Test various scenarios for PostgreSQL client argument ordering."""
++    
++    test_cases = [
++        {
++            'name': 'Basic case with parameters',
++            'settings': {
++                'NAME': 'test_db',
++                'USER': 'test_user',
++                'HOST': 'localhost',
++                'PORT': '5432',
++                'OPTIONS': {}
++            },
++            'parameters': ['-c', 'SELECT version();'],
++            'expected_order': ['-c', 'SELECT version();', 'test_db']
++        },
++        {
++            'name': 'No database name (defaults to postgres)',
++            'settings': {
++                'NAME': '',
++                'USER': 'test_user',
++                'HOST': 'localhost',
++                'PORT': '5432',
++                'OPTIONS': {}
++            },
++            'parameters': ['-c', 'SELECT 1;'],
++            'expected_order': ['-c', 'SELECT 1;', 'postgres']
++        },
++        {
++            'name': 'No parameters',
++            'settings': {
++                'NAME': 'test_db',
++                'USER': 'test_user',
++                'HOST': 'localhost',
++                'PORT': '5432',
++                'OPTIONS': {}
++            },
++            'parameters': [],
++            'expected_order': ['test_db']
++        },
++        {
++            'name': 'Multiple parameters',
++            'settings': {
++                'NAME': 'my_db',
++                'USER': 'user',
++                'HOST': '127.0.0.1',
++                'PORT': '5433',
++                'OPTIONS': {}
++            },
++            'parameters': ['-f', 'script.sql', '-v', 'ON_ERROR_STOP=1'],
++            'expected_order': ['-f', 'script.sql', '-v', 'ON_ERROR_STOP=1', 'my_db']
++        }
++    ]
++    
++    all_passed = True
++    
++    for i, test_case in enumerate(test_cases, 1):
++        print(f"\nTest {i}: {test_case['name']}")
++        
++        args, env = DatabaseClient.settings_to_cmd_args_env(
++            test_case['settings'], test_case['parameters']
++        )
++        
++        print(f"Generated args: {args}")
++        
++        # Check if database name is in the expected position
++        dbname = test_case['settings']['NAME']
++        expected_order = test_case['expected_order']
++        
++        # Extract the relevant part of args (after psql and connection options)
++        # We look for the parameters and database name
++        # The structure is: ['psql', '-U', user, '-h', host, '-p', port, parameters..., dbname]
++        # So we need to skip the first 6 elements (psql + 5 connection options)
++        # But if some options are missing, we need a more robust approach
++        
++        # Find the position where parameters start (after all connection options)
++        # Look for the first argument that's not a connection option
++        connection_options = ['-U', '-h', '-p']
++        param_start_index = 1  # Start after 'psql'
++        
++        while param_start_index < len(args) and any(args[param_start_index].startswith(opt) for opt in connection_options):
++            param_start_index += 2  # Skip option and its value
++        
++        relevant_args = args[param_start_index:]
++        
++        if relevant_args != expected_order:
++            print(f"❌ FAIL: Expected {expected_order}, got {relevant_args}")
++            all_passed = False
++        else:
++            print(f"✅ PASS: Order is correct")
++    
++    return all_passed
++
++if __name__ == '__main__':
++    print("Running comprehensive PostgreSQL client tests...")
++    success = test_scenarios()
++    
++    if success:
++        print("\n🎉 All tests passed!")
++        sys.exit(0)
++    else:
++        print("\n❌ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..9839a61116
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the PostgreSQL dbshell fix.
++"""
++
++import sys
++sys.path.insert(0, '/testbed')
++
++from django.db.backends.postgresql.client import DatabaseClient
++
++def test_edge_cases():
++    """Test various edge cases."""
++    
++    test_cases = [
++        {
++            'name': 'No connection options, only parameters',
++            'settings': {"NAME": "test_db"},
++            'parameters': ['-c', 'SELECT 1;'],
++            'expected_args_suffix': ['-c', 'SELECT 1;', 'test_db']
++        },
++        {
++            'name': 'No database name, no parameters',
++            'settings': {"NAME": ""},
++            'parameters': [],
++            'expected_args_suffix': ['postgres']  # Should default to postgres
++        },
++        {
++            'name': 'All connection options with parameters',
++            'settings': {
++                "NAME": "my_db",
++                "USER": "my_user", 
++                "HOST": "db.example.com",
++                "PORT": "5433",
++                "OPTIONS": {}
++            },
++            'parameters': ['-f', 'script.sql'],
++            'expected_args_suffix': ['-f', 'script.sql', 'my_db']
++        },
++        {
++            'name': 'Multiple parameters',
++            'settings': {"NAME": "test_db"},
++            'parameters': ['-v', 'ON_ERROR_STOP=1', '-c', 'SELECT 1;'],
++            'expected_args_suffix': ['-v', 'ON_ERROR_STOP=1', '-c', 'SELECT 1;', 'test_db']
++        }
++    ]
++    
++    all_passed = True
++    
++    for test_case in test_cases:
++        print(f"\nTesting: {test_case['name']}")
++        
++        args, env = DatabaseClient.settings_to_cmd_args_env(
++            test_case['settings'], test_case['parameters']
++        )
++        
++        print(f"Generated args: {args}")
++        
++        # Check that the suffix (parameters + dbname) matches expected order
++        # We need to find where the parameters start
++        connection_options = ['-U', '-h', '-p']
++        param_start_index = 1  # Start after 'psql'
++        
++        while param_start_index < len(args) and any(args[param_start_index].startswith(opt) for opt in connection_options):
++            param_start_index += 2  # Skip option and its value
++        
++        actual_suffix = args[param_start_index:]
++        expected_suffix = test_case['expected_args_suffix']
++        
++        if actual_suffix == expected_suffix:
++            print("✓ Order is correct")
++        else:
++            print(f"✗ Order incorrect. Expected {expected_suffix}, got {actual_suffix}")
++            all_passed = False
++    
++    return all_passed
++
++if __name__ == '__main__':
++    print("Testing PostgreSQL dbshell edge cases...")
++    success = test_edge_cases()
++    
++    if success:
++        print("\n🎉 All edge case tests passed!")
++        sys.exit(0)
++    else:
++        print("\n❌ Some edge case tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_fix_simple.py b/test_fix_simple.py
+new file mode 100644
+index 0000000000..b7242069f4
+--- /dev/null
++++ b/test_fix_simple.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the PostgreSQL dbshell fix works correctly.
++"""
++
++import sys
++sys.path.insert(0, '/testbed')
++
++from django.db.backends.postgresql.client import DatabaseClient
++
++def test_parameters_before_dbname():
++    """Test that parameters come before database name."""
++    
++    # Test case 1: Basic parameters
++    settings = {"NAME": "test_db"}
++    parameters = ["-c", "SELECT 1;"]
++    
++    args, env = DatabaseClient.settings_to_cmd_args_env(settings, parameters)
++    print(f"Test 1 - Args: {args}")
++    
++    # Check that parameters come before database name
++    dbname_index = args.index("test_db") if "test_db" in args else -1
++    param_indices = [i for i, arg in enumerate(args) if arg in parameters]
++    
++    if param_indices and dbname_index != -1:
++        if all(param_index < dbname_index for param_index in param_indices):
++            print("✓ Parameters come before database name")
++        else:
++            print("✗ Parameters do not come before database name")
++            return False
++    else:
++        print("⚠️ Could not find both parameters and database name")
++    
++    # Test case 2: No parameters
++    settings = {"NAME": "test_db"}
++    parameters = []
++    
++    args, env = DatabaseClient.settings_to_cmd_args_env(settings, parameters)
++    print(f"Test 2 - Args: {args}")
++    
++    if "test_db" in args:
++        print("✓ Database name is present when no parameters")
++    else:
++        print("✗ Database name is missing")
++        return False
++    
++    # Test case 3: No database name (should default to 'postgres')
++    settings = {"NAME": ""}
++    parameters = ["-c", "SELECT 1;"]
++    
++    args, env = DatabaseClient.settings_to_cmd_args_env(settings, parameters)
++    print(f"Test 3 - Args: {args}")
++    
++    if "postgres" in args:
++        print("✓ Defaults to 'postgres' when no database name")
++    else:
++        print("✗ Does not default to 'postgres'")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    print("Testing PostgreSQL dbshell parameter ordering fix...")
++    success = test_parameters_before_dbname()
++    
++    if success:
++        print("\n🎉 Fix is working correctly!")
++        sys.exit(0)
++    else:
++        print("\n❌ Fix is not working!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..6bab524110
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++"""
++Test to demonstrate that the original GitHub issue is fixed.
++The issue was: psql expects all options to proceed the database name.
++"""
++
++import sys
++sys.path.insert(0, '/testbed')
++
++from django.db.backends.postgresql.client import DatabaseClient
++
++def test_original_issue():
++    """Test the exact scenario described in the GitHub issue."""
++    
++    print("Testing the original GitHub issue scenario...")
++    print("Before the fix: psql would show warnings about extra arguments")
++    print("After the fix: Parameters should come before database name")
++    
++    # Simulate the command: ./manage.py dbshell -- -c "select * from some_table;"
++    # The '--' separates manage.py args from psql args, so parameters would be:
++    # ['-c', 'select * from some_table;']
++    
++    settings = {
++        "NAME": "some_database",
++        "USER": "test_user",
++        "HOST": "localhost",
++        "PORT": "5432",
++        "OPTIONS": {}
++    }
++    
++    parameters = ['-c', 'select * from some_table;']
++    
++    args, env = DatabaseClient.settings_to_cmd_args_env(settings, parameters)
++    
++    print(f"\nGenerated command: {' '.join(args)}")
++    print(f"Environment: {env}")
++    
++    # Check the order: parameters should come before database name
++    dbname_index = args.index("some_database") if "some_database" in args else -1
++    param_indices = [i for i, arg in enumerate(args) if arg in parameters]
++    
++    print(f"\nDatabase name position: {dbname_index}")
++    print(f"Parameter positions: {param_indices}")
++    
++    if param_indices and dbname_index != -1:
++        if all(param_index < dbname_index for param_index in param_indices):
++            print("✅ SUCCESS: Parameters come before database name")
++            print("✅ The psql command will work correctly without warnings")
++            return True
++        else:
++            print("❌ FAIL: Parameters do not come before database name")
++            print("❌ psql would still show warnings about extra arguments")
++            return False
++    else:
++        print("⚠️  Could not verify the order")
++        return False
++
++if __name__ == '__main__':
++    success = test_original_issue()
++    
++    if success:
++        print("\n🎉 The original GitHub issue has been fixed!")
++        sys.exit(0)
++    else:
++        print("\n❌ The original GitHub issue is not fixed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/tests/dbshell/test_postgresql.py b/tests/dbshell/test_postgresql.py
+index 02924d0bcc..53dedaca01 100644
+--- a/tests/dbshell/test_postgresql.py
++++ b/tests/dbshell/test_postgresql.py
+@@ -154,7 +154,7 @@ class PostgreSqlDbshellCommandTestCase(SimpleTestCase):
+     def test_parameters(self):
+         self.assertEqual(
+             self.settings_to_cmd_args_env({"NAME": "dbname"}, ["--help"]),
+-            (["psql", "dbname", "--help"], None),
++            (["psql", "--help", "dbname"], None),
+         )
+ 
+     @skipUnless(connection.vendor == "postgresql", "Requires a PostgreSQL connection")

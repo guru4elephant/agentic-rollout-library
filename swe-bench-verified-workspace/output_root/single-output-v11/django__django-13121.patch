@@ -1,0 +1,396 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..3fa90dfd9a
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure minimal Django settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    USE_TZ=True,
++)
++
++# Initialize Django
++django.setup()
++
++import datetime
++from django.db import models
++from django.db.models import F
++
++# Create the test model
++class Experiment(models.Model):
++    estimated_time = models.DurationField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Create tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Experiment)
++
++def test_duration_expressions():
++    print("Testing duration expressions with SQLite...")
++    
++    # Create test instances with various durations
++    test_cases = [
++        datetime.timedelta(hours=2),
++        datetime.timedelta(days=1),
++        datetime.timedelta(seconds=30),
++        datetime.timedelta(microseconds=500000),
++    ]
++    
++    for i, duration in enumerate(test_cases):
++        exp = Experiment.objects.create(estimated_time=duration)
++        print(f"Test case {i+1}: {duration}")
++    
++    try:
++        # Test the original issue: duration + timedelta
++        result = list(Experiment.objects.annotate(
++            duration=F('estimated_time') + datetime.timedelta(days=1)
++        ))
++        print("SUCCESS: duration + timedelta worked")
++        
++        # Test other operations
++        result2 = list(Experiment.objects.annotate(
++            duration=F('estimated_time') - datetime.timedelta(hours=1)
++        ))
++        print("SUCCESS: duration - timedelta worked")
++        
++        # Test with zero timedelta
++        result3 = list(Experiment.objects.annotate(
++            duration=F('estimated_time') + datetime.timedelta(0)
++        ))
++        print("SUCCESS: duration + zero timedelta worked")
++        
++        # Test with negative timedelta
++        result4 = list(Experiment.objects.annotate(
++            duration=F('estimated_time') + datetime.timedelta(days=-1)
++        ))
++        print("SUCCESS: duration + negative timedelta worked")
++        
++        print(f"All tests passed! Results: {len(result)}, {len(result2)}, {len(result3)}, {len(result4)}")
++        
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++def test_edge_cases():
++    print("\nTesting edge cases...")
++    
++    try:
++        # Test with None values
++        exp = Experiment.objects.create(estimated_time=None)
++        result = list(Experiment.objects.annotate(
++            duration=F('estimated_time') + datetime.timedelta(days=1)
++        ))
++        print("SUCCESS: None values handled correctly")
++        
++        # Test with very large durations
++        large_duration = datetime.timedelta(days=365)
++        exp = Experiment.objects.create(estimated_time=large_duration)
++        result = list(Experiment.objects.annotate(
++            duration=F('estimated_time') + datetime.timedelta(days=1)
++        ))
++        print("SUCCESS: Large durations handled correctly")
++        
++    except Exception as e:
++        print(f"ERROR in edge cases: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    test_duration_expressions()
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/django/db/backends/base/operations.py b/django/db/backends/base/operations.py
+index 2e283a3193..ba2c7f2945 100644
+--- a/django/db/backends/base/operations.py
++++ b/django/db/backends/base/operations.py
+@@ -580,7 +580,11 @@ class BaseDatabaseOperations:
+ 
+     def convert_durationfield_value(self, value, expression, connection):
+         if value is not None:
+-            return datetime.timedelta(0, 0, value)
++            if isinstance(value, int):
++                return datetime.timedelta(0, 0, value)
++            elif isinstance(value, str):
++                from django.utils.dateparse import parse_duration
++                return parse_duration(value)
+ 
+     def check_expression_support(self, expression):
+         """
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..174d018cbc
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++sys.path.insert(0, '.')
++
++# Initialize Django
++django.setup()
++
++import datetime
++from django.db import models
++from django.db.models import F
++from django.test import TestCase
++
++# Create the test model
++class Experiment(models.Model):
++    estimated_time = models.DurationField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Test the issue
++def test_duration_expressions():
++    print("Testing duration expressions with SQLite...")
++    
++    # Create a test instance
++    exp = Experiment.objects.create(estimated_time=datetime.timedelta(hours=2))
++    
++    try:
++        # This should trigger the error
++        result = list(Experiment.objects.annotate(
++            duration=F('estimated_time') + datetime.timedelta(days=1)
++        ))
++        print("SUCCESS: No error occurred")
++        print(f"Result: {result}")
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    test_duration_expressions()
+\ No newline at end of file
+diff --git a/test_mysql.py b/test_mysql.py
+new file mode 100644
+index 0000000000..62901e31ec
+--- /dev/null
++++ b/test_mysql.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure minimal Django settings for MySQL
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.mysql',
++            'NAME': 'test_db',
++            'USER': 'test_user',
++            'PASSWORD': 'test_password',
++            'HOST': 'localhost',
++            'PORT': '3306',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    USE_TZ=True,
++)
++
++# Initialize Django
++django.setup()
++
++import datetime
++from django.db import models
++from django.db.models import F
++
++# Create the test model
++class Experiment(models.Model):
++    estimated_time = models.DurationField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Test the issue
++def test_duration_expressions():
++    print("Testing duration expressions with MySQL...")
++    
++    try:
++        # This should trigger the error if MySQL has the same issue
++        result = list(Experiment.objects.annotate(
++            duration=F('estimated_time') + datetime.timedelta(days=1)
++        ))
++        print("SUCCESS: No error occurred")
++        print(f"Result: {result}")
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    test_duration_expressions()
+\ No newline at end of file
+diff --git a/test_reproduce.py b/test_reproduce.py
+new file mode 100644
+index 0000000000..049c76655c
+--- /dev/null
++++ b/test_reproduce.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure minimal Django settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    USE_TZ=True,
++)
++
++# Initialize Django
++django.setup()
++
++import datetime
++from django.db import models
++from django.db.models import F
++
++# Create the test model
++class Experiment(models.Model):
++    estimated_time = models.DurationField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Create tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Experiment)
++
++# Test the issue
++def test_duration_expressions():
++    print("Testing duration expressions with SQLite...")
++    
++    # Create a test instance
++    exp = Experiment.objects.create(estimated_time=datetime.timedelta(hours=2))
++    
++    try:
++        # This should trigger the error
++        result = list(Experiment.objects.annotate(
++            duration=F('estimated_time') + datetime.timedelta(days=1)
++        ))
++        print("SUCCESS: No error occurred")
++        print(f"Result: {result}")
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    test_duration_expressions()
+\ No newline at end of file
+diff --git a/test_robustness.py b/test_robustness.py
+new file mode 100644
+index 0000000000..1e199fe940
+--- /dev/null
++++ b/test_robustness.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure minimal Django settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    USE_TZ=True,
++)
++
++# Initialize Django
++django.setup()
++
++from django.db.backends.base.operations import BaseDatabaseOperations
++
++class MockConnection:
++    pass
++
++def test_convert_durationfield_value():
++    print("Testing convert_durationfield_value robustness...")
++    
++    ops = BaseDatabaseOperations(MockConnection())
++    
++    # Test integer input (microseconds)
++    result = ops.convert_durationfield_value(3600000000, None, None)
++    print(f"Integer input (3600000000 microseconds): {result}")
++    
++    # Test string input (duration representation)
++    result = ops.convert_durationfield_value("1 00:00:00", None, None)
++    print(f'String input ("1 00:00:00"): {result}')
++    
++    # Test None input
++    result = ops.convert_durationfield_value(None, None, None)
++    print(f"None input: {result}")
++    
++    # Test invalid string input
++    try:
++        result = ops.convert_durationfield_value("invalid_duration", None, None)
++        print(f'Invalid string input ("invalid_duration"): {result}')
++    except Exception as e:
++        print(f'Invalid string input error (expected): {type(e).__name__}: {e}')
++    
++    # Test other types
++    try:
++        result = ops.convert_durationfield_value(3.14, None, None)
++        print(f"Float input (3.14): {result}")
++    except Exception as e:
++        print(f"Float input error (expected): {type(e).__name__}: {e}")
++
++if __name__ == '__main__':
++    test_convert_durationfield_value()
+\ No newline at end of file

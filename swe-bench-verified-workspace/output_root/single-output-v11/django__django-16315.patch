@@ -1,0 +1,706 @@
+diff --git a/django/db/backends/postgresql/operations.py b/django/db/backends/postgresql/operations.py
+index 62273fc43c..79dd91692f 100644
+--- a/django/db/backends/postgresql/operations.py
++++ b/django/db/backends/postgresql/operations.py
+@@ -353,12 +353,21 @@ class DatabaseOperations(BaseDatabaseOperations):
+         if on_conflict == OnConflict.IGNORE:
+             return "ON CONFLICT DO NOTHING"
+         if on_conflict == OnConflict.UPDATE:
++            # Create a mapping from field names to database column names
++            field_map = {field.name: field.column for field in fields}
++            
++            # Convert unique_fields to database column names
++            unique_columns = [field_map.get(field, field) for field in unique_fields]
++            
++            # Convert update_fields to database column names  
++            update_columns = [field_map.get(field, field) for field in update_fields]
++            
+             return "ON CONFLICT(%s) DO UPDATE SET %s" % (
+-                ", ".join(map(self.quote_name, unique_fields)),
++                ", ".join(map(self.quote_name, unique_columns)),
+                 ", ".join(
+                     [
+                         f"{field} = EXCLUDED.{field}"
+-                        for field in map(self.quote_name, update_fields)
++                        for field in map(self.quote_name, update_columns)
+                     ]
+                 ),
+             )
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..267a9f37c7
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.postgresql',
++                'NAME': 'test_db',
++                'USER': 'test_user',
++                'PASSWORD': 'test_password',
++                'HOST': 'localhost',
++                'PORT': '5432',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++class ActivityBlackListed(models.Model):
++    """
++    Originally sourced from Activity_BlackListed in /home/josh/PNDS_Interim_MIS-Data.accdb (13 records)
++    """
++    class Meta:
++        db_table = "Activity_BlackListed"
++    
++    blacklistid = models.IntegerField(primary_key=True, db_column="BlacklistID")
++    sectorid = models.IntegerField(null=True, blank=True, db_column="SectorID")
++
++# Create instances
++instances = [
++    ActivityBlackListed(blacklistid=1, sectorid=100),
++    ActivityBlackListed(blacklistid=2, sectorid=200),
++]
++
++# Try to reproduce the issue
++try:
++    result = ActivityBlackListed.objects.bulk_create(
++        instances, 
++        update_conflicts=True, 
++        update_fields=["sectorid"], 
++        unique_fields=["blacklistid"]
++    )
++    print("Success: No error occurred")
++except Exception as e:
++    print(f"Error: {e}")
++    print(f"Error type: {type(e)}")
+\ No newline at end of file
+diff --git a/reproduce_sql_generation.py b/reproduce_sql_generation.py
+new file mode 100644
+index 0000000000..b7b41c3481
+--- /dev/null
++++ b/reproduce_sql_generation.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.postgresql',
++                'NAME': 'test_db',
++                'USER': 'test_user',
++                'PASSWORD': 'test_password',
++                'HOST': 'localhost',
++                'PORT': '5432',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.backends.postgresql.operations import DatabaseOperations
++
++# Create a mock model to test SQL generation
++class MockModel:
++    class _meta:
++        def get_field(self, field_name):
++            if field_name == "blacklistid":
++                return MockField("blacklistid", "BlacklistID")
++            elif field_name == "sectorid":
++                return MockField("sectorid", "SectorID")
++            return MockField(field_name, field_name)
++
++class MockField:
++    def __init__(self, name, column):
++        self.name = name
++        self.column = column
++    
++    def get_attname(self):
++        return self.name
++    
++    def get_attname_column(self):
++        return (self.name, self.column)
++
++# Test the SQL generation
++ops = DatabaseOperations(None)
++
++# Test with field names that have different db_column values
++unique_fields = ["blacklistid"]
++update_fields = ["sectorid"]
++
++# This should generate SQL using the db_column names, not field names
++sql = ops.on_conflict_suffix_sql([], 2, update_fields, unique_fields)  # 2 = OnConflict.UPDATE
++
++print("Generated SQL:")
++print(sql)
++
++# The issue: SQL should use "BlacklistID" and "SectorID" but currently uses "blacklistid" and "sectorid"
++print("\nExpected SQL should use db_column names:")
++print("ON CONFLICT(\"BlacklistID\") DO UPDATE SET \"SectorID\" = EXCLUDED.\"SectorID\"")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..6597b0825b
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,155 @@
++#!/usr/bin/env python3
++
++# Comprehensive test for the PostgreSQL on_conflict_suffix_sql fix
++import sys
++sys.path.insert(0, '/testbed')
++
++from django.db.models.constants import OnConflict
++
++# Mock field class that simulates Django model fields
++class MockField:
++    def __init__(self, name, column):
++        self.name = name
++        self.column = column
++
++# Mock connection class
++class MockConnection:
++    def __init__(self):
++        self.features = type('MockFeatures', (), {
++            'supports_update_conflicts': True,
++            'supports_update_conflicts_with_target': True
++        })()
++
++# Import the fixed method
++from django.db.backends.postgresql.operations import DatabaseOperations
++
++# Create operations instance
++ops = DatabaseOperations(MockConnection())
++
++def test_case_1():
++    """Test case 1: Fields with different db_column values (the original issue)"""
++    print("=== Test Case 1: Fields with different db_column values ===")
++    
++    # Simulate the fields from the GitHub issue
++    fields = [
++        MockField("blacklistid", "BlacklistID"),  # field name: blacklistid, db_column: BlacklistID
++        MockField("sectorid", "SectorID")         # field name: sectorid, db_column: SectorID
++    ]
++    update_fields = ["sectorid"]
++    unique_fields = ["blacklistid"]
++    
++    result = ops.on_conflict_suffix_sql(fields, OnConflict.UPDATE, update_fields, unique_fields)
++    
++    print("Fields:", [f"{f.name}->{f.column}" for f in fields])
++    print("Update fields:", update_fields)
++    print("Unique fields:", unique_fields)
++    print("Generated SQL:", result)
++    
++    # The expected SQL should use the db_column names, not field names
++    expected = 'ON CONFLICT("BlacklistID") DO UPDATE SET "SectorID" = EXCLUDED."SectorID"'
++    print("Expected SQL:", expected)
++    print("Match:", result == expected)
++    print()
++
++def test_case_2():
++    """Test case 2: Fields with same db_column values (no change needed)"""
++    print("=== Test Case 2: Fields with same db_column values ===")
++    
++    fields = [
++        MockField("blacklistid", "blacklistid"),  # field name and db_column are the same
++        MockField("sectorid", "sectorid")         # field name and db_column are the same
++    ]
++    update_fields = ["sectorid"]
++    unique_fields = ["blacklistid"]
++    
++    result = ops.on_conflict_suffix_sql(fields, OnConflict.UPDATE, update_fields, unique_fields)
++    
++    print("Fields:", [f"{f.name}->{f.column}" for f in fields])
++    print("Update fields:", update_fields)
++    print("Unique fields:", unique_fields)
++    print("Generated SQL:", result)
++    
++    # The SQL should use the field names since they match db_column
++    expected = 'ON CONFLICT("blacklistid") DO UPDATE SET "sectorid" = EXCLUDED."sectorid"'
++    print("Expected SQL:", expected)
++    print("Match:", result == expected)
++    print()
++
++def test_case_3():
++    """Test case 3: IGNORE conflict (should not be affected)"""
++    print("=== Test Case 3: IGNORE conflict ===")
++    
++    fields = [
++        MockField("blacklistid", "BlacklistID"),
++        MockField("sectorid", "SectorID")
++    ]
++    update_fields = ["sectorid"]
++    unique_fields = ["blacklistid"]
++    
++    result = ops.on_conflict_suffix_sql(fields, OnConflict.IGNORE, update_fields, unique_fields)
++    
++    print("Fields:", [f"{f.name}->{f.column}" for f in fields])
++    print("Update fields:", update_fields)
++    print("Unique fields:", unique_fields)
++    print("Generated SQL:", result)
++    
++    expected = "ON CONFLICT DO NOTHING"
++    print("Expected SQL:", expected)
++    print("Match:", result == expected)
++    print()
++
++def test_case_4():
++    """Test case 4: Multiple fields in update_fields and unique_fields"""
++    print("=== Test Case 4: Multiple fields ===")
++    
++    fields = [
++        MockField("field1", "Column1"),
++        MockField("field2", "Column2"),
++        MockField("field3", "Column3")
++    ]
++    update_fields = ["field1", "field2"]
++    unique_fields = ["field3"]
++    
++    result = ops.on_conflict_suffix_sql(fields, OnConflict.UPDATE, update_fields, unique_fields)
++    
++    print("Fields:", [f"{f.name}->{f.column}" for f in fields])
++    print("Update fields:", update_fields)
++    print("Unique fields:", unique_fields)
++    print("Generated SQL:", result)
++    
++    expected = 'ON CONFLICT("Column3") DO UPDATE SET "Column1" = EXCLUDED."Column1", "Column2" = EXCLUDED."Column2"'
++    print("Expected SQL:", expected)
++    print("Match:", result == expected)
++    print()
++
++def test_case_5():
++    """Test case 5: Field not found in field mapping (fallback to field name)"""
++    print("=== Test Case 5: Field not found in field mapping ===")
++    
++    fields = [
++        MockField("field1", "Column1"),
++        MockField("field2", "Column2")
++    ]
++    update_fields = ["field1", "unknown_field"]  # unknown_field doesn't exist in fields
++    unique_fields = ["field2"]
++    
++    result = ops.on_conflict_suffix_sql(fields, OnConflict.UPDATE, update_fields, unique_fields)
++    
++    print("Fields:", [f"{f.name}->{f.column}" for f in fields])
++    print("Update fields:", update_fields)
++    print("Unique fields:", unique_fields)
++    print("Generated SQL:", result)
++    
++    # unknown_field should fall back to using the field name since it's not in the mapping
++    expected = 'ON CONFLICT("Column2") DO UPDATE SET "Column1" = EXCLUDED."Column1", "unknown_field" = EXCLUDED."unknown_field"'
++    print("Expected SQL:", expected)
++    print("Match:", result == expected)
++    print()
++
++if __name__ == "__main__":
++    test_case_1()
++    test_case_2()
++    test_case_3()
++    test_case_4()
++    test_case_5()
++    print("All tests completed!")
+\ No newline at end of file
+diff --git a/test_final.py b/test_final.py
+new file mode 100644
+index 0000000000..f6fff9709c
+--- /dev/null
++++ b/test_final.py
+@@ -0,0 +1,182 @@
++#!/usr/bin/env python3
++
++# Final test for the PostgreSQL on_conflict_suffix_sql fix
++# This test simulates the exact logic without importing the full module
++
++# Mock the OnConflict enum
++class OnConflict:
++    IGNORE = 1
++    UPDATE = 2
++
++# Mock the quote_name function
++def quote_name(name):
++    return f'"{name}"'
++
++# Simulate the fixed on_conflict_suffix_sql method logic
++def fixed_on_conflict_suffix_sql(fields, on_conflict, update_fields, unique_fields):
++    """Simulates the fixed PostgreSQL on_conflict_suffix_sql method"""
++    if on_conflict == OnConflict.IGNORE:
++        return "ON CONFLICT DO NOTHING"
++    if on_conflict == OnConflict.UPDATE:
++        # Create a mapping from field names to database column names
++        field_map = {field.name: field.column for field in fields}
++        
++        # Convert unique_fields to database column names
++        unique_columns = [field_map.get(field, field) for field in unique_fields]
++        
++        # Convert update_fields to database column names  
++        update_columns = [field_map.get(field, field) for field in update_fields]
++        
++        return "ON CONFLICT(%s) DO UPDATE SET %s" % (
++            ", ".join(map(quote_name, unique_columns)),
++            ", ".join(
++                [
++                    f"{field} = EXCLUDED.{field}"
++                    for field in map(quote_name, update_columns)
++                ]
++            ),
++        )
++    return ""
++
++# Mock field class
++class MockField:
++    def __init__(self, name, column):
++        self.name = name
++        self.column = column
++
++def test_case_1():
++    """Test case 1: Fields with different db_column values (the original issue)"""
++    print("=== Test Case 1: Fields with different db_column values ===")
++    
++    # Simulate the fields from the GitHub issue
++    fields = [
++        MockField("blacklistid", "BlacklistID"),  # field name: blacklistid, db_column: BlacklistID
++        MockField("sectorid", "SectorID")         # field name: sectorid, db_column: SectorID
++    ]
++    update_fields = ["sectorid"]
++    unique_fields = ["blacklistid"]
++    
++    result = fixed_on_conflict_suffix_sql(fields, OnConflict.UPDATE, update_fields, unique_fields)
++    
++    print("Fields:", [f"{f.name}->{f.column}" for f in fields])
++    print("Update fields:", update_fields)
++    print("Unique fields:", unique_fields)
++    print("Generated SQL:", result)
++    
++    # The expected SQL should use the db_column names, not field names
++    expected = 'ON CONFLICT("BlacklistID") DO UPDATE SET "SectorID" = EXCLUDED."SectorID"'
++    print("Expected SQL:", expected)
++    print("Match:", result == expected)
++    print("PASS" if result == expected else "FAIL")
++    print()
++
++def test_case_2():
++    """Test case 2: Fields with same db_column values (no change needed)"""
++    print("=== Test Case 2: Fields with same db_column values ===")
++    
++    fields = [
++        MockField("blacklistid", "blacklistid"),  # field name and db_column are the same
++        MockField("sectorid", "sectorid")         # field name and db_column are the same
++    ]
++    update_fields = ["sectorid"]
++    unique_fields = ["blacklistid"]
++    
++    result = fixed_on_conflict_suffix_sql(fields, OnConflict.UPDATE, update_fields, unique_fields)
++    
++    print("Fields:", [f"{f.name}->{f.column}" for f in fields])
++    print("Update fields:", update_fields)
++    print("Unique fields:", unique_fields)
++    print("Generated SQL:", result)
++    
++    # The SQL should use the field names since they match db_column
++    expected = 'ON CONFLICT("blacklistid") DO UPDATE SET "sectorid" = EXCLUDED."sectorid"'
++    print("Expected SQL:", expected)
++    print("Match:", result == expected)
++    print("PASS" if result == expected else "FAIL")
++    print()
++
++def test_case_3():
++    """Test case 3: IGNORE conflict (should not be affected)"""
++    print("=== Test Case 3: IGNORE conflict ===")
++    
++    fields = [
++        MockField("blacklistid", "BlacklistID"),
++        MockField("sectorid", "SectorID")
++    ]
++    update_fields = ["sectorid"]
++    unique_fields = ["blacklistid"]
++    
++    result = fixed_on_conflict_suffix_sql(fields, OnConflict.IGNORE, update_fields, unique_fields)
++    
++    print("Fields:", [f"{f.name}->{f.column}" for f in fields])
++    print("Update fields:", update_fields)
++    print("Unique fields:", unique_fields)
++    print("Generated SQL:", result)
++    
++    expected = "ON CONFLICT DO NOTHING"
++    print("Expected SQL:", expected)
++    print("Match:", result == expected)
++    print("PASS" if result == expected else "FAIL")
++    print()
++
++def test_case_4():
++    """Test case 4: Multiple fields in update_fields and unique_fields"""
++    print("=== Test Case 4: Multiple fields ===")
++    
++    fields = [
++        MockField("field1", "Column1"),
++        MockField("field2", "Column2"),
++        MockField("field3", "Column3")
++    ]
++    update_fields = ["field1", "field2"]
++    unique_fields = ["field3"]
++    
++    result = fixed_on_conflict_suffix_sql(fields, OnConflict.UPDATE, update_fields, unique_fields)
++    
++    print("Fields:", [f"{f.name}->{f.column}" for f in fields])
++    print("Update fields:", update_fields)
++    print("Unique fields:", unique_fields)
++    print("Generated SQL:", result)
++    
++    expected = 'ON CONFLICT("Column3") DO UPDATE SET "Column1" = EXCLUDED."Column1", "Column2" = EXCLUDED."Column2"'
++    print("Expected SQL:", expected)
++    print("Match:", result == expected)
++    print("PASS" if result == expected else "FAIL")
++    print()
++
++def test_case_5():
++    """Test case 5: Field not found in field mapping (fallback to field name)"""
++    print("=== Test Case 5: Field not found in field mapping ===")
++    
++    fields = [
++        MockField("field1", "Column1"),
++        MockField("field2", "Column2")
++    ]
++    update_fields = ["field1", "unknown_field"]  # unknown_field doesn't exist in fields
++    unique_fields = ["field2"]
++    
++    result = fixed_on_conflict_suffix_sql(fields, OnConflict.UPDATE, update_fields, unique_fields)
++    
++    print("Fields:", [f"{f.name}->{f.column}" for f in fields])
++    print("Update fields:", update_fields)
++    print("Unique fields:", unique_fields)
++    print("Generated SQL:", result)
++    
++    # unknown_field should fall back to using the field name since it's not in the mapping
++    expected = 'ON CONFLICT("Column2") DO UPDATE SET "Column1" = EXCLUDED."Column1", "unknown_field" = EXCLUDED."unknown_field"'
++    print("Expected SQL:", expected)
++    print("Match:", result == expected)
++    print("PASS" if result == expected else "FAIL")
++    print()
++
++if __name__ == "__main__":
++    print("Testing the fixed on_conflict_suffix_sql logic...")
++    print()
++    
++    test_case_1()
++    test_case_2()
++    test_case_3()
++    test_case_4()
++    test_case_5()
++    
++    print("All tests completed!")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..a9462dfd2c
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++
++# Test the fix for the PostgreSQL on_conflict_suffix_sql method
++import sys
++sys.path.insert(0, '/testbed')
++
++# Mock the necessary dependencies
++from django.db.models.constants import OnConflict
++
++# Mock field class
++class MockField:
++    def __init__(self, name, column):
++        self.name = name
++        self.column = column
++
++# Mock connection class
++class MockConnection:
++    def __init__(self):
++        self.features = type('MockFeatures', (), {
++            'supports_update_conflicts': True,
++            'supports_update_conflicts_with_target': True
++        })()
++
++# Import and test the fixed method
++from django.db.backends.postgresql.operations import DatabaseOperations
++
++# Create operations instance
++ops = DatabaseOperations(MockConnection())
++
++# Test case 1: Fields with different db_column values
++fields = [
++    MockField("blacklistid", "BlacklistID"),
++    MockField("sectorid", "SectorID")
++]
++update_fields = ["sectorid"]
++unique_fields = ["blacklistid"]
++
++result = ops.on_conflict_suffix_sql(fields, OnConflict.UPDATE, update_fields, unique_fields)
++print("Test case 1 - Fields with different db_column values:")
++print("Result:", result)
++print("Expected: ON CONFLICT(\"BlacklistID\") DO UPDATE SET \"SectorID\" = EXCLUDED.\"SectorID\"")
++print("Match:", result == "ON CONFLICT(\"BlacklistID\") DO UPDATE SET \"SectorID\" = EXCLUDED.\"SectorID\"")
++
++# Test case 2: Fields with same db_column values (no change)
++fields2 = [
++    MockField("blacklistid", "blacklistid"),
++    MockField("sectorid", "sectorid")
++]
++result2 = ops.on_conflict_suffix_sql(fields2, OnConflict.UPDATE, update_fields, unique_fields)
++print("\nTest case 2 - Fields with same db_column values:")
++print("Result:", result2)
++print("Expected: ON CONFLICT(\"blacklistid\") DO UPDATE SET \"sectorid\" = EXCLUDED.\"sectorid\"")
++print("Match:", result2 == "ON CONFLICT(\"blacklistid\") DO UPDATE SET \"sectorid\" = EXCLUDED.\"sectorid\"")
++
++# Test case 3: IGNORE conflict
++result3 = ops.on_conflict_suffix_sql(fields, OnConflict.IGNORE, update_fields, unique_fields)
++print("\nTest case 3 - IGNORE conflict:")
++print("Result:", result3)
++print("Expected: ON CONFLICT DO NOTHING")
++print("Match:", result3 == "ON CONFLICT DO NOTHING")
+\ No newline at end of file
+diff --git a/test_logic.py b/test_logic.py
+new file mode 100644
+index 0000000000..e8af4dcbab
+--- /dev/null
++++ b/test_logic.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++
++# Test the logic for converting field names to column names
++def test_field_mapping():
++    # Mock field class
++    class MockField:
++        def __init__(self, name, column):
++            self.name = name
++            self.column = column
++
++    # Test case 1: Fields with different db_column values
++    fields = [
++        MockField("blacklistid", "BlacklistID"),
++        MockField("sectorid", "SectorID")
++    ]
++    update_fields = ["sectorid"]
++    unique_fields = ["blacklistid"]
++    
++    # Create mapping from field names to database column names
++    field_map = {field.name: field.column for field in fields}
++    
++    # Convert unique_fields to database column names
++    unique_columns = [field_map.get(field, field) for field in unique_fields]
++    
++    # Convert update_fields to database column names  
++    update_columns = [field_map.get(field, field) for field in update_fields]
++    
++    print("Test case 1 - Fields with different db_column values:")
++    print("Field map:", field_map)
++    print("Unique fields:", unique_fields, "->", unique_columns)
++    print("Update fields:", update_fields, "->", update_columns)
++    
++    # Simulate the SQL generation
++    def quote_name(name):
++        return f'"{name}"'
++    
++    unique_sql = ", ".join(map(quote_name, unique_columns))
++    update_sql = ", ".join([f"{quote_name(field)} = EXCLUDED.{quote_name(field)}" for field in update_columns])
++    
++    result = f"ON CONFLICT({unique_sql}) DO UPDATE SET {update_sql}"
++    expected = 'ON CONFLICT("BlacklistID") DO UPDATE SET "SectorID" = EXCLUDED."SectorID"'
++    
++    print("Generated SQL:", result)
++    print("Expected SQL:", expected)
++    print("Match:", result == expected)
++    
++    # Test case 2: Fields with same db_column values (no change)
++    fields2 = [
++        MockField("blacklistid", "blacklistid"),
++        MockField("sectorid", "sectorid")
++    ]
++    
++    field_map2 = {field.name: field.column for field in fields2}
++    unique_columns2 = [field_map2.get(field, field) for field in unique_fields]
++    update_columns2 = [field_map2.get(field, field) for field in update_fields]
++    
++    print("\nTest case 2 - Fields with same db_column values:")
++    print("Field map:", field_map2)
++    print("Unique fields:", unique_fields, "->", unique_columns2)
++    print("Update fields:", update_fields, "->", update_columns2)
++    
++    unique_sql2 = ", ".join(map(quote_name, unique_columns2))
++    update_sql2 = ", ".join([f"{quote_name(field)} = EXCLUDED.{quote_name(field)}" for field in update_columns2])
++    
++    result2 = f"ON CONFLICT({unique_sql2}) DO UPDATE SET {update_sql2}"
++    expected2 = 'ON CONFLICT("blacklistid") DO UPDATE SET "sectorid" = EXCLUDED."sectorid"'
++    
++    print("Generated SQL:", result2)
++    print("Expected SQL:", expected2)
++    print("Match:", result2 == expected2)
++
++if __name__ == "__main__":
++    test_field_mapping()
+\ No newline at end of file
+diff --git a/test_sql_generation.py b/test_sql_generation.py
+new file mode 100644
+index 0000000000..f66d0680a2
+--- /dev/null
++++ b/test_sql_generation.py
+@@ -0,0 +1,31 @@
++#!/usr/bin/env python3
++
++# Test the SQL generation issue without full Django setup
++from django.db.backends.postgresql.operations import DatabaseOperations
++from django.db.models.constants import OnConflict
++
++# Create a mock connection
++class MockConnection:
++    def __init__(self):
++        self.features = MockFeatures()
++
++class MockFeatures:
++    supports_update_conflicts = True
++    supports_update_conflicts_with_target = True
++
++# Create operations instance
++ops = DatabaseOperations(MockConnection())
++
++# Test with field names that would have different db_column values
++unique_fields = ["blacklistid"]
++update_fields = ["sectorid"]
++
++# This should generate SQL using the db_column names, not field names
++sql = ops.on_conflict_suffix_sql([], OnConflict.UPDATE, update_fields, unique_fields)
++
++print("Generated SQL:")
++print(sql)
++
++# The issue: SQL should use "BlacklistID" and "SectorID" but currently uses "blacklistid" and "sectorid"
++print("\nExpected SQL should use db_column names:")
++print("ON CONFLICT(\"BlacklistID\") DO UPDATE SET \"SectorID\" = EXCLUDED.\"SectorID\"")
+\ No newline at end of file

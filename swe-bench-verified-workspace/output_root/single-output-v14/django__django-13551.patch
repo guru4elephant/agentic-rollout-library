@@ -1,0 +1,449 @@
+diff --git a/django/contrib/auth/tokens.py b/django/contrib/auth/tokens.py
+index 93e2d71af2..b8dbd7337e 100644
+--- a/django/contrib/auth/tokens.py
++++ b/django/contrib/auth/tokens.py
+@@ -85,6 +85,7 @@ class PasswordResetTokenGenerator:
+            same password is chosen, due to password salting).
+         2. The last_login field will usually be updated very shortly after
+            a password reset.
++        3. The email field will change if the user's email address changes.
+         Failing those things, settings.PASSWORD_RESET_TIMEOUT eventually
+         invalidates the token.
+ 
+@@ -94,7 +95,9 @@ class PasswordResetTokenGenerator:
+         # Truncate microseconds so that tokens are consistent even if the
+         # database doesn't support microseconds.
+         login_timestamp = '' if user.last_login is None else user.last_login.replace(microsecond=0, tzinfo=None)
+-        return str(user.pk) + user.password + str(login_timestamp) + str(timestamp)
++        # Include the email address if it exists to invalidate tokens when email changes
++        email = getattr(user, 'email', '')
++        return str(user.pk) + user.password + str(login_timestamp) + str(timestamp) + str(email)
+ 
+     def _num_seconds(self, dt):
+         return int((dt - datetime(2001, 1, 1)).total_seconds())
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..22cde9cdcb
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,113 @@
++#!/usr/bin/env python3
++"""
++Final test to verify our fix works correctly with actual token generation and validation.
++"""
++
++import sys
++sys.path.insert(0, '/testbed')
++
++# Configure minimal Django settings
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        SECRET_KEY='test-secret-key-for-reproduction',
++        USE_TZ=True,
++        PASSWORD_RESET_TIMEOUT=60 * 60 * 24 * 7,  # 7 days
++        DEFAULT_HASHING_ALGORITHM='sha256',
++    )
++    django.setup()
++
++from django.contrib.auth.tokens import PasswordResetTokenGenerator
++
++# Create mock user objects that simulate real User model behavior
++class MockUser:
++    def __init__(self, pk, password, email=None, last_login=None):
++        self.pk = pk
++        self.password = password
++        self.email = email
++        self.last_login = last_login
++
++def test_complete_token_flow():
++    """Test the complete token generation and validation flow with email change."""
++    print("=== Testing Complete Token Flow with Email Change ===")
++    
++    token_generator = PasswordResetTokenGenerator()
++    
++    # Create a user with initial email
++    user = MockUser(pk=1, password="hashed_password_123", email="foo@example.com")
++    
++    # Generate a token for the user
++    token = token_generator.make_token(user)
++    print(f"Generated token for user with email '{user.email}': {token}")
++    
++    # Verify the token is initially valid
++    is_valid_initial = token_generator.check_token(user, token)
++    print(f"Token is initially valid: {is_valid_initial}")
++    
++    if not is_valid_initial:
++        print("❌ FAIL: Token should be valid initially")
++        return False
++    
++    # Change the user's email address (simulating the issue scenario)
++    original_email = user.email
++    user.email = "bar@example.com"
++    print(f"Changed user email from '{original_email}' to '{user.email}'")
++    
++    # Verify the token should now be invalid after email change
++    is_valid_after_email_change = token_generator.check_token(user, token)
++    print(f"Token is valid after email change: {is_valid_after_email_change}")
++    
++    if is_valid_after_email_change:
++        print("❌ FAIL: Token should be invalid after email change")
++        return False
++    else:
++        print("✅ PASS: Token correctly invalidated after email change")
++        return True
++
++def test_backwards_compatibility():
++    """Test that our changes don't break existing functionality."""
++    print("\n=== Testing Backwards Compatibility ===")
++    
++    token_generator = PasswordResetTokenGenerator()
++    
++    # Test with user without email
++    user_no_email = MockUser(pk=1, password="hashed_password_123", email=None)
++    token = token_generator.make_token(user_no_email)
++    is_valid = token_generator.check_token(user_no_email, token)
++    
++    print(f"User without email: token valid = {is_valid}")
++    if not is_valid:
++        print("❌ FAIL: Token should be valid for users without email")
++        return False
++    
++    # Test with user with empty email
++    user_empty_email = MockUser(pk=1, password="hashed_password_123", email="")
++    token = token_generator.make_token(user_empty_email)
++    is_valid = token_generator.check_token(user_empty_email, token)
++    
++    print(f"User with empty email: token valid = {is_valid}")
++    if not is_valid:
++        print("❌ FAIL: Token should be valid for users with empty email")
++        return False
++    
++    print("✅ PASS: Backwards compatibility maintained")
++    return True
++
++if __name__ == '__main__':
++    print("Final verification of password reset token fix")
++    print("=" * 60)
++    
++    results = []
++    results.append(test_complete_token_flow())
++    results.append(test_backwards_compatibility())
++    
++    print("\n" + "=" * 60)
++    if all(results):
++        print("🎉 SUCCESS: All tests passed! The fix is working correctly.")
++        print("The password reset tokens are now properly invalidated when a user changes their email address.")
++    else:
++        print("❌ FAILURE: Some tests failed. The fix needs more work.")
++    
++    sys.exit(0 if all(results) else 1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..6fd4b1ecc7
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where password reset tokens remain valid
++after a user changes their email address.
++"""
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++from django.contrib.auth.models import User
++from django.contrib.auth.tokens import PasswordResetTokenGenerator
++from django.test import TestCase
++
++# Setup Django
++django.setup()
++
++class TestEmailChangeIssue(TestCase):
++    def test_email_change_invalidates_token(self):
++        """Test that changing email invalidates password reset tokens."""
++        print("=== Testing password reset token after email change ===")
++        
++        # Create a user with an email address
++        user = User.objects.create_user('testuser', 'foo@example.com', 'testpassword')
++        print(f"Created user: {user.username} with email: {user.email}")
++        
++        # Generate a password reset token for the user
++        token_generator = PasswordResetTokenGenerator()
++        token = token_generator.make_token(user)
++        print(f"Generated password reset token: {token}")
++        
++        # Verify the token is initially valid
++        is_valid_initial = token_generator.check_token(user, token)
++        print(f"Token is initially valid: {is_valid_initial}")
++        self.assertTrue(is_valid_initial)
++        
++        # Change the user's email address
++        user.email = 'bar@example.com'
++        user.save()
++        print(f"Changed user email to: {user.email}")
++        
++        # Verify the token should be invalid after email change
++        is_valid_after_email_change = token_generator.check_token(user, token)
++        print(f"Token is valid after email change: {is_valid_after_email_change}")
++        
++        # This is the bug: token should be invalid but currently is valid
++        if is_valid_after_email_change:
++            print("❌ BUG CONFIRMED: Token remains valid after email change!")
++            self.fail("Token should be invalid after email change but it's not")
++        else:
++            print("✅ Token correctly invalidated after email change")
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..450e58eacd
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++"""
++Simple script to reproduce the password reset token issue without full Django setup.
++"""
++
++# Let's directly examine the _make_hash_value method to understand the issue
++import sys
++sys.path.insert(0, '/testbed')
++
++# Configure minimal Django settings
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        SECRET_KEY='test-secret-key-for-reproduction',
++        USE_TZ=True,
++    )
++    django.setup()
++
++# Import just the token generator
++from django.contrib.auth.tokens import PasswordResetTokenGenerator
++
++# Create a mock user object for testing
++class MockUser:
++    def __init__(self, pk, password, email, last_login=None):
++        self.pk = pk
++        self.password = password
++        self.email = email
++        self.last_login = last_login
++
++def test_hash_generation():
++    """Test how the hash value is generated and what changes affect it."""
++    print("=== Testing PasswordResetTokenGenerator._make_hash_value ===")
++    
++    token_generator = PasswordResetTokenGenerator()
++    timestamp = 123456789
++    
++    # Create a user with initial email
++    user1 = MockUser(pk=1, password="hashed_password_123", email="foo@example.com")
++    
++    # Create the same user but with changed email
++    user2 = MockUser(pk=1, password="hashed_password_123", email="bar@example.com")
++    
++    # Generate hash values for both users
++    hash1 = token_generator._make_hash_value(user1, timestamp)
++    hash2 = token_generator._make_hash_value(user2, timestamp)
++    
++    print(f"User 1 (foo@example.com) hash: {hash1}")
++    print(f"User 2 (bar@example.com) hash: {hash2}")
++    print(f"Hash values are equal: {hash1 == hash2}")
++    
++    if hash1 == hash2:
++        print("❌ ISSUE CONFIRMED: Email change doesn't affect the hash value!")
++        print("The _make_hash_value method only uses:")
++        print("  - user.pk")
++        print("  - user.password") 
++        print("  - user.last_login")
++        print("  - timestamp")
++        print("But it should also include user.email to invalidate tokens on email change")
++        return False
++    else:
++        print("✅ Hash values differ based on email (this would be the fix)")
++        return True
++
++if __name__ == '__main__':
++    result = test_hash_generation()
++    sys.exit(0 if result else 1)
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 0000000000..e0bcaadecc
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,155 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the password reset token fix handles all edge cases.
++"""
++
++import sys
++sys.path.insert(0, '/testbed')
++
++# Configure minimal Django settings
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        SECRET_KEY='test-secret-key-for-reproduction',
++        USE_TZ=True,
++    )
++    django.setup()
++
++from django.contrib.auth.tokens import PasswordResetTokenGenerator
++
++# Create mock user objects for testing
++class MockUser:
++    def __init__(self, pk, password, email=None, last_login=None):
++        self.pk = pk
++        self.password = password
++        self.email = email
++        self.last_login = last_login
++
++def test_email_change_scenario():
++    """Test the main issue: email change should invalidate tokens."""
++    print("=== Test 1: Email change invalidates tokens ===")
++    
++    token_generator = PasswordResetTokenGenerator()
++    timestamp = 123456789
++    
++    # Create a user with initial email
++    user1 = MockUser(pk=1, password="hashed_password_123", email="foo@example.com")
++    
++    # Create the same user but with changed email
++    user2 = MockUser(pk=1, password="hashed_password_123", email="bar@example.com")
++    
++    # Generate hash values for both users
++    hash1 = token_generator._make_hash_value(user1, timestamp)
++    hash2 = token_generator._make_hash_value(user2, timestamp)
++    
++    print(f"User 1 email: {user1.email}")
++    print(f"User 2 email: {user2.email}")
++    print(f"Hash values differ: {hash1 != hash2}")
++    
++    if hash1 != hash2:
++        print("✅ PASS: Email change correctly affects hash value")
++        return True
++    else:
++        print("❌ FAIL: Email change should affect hash value")
++        return False
++
++def test_no_email_user():
++    """Test that users without email addresses work correctly."""
++    print("\n=== Test 2: Users without email addresses ===")
++    
++    token_generator = PasswordResetTokenGenerator()
++    timestamp = 123456789
++    
++    # Create a user without email
++    user1 = MockUser(pk=1, password="hashed_password_123", email=None)
++    user2 = MockUser(pk=1, password="hashed_password_123", email=None)
++    
++    # Generate hash values
++    hash1 = token_generator._make_hash_value(user1, timestamp)
++    hash2 = token_generator._make_hash_value(user2, timestamp)
++    
++    print(f"User 1 email: {user1.email}")
++    print(f"User 2 email: {user2.email}")
++    print(f"Hash values are consistent: {hash1 == hash2}")
++    
++    if hash1 == hash2:
++        print("✅ PASS: Users without email work correctly")
++        return True
++    else:
++        print("❌ FAIL: Users without email should have consistent hashes")
++        return False
++
++def test_empty_email_user():
++    """Test that users with empty email addresses work correctly."""
++    print("\n=== Test 3: Users with empty email addresses ===")
++    
++    token_generator = PasswordResetTokenGenerator()
++    timestamp = 123456789
++    
++    # Create a user with empty email
++    user1 = MockUser(pk=1, password="hashed_password_123", email="")
++    user2 = MockUser(pk=1, password="hashed_password_123", email="")
++    
++    # Generate hash values
++    hash1 = token_generator._make_hash_value(user1, timestamp)
++    hash2 = token_generator._make_hash_value(user2, timestamp)
++    
++    print(f"User 1 email: '{user1.email}'")
++    print(f"User 2 email: '{user2.email}'")
++    print(f"Hash values are consistent: {hash1 == hash2}")
++    
++    if hash1 == hash2:
++        print("✅ PASS: Users with empty email work correctly")
++        return True
++    else:
++        print("❌ FAIL: Users with empty email should have consistent hashes")
++        return False
++
++def test_user_without_email_attribute():
++    """Test that users without email attribute work correctly (using getattr fallback)."""
++    print("\n=== Test 4: Users without email attribute ===")
++    
++    token_generator = PasswordResetTokenGenerator()
++    timestamp = 123456789
++    
++    # Create a user without email attribute (simulating AbstractBaseUser)
++    class UserWithoutEmail:
++        def __init__(self, pk, password, last_login=None):
++            self.pk = pk
++            self.password = password
++            self.last_login = last_login
++    
++    user1 = UserWithoutEmail(pk=1, password="hashed_password_123")
++    user2 = UserWithoutEmail(pk=1, password="hashed_password_123")
++    
++    # Generate hash values
++    hash1 = token_generator._make_hash_value(user1, timestamp)
++    hash2 = token_generator._make_hash_value(user2, timestamp)
++    
++    print(f"User 1 has email attribute: {hasattr(user1, 'email')}")
++    print(f"User 2 has email attribute: {hasattr(user2, 'email')}")
++    print(f"Hash values are consistent: {hash1 == hash2}")
++    
++    if hash1 == hash2:
++        print("✅ PASS: Users without email attribute work correctly")
++        return True
++    else:
++        print("❌ FAIL: Users without email attribute should have consistent hashes")
++        return False
++
++if __name__ == '__main__':
++    print("Testing comprehensive fix for password reset token email issue")
++    print("=" * 60)
++    
++    results = []
++    results.append(test_email_change_scenario())
++    results.append(test_no_email_user())
++    results.append(test_empty_email_user())
++    results.append(test_user_without_email_attribute())
++    
++    print("\n" + "=" * 60)
++    print(f"Overall result: {'✅ ALL TESTS PASSED' if all(results) else '❌ SOME TESTS FAILED'}")
++    
++    sys.exit(0 if all(results) else 1)
+\ No newline at end of file

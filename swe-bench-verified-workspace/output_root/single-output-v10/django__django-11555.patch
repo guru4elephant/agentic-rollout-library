@@ -1,0 +1,565 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index e15e64cde4..82ac104986 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -2217,6 +2217,23 @@ def get_order_dir(field, default='ASC'):
+     The 'default' param is used to indicate which way no prefix (or a '+'
+     prefix) should sort. The '-' prefix always sorts the opposite way.
+     """
++    # Handle OrderBy objects
++    from django.db.models.expressions import OrderBy
++    if isinstance(field, OrderBy):
++        # Extract field name from the expression
++        expression = field.expression
++        if hasattr(expression, 'name'):
++            field_name = expression.name
++        elif hasattr(expression, 'target'):
++            field_name = expression.target.name
++        else:
++            # Fallback: try to get string representation
++            field_name = str(expression)
++        
++        # Determine direction based on descending attribute
++        direction = 'DESC' if field.descending else 'ASC'
++        return field_name, direction
++    
+     dirn = ORDER_DIR[default]
+     if field[0] == '-':
+         return field[1:], dirn[1]
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..404119670a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.expressions import OrderBy, F
++
++# Create models with multi-table inheritance and Meta.ordering containing expressions
++class ParentModel(models.Model):
++    name = models.CharField(max_length=100)
++    age = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++        ordering = [OrderBy(F('age'), descending=True)]  # This should cause the issue
++
++class ChildModel(ParentModel):
++    extra_field = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the issue
++def test_order_by_parent_model():
++    print("Testing order_by() on parent model with Meta.ordering containing expressions...")
++    
++    # Create database tables
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(ParentModel)
++        schema_editor.create_model(ChildModel)
++    
++    # Create some test data
++    parent1 = ParentModel.objects.create(name="Parent 1", age=30)
++    parent2 = ParentModel.objects.create(name="Parent 2", age=25)
++    child1 = ChildModel.objects.create(name="Child 1", age=20, extra_field="extra1")
++    child2 = ChildModel.objects.create(name="Child 2", age=35, extra_field="extra2")
++    
++    # This should trigger the bug according to the issue
++    try:
++        # Try to order by the parent model field
++        results = ChildModel.objects.order_by('age')
++        print("Success! No error occurred.")
++        print("Results:", list(results))
++    except Exception as e:
++        print(f"Error occurred: {e}")
++        print(f"Error type: {type(e)}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_order_by_parent_model()
+\ No newline at end of file
+diff --git a/reproduce_issue2.py b/reproduce_issue2.py
+new file mode 100644
+index 0000000000..68152055cf
+--- /dev/null
++++ b/reproduce_issue2.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.expressions import OrderBy, F
++from django.db.models.sql.query import get_order_dir
++
++# Test the specific issue: get_order_dir receiving an OrderBy object
++def test_get_order_dir_with_orderby():
++    print("Testing get_order_dir with OrderBy object...")
++    
++    # Create an OrderBy expression
++    order_by_expr = OrderBy(F('age'), descending=True)
++    
++    # This should trigger the bug according to the issue
++    try:
++        result = get_order_dir(order_by_expr, 'ASC')
++        print("Success! Result:", result)
++    except Exception as e:
++        print(f"Error occurred: {e}")
++        print(f"Error type: {type(e)}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_get_order_dir_with_orderby()
+\ No newline at end of file
+diff --git a/reproduce_issue3.py b/reproduce_issue3.py
+new file mode 100644
+index 0000000000..280b0f4a52
+--- /dev/null
++++ b/reproduce_issue3.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.expressions import OrderBy, F
++from django.db.models.sql.compiler import SQLCompiler
++from django.db.models.sql.query import Query
++from django.db import connection
++
++# Create models with multi-table inheritance and Meta.ordering containing expressions
++class ParentModel(models.Model):
++    name = models.CharField(max_length=100)
++    age = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++        ordering = [OrderBy(F('age'), descending=True)]  # This should cause the issue
++
++class ChildModel(ParentModel):
++    extra_field = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_compiler_ordering():
++    print("Testing compiler ordering with OrderBy expressions...")
++    
++    # Create a query and compiler to simulate the issue
++    query = Query(ChildModel)
++    compiler = SQLCompiler(query, connection, 'default')
++    
++    # Get the ordering from the parent model's Meta
++    ordering = ParentModel._meta.ordering
++    
++    print(f"Ordering: {ordering}")
++    print(f"Ordering type: {type(ordering[0])}")
++    
++    # Simulate the compiler's order_by handling
++    try:
++        # This simulates what happens in the compiler's order_by processing
++        asc, desc = ('ASC', 'DESC')  # Simplified ORDER_DIR
++        
++        order_by = []
++        for field in ordering:
++            print(f"Processing field: {field}, type: {type(field)}")
++            
++            if hasattr(field, 'resolve_expression'):
++                print("Field has resolve_expression")
++                if not isinstance(field, OrderBy):
++                    field = field.asc()
++                order_by.append((field, False))
++                continue
++            
++            # This is where the bug would occur - get_order_dir called with OrderBy object
++            from django.db.models.sql.query import get_order_dir
++            col, order = get_order_dir(field, asc)
++            descending = order == 'DESC'
++            print(f"get_order_dir result: col={col}, order={order}")
++            
++    except Exception as e:
++        print(f"Error occurred: {e}")
++        print(f"Error type: {type(e)}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_compiler_ordering()
+\ No newline at end of file
+diff --git a/reproduce_issue4.py b/reproduce_issue4.py
+new file mode 100644
+index 0000000000..21c2a115f9
+--- /dev/null
++++ b/reproduce_issue4.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.expressions import OrderBy, F
++from django.db import connection
++
++# Create models with multi-table inheritance and Meta.ordering containing expressions
++class ParentModel(models.Model):
++    name = models.CharField(max_length=100)
++    age = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++        ordering = [OrderBy(F('age'), descending=True)]  # This should cause the issue
++
++class ChildModel(ParentModel):
++    extra_field = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_order_by_parent_field():
++    print("Testing order_by() on parent model field with Meta.ordering containing expressions...")
++    
++    # Create database tables
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(ParentModel)
++        schema_editor.create_model(ChildModel)
++    
++    # Create some test data
++    parent1 = ParentModel.objects.create(name="Parent 1", age=30)
++    parent2 = ParentModel.objects.create(name="Parent 2", age=25)
++    child1 = ChildModel.objects.create(name="Child 1", age=20, extra_field="extra1")
++    child2 = ChildModel.objects.create(name="Child 2", age=35, extra_field="extra2")
++    
++    # This should trigger the bug according to the issue
++    try:
++        # Try to order by the parent model field - this should trigger the issue
++        # during query compilation when the parent's Meta.ordering is processed
++        results = ChildModel.objects.order_by('age')
++        print("Success! No error occurred.")
++        print("Results:", list(results))
++    except Exception as e:
++        print(f"Error occurred: {e}")
++        print(f"Error type: {type(e)}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_order_by_parent_field()
+\ No newline at end of file
+diff --git a/reproduce_issue5.py b/reproduce_issue5.py
+new file mode 100644
+index 0000000000..7ad836682c
+--- /dev/null
++++ b/reproduce_issue5.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.expressions import OrderBy, F
++from django.db.models.sql.compiler import SQLCompiler
++from django.db.models.sql.query import Query
++from django.db import connection
++
++# Create models with multi-table inheritance and Meta.ordering containing expressions
++class ParentModel(models.Model):
++    name = models.CharField(max_length=100)
++    age = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++        ordering = [OrderBy(F('age'), descending=True)]  # This should cause the issue
++
++class ChildModel(ParentModel):
++    extra_field = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_inheritance_ordering_issue():
++    print("Testing multi-table inheritance ordering issue...")
++    
++    # Create database tables
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(ParentModel)
++        schema_editor.create_model(ChildModel)
++    
++    # Create some test data
++    parent1 = ParentModel.objects.create(name="Parent 1", age=30)
++    parent2 = ParentModel.objects.create(name="Parent 2", age=25)
++    child1 = ChildModel.objects.create(name="Child 1", age=20, extra_field="extra1")
++    child2 = ChildModel.objects.create(name="Child 2", age=35, extra_field="extra2")
++    
++    # Simulate the scenario where the issue might occur
++    # This might happen during query compilation when accessing parent's ordering
++    
++    # Create a query for the child model
++    query = Query(ChildModel)
++    
++    # Access the parent model's ordering - this might trigger the issue
++    parent_ordering = ParentModel._meta.ordering
++    print(f"Parent ordering: {parent_ordering}")
++    print(f"Parent ordering type: {type(parent_ordering[0])}")
++    
++    # Try to process the parent's ordering through the compiler
++    compiler = SQLCompiler(query, connection, 'default')
++    
++    # This simulates what might happen during query compilation
++    try:
++        # Simulate the order_by processing that might access parent ordering
++        results = list(ChildModel.objects.all())
++        print("Query execution successful")
++        
++        # Now try to order by a field that might trigger the parent's ordering processing
++        try:
++            results = ChildModel.objects.order_by('age')
++            print("Order by successful")
++        except Exception as e:
++            print(f"Order by failed: {e}")
++            import traceback
++            traceback.print_exc()
++            
++    except Exception as e:
++        print(f"Query execution failed: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_inheritance_ordering_issue()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..8e0132926e
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.expressions import OrderBy, F
++from django.db.models.sql.query import get_order_dir
++
++def test_get_order_dir_with_orderby():
++    """Test that get_order_dir handles OrderBy objects correctly"""
++    print("Testing get_order_dir with OrderBy object...")
++    
++    # Create an OrderBy expression
++    order_by_expr = OrderBy(F('age'), descending=True)
++    
++    # This should work now with our fix
++    result = get_order_dir(order_by_expr, 'ASC')
++    print(f"Success! Result: {result}")
++    assert result == ('age', 'DESC'), f"Expected ('age', 'DESC'), got {result}"
++    
++    # Test with ascending order
++    order_by_expr_asc = OrderBy(F('name'), descending=False)
++    result = get_order_dir(order_by_expr_asc, 'ASC')
++    print(f"Success! Result: {result}")
++    assert result == ('name', 'ASC'), f"Expected ('name', 'ASC'), got {result}"
++
++def test_get_order_dir_with_strings():
++    """Test that get_order_dir still works with strings"""
++    print("Testing get_order_dir with strings...")
++    
++    # Test with regular string
++    result = get_order_dir('age', 'ASC')
++    print(f"Success! Result: {result}")
++    assert result == ('age', 'ASC'), f"Expected ('age', 'ASC'), got {result}"
++    
++    # Test with descending prefix
++    result = get_order_dir('-age', 'ASC')
++    print(f"Success! Result: {result}")
++    assert result == ('age', 'DESC'), f"Expected ('age', 'DESC'), got {result}"
++
++def test_multi_table_inheritance_scenario():
++    """Test the multi-table inheritance scenario described in the issue"""
++    print("Testing multi-table inheritance scenario...")
++    
++    # Create models with multi-table inheritance and Meta.ordering containing expressions
++    class ParentModel(models.Model):
++        name = models.CharField(max_length=100)
++        age = models.IntegerField()
++        
++        class Meta:
++            app_label = 'test'
++            ordering = [OrderBy(F('age'), descending=True)]  # This should cause the issue
++
++    class ChildModel(ParentModel):
++        extra_field = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test'
++    
++    # Create database tables
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(ParentModel)
++        schema_editor.create_model(ChildModel)
++    
++    # Create some test data
++    parent1 = ParentModel.objects.create(name="Parent 1", age=30)
++    parent2 = ParentModel.objects.create(name="Parent 2", age=25)
++    child1 = ChildModel.objects.create(name="Child 1", age=20, extra_field="extra1")
++    child2 = ChildModel.objects.create(name="Child 2", age=35, extra_field="extra2")
++    
++    # This should work now with our fix
++    try:
++        results = ChildModel.objects.order_by('age')
++        print("Success! Multi-table inheritance ordering works")
++        print("Results:", list(results))
++    except Exception as e:
++        print(f"Error occurred: {e}")
++        import traceback
++        traceback.print_exc()
++        raise
++
++if __name__ == "__main__":
++    test_get_order_dir_with_orderby()
++    test_get_order_dir_with_strings()
++    test_multi_table_inheritance_scenario()
++    print("All tests passed!")
+\ No newline at end of file

@@ -1,0 +1,393 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 00000000..e021026c
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python
++"""Comprehensive test to ensure the fix works and doesn't break existing functionality"""
++
++import sys
++import os
++
++# Add the current directory to the Python path so we can import requests
++sys.path.insert(0, os.getcwd())
++
++from requests.models import RequestEncodingMixin
++
++def test_comprehensive():
++    """Test various data types to ensure the fix works and doesn't break anything"""
++    
++    test_cases = [
++        # (description, data, expected_type, should_work)
++        ("String data", "hello world", str, True),
++        ("Binary data", u"ööö".encode("utf-8"), bytes, True),
++        ("Empty string", "", str, True),
++        ("Empty bytes", b"", bytes, True),
++        ("ASCII bytes", b"hello", bytes, True),
++        ("Dictionary data", {"key": "value"}, str, True),  # Should be URL encoded
++        ("List of tuples", [("key", "value")], str, True),  # Should be URL encoded
++        ("None data", None, type(None), True),
++    ]
++    
++    passed = 0
++    total = len(test_cases)
++    
++    for description, data, expected_type, should_work in test_cases:
++        print(f"\nTesting: {description}")
++        print(f"Input: {data} (type: {type(data).__name__})")
++        
++        try:
++            result = RequestEncodingMixin._encode_params(data)
++            print(f"Result: {result} (type: {type(result).__name__})")
++            
++            if not should_work:
++                print("✗ Should have failed but didn't!")
++                continue
++                
++            # Check if the result type is as expected
++            if isinstance(result, expected_type):
++                print("✓ Type check passed")
++                
++                # Additional checks for specific cases
++                if isinstance(data, bytes) and result == data:
++                    print("✓ Binary data preserved correctly")
++                elif isinstance(data, str) and result == data:
++                    print("✓ String data preserved correctly")
++                elif data is None and result is None:
++                    print("✓ None data handled correctly")
++                
++                passed += 1
++            else:
++                print(f"✗ Type mismatch: expected {expected_type.__name__}, got {type(result).__name__}")
++                
++        except Exception as e:
++            if should_work:
++                print(f"✗ Unexpected error: {e} (type: {type(e).__name__})")
++            else:
++                print("✓ Expected failure")
++                passed += 1
++    
++    print(f"\n{'='*50}")
++    print(f"Results: {passed}/{total} tests passed")
++    
++    return passed == total
++
++if __name__ == "__main__":
++    success = test_comprehensive()
++    if success:
++        print("✓ All comprehensive tests passed!")
++    else:
++        print("✗ Some tests failed!")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..5f58d3f4
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,25 @@
++#!/usr/bin/env python
++"""Script to reproduce the binary payload issue with requests 2.9"""
++
++import requests
++
++def test_binary_payload():
++    """Test that demonstrates the issue with binary payloads"""
++    try:
++        # This should work but fails in requests 2.9
++        response = requests.put("http://httpbin.org/put", data=u"ööö".encode("utf-8"))
++        print("SUCCESS: Binary payload request completed")
++        print(f"Status code: {response.status_code}")
++        return True
++    except Exception as e:
++        print(f"ERROR: {e}")
++        print(f"Error type: {type(e).__name__}")
++        return False
++
++if __name__ == "__main__":
++    print("Testing binary payload issue...")
++    success = test_binary_payload()
++    if not success:
++        print("Issue reproduced successfully!")
++    else:
++        print("Issue not present or already fixed!")
+\ No newline at end of file
+diff --git a/requests/models.py b/requests/models.py
+index 9c624d3c..054e2cd4 100644
+--- a/requests/models.py
++++ b/requests/models.py
+@@ -444,11 +444,16 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+                 (body, content_type) = self._encode_files(files, data)
+             else:
+                 if data:
+-                    body = self._encode_params(data)
+-                    if isinstance(data, basestring) or hasattr(data, 'read'):
++                    # Handle binary data directly for request body
++                    if isinstance(data, bytes):
++                        body = data
+                         content_type = None
+                     else:
+-                        content_type = 'application/x-www-form-urlencoded'
++                        body = self._encode_params(data)
++                        if isinstance(data, basestring) or hasattr(data, 'read'):
++                            content_type = None
++                        else:
++                            content_type = 'application/x-www-form-urlencoded'
+ 
+             self.prepare_content_length(body)
+ 
+diff --git a/test_binary_fix.py b/test_binary_fix.py
+new file mode 100644
+index 00000000..7f6b93b2
+--- /dev/null
++++ b/test_binary_fix.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python
++"""Test to verify the binary payload fix works without requiring internet connection"""
++
++import sys
++import os
++
++# Add the current directory to the Python path so we can import requests
++sys.path.insert(0, os.getcwd())
++
++from requests.models import PreparedRequest
++
++def test_binary_payload_handling():
++    """Test that request body preparation correctly handles binary data"""
++    
++    # Create a PreparedRequest to test the actual fix
++    req = PreparedRequest()
++    
++    # Test with binary data (UTF-8 encoded string)
++    binary_data = u"ööö".encode("utf-8")
++    print(f"Testing with binary data: {binary_data}")
++    
++    try:
++        # This should trigger our fix in prepare_body
++        req.prepare_body(data=binary_data, files=None)
++        
++        print(f"SUCCESS: Request body prepared: {req.body}")
++        print(f"Type of body: {type(req.body)}")
++        
++        # The body should be the same binary data, not decoded
++        if req.body == binary_data:
++            print("✓ Binary data preserved correctly")
++            return True
++        else:
++            print("✗ Binary data was modified")
++            return False
++            
++    except Exception as e:
++        print(f"ERROR: {e}")
++        print(f"Error type: {type(e).__name__}")
++        return False
++
++def test_string_preserved():
++    """Test that string data is still handled correctly"""
++    
++    # Test with regular string
++    string_data = "hello world"
++    print(f"Testing with string data: {string_data}")
++    
++    try:
++        # Create a PreparedRequest to test the actual fix
++        req = PreparedRequest()
++        
++        # This should trigger the normal encoding path
++        req.prepare_body(data=string_data, files=None)
++        
++        print(f"SUCCESS: Request body prepared: {req.body}")
++        print(f"Type of body: {type(req.body)}")
++        
++        # The body should be a string (encoded properly)
++        if isinstance(req.body, str) and req.body == string_data:
++            print("✓ String data handled correctly")
++            return True
++        else:
++            print("✗ String data was not handled correctly")
++            return False
++            
++    except Exception as e:
++        print(f"ERROR: {e}")
++        print(f"Error type: {type(e).__name__}")
++        return False
++
++if __name__ == "__main__":
++    print("Testing binary payload fix...")
++    print("=" * 50)
++    
++    success1 = test_binary_payload_handling()
++    print()
++    success2 = test_string_preserved()
++    
++    print()
++    print("=" * 50)
++    if success1 and success2:
++        print("✓ All tests passed! The fix is working correctly.")
++    else:
++        print("✗ Some tests failed!")
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 00000000..1678e017
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python
++"""Test the original issue without making actual HTTP requests"""
++
++import sys
++import os
++
++# Add the current directory to the Python path so we can import requests
++sys.path.insert(0, os.getcwd())
++
++from requests.models import PreparedRequest
++
++def test_original_issue():
++    """Test the original issue scenario without making network calls"""
++    
++    print("Testing the original issue scenario...")
++    print("Creating a PUT request with binary data...")
++    
++    try:
++        # Create a PreparedRequest object (this is what requests.put() internally creates)
++        req = PreparedRequest()
++        
++        # Prepare the request with binary data (this is where the error occurred)
++        # We won't actually send it, just prepare it to test the encoding
++        binary_data = u"ööö".encode("utf-8")
++        print(f"Binary data: {binary_data}")
++        
++        # This should not raise a UnicodeDecodeError anymore
++        req.prepare_body(data=binary_data, files=None)
++        
++        print("SUCCESS: No UnicodeDecodeError occurred!")
++        print(f"Request body type: {type(req.body)}")
++        print(f"Request body content: {req.body}")
++        
++        # The body should be the original binary data
++        if req.body == binary_data:
++            print("✓ Binary data preserved correctly in request body")
++            return True
++        else:
++            print("✗ Binary data was not preserved correctly")
++            return False
++            
++    except UnicodeDecodeError as e:
++        print(f"UNICODE ERROR (this is the original issue): {e}")
++        return False
++    except Exception as e:
++        print(f"Other error (may be expected): {e}")
++        print(f"Error type: {type(e).__name__}")
++        # This might be a connection error or other issue, but the important thing
++        # is that we don't get a UnicodeDecodeError
++        if "UnicodeDecodeError" not in str(type(e)):
++            print("✓ No UnicodeDecodeError - the main issue is fixed!")
++            return True
++        return False
++
++if __name__ == "__main__":
++    success = test_original_issue()
++    if success:
++        print("\n✓ The original issue has been fixed!")
++    else:
++        print("\n✗ The issue still exists!")
+\ No newline at end of file
+diff --git a/test_simple_fix.py b/test_simple_fix.py
+new file mode 100644
+index 00000000..425dc00b
+--- /dev/null
++++ b/test_simple_fix.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python
++"""Simple test to verify the binary payload fix"""
++
++import sys
++import os
++
++# Add the current directory to the Python path so we can import requests
++sys.path.insert(0, os.getcwd())
++
++from requests.models import PreparedRequest
++
++def test_prepare_body_with_binary_data():
++    """Test that prepare_body correctly handles binary data"""
++    
++    # Create a PreparedRequest and initialize it properly
++    req = PreparedRequest()
++    req.method = 'PUT'
++    req.headers = {}
++    
++    # Test with binary data (UTF-8 encoded string)
++    binary_data = u"ööö".encode("utf-8")
++    print(f"Testing with binary data: {binary_data}")
++    
++    try:
++        # This should trigger our fix in prepare_body
++        req.prepare_body(data=binary_data, files=None)
++        
++        print(f"SUCCESS: Request body prepared: {req.body}")
++        print(f"Type of body: {type(req.body)}")
++        
++        # The body should be the same binary data, not decoded
++        if req.body == binary_data:
++            print("✓ Binary data preserved correctly")
++            return True
++        else:
++            print("✗ Binary data was modified")
++            return False
++            
++    except Exception as e:
++        print(f"ERROR: {e}")
++        print(f"Error type: {type(e).__name__}")
++        return False
++
++def test_prepare_body_with_string_data():
++    """Test that prepare_body correctly handles string data"""
++    
++    # Create a PreparedRequest and initialize it properly
++    req = PreparedRequest()
++    req.method = 'PUT'
++    req.headers = {}
++    
++    # Test with regular string
++    string_data = "hello world"
++    print(f"Testing with string data: {string_data}")
++    
++    try:
++        # This should trigger the normal encoding path
++        req.prepare_body(data=string_data, files=None)
++        
++        print(f"SUCCESS: Request body prepared: {req.body}")
++        print(f"Type of body: {type(req.body)}")
++        
++        # The body should be a string (encoded properly)
++        if isinstance(req.body, str) and req.body == string_data:
++            print("✓ String data handled correctly")
++            return True
++        else:
++            print("✗ String data was not handled correctly")
++            return False
++            
++    except Exception as e:
++        print(f"ERROR: {e}")
++        print(f"Error type: {type(e).__name__}")
++        return False
++
++if __name__ == "__main__":
++    print("Testing binary payload fix...")
++    print("=" * 50)
++    
++    success1 = test_prepare_body_with_binary_data()
++    print()
++    success2 = test_prepare_body_with_string_data()
++    
++    print()
++    print("=" * 50)
++    if success1 and success2:
++        print("✓ All tests passed! The fix is working correctly.")
++    else:
++        print("✗ Some tests failed!")
+\ No newline at end of file

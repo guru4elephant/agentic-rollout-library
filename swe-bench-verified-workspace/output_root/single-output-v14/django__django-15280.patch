@@ -1,0 +1,243 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..23a948a3d9
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++# Set up Django environment like the test runner does
++from django.conf import settings
++
++# Configure settings for testing
++settings.configure(
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    SECRET_KEY='test-secret-key',
++    USE_TZ=True,
++)
++
++import django
++django.setup()
++
++from django.db import models
++from django.db.models import Prefetch
++from django.core.management.color import no_style
++from django.db import connection
++
++# Create the models from the issue description
++class User(models.Model):
++    email = models.EmailField()
++    kind = models.CharField(
++        max_length=10, choices=[("ADMIN", "Admin"), ("REGULAR", "Regular")]
++    )
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Profile(models.Model):
++    full_name = models.CharField(max_length=255)
++    user = models.OneToOneField(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_only_related_queryset():
++    # Create database tables
++    style = no_style()
++    sql = connection.ops.sql_table_creation_suffix()
++    tables = connection.introspection.django_table_names()
++    sql = connection.ops.sql_table_creation_suffix()
++    tables_sql = connection.ops.sql_table_creation_suffix()
++    
++    # Create tables for our models
++    from django.db import models
++    models.Model.metadata = True
++    sql = connection.ops.sql_table_creation_suffix()
++    
++    # Create test data
++    user = User.objects.create(
++        email="test@example.com",
++        kind="ADMIN",
++    )
++    Profile.objects.create(user=user, full_name="Test Tester")
++    
++    # Create the queryset as described in the issue
++    queryset = User.objects.only("email").prefetch_related(
++        Prefetch(
++            "profile",
++            queryset=Profile.objects.prefetch_related(
++                Prefetch("user", queryset=User.objects.only("kind"))
++            ),
++        )
++    )
++    
++    # Execute the first query - this should trigger 3 queries
++    print("Executing queryset.first()...")
++    user = queryset.first()
++    print(f"User: {user.email}, Kind: {user.kind}")
++    
++    # Check deferred fields
++    print(f"User deferred fields: {user.get_deferred_fields()}")
++    
++    # This should not trigger any additional queries but currently does
++    print("Accessing user.profile.user.kind...")
++    try:
++        result = user.profile.user.kind
++        print(f"Result: {result}")
++        print(f"Profile user deferred fields: {user.profile.user.get_deferred_fields()}")
++    except Exception as e:
++        print(f"Error: {e}")
++
++if __name__ == "__main__":
++    test_only_related_queryset()
+\ No newline at end of file
+diff --git a/test_reproduce_issue.py b/test_reproduce_issue.py
+new file mode 100644
+index 0000000000..33daccd0b7
+--- /dev/null
++++ b/test_reproduce_issue.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++# Use the test runner infrastructure
++from tests.runtests import setup_collect_tests
++
++# Set up Django environment
++test_modules, state = setup_collect_tests(None, None)
++
++from django.db import models
++from django.db.models import Prefetch
++from django.test import TestCase
++
++# Create the models from the issue description
++class User(models.Model):
++    email = models.EmailField()
++    kind = models.CharField(
++        max_length=10, choices=[("ADMIN", "Admin"), ("REGULAR", "Regular")]
++    )
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Profile(models.Model):
++    full_name = models.CharField(max_length=255)
++    user = models.OneToOneField(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class TestDeferredPrefetch(TestCase):
++    def test_only_related_queryset(self):
++        # Create test data
++        user = User.objects.create(
++            email="test@example.com",
++            kind="ADMIN",
++        )
++        Profile.objects.create(user=user, full_name="Test Tester")
++        
++        # Create the queryset as described in the issue
++        queryset = User.objects.only("email").prefetch_related(
++            Prefetch(
++                "profile",
++                queryset=Profile.objects.prefetch_related(
++                    Prefetch("user", queryset=User.objects.only("kind"))
++                ),
++            )
++        )
++        
++        # Execute the first query - this should trigger 3 queries
++        print("Executing queryset.first()...")
++        with self.assertNumQueries(3):
++            user = queryset.first()
++        print(f"User: {user.email}, Kind: {user.kind}")
++        
++        # Check deferred fields
++        print(f"User deferred fields: {user.get_deferred_fields()}")
++        
++        # This should not trigger any additional queries but currently does
++        print("Accessing user.profile.user.kind...")
++        with self.assertNumQueries(0):
++            result = user.profile.user.kind
++            print(f"Result: {result}")
++            print(f"Profile user deferred fields: {user.profile.user.get_deferred_fields()}")
++
++if __name__ == "__main__":
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/tests/prefetch_related/models.py b/tests/prefetch_related/models.py
+index 0ded7e8b4a..85bd0bb685 100644
+--- a/tests/prefetch_related/models.py
++++ b/tests/prefetch_related/models.py
+@@ -282,3 +282,15 @@ class Flea(models.Model):
+     current_room = models.ForeignKey(Room, models.SET_NULL, related_name='fleas', null=True)
+     pets_visited = models.ManyToManyField(Pet, related_name='fleas_hosted')
+     people_visited = models.ManyToManyField(Person, related_name='fleas_hosted')
++
++
++# Models for testing deferred fields with prefetch_related
++class User(models.Model):
++    email = models.EmailField()
++    kind = models.CharField(
++        max_length=10, choices=[("ADMIN", "Admin"), ("REGULAR", "Regular")]
++    )
++
++class Profile(models.Model):
++    full_name = models.CharField(max_length=255)
++    user = models.OneToOneField(User, on_delete=models.CASCADE)
+diff --git a/tests/prefetch_related/tests.py b/tests/prefetch_related/tests.py
+index 4ea7fccd5e..571f78c8ff 100644
+--- a/tests/prefetch_related/tests.py
++++ b/tests/prefetch_related/tests.py
+@@ -1614,3 +1614,36 @@ class ReadPrefetchedObjectsCacheTests(TestCase):
+         with self.assertNumQueries(4):
+             # AuthorWithAge -> Author -> FavoriteAuthors, Book
+             self.assertSequenceEqual(authors, [self.author1, self.author2])
++
++    def test_deferred_fields_prefetch_related(self):
++        """
++        Test that deferred fields are handled correctly when using nested
++        prefetch_related queries with only().
++        """
++        from .models import User, Profile
++        
++        # Create test data
++        user = User.objects.create(
++            email="test@example.com",
++            kind="ADMIN",
++        )
++        Profile.objects.create(user=user, full_name="Test Tester")
++        
++        # Create the queryset as described in the issue
++        queryset = User.objects.only("email").prefetch_related(
++            Prefetch(
++                "profile",
++                queryset=Profile.objects.prefetch_related(
++                    Prefetch("user", queryset=User.objects.only("kind"))
++                ),
++            )
++        )
++        
++        # Execute the first query - this should trigger 3 queries
++        with self.assertNumQueries(3):
++            user = queryset.first()
++        
++        # This should not trigger any additional queries but currently does
++        with self.assertNumQueries(0):
++            result = user.profile.user.kind
++            self.assertEqual(result, "ADMIN")

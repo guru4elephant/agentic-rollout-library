@@ -1,0 +1,513 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..8683619c98
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,125 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test',
++    )
++
++django.setup()
++
++from django.db import models
++
++print("Running comprehensive tests...")
++
++# Test 1: Field with from_db_value method
++class MyIntWrapper:
++    def __init__(self, value):
++        self.value = value
++    
++    def __repr__(self):
++        return f"<MyIntWrapper: {self.value}>"
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return False
++
++class MyAutoField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        if isinstance(value, MyIntWrapper):
++            return value.value
++        return int(value)
++
++class AutoModel(models.Model):
++    id = MyAutoField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create table
++from django.db import connection
++with connection.cursor() as cursor:
++    cursor.execute("""
++        CREATE TABLE test_automodel (
++            id INTEGER PRIMARY KEY AUTOINCREMENT
++        )
++    """)
++
++# Test create operation
++obj = AutoModel.objects.create()
++print(f"✓ Custom field create: {obj.id} (type: {type(obj.id)})")
++assert isinstance(obj.id, MyIntWrapper), f"Expected MyIntWrapper, got {type(obj.id)}"
++
++# Test 2: Regular field without from_db_value
++class RegularModel(models.Model):
++    id = models.BigAutoField(primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++with connection.cursor() as cursor:
++    cursor.execute("""
++        CREATE TABLE test_regularmodel (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            name VARCHAR(100)
++        )
++    """)
++
++obj = RegularModel.objects.create(name="test")
++print(f"✓ Regular field create: {obj.id} (type: {type(obj.id)})")
++assert isinstance(obj.id, int), f"Expected int, got {type(obj.id)}"
++
++# Test 3: Field that inherits but doesn't override from_db_value
++class NoConverterField(models.BigAutoField):
++    # This field doesn't override from_db_value
++    pass
++
++class NoConverterModel(models.Model):
++    id = NoConverterField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++with connection.cursor() as cursor:
++    cursor.execute("""
++        CREATE TABLE test_noconvertermodel (
++            id INTEGER PRIMARY KEY AUTOINCREMENT
++        )
++    """)
++
++obj = NoConverterModel.objects.create()
++print(f"✓ No converter field create: {obj.id} (type: {type(obj.id)})")
++assert isinstance(obj.id, int), f"Expected int, got {type(obj.id)}"
++
++# Test 4: Query existing instances to ensure they still work
++AutoModel.objects.create()  # Create another instance
++queried = AutoModel.objects.first()
++print(f"✓ Query existing: {queried.id} (type: {type(queried.id)})")
++assert isinstance(queried.id, MyIntWrapper), f"Expected MyIntWrapper, got {type(queried.id)}"
++
++print("\nAll comprehensive tests passed! The fix handles all edge cases correctly.")
+\ No newline at end of file
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 55b1691166..e351837e26 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -872,7 +872,10 @@ class Model(metaclass=ModelBase):
+             results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
+             if results:
+                 for value, field in zip(results[0], returning_fields):
+-                    setattr(self, field.attname, value)
++                    if hasattr(field, 'from_db_value'):
++                        setattr(self, field.attname, field.from_db_value(value, None, connections[using]))
++                    else:
++                        setattr(self, field.attname, value)
+         return updated
+ 
+     def _do_update(self, base_qs, using, pk_val, values, update_fields, forced_update):
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 387deca527..813d92aa68 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -505,7 +505,10 @@ class QuerySet:
+                 for obj_with_pk, results in zip(objs_with_pk, returned_columns):
+                     for result, field in zip(results, opts.db_returning_fields):
+                         if field != opts.pk:
+-                            setattr(obj_with_pk, field.attname, result)
++                            if hasattr(field, 'from_db_value'):
++                                setattr(obj_with_pk, field.attname, field.from_db_value(result, None, connections[self.db]))
++                            else:
++                                setattr(obj_with_pk, field.attname, result)
+                 for obj_with_pk in objs_with_pk:
+                     obj_with_pk._state.adding = False
+                     obj_with_pk._state.db = self.db
+@@ -518,7 +521,10 @@ class QuerySet:
+                     assert len(returned_columns) == len(objs_without_pk)
+                 for obj_without_pk, results in zip(objs_without_pk, returned_columns):
+                     for result, field in zip(results, opts.db_returning_fields):
+-                        setattr(obj_without_pk, field.attname, result)
++                        if hasattr(field, 'from_db_value'):
++                            setattr(obj_without_pk, field.attname, field.from_db_value(result, None, connections[self.db]))
++                        else:
++                            setattr(obj_without_pk, field.attname, result)
+                     obj_without_pk._state.adding = False
+                     obj_without_pk._state.db = self.db
+ 
+diff --git a/edge_case_test.py b/edge_case_test.py
+new file mode 100644
+index 0000000000..56191c4778
+--- /dev/null
++++ b/edge_case_test.py
+@@ -0,0 +1,104 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test',
++    )
++
++django.setup()
++
++from django.db import models
++
++print("Running edge case tests...")
++
++# Test 1: Field that returns None from from_db_value
++class NoneReturningField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        return None  # Always return None
++
++class NoneModel(models.Model):
++    id = NoneReturningField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create table
++from django.db import connection
++with connection.cursor() as cursor:
++    cursor.execute("""
++        CREATE TABLE test_nonemodel (
++            id INTEGER PRIMARY KEY AUTOINCREMENT
++        )
++    """)
++
++obj = NoneModel.objects.create()
++print(f"✓ None returning field: {obj.id} (type: {type(obj.id)})")
++assert obj.id is None, f"Expected None, got {obj.id}"
++
++# Test 2: Field that returns a different type
++class StringReturningField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        return f"ID_{value}"  # Return string instead of int
++
++class StringModel(models.Model):
++    id = StringReturningField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++with connection.cursor() as cursor:
++    cursor.execute("""
++        CREATE TABLE test_stringmodel (
++            id INTEGER PRIMARY KEY AUTOINCREMENT
++        )
++    """)
++
++obj = StringModel.objects.create()
++print(f"✓ String returning field: {obj.id} (type: {type(obj.id)})")
++assert isinstance(obj.id, str) and obj.id.startswith("ID_"), f"Expected string starting with 'ID_', got {obj.id}"
++
++# Test 3: Field that might raise an exception (should not happen in normal usage)
++class SafeField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        try:
++            # Some complex logic that should not fail
++            return int(value) * 2
++        except Exception:
++            # Fallback to original value
++            return value
++
++class SafeModel(models.Model):
++    id = SafeField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++with connection.cursor() as cursor:
++    cursor.execute("""
++        CREATE TABLE test_safemodel (
++            id INTEGER PRIMARY KEY AUTOINCREMENT
++        )
++    """)
++
++obj = SafeModel.objects.create()
++print(f"✓ Safe field: {obj.id} (type: {type(obj.id)})")
++assert isinstance(obj.id, int) and obj.id > 0, f"Expected positive integer, got {obj.id}"
++
++print("\nAll edge case tests passed! The fix handles various return types correctly.")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..2cdad1b01f
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a custom field that wraps integers
++class MyIntWrapper:
++    def __init__(self, value):
++        self.value = value
++    
++    def __repr__(self):
++        return f"<MyIntWrapper: {self.value}>"
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return False
++
++class MyAutoField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        if isinstance(value, MyIntWrapper):
++            return value.value
++        return int(value)
++
++class AutoModel(models.Model):
++    id = MyAutoField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++
++cursor = connection.cursor()
++
++# Create table
++cursor.execute("""
++    CREATE TABLE test_automodel (
++        id INTEGER PRIMARY KEY AUTOINCREMENT
++    )
++""")
++
++# Test the issue
++print("Testing the issue...")
++
++# Test 1: Query existing instance (should work correctly)
++cursor.execute("INSERT INTO test_automodel (id) VALUES (1)")
++am = AutoModel.objects.first()
++print(f"Queried instance id: {am.id} (type: {type(am.id)})")
++
++# Test 2: Create new instance (should show the issue)
++am2 = AutoModel.objects.create()
++print(f"Created instance id: {am2.id} (type: {type(am2.id)})")
++
++# Test 3: Bulk create (should also show the issue)
++ams = [AutoModel()]
++AutoModel.objects.bulk_create(ams)
++print(f"Bulk created instance id: {ams[0].id} (type: {type(ams[0].id)})")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..7f4c0c04b7
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,125 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a custom field that wraps integers
++class MyIntWrapper:
++    def __init__(self, value):
++        self.value = value
++    
++    def __repr__(self):
++        return f"<MyIntWrapper: {self.value}>"
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return False
++
++class MyAutoField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        if isinstance(value, MyIntWrapper):
++            return value.value
++        return int(value)
++
++class AutoModel(models.Model):
++    id = MyAutoField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++
++cursor = connection.cursor()
++
++# Create table
++cursor.execute("""
++    CREATE TABLE test_automodel (
++        id INTEGER PRIMARY KEY AUTOINCREMENT
++    )
++""")
++
++print("Testing the fix...")
++
++# Test 1: Query existing instance (should work correctly)
++cursor.execute("INSERT INTO test_automodel (id) VALUES (1)")
++am = AutoModel.objects.first()
++print(f"✓ Queried instance id: {am.id} (type: {type(am.id)})")
++assert isinstance(am.id, MyIntWrapper), f"Expected MyIntWrapper, got {type(am.id)}"
++
++# Test 2: Create new instance (should now work correctly)
++am2 = AutoModel.objects.create()
++print(f"✓ Created instance id: {am2.id} (type: {type(am2.id)})")
++assert isinstance(am2.id, MyIntWrapper), f"Expected MyIntWrapper, got {type(am2.id)}"
++
++# Test 3: Test with regular field (should not break existing functionality)
++class RegularModel(models.Model):
++    id = models.BigAutoField(primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++cursor.execute("""
++    CREATE TABLE test_regularmodel (
++        id INTEGER PRIMARY KEY AUTOINCREMENT,
++        name VARCHAR(100)
++    )
++""")
++
++rm = RegularModel.objects.create(name="test")
++print(f"✓ Regular model created with id: {rm.id} (type: {type(rm.id)})")
++assert isinstance(rm.id, int), f"Expected int, got {type(rm.id)}"
++
++# Test 4: Test with field that doesn't have from_db_value
++class NoConverterField(models.BigAutoField):
++    # This field doesn't override from_db_value
++    pass
++
++class NoConverterModel(models.Model):
++    id = NoConverterField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++cursor.execute("""
++    CREATE TABLE test_noconvertermodel (
++        id INTEGER PRIMARY KEY AUTOINCREMENT
++    )
++""")
++
++ncm = NoConverterModel.objects.create()
++print(f"✓ No converter model created with id: {ncm.id} (type: {type(ncm.id)})")
++assert isinstance(ncm.id, int), f"Expected int, got {type(ncm.id)}"
++
++print("\nAll tests passed! The fix is working correctly.")
+\ No newline at end of file

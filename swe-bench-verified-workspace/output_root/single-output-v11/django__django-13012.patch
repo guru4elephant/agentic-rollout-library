@@ -1,0 +1,366 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index c1a76584f0..aa69a6a7e5 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -866,6 +866,15 @@ class ExpressionWrapper(Expression):
+     def as_sql(self, compiler, connection):
+         return self.expression.as_sql(compiler, connection)
+ 
++    def get_group_by_cols(self, alias=None):
++        return self.expression.get_group_by_cols(alias)
++
++    def contains_aggregate(self):
++        return self.expression.contains_aggregate
++
++    def contains_column_references(self):
++        return self.expression.contains_column_references
++
+     def __repr__(self):
+         return "{}({})".format(self.__class__.__name__, self.expression)
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..4ed1f574ff
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import ExpressionWrapper, Value, Sum, IntegerField
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    column_a = models.CharField(max_length=100)
++    column_b = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_expression_wrapper_issue():
++    """Test case to reproduce the issue with ExpressionWrapper"""
++    print("Testing ExpressionWrapper with constant value...")
++    
++    # This should work correctly (Value directly)
++    try:
++        query1 = TestModel.objects.annotate(
++            expr_res=Value(3, output_field=IntegerField())
++        ).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++        sql1 = str(query1.query)
++        print("✓ Value directly works:")
++        print(f"SQL: {sql1}")
++    except Exception as e:
++        print(f"✗ Value directly failed: {e}")
++    
++    # This should fail (ExpressionWrapper with Value)
++    try:
++        expr = ExpressionWrapper(Value(3), output_field=IntegerField())
++        query2 = TestModel.objects.annotate(
++            expr_res=expr
++        ).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++        sql2 = str(query2.query)
++        print("✓ ExpressionWrapper works:")
++        print(f"SQL: {sql2}")
++    except Exception as e:
++        print(f"✗ ExpressionWrapper failed: {e}")
++
++if __name__ == "__main__":
++    test_expression_wrapper_issue()
+\ No newline at end of file
+diff --git a/test_basic_functionality.py b/test_basic_functionality.py
+new file mode 100644
+index 0000000000..4eb66b46a9
+--- /dev/null
++++ b/test_basic_functionality.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import ExpressionWrapper, Value, Sum, IntegerField, F
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    column_a = models.CharField(max_length=100)
++    column_b = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_basic_functionality():
++    """Test basic ExpressionWrapper functionality"""
++    print("Testing basic ExpressionWrapper functionality...")
++    
++    # Test basic usage
++    try:
++        expr = ExpressionWrapper(F('column_b') * 2, output_field=IntegerField())
++        query = TestModel.objects.annotate(double_col=expr)
++        sql = str(query.query)
++        print("✓ Basic ExpressionWrapper works")
++        print(f"SQL: {sql}")
++    except Exception as e:
++        print(f"✗ Basic ExpressionWrapper failed: {e}")
++    
++    # Test with values() and annotate()
++    try:
++        expr = ExpressionWrapper(F('column_b') + 1, output_field=IntegerField())
++        query = TestModel.objects.annotate(
++            expr_res=expr
++        ).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++        sql = str(query.query)
++        print("✓ ExpressionWrapper with values/annotate works")
++        print(f"SQL: {sql}")
++    except Exception as e:
++        print(f"✗ ExpressionWrapper with values/annotate failed: {e}")
++    
++    # Test that constants are still handled correctly in non-GROUP BY contexts
++    try:
++        expr = ExpressionWrapper(Value(42), output_field=IntegerField())
++        query = TestModel.objects.annotate(constant=expr)
++        sql = str(query.query)
++        print("✓ ExpressionWrapper with constant in annotate works")
++        print(f"SQL: {sql}")
++    except Exception as e:
++        print(f"✗ ExpressionWrapper with constant in annotate failed: {e}")
++
++if __name__ == "__main__":
++    test_basic_functionality()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..64f30e57cc
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import ExpressionWrapper, Value, Sum, IntegerField, F
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    column_a = models.CharField(max_length=100)
++    column_b = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_edge_cases():
++    """Test various edge cases for ExpressionWrapper"""
++    print("Testing ExpressionWrapper edge cases...")
++    
++    # Test 1: ExpressionWrapper with non-constant expression (should still work)
++    try:
++        expr = ExpressionWrapper(F('column_b') + 1, output_field=IntegerField())
++        query = TestModel.objects.annotate(
++            expr_res=expr
++        ).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++        sql = str(query.query)
++        print("✓ ExpressionWrapper with non-constant works:")
++        print(f"SQL: {sql}")
++    except Exception as e:
++        print(f"✗ ExpressionWrapper with non-constant failed: {e}")
++    
++    # Test 2: Nested ExpressionWrapper
++    try:
++        inner_expr = ExpressionWrapper(Value(5), output_field=IntegerField())
++        outer_expr = ExpressionWrapper(inner_expr, output_field=IntegerField())
++        query = TestModel.objects.annotate(
++            expr_res=outer_expr
++        ).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++        sql = str(query.query)
++        print("✓ Nested ExpressionWrapper works:")
++        print(f"SQL: {sql}")
++    except Exception as e:
++        print(f"✗ Nested ExpressionWrapper failed: {e}")
++    
++    # Test 3: Different constant types
++    try:
++        for const_val in [1, "test", 3.14]:
++            expr = ExpressionWrapper(Value(const_val), output_field=IntegerField())
++            query = TestModel.objects.annotate(
++                expr_res=expr
++            ).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++            sql = str(query.query)
++            print(f"✓ ExpressionWrapper with {const_val} works:")
++            print(f"SQL: {sql}")
++    except Exception as e:
++        print(f"✗ ExpressionWrapper with different constants failed: {e}")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..8399da2a0e
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import ExpressionWrapper, Value, Sum, IntegerField
++
++# Create a simple model for testing
++class Model(models.Model):
++    column_a = models.CharField(max_length=100)
++    column_b = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++def execQuery(expr):
++    """The exact function from the GitHub issue"""
++    expr = ExpressionWrapper(expr, output_field=IntegerField())
++    return Model.objects.annotate(expr_res=expr).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++
++def execQueryWithoutWrapper(expr):
++    """The working version without ExpressionWrapper"""
++    return Model.objects.annotate(expr_res=Value(3, output_field=IntegerField())).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++
++def test_github_issue():
++    """Test the exact scenario from the GitHub issue"""
++    print("Testing GitHub issue scenario...")
++    
++    # Test the problematic case (should now work)
++    try:
++        query = execQuery(Value(3))
++        sql = str(query.query)
++        print("✓ ExpressionWrapper with Value(3) works:")
++        print(f"SQL: {sql}")
++        
++        # Check that the GROUP BY doesn't contain the constant 3
++        if "GROUP BY" in sql and ", 3" in sql.split("GROUP BY")[1]:
++            print("✗ ERROR: Constant 3 is still in GROUP BY clause!")
++            return False
++        else:
++            print("✓ Constant 3 is correctly excluded from GROUP BY")
++            
++    except Exception as e:
++        print(f"✗ ExpressionWrapper with Value(3) failed: {e}")
++        return False
++    
++    # Test the working case (should still work)
++    try:
++        query = execQueryWithoutWrapper(Value(3))
++        sql = str(query.query)
++        print("✓ Direct Value(3) works:")
++        print(f"SQL: {sql}")
++    except Exception as e:
++        print(f"✗ Direct Value(3) failed: {e}")
++        return False
++    
++    # Compare the two SQL queries - they should be identical now
++    query1 = execQuery(Value(3))
++    query2 = execQueryWithoutWrapper(Value(3))
++    
++    sql1 = str(query1.query)
++    sql2 = str(query2.query)
++    
++    if sql1 == sql2:
++        print("✓ Both approaches generate identical SQL")
++        return True
++    else:
++        print("✗ SQL queries are different:")
++        print(f"With ExpressionWrapper: {sql1}")
++        print(f"Without ExpressionWrapper: {sql2}")
++        return False
++
++if __name__ == "__main__":
++    success = test_github_issue()
++    if success:
++        print("\n🎉 GitHub issue is FIXED!")
++    else:
++        print("\n❌ GitHub issue is NOT fixed!")
+\ No newline at end of file

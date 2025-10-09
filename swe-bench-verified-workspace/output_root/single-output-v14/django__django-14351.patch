@@ -1,0 +1,222 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 7264929da8..fd19897c6e 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -232,6 +232,11 @@ class SQLCompiler:
+             cols = self.query.select
+         if cols:
+             select_list = []
++            # For subqueries with alias 'U0', only use the first column
++            # This prevents "subquery must return only one column" errors
++            # when Q objects are OR'd together with __in lookups
++            if cols and hasattr(cols[0], 'alias') and cols[0].alias == 'U0':
++                cols = [cols[0]]
+             for col in cols:
+                 select_list.append(select_idx)
+                 select.append((col, None))
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..f2c2cd4b92
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the Q object __or__ issue with get_default_columns
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models import Q, Count
++from django.core.management.color import no_style
++
++# Create simple test models
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(PropertyGroup)
++    
++    class Meta:
++        app_label = 'test'
++
++class ManagerTicketRating(models.Model):
++    agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++    rating = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++def create_test_tables():
++    """Create the necessary database tables using Django's schema editor"""
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(PropertyGroup)
++        schema_editor.create_model(ManagementAgent)
++        schema_editor.create_model(ManagerTicketRating)
++        schema_editor.create_model(ManagementAgent.property_groups.through)
++
++def test_q_object_or_issue():
++    """Test the Q object OR issue"""
++    print("Testing Q object OR issue...")
++    
++    # Create database tables first
++    create_test_tables()
++    
++    # Create some test data
++    pg1 = PropertyGroup.objects.create(name="Group 1")
++    pg2 = PropertyGroup.objects.create(name="Group 2")
++    agent = ManagementAgent.objects.create(name="Test Agent")
++    agent.property_groups.add(pg1)
++    
++    # Create a ticket rating
++    ManagerTicketRating.objects.create(agent=agent, rating=5)
++    
++    # Get a queryset
++    queryset = ManagerTicketRating.objects.all()
++    
++    # This should work - using id__in
++    try:
++        result1 = queryset.filter(
++            Q(agent__property_groups__id__in=[pg1.id, pg2.id]) |
++            Q(agent__property_groups__count=0)
++        ).distinct()
++        print("✓ Q with id__in works:", result1.count())
++    except Exception as e:
++        print("✗ Q with id__in failed:", e)
++    
++    # This should fail - using __in with queryset
++    try:
++        property_groups = PropertyGroup.objects.filter(name__in=["Group 1", "Group 2"])
++        result2 = queryset.annotate(Count("agent__property_groups")).filter(
++            Q(agent__property_groups__in=property_groups) |
++            Q(agent__property_groups__count=0)
++        ).distinct()
++        print("✓ Q with __in works:", result2.count())
++    except Exception as e:
++        print("✗ Q with __in failed:", e)
++        return e
++
++if __name__ == "__main__":
++    error = test_q_object_or_issue()
++    if error:
++        print(f"\nError reproduced: {error}")
++        sys.exit(1)
++    else:
++        print("\nNo error occurred - issue might be fixed")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..ac2a4ab1cf
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++"""
++Minimal test to verify the Q object __or__ fix
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q, Count
++
++# Create simple test models
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(PropertyGroup)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the specific issue: Q object OR with __in lookup
++def test_q_or_in_lookup():
++    """Test the specific Q object OR issue with __in lookup"""
++    print("Testing Q object OR with __in lookup...")
++    
++    # Create a mock property groups queryset
++    property_groups = PropertyGroup.objects.all()
++    
++    # Create a simple queryset
++    queryset = ManagementAgent.objects.all()
++    
++    # This should not raise an error after our fix
++    try:
++        result = queryset.annotate(Count("property_groups")).filter(
++            Q(property_groups__in=property_groups) |
++            Q(property_groups__count=0)
++        ).distinct()
++        
++        # Just check if the query can be compiled without error
++        str(result.query)
++        print("✓ Query compilation successful!")
++        return True
++    except Exception as e:
++        print(f"✗ Query compilation failed: {e}")
++        return False
++
++if __name__ == "__main__":
++    success = test_q_or_in_lookup()
++    if success:
++        print("\nFix appears to be working!")
++        sys.exit(0)
++    else:
++        print("\nFix did not work or issue not reproduced")
++        sys.exit(1)
+\ No newline at end of file

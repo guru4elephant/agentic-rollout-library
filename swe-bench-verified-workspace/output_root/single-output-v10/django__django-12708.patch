@@ -1,0 +1,313 @@
+diff --git a/accurate_reproduce.py b/accurate_reproduce.py
+new file mode 100644
+index 0000000000..1579b21987
+--- /dev/null
++++ b/accurate_reproduce.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python
++"""
++Accurate reproduction script for the index_together + unique_together migration issue.
++"""
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++
++class MockMeta:
++    db_table = 'test_table'
++    constraints = []
++    indexes = []
++    
++    def get_field(self, field_name):
++        # Mock field with column property
++        field = type('MockField', (), {})()
++        field.column = field_name
++        return field
++
++class MockModel:
++    _meta = MockMeta()
++
++class MockSchemaEditor(BaseDatabaseSchemaEditor):
++    def __init__(self):
++        self.connection = type('MockConnection', (), {})()
++        self.connection.introspection = type('MockIntrospection', (), {})()
++        
++    def execute(self, sql):
++        print(f"Would execute: {sql}")
++    
++    def _constraint_names(self, model, column_names=None, **kwargs):
++        # Simulate the REAL scenario where both unique and index constraints exist
++        # for the same fields - this is what causes the ValueError
++        if column_names == ['field1', 'field2']:
++            # When looking for index constraints, return both constraints
++            # This simulates the database having both unique and index constraints
++            # for the same fields
++            return ['test_table_field1_field2_uniq', 'test_table_field1_field2_idx']
++        return []
++    
++    def _delete_constraint_sql(self, sql_template, model, constraint_name):
++        return f"DELETE CONSTRAINT {constraint_name}"
++
++def test_delete_composed_index():
++    """Test the _delete_composed_index method with both unique and index constraints."""
++    
++    schema_editor = MockSchemaEditor()
++    model = MockModel()
++    
++    print("Testing _delete_composed_index with index constraint...")
++    print("This should fail with ValueError because both constraints are found")
++    try:
++        schema_editor._delete_composed_index(
++            model, 
++            ['field1', 'field2'], 
++            {'index': True}, 
++            "DROP INDEX %s"
++        )
++        print("SUCCESS: Index constraint deletion worked (unexpected)")
++    except ValueError as e:
++        print(f"EXPECTED ERROR: {e}")
++        print("This confirms the bug described in the issue!")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    print("Testing _delete_composed_index method with realistic scenario...")
++    success = test_delete_composed_index()
++    if success:
++        print("Test passed - no issue found (unexpected)")
++    else:
++        print("Test failed - issue reproduced as expected")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..c854ae716b
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the index_together + unique_together migration issue.
++"""
++
++import os
++import sys
++import tempfile
++import shutil
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++from django.conf import settings
++from django.db import models, connections
++from django.db.migrations import Migration, operations
++from django.db.migrations.state import ProjectState
++from django.db.migrations.executor import MigrationExecutor
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++# Setup Django
++import django
++django.setup()
++
++
++class TestModel(models.Model):
++    field1 = models.CharField(max_length=100)
++    field2 = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++        unique_together = [('field1', 'field2')]
++        index_together = [('field1', 'field2')]
++
++
++def test_migration_issue():
++    """Test the migration issue with index_together and unique_together on same fields."""
++    
++    # Create a temporary migration directory
++    migration_dir = tempfile.mkdtemp()
++    
++    try:
++        # Create initial migration
++        initial_migration = Migration('0001_initial', 'test_app')
++        initial_migration.operations = [
++            operations.CreateModel(
++                name='TestModel',
++                fields=[
++                    ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
++                    ('field1', models.CharField(max_length=100)),
++                    ('field2', models.CharField(max_length=100)),
++                ],
++                options={
++                    'unique_together': {('field1', 'field2')},
++                    'index_together': {('field1', 'field2')},
++                },
++            )
++        ]
++        
++        # Create migration to remove index_together
++        remove_index_migration = Migration('0002_remove_index_together', 'test_app')
++        remove_index_migration.operations = [
++            operations.AlterIndexTogether(
++                name='testmodel',
++                index_together=set(),
++            )
++        ]
++        
++        # Create project state
++        project_state = ProjectState()
++        project_state.add_model(TestModel._meta)
++        
++        # Execute migrations
++        executor = MigrationExecutor(connections['default'])
++        
++        print("Applying initial migration...")
++        executor.apply_migration(project_state, initial_migration)
++        print("Initial migration applied successfully!")
++        
++        print("Applying migration to remove index_together...")
++        try:
++            executor.apply_migration(project_state, remove_index_migration)
++            print("Migration to remove index_together applied successfully!")
++        except ValueError as e:
++            print(f"ERROR: {e}")
++            print("This confirms the bug described in the issue.")
++            return False
++        
++        return True
++        
++    finally:
++        shutil.rmtree(migration_dir)
++
++
++if __name__ == '__main__':
++    print("Testing migration issue with index_together and unique_together on same fields...")
++    success = test_migration_issue()
++    if success:
++        print("Test passed - no issue found")
++    else:
++        print("Test failed - issue reproduced")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..d86bb4221c
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python
++"""
++Simple reproduction script for the index_together + unique_together migration issue.
++"""
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++from django.db import models
++from django.db.models.options import Options
++
++# Create a mock model and schema editor to test the _delete_composed_index method
++
++class MockMeta:
++    db_table = 'test_table'
++    constraints = []
++    indexes = []
++    
++    def get_field(self, field_name):
++        # Mock field with column property
++        field = type('MockField', (), {})()
++        field.column = field_name
++        return field
++
++class MockModel:
++    _meta = MockMeta()
++
++class MockSchemaEditor(BaseDatabaseSchemaEditor):
++    def __init__(self):
++        self.connection = type('MockConnection', (), {})()
++        self.connection.introspection = type('MockIntrospection', (), {})()
++        
++    def execute(self, sql):
++        print(f"Would execute: {sql}")
++    
++    def _constraint_names(self, model, column_names=None, **kwargs):
++        # Simulate the scenario where both unique and index constraints exist
++        # for the same fields
++        if column_names == ['field1', 'field2']:
++            if kwargs.get('unique'):
++                return ['test_table_field1_field2_uniq']
++            elif kwargs.get('index'):
++                return ['test_table_field1_field2_idx']
++        return []
++    
++    def _delete_constraint_sql(self, sql_template, model, constraint_name):
++        return f"DELETE CONSTRAINT {constraint_name}"
++
++def test_delete_composed_index():
++    """Test the _delete_composed_index method with both unique and index constraints."""
++    
++    schema_editor = MockSchemaEditor()
++    model = MockModel()
++    
++    print("Testing _delete_composed_index with index constraint...")
++    try:
++        schema_editor._delete_composed_index(
++            model, 
++            ['field1', 'field2'], 
++            {'index': True}, 
++            "DROP INDEX %s"
++        )
++        print("SUCCESS: Index constraint deletion worked")
++    except ValueError as e:
++        print(f"ERROR: {e}")
++        return False
++    
++    print("Testing _delete_composed_index with unique constraint...")
++    try:
++        schema_editor._delete_composed_index(
++            model, 
++            ['field1', 'field2'], 
++            {'unique': True}, 
++            "DROP UNIQUE %s"
++        )
++        print("SUCCESS: Unique constraint deletion worked")
++    except ValueError as e:
++        print(f"ERROR: {e}")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    print("Testing _delete_composed_index method...")
++    success = test_delete_composed_index()
++    if success:
++        print("All tests passed!")
++    else:
++        print("Tests failed - issue reproduced")
++        sys.exit(1)
+\ No newline at end of file

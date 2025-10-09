@@ -1,0 +1,1021 @@
+diff --git a/analyze_issue.py b/analyze_issue.py
+new file mode 100644
+index 0000000000..30a37eb076
+--- /dev/null
++++ b/analyze_issue.py
+@@ -0,0 +1,111 @@
++#!/usr/bin/env python3
++"""
++Analyze the db_collation issue by examining the migration operations and SQL generation.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++def analyze_migration_operations():
++    """Analyze how migration operations handle collation changes"""
++    print("Analyzing migration operations for collation changes...")
++    
++    # Create field definitions
++    old_field = models.CharField(primary_key=True, max_length=22)
++    new_field = models.CharField(primary_key=True, max_length=22, db_collation='utf8_bin')
++    
++    print(f"Old field db_parameters: {old_field.db_parameters()}")
++    print(f"New field db_parameters: {new_field.db_parameters()}")
++    
++    # Check if there's a difference in collation
++    old_params = old_field.db_parameters()
++    new_params = new_field.db_parameters()
++    
++    print(f"Old collation: {old_params.get('collation')}")
++    print(f"New collation: {new_params.get('collation')}")
++    
++    # Let's examine the SQL templates
++    from django.db.backends.mysql.schema import DatabaseSchemaEditor
++    
++    print(f"\nMySQL SQL templates:")
++    print(f"sql_alter_column_type: {DatabaseSchemaEditor.sql_alter_column_type}")
++    print(f"sql_alter_column_collate: {DatabaseSchemaEditor.sql_alter_column_collate}")
++    
++    # Let's see what happens when we create the SQL for collation change
++    try:
++        # Create a mock schema editor
++        schema_editor = DatabaseSchemaEditor.__new__(DatabaseSchemaEditor)
++        
++        # Mock the necessary attributes
++        schema_editor.connection = None
++        schema_editor.quote_name = lambda x: f"`{x}`"
++        schema_editor._collate_sql = lambda x: f" COLLATE {x}"
++        
++        sql, params = schema_editor._alter_column_collation_sql(None, new_field, 'varchar(22)', 'utf8_bin')
++        print(f"\nGenerated collation SQL: {sql}")
++        print(f"Params: {params}")
++        
++    except Exception as e:
++        print(f"Error: {e}")
++        import traceback
++        traceback.print_exc()
++
++def examine_foreign_key_handling():
++    """Examine how foreign keys are handled during field alterations"""
++    print("\n" + "="*50)
++    print("Examining foreign key handling...")
++    
++    from django.db.migrations.operations.fields import AlterField
++    from django.db.models.fields.related import ForeignKey
++    
++    # Create an AlterField operation
++    alter_op = AlterField(
++        model_name='Account',
++        name='id',
++        field=models.CharField(primary_key=True, max_length=22, db_collation='utf8_bin'),
++    )
++    
++    print(f"AlterField operation: {alter_op}")
++    print(f"Field type: {type(alter_op.field)}")
++    print(f"Field db_collation: {alter_op.field.db_collation}")
++    
++    # Check if the field has any foreign key relationships
++    # We need to understand how Django detects and handles related fields
++    from django.db.migrations.utils import field_references
++    
++    # Mock app_label and model names
++    app_label = 'test_app'
++    model_name = 'Account'
++    
++    # Check if this field is referenced by any foreign keys
++    # This is the key issue - Django should detect when a field with collation
++    # is referenced by foreign keys and ensure the collation propagates
++    
++    print("\nLooking for field references...")
++    # We need to examine the migration autodetector logic
++
++if __name__ == '__main__':
++    analyze_migration_operations()
++    examine_foreign_key_handling()
+\ No newline at end of file
+diff --git a/direct_analysis.py b/direct_analysis.py
+new file mode 100644
+index 0000000000..38ccf8e498
+--- /dev/null
++++ b/direct_analysis.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""
++Direct analysis of the db_collation issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++def analyze_collation_propagation():
++    """Analyze how collation should propagate to foreign keys"""
++    print("Analyzing collation propagation issue...")
++    
++    # The key issue is that when a primary key field with collation is altered,
++    # any foreign key fields that reference it should also have their collation
++    # updated to match.
++    
++    # Let's examine the migration operations to understand the flow
++    from django.db.migrations.operations.fields import AlterField
++    
++    # Create an AlterField operation for the primary key
++    alter_op = AlterField(
++        model_name='Account',
++        name='id',
++        field=models.CharField(primary_key=True, max_length=22, db_collation='utf8_bin'),
++    )
++    
++    print(f"AlterField operation created: {alter_op}")
++    print(f"Field db_collation: {alter_op.field.db_collation}")
++    
++    # The issue is that Django needs to detect when a field being altered
++    # is referenced by foreign keys in other models, and ensure that those
++    # foreign key fields also get the collation updated.
++    
++    # Let's examine the migration autodetector logic
++    from django.db.migrations.autodetector import MigrationAutodetector
++    from django.db.migrations.state import ProjectState
++    
++    # Create a simple state to understand the detection logic
++    initial_state = ProjectState()
++    target_state = ProjectState()
++    
++    # The key function is likely in the autodetector's _generate_altered_fields
++    # or similar method that detects when fields are altered and need to
++    # propagate changes to related fields.
++    
++    print("\nLooking at MySQL schema SQL templates...")
++    
++    # The MySQL schema has specific SQL templates for collation
++    from django.db.backends.mysql.schema import DatabaseSchemaEditor
++    
++    print(f"sql_alter_column_collate: {DatabaseSchemaEditor.sql_alter_column_collate}")
++    
++    # The template is: "MODIFY %(column)s %(type)s%(collation)s"
++    # This means when collation changes, it should generate SQL like:
++    # MODIFY column_name varchar(22) COLLATE utf8_bin
++    
++    # The issue is that when a primary key field is altered with collation,
++    # the foreign key fields that reference it should also get similar
++    # ALTER TABLE statements to ensure collation matches.
++    
++    print("\nThe problem:")
++    print("1. Account.id is altered to have COLLATE utf8_bin")
++    print("2. Address.account_id and Profile.account_id reference Account.id")
++    print("3. These foreign key fields should also get COLLATE utf8_bin")
++    print("4. Currently, Django doesn't automatically propagate collation to FKs")
++    
++    print("\nSolution approach:")
++    print("We need to modify the migration logic to detect when a field with")
++    print("collation is referenced by foreign keys and generate additional")
++    print("AlterField operations for those foreign key fields.")
++
++if __name__ == '__main__':
++    analyze_collation_propagation()
+\ No newline at end of file
+diff --git a/django/db/migrations/autodetector.py b/django/db/migrations/autodetector.py
+index 04e651ec4a..357c59639b 100644
+--- a/django/db/migrations/autodetector.py
++++ b/django/db/migrations/autodetector.py
+@@ -1171,6 +1171,42 @@ class MigrationAutodetector:
+                         ),
+                         dependencies=dependencies,
+                     )
++                    
++                    # Propagate collation changes to foreign key fields that reference this field
++                    old_collation = getattr(old_field, 'db_collation', None)
++                    new_collation = getattr(new_field, 'db_collation', None)
++                    
++                    if new_collation and old_collation != new_collation:
++                        # Get all foreign key fields that reference this field
++                        from django.db.migrations.utils import get_references
++                        
++                        # Find all fields that reference this field
++                        model_key = (app_label, model_name.lower())
++                        field_tuple = (field_name,)
++                        
++                        for ref_model_state, ref_field_name, ref_field, reference in get_references(
++                            self.to_state, model_key, field_tuple
++                        ):
++                            # This field references our field, check if it needs collation update
++                            ref_field_obj = ref_model_state.get_field(ref_field_name)
++                            
++                            # Only update if the referenced field doesn't already have the same collation
++                            ref_collation = getattr(ref_field_obj, 'db_collation', None)
++                            if ref_collation != new_collation:
++                                # Create an AlterField operation for the foreign key field
++                                # Create a new field with the same parameters but updated collation
++                                field_copy = ref_field_obj.clone()
++                                field_copy.db_collation = new_collation
++                                self.add_operation(
++                                    ref_model_state.app_label,
++                                    operations.AlterField(
++                                        model_name=ref_model_state.name,
++                                        name=ref_field_name,
++                                        field=field_copy,
++                                        preserve_default=True,
++                                    ),
++                                    dependencies=[],
++                                )
+                 else:
+                     # We cannot alter between m2m and concrete fields
+                     self._generate_removed_field(app_label, model_name, field_name)
+diff --git a/focused_test.py b/focused_test.py
+new file mode 100644
+index 0000000000..4d7be94902
+--- /dev/null
++++ b/focused_test.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++"""
++Focused test to understand relations structure.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations.state import ProjectState
++
++def test_relations_simple():
++    """Simple test to understand relations structure"""
++    print("Testing relations structure...")
++    
++    # Create a simple project state
++    state = ProjectState()
++    
++    # Create model states manually
++    from django.db.migrations.state import ModelState
++    
++    # Create Account model state
++    account_fields = {
++        'id': models.CharField(primary_key=True, max_length=22),
++        'name': models.CharField(max_length=100),
++    }
++    account_state = ModelState('test_app', 'Account', account_fields)
++    state.add_model(account_state)
++    
++    # Create Address model state with foreign key to Account
++    address_fields = {
++        'id': models.CharField(primary_key=True, max_length=22),
++        'account': models.OneToOneField('test_app.Account', on_delete=models.CASCADE),
++    }
++    address_state = ModelState('test_app', 'Address', address_fields)
++    state.add_model(address_state)
++    
++    # Create Profile model state with foreign key to Account
++    profile_fields = {
++        'id': models.CharField(primary_key=True, max_length=22),
++        'account': models.ForeignKey('test_app.Account', on_delete=models.CASCADE, null=True, blank=True),
++    }
++    profile_state = ModelState('test_app', 'Profile', profile_fields)
++    state.add_model(profile_state)
++    
++    # Now access relations
++    relations = state.relations
++    print(f"Relations keys: {list(relations.keys())}")
++    
++    # Look for relations to Account model
++    account_key = ('test_app', 'account')
++    if account_key in relations:
++        print(f"Found relations to Account: {relations[account_key]}")
++        
++        # For each model that references Account, find the fields
++        for model_key, fields in relations[account_key].items():
++            print(f"Model {model_key} references Account with fields: {list(fields.keys())}")
++    else:
++        print("No relations found for Account model")
++
++if __name__ == '__main__':
++    test_relations_simple()
+\ No newline at end of file
+diff --git a/reproduce_collation.py b/reproduce_collation.py
+new file mode 100644
+index 0000000000..cd5c1b37c0
+--- /dev/null
++++ b/reproduce_collation.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++"""
++Simple reproduction script for db_collation issue with foreign keys.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Define the models from the issue
++class Account(models.Model):
++    id = models.CharField(primary_key=True, max_length=22)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Address(models.Model):
++    id = models.CharField(primary_key=True, max_length=22)
++    account = models.OneToOneField(Account, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Profile(models.Model):
++    id = models.CharField(primary_key=True, max_length=22)
++    account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_collation_sql_generation():
++    """Test SQL generation for collation changes"""
++    from django.db.backends.mysql.schema import DatabaseSchemaEditor
++    from django.db.backends.mysql.base import DatabaseWrapper
++    
++    # Create a mock connection
++    connection = DatabaseWrapper({
++        'ENGINE': 'django.db.backends.mysql',
++        'NAME': 'test_db',
++        'USER': 'root',
++        'PASSWORD': '',
++        'HOST': 'localhost',
++        'PORT': '3306',
++    })
++    
++    schema_editor = DatabaseSchemaEditor(connection)
++    
++    # Create field definitions
++    old_field = models.CharField(primary_key=True, max_length=22)
++    new_field = models.CharField(primary_key=True, max_length=22, db_collation='utf8_bin')
++    
++    # Mock model
++    class MockModel:
++        class _meta:
++            db_table = 'test_app_account'
++    
++    print("Testing SQL generation for collation change...")
++    print(f"Old field: {old_field.db_parameters(connection=connection)}")
++    print(f"New field: {new_field.db_parameters(connection=connection)}")
++    
++    # Test the SQL generation
++    try:
++        sql, params = schema_editor._alter_column_collation_sql(MockModel, new_field, 'varchar(22)', 'utf8_bin')
++        print(f"Generated SQL: {sql}")
++        print(f"Params: {params}")
++    except Exception as e:
++        print(f"Error generating SQL: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    test_collation_sql_generation()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..4b86c56213
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for db_collation issue with foreign keys in MySQL.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.mysql',
++                'NAME': 'test_db',
++                'USER': 'root',
++                'PASSWORD': '',
++                'HOST': 'localhost',
++                'PORT': '3306',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Define the models from the issue
++class Account(models.Model):
++    id = models.CharField(primary_key=True, max_length=22)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Address(models.Model):
++    id = models.CharField(primary_key=True, max_length=22)
++    account = models.OneToOneField(Account, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Profile(models.Model):
++    id = models.CharField(primary_key=True, max_length=22)
++    account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_collation_issue():
++    """Test the collation issue with foreign keys"""
++    from django.db import connection
++    from django.db.migrations.executor import MigrationExecutor
++    
++    print("Testing db_collation issue...")
++    
++    # Create a migration that changes the Account.id field to have collation
++    from django.db.migrations import Migration
++    from django.db.migrations.operations import AlterField
++    
++    class TestMigration(Migration):
++        dependencies = []
++        operations = [
++            AlterField(
++                model_name='Account',
++                name='id',
++                field=models.CharField(primary_key=True, max_length=22, db_collation='utf8_bin'),
++            ),
++        ]
++    
++    # Try to generate SQL for this migration
++    executor = MigrationExecutor(connection)
++    try:
++        sql = executor.migration_sql(TestMigration('test', 'test_app'))
++        print("Generated SQL:")
++        for statement in sql:
++            print(statement)
++    except Exception as e:
++        print(f"Error generating SQL: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    test_collation_issue()
+\ No newline at end of file
+diff --git a/reproduce_issue_simple.py b/reproduce_issue_simple.py
+new file mode 100644
+index 0000000000..3325c24736
+--- /dev/null
++++ b/reproduce_issue_simple.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++"""
++Simple reproduction script for db_collation issue with foreign keys.
++Focuses on SQL generation without requiring database connection.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Define the models from the issue
++class Account(models.Model):
++    id = models.CharField(primary_key=True, max_length=22)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Address(models.Model):
++    id = models.CharField(primary_key=True, max_length=22)
++    account = models.OneToOneField(Account, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Profile(models.Model):
++    id = models.CharField(primary_key=True, max_length=22)
++    account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_collation_issue():
++    """Test the collation issue with foreign keys by examining migration operations"""
++    from django.db.migrations.state import ProjectState
++    from django.db.migrations.migration import Migration
++    from django.db.migrations.operations import AlterField
++    
++    print("Testing db_collation issue...")
++    
++    # Create initial state with models without collation
++    initial_state = ProjectState()
++    initial_state.add_model(Account._meta)
++    initial_state.add_model(Address._meta)
++    initial_state.add_model(Profile._meta)
++    
++    # Create target state with collation on Account.id
++    target_state = ProjectState()
++    
++    # Create Account with collation
++    account_with_collation = type('Account', (models.Model,), {
++        'id': models.CharField(primary_key=True, max_length=22, db_collation='utf8_bin'),
++        'name': models.CharField(max_length=100),
++        'Meta': type('Meta', (), {'app_label': 'test_app', 'db_table': 'test_app_account'}),
++        '__module__': '__main__',
++    })
++    
++    target_state.add_model(account_with_collation._meta)
++    target_state.add_model(Address._meta)
++    target_state.add_model(Profile._meta)
++    
++    # Generate migration operations
++    from django.db.migrations.autodetector import MigrationAutodetector
++    from django.db.migrations.state import ModelState
++    
++    autodetector = MigrationAutodetector(initial_state, target_state)
++    changes = autodetector._detect_changes()
++    
++    print("Detected changes:")
++    for app_label, app_changes in changes.items():
++        for migration in app_changes:
++            print(f"Migration: {migration}")
++            for operation in migration.operations:
++                print(f"  Operation: {operation}")
++                if hasattr(operation, 'field') and operation.field.db_collation:
++                    print(f"    Field collation: {operation.field.db_collation}")
++    
++    # Let's also check what happens when we alter a field with collation
++    print("\n" + "="*50)
++    print("Testing AlterField operation with collation...")
++    
++    # Create an AlterField operation
++    alter_op = AlterField(
++        model_name='Account',
++        name='id',
++        field=models.CharField(primary_key=True, max_length=22, db_collation='utf8_bin'),
++    )
++    
++    print(f"AlterField operation: {alter_op}")
++    print(f"Field db_collation: {alter_op.field.db_collation}")
++
++if __name__ == '__main__':
++    test_collation_issue()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..394deed77f
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,128 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for the collation propagation fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations.state import ProjectState, ModelState
++from django.db.migrations.autodetector import MigrationAutodetector
++
++def test_comprehensive_collation():
++    """Test comprehensive collation propagation scenarios"""
++    print("Testing comprehensive collation propagation...")
++    
++    # Test 1: Basic collation propagation
++    print("\n1. Testing basic collation propagation...")
++    initial_state = ProjectState()
++    
++    # Create models without collation
++    account_fields = {'id': models.CharField(primary_key=True, max_length=22)}
++    account_state = ModelState('test_app', 'Account', account_fields)
++    initial_state.add_model(account_state)
++    
++    address_fields = {'account': models.OneToOneField('test_app.Account', on_delete=models.CASCADE)}
++    address_state = ModelState('test_app', 'Address', address_fields)
++    initial_state.add_model(address_state)
++    
++    # Target state with collation on Account.id
++    target_state = ProjectState()
++    account_fields_with_collation = {'id': models.CharField(primary_key=True, max_length=22, db_collation='utf8_bin')}
++    account_state_with_collation = ModelState('test_app', 'Account', account_fields_with_collation)
++    target_state.add_model(account_state_with_collation)
++    target_state.add_model(address_state)
++    
++    autodetector = MigrationAutodetector(initial_state, target_state)
++    changes = autodetector._detect_changes()
++    
++    alter_operations = []
++    for app_label, app_changes in changes.items():
++        for migration in app_changes:
++            for operation in migration.operations:
++                if operation.__class__.__name__ == 'AlterField':
++                    alter_operations.append(operation)
++    
++    print(f"Found {len(alter_operations)} AlterField operations")
++    for op in alter_operations:
++        collation = getattr(op.field, 'db_collation', None)
++        print(f"  {op.model_name}.{op.name}: {collation}")
++    
++    # Test 2: No propagation when collation doesn't change
++    print("\n2. Testing no propagation when collation doesn't change...")
++    initial_state2 = ProjectState()
++    account_fields2 = {'id': models.CharField(primary_key=True, max_length=22, db_collation='utf8_bin')}
++    account_state2 = ModelState('test_app', 'Account', account_fields2)
++    initial_state2.add_model(account_state2)
++    initial_state2.add_model(address_state)
++    
++    target_state2 = ProjectState()
++    account_fields_same_collation = {'id': models.CharField(primary_key=True, max_length=22, db_collation='utf8_bin')}
++    account_state_same_collation = ModelState('test_app', 'Account', account_fields_same_collation)
++    target_state2.add_model(account_state_same_collation)
++    target_state2.add_model(address_state)
++    
++    autodetector2 = MigrationAutodetector(initial_state2, target_state2)
++    changes2 = autodetector2._detect_changes()
++    
++    alter_operations2 = []
++    for app_label, app_changes in changes2.items():
++        for migration in app_changes:
++            for operation in migration.operations:
++                if operation.__class__.__name__ == 'AlterField':
++                    alter_operations2.append(operation)
++    
++    print(f"Found {len(alter_operations2)} AlterField operations (should be 0)")
++    
++    # Test 3: Propagation when changing to different collation
++    print("\n3. Testing propagation when changing to different collation...")
++    initial_state3 = ProjectState()
++    account_fields3 = {'id': models.CharField(primary_key=True, max_length=22, db_collation='utf8_bin')}
++    account_state3 = ModelState('test_app', 'Account', account_fields3)
++    initial_state3.add_model(account_state3)
++    initial_state3.add_model(address_state)
++    
++    target_state3 = ProjectState()
++    account_fields_diff_collation = {'id': models.CharField(primary_key=True, max_length=22, db_collation='utf8_general_ci')}
++    account_state_diff_collation = ModelState('test_app', 'Account', account_fields_diff_collation)
++    target_state3.add_model(account_state_diff_collation)
++    target_state3.add_model(address_state)
++    
++    autodetector3 = MigrationAutodetector(initial_state3, target_state3)
++    changes3 = autodetector3._detect_changes()
++    
++    alter_operations3 = []
++    for app_label, app_changes in changes3.items():
++        for migration in app_changes:
++            for operation in migration.operations:
++                if operation.__class__.__name__ == 'AlterField':
++                    alter_operations3.append(operation)
++    
++    print(f"Found {len(alter_operations3)} AlterField operations")
++    for op in alter_operations3:
++        collation = getattr(op.field, 'db_collation', None)
++        print(f"  {op.model_name}.{op.name}: {collation}")
++
++if __name__ == '__main__':
++    test_comprehensive_collation()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..bac558d5b6
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the collation propagation fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations.state import ProjectState, ModelState
++from django.db.migrations.autodetector import MigrationAutodetector
++
++def test_collation_propagation():
++    """Test that collation changes propagate to foreign keys"""
++    print("Testing collation propagation fix...")
++    
++    # Create initial state without collation
++    initial_state = ProjectState()
++    
++    # Create Account model state without collation
++    account_fields = {
++        'id': models.CharField(primary_key=True, max_length=22),
++        'name': models.CharField(max_length=100),
++    }
++    account_state = ModelState('test_app', 'Account', account_fields)
++    initial_state.add_model(account_state)
++    
++    # Create Address model state with foreign key to Account
++    address_fields = {
++        'id': models.CharField(primary_key=True, max_length=22),
++        'account': models.OneToOneField('test_app.Account', on_delete=models.CASCADE),
++    }
++    address_state = ModelState('test_app', 'Address', address_fields)
++    initial_state.add_model(address_state)
++    
++    # Create Profile model state with foreign key to Account
++    profile_fields = {
++        'id': models.CharField(primary_key=True, max_length=22),
++        'account': models.ForeignKey('test_app.Account', on_delete=models.CASCADE, null=True, blank=True),
++    }
++    profile_state = ModelState('test_app', 'Profile', profile_fields)
++    initial_state.add_model(profile_state)
++    
++    # Create target state with collation on Account.id
++    target_state = ProjectState()
++    
++    # Create Account model state with collation
++    account_fields_with_collation = {
++        'id': models.CharField(primary_key=True, max_length=22, db_collation='utf8_bin'),
++        'name': models.CharField(max_length=100),
++    }
++    account_state_with_collation = ModelState('test_app', 'Account', account_fields_with_collation)
++    target_state.add_model(account_state_with_collation)
++    
++    # Create Address model state (unchanged)
++    target_state.add_model(address_state)
++    
++    # Create Profile model state (unchanged)
++    target_state.add_model(profile_state)
++    
++    # Create autodetector and detect changes
++    autodetector = MigrationAutodetector(initial_state, target_state)
++    changes = autodetector._detect_changes()
++    
++    print("Detected changes:")
++    for app_label, app_changes in changes.items():
++        for migration in app_changes:
++            print(f"Migration: {migration}")
++            for operation in migration.operations:
++                print(f"  Operation: {operation}")
++                if hasattr(operation, 'field') and hasattr(operation.field, 'db_collation'):
++                    print(f"    Field collation: {operation.field.db_collation}")
++    
++    # Check if we have the expected operations
++    # We should have 3 AlterField operations:
++    # 1. For Account.id with collation
++    # 2. For Address.account with collation (propagated)
++    # 3. For Profile.account with collation (propagated)
++    
++    alter_operations = []
++    for app_label, app_changes in changes.items():
++        for migration in app_changes:
++            for operation in migration.operations:
++                if operation.__class__.__name__ == 'AlterField':
++                    alter_operations.append(operation)
++    
++    print(f"\nFound {len(alter_operations)} AlterField operations:")
++    for op in alter_operations:
++        print(f"  {op.model_name}.{op.name}: {getattr(getattr(op.field, 'db_collation', None), 'db_collation', None)}")
++
++if __name__ == '__main__':
++    test_collation_propagation()
+\ No newline at end of file
+diff --git a/test_relations.py b/test_relations.py
+new file mode 100644
+index 0000000000..ae5e2fedec
+--- /dev/null
++++ b/test_relations.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++"""
++Test script to understand the relations structure in migration state.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations.state import ProjectState
++
++# Define the models from the issue
++class Account(models.Model):
++    id = models.CharField(primary_key=True, max_length=22)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Address(models.Model):
++    id = models.CharField(primary_key=True, max_length=22)
++    account = models.OneToOneField(Account, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Profile(models.Model):
++    id = models.CharField(primary_key=True, max_length=22)
++    account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_relations_structure():
++    """Test the relations structure in ProjectState"""
++    print("Testing relations structure...")
++    
++    # Create a project state with our models
++    state = ProjectState()
++    state.add_model(Account._meta)
++    state.add_model(Address._meta)
++    state.add_model(Profile._meta)
++    
++    # Access the relations
++    relations = state.relations
++    print(f"Relations type: {type(relations)}")
++    
++    # Find relations to Account model
++    account_key = ('test_app', 'account')
++    if account_key in relations:
++        print(f"Relations to Account: {relations[account_key]}")
++        
++        # For each model that references Account, find the fields
++        for model_key, fields in relations[account_key].items():
++            print(f"Model {model_key} references Account with fields: {list(fields.keys())}")
++            for field_name, field in fields.items():
++                print(f"  Field {field_name}: {field}")
++                print(f"    Field type: {type(field)}")
++                print(f"    Field db_parameters: {field.db_parameters(connection=None)}")
++    else:
++        print("No relations found for Account model")
++
++if __name__ == '__main__':
++    test_relations_structure()
+\ No newline at end of file

@@ -1,0 +1,190 @@
+diff --git a/django/db/models/aggregates.py b/django/db/models/aggregates.py
+index 8c4eae7906..bc31b48d8d 100644
+--- a/django/db/models/aggregates.py
++++ b/django/db/models/aggregates.py
+@@ -65,7 +65,9 @@ class Aggregate(Func):
+         if hasattr(default, 'resolve_expression'):
+             default = default.resolve_expression(query, allow_joins, reuse, summarize)
+         c.default = None  # Reset the default argument before wrapping.
+-        return Coalesce(c, default, output_field=c._output_field_or_none)
++        coalesce = Coalesce(c, default, output_field=c._output_field_or_none)
++        coalesce.is_summary = c.is_summary
++        return coalesce
+ 
+     @property
+     def default_alias(self):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..11463e6bfb
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure a simple database for testing
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum
++from django.db.models.functions import Coalesce
++
++# Create a simple model for testing
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    id = models.AutoField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Book)
++
++# Insert some test data
++Book.objects.bulk_create([
++    Book(title=f'Book {i}', id=i) for i in range(1, 6)
++])
++
++print("Testing aggregate without default (should work):")
++result1 = Book.objects.annotate(idx=F("id")).aggregate(Sum("id"))
++print(f"Result: {result1}")
++
++print("\nTesting aggregate with default (should fail):")
++try:
++    result2 = Book.objects.annotate(idx=F("id")).aggregate(Sum("id", default=0))
++    print(f"Result: {result2}")
++except Exception as e:
++    print(f"Error: {e}")
++    import traceback
++    traceback.print_exc()
++
++print("\nTesting with Coalesce (should work):")
++result3 = Book.objects.annotate(idx=F("id")).aggregate(x=Coalesce(Sum("id"), 0))
++print(f"Result: {result3}")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..db7ae164b0
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure a simple database for testing
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Avg, Count
++from django.db.models.functions import Coalesce
++
++# Create a simple model for testing
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    id = models.AutoField(primary_key=True)
++    price = models.DecimalField(max_digits=5, decimal_places=2)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Book)
++
++# Insert some test data
++Book.objects.bulk_create([
++    Book(title=f'Book {i}', id=i, price=i * 10.0) for i in range(1, 6)
++])
++
++print("Testing edge cases:")
++
++print("\n1. Multiple aggregates with default:")
++try:
++    result = Book.objects.annotate(idx=F("id")).aggregate(
++        total_sum=Sum("id", default=0),
++        total_avg=Avg("price", default=0),
++        total_count=Count("id", default=0)
++    )
++    print(f"Result: {result}")
++except Exception as e:
++    print(f"Error: {e}")
++
++print("\n2. Empty queryset with default:")
++try:
++    result = Book.objects.filter(id=999).annotate(idx=F("id")).aggregate(Sum("id", default=0))
++    print(f"Result: {result}")
++except Exception as e:
++    print(f"Error: {e}")
++
++print("\n3. Without annotate (should work):")
++try:
++    result = Book.objects.aggregate(Sum("id", default=0))
++    print(f"Result: {result}")
++except Exception as e:
++    print(f"Error: {e}")
++
++print("\n4. Complex annotation with default:")
++try:
++    result = Book.objects.annotate(
++        double_id=F("id") * 2,
++        price_squared=F("price") * F("price")
++    ).aggregate(Sum("id", default=0))
++    print(f"Result: {result}")
++except Exception as e:
++    print(f"Error: {e}")
+\ No newline at end of file

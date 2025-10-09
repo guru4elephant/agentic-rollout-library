@@ -1,0 +1,404 @@
+diff --git a/debug.db b/debug.db
+new file mode 100644
+index 0000000000..5a0df8e595
+Binary files /dev/null and b/debug.db differ
+diff --git a/debug_save.db b/debug_save.db
+new file mode 100644
+index 0000000000..36ec8acc14
+Binary files /dev/null and b/debug_save.db differ
+diff --git a/debug_save.py b/debug_save.py
+new file mode 100644
+index 0000000000..f961594026
+--- /dev/null
++++ b/debug_save.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': 'debug_save.db',
++            }
++        },
++        INSTALLED_APPS=[
++            'test_app',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from test_app.models import Item, Derived
++
++# Create the tables
++from django.core.management import execute_from_command_line
++execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++
++# Monkey patch to add debug output
++from django.db.models.base import Model
++
++original_save_table = Model._save_table
++
++def debug_save_table(self, raw=False, cls=None, force_insert=False,
++                    force_update=False, using=None, update_fields=None):
++    print(f"_save_table called with:")
++    print(f"  raw: {raw}")
++    print(f"  cls: {cls}")
++    print(f"  force_insert: {force_insert}")
++    print(f"  force_update: {force_update}")
++    print(f"  using: {using}")
++    print(f"  update_fields: {update_fields}")
++    print(f"  self._state.adding: {self._state.adding}")
++    print(f"  self.pk: {self.pk}")
++    
++    result = original_save_table(self, raw, cls, force_insert, force_update, using, update_fields)
++    
++    print(f"_save_table result: {result}")
++    return result
++
++Model._save_table = debug_save_table
++
++# Test the issue
++print("Creating initial object...")
++derived = Derived.objects.create(f=True)
++print(f"Created object with pk: {derived.pk}, f: {derived.f}")
++
++print("Getting item and derived object...")
++item = Item.objects.get(pk=derived.pk)
++obj1 = item.derived
++print(f"Got derived object with pk: {obj1.pk}, f: {obj1.f}")
++
++print("Resetting object...")
++obj1.reset()
++print(f"After reset - pk: {obj1.pk}, uid: {obj1.uid}, f: {obj1.f}")
++
++print("Saving object...")
++obj1.save()
++
++print("Checking if object was overwritten...")
++obj = Item.objects.get(pk=derived.pk)
++print(f"Final object - pk: {obj.pk}, f: {obj.f}")
+\ No newline at end of file
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 0000000000..883a22776c
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': 'debug.db',
++            }
++        },
++        INSTALLED_APPS=[
++            'test_app',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from test_app.models import Item, Derived
++
++# Create the tables
++from django.core.management import execute_from_command_line
++execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++
++# Test the issue
++print("Creating initial object...")
++derived = Derived.objects.create(f=True)
++print(f"Created object with pk: {derived.pk}, f: {derived.f}")
++print(f"Object _state.adding: {derived._state.adding}")
++
++print("Getting item and derived object...")
++item = Item.objects.get(pk=derived.pk)
++obj1 = item.derived
++print(f"Got derived object with pk: {obj1.pk}, f: {obj1.f}")
++print(f"Derived object _state.adding: {obj1._state.adding}")
++
++print("Resetting object...")
++obj1.reset()
++print(f"After reset - pk: {obj1.pk}, f: {obj1.f}")
++print(f"After reset _state.adding: {obj1._state.adding}")
++
++print("Saving object...")
++obj1.save()
++
++print("Checking if object was overwritten...")
++obj = Item.objects.get(pk=derived.pk)
++print(f"Final object - pk: {obj.pk}, f: {obj.f}")
+\ No newline at end of file
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 844c01e95e..ea4ab5f2e7 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -840,20 +840,25 @@ class Model(metaclass=ModelBase):
+                        if f.name in update_fields or f.attname in update_fields]
+ 
+         pk_val = self._get_pk_val(meta)
++        # Track if we're generating a new PK for an existing object
++        generating_new_pk = False
+         if pk_val is None:
+             pk_val = meta.pk.get_pk_value_on_save(self)
+             setattr(self, meta.pk.attname, pk_val)
++            # If we're generating a new PK and the object was previously saved,
++            # we should force an INSERT to create a new object
++            generating_new_pk = not self._state.adding
+         pk_set = pk_val is not None
+         if not pk_set and (force_update or update_fields):
+             raise ValueError("Cannot force an update in save() with no primary key.")
+         updated = False
+-        # Skip an UPDATE when adding an instance and primary key has a default.
++        # Skip an UPDATE when adding an instance and primary key has a default,
++        # or when we're generating a new PK for an existing object.
+         if (
+             not raw and
+             not force_insert and
+-            self._state.adding and
+-            self._meta.pk.default and
+-            self._meta.pk.default is not NOT_PROVIDED
++            (self._state.adding or generating_new_pk) and
++            (self._meta.pk.default is not NOT_PROVIDED or generating_new_pk)
+         ):
+             force_insert = True
+         # If possible, try an UPDATE. If that doesn't update anything, do an INSERT.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..9a0956f364
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++import uuid
++from django.test import TestCase
++from django.core.management import execute_from_command_line
++
++class Item(models.Model):
++    # uid = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++    uid = models.AutoField(primary_key=True, editable=False)
++    f = models.BooleanField(default=False)
++    
++    def reset(self):
++        self.uid = None
++        self.f = False
++        
++    class Meta:
++        app_label = 'test'
++
++class Derived(Item):
++    class Meta:
++        app_label = 'test'
++
++class SaveTestCase(TestCase):
++    def setUp(self):
++        self.derived = Derived.objects.create(f=True) # create the first object
++        item = Item.objects.get(pk=self.derived.pk)
++        obj1 = item.derived
++        obj1.reset()
++        obj1.save() # the first object is overwritten
++        
++    def test_f_true(self):
++        obj = Item.objects.get(pk=self.derived.pk)
++        self.assertTrue(obj.f)
++
++if __name__ == '__main__':
++    # Create database tables using Django's test framework
++    from django.test.utils import setup_test_environment, setup_databases
++    
++    setup_test_environment()
++    old_config = setup_databases(verbosity=1, interactive=False)
++    
++    try:
++        test = SaveTestCase()
++        test.setUp()
++        test.test_f_true()
++        print("Test passed!")
++    finally:
++        from django.test.utils import teardown_databases
++        teardown_databases(old_config, verbosity=1)
+\ No newline at end of file
+diff --git a/test_app/models.py b/test_app/models.py
+new file mode 100644
+index 0000000000..12ac3b72dd
+--- /dev/null
++++ b/test_app/models.py
+@@ -0,0 +1,12 @@
++from django.db import models
++
++class Item(models.Model):
++    uid = models.AutoField(primary_key=True, editable=False)
++    f = models.BooleanField(default=False)
++    
++    def reset(self):
++        self.uid = None
++        self.f = False
++
++class Derived(Item):
++    pass
+\ No newline at end of file
+diff --git a/test_app/tests.py b/test_app/tests.py
+new file mode 100644
+index 0000000000..44035b34ed
+--- /dev/null
++++ b/test_app/tests.py
+@@ -0,0 +1,14 @@
++from django.test import TestCase
++from .models import Item, Derived
++
++class SaveTestCase(TestCase):
++    def setUp(self):
++        self.derived = Derived.objects.create(f=True) # create the first object
++        item = Item.objects.get(pk=self.derived.pk)
++        obj1 = item.derived
++        obj1.reset()
++        obj1.save() # the first object is overwritten
++        
++    def test_f_true(self):
++        obj = Item.objects.get(pk=self.derived.pk)
++        self.assertTrue(obj.f)
+\ No newline at end of file
+diff --git a/test_issue.py b/test_issue.py
+new file mode 100644
+index 0000000000..5f1129425d
+--- /dev/null
++++ b/test_issue.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': 'test.db',
++            }
++        },
++        INSTALLED_APPS=[
++            'test_app',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++import uuid
++
++class Item(models.Model):
++    uid = models.AutoField(primary_key=True, editable=False)
++    f = models.BooleanField(default=False)
++    
++    def reset(self):
++        self.uid = None
++        self.f = False
++        
++    class Meta:
++        app_label = 'test_app'
++
++class Derived(Item):
++    class Meta:
++        app_label = 'test_app'
++
++# Create the tables
++from django.core.management import execute_from_command_line
++execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++
++# Now test the issue
++print("Creating initial object...")
++derived = Derived.objects.create(f=True)
++print(f"Created object with pk: {derived.pk}, f: {derived.f}")
++
++print("Getting item and derived object...")
++item = Item.objects.get(pk=derived.pk)
++obj1 = item.derived
++print(f"Got derived object with pk: {obj1.pk}, f: {obj1.f}")
++
++print("Resetting object...")
++obj1.reset()
++print(f"After reset - pk: {obj1.pk}, f: {obj1.f}")
++
++print("Saving object...")
++obj1.save()
++
++print("Checking if object was overwritten...")
++obj = Item.objects.get(pk=derived.pk)
++print(f"Final object - pk: {obj.pk}, f: {obj.f}")
++
++if obj.f:
++    print("BUG: The object was overwritten instead of creating a new one!")
++else:
++    print("SUCCESS: The object was properly reset!")
+\ No newline at end of file
+diff --git a/test_settings.py b/test_settings.py
+new file mode 100644
+index 0000000000..2eaba270b4
+--- /dev/null
++++ b/test_settings.py
+@@ -0,0 +1,12 @@
++DEBUG = True
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': 'test.db',
++    }
++}
++INSTALLED_APPS = [
++    'test_app',
++]
++SECRET_KEY = 'test-secret-key'
++USE_TZ = True
+\ No newline at end of file

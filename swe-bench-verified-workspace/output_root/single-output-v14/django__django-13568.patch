@@ -1,0 +1,113 @@
+diff --git a/django/contrib/auth/checks.py b/django/contrib/auth/checks.py
+index 65fc266f7e..8a03378951 100644
+--- a/django/contrib/auth/checks.py
++++ b/django/contrib/auth/checks.py
+@@ -4,10 +4,23 @@ from types import MethodType
+ from django.apps import apps
+ from django.conf import settings
+ from django.core import checks
++from django.db.models import UniqueConstraint
+ 
+ from .management import _get_builtin_permissions
+ 
+ 
++def _is_field_in_unique_constraint(model, field_name):
++    """
++    Check if the given field is part of any unique constraint on the model.
++    """
++    for constraint in model._meta.constraints:
++        if (isinstance(constraint, UniqueConstraint) and 
++            constraint.condition is None and
++            field_name in constraint.fields):
++            return True
++    return False
++
++
+ def check_user_model(app_configs=None, **kwargs):
+     if app_configs is None:
+         cls = apps.get_model(settings.AUTH_USER_MODEL)
+@@ -52,7 +65,8 @@ def check_user_model(app_configs=None, **kwargs):
+         )
+ 
+     # Check that the username field is unique
+-    if not cls._meta.get_field(cls.USERNAME_FIELD).unique:
++    username_field = cls._meta.get_field(cls.USERNAME_FIELD)
++    if not (username_field.unique or _is_field_in_unique_constraint(cls, cls.USERNAME_FIELD)):
+         if (settings.AUTHENTICATION_BACKENDS ==
+                 ['django.contrib.auth.backends.ModelBackend']):
+             errors.append(
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..b0af1a098b
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings with a custom user model
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        AUTH_USER_MODEL='testapp.TestUser',
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.auth.models import AbstractBaseUser
++from django.contrib.auth.checks import check_user_model
++
++# Create a test app config to simulate our test model
++class TestAppConfig:
++    label = 'testapp'
++    
++    def get_model(self, model_name):
++        if model_name == 'TestUser':
++            # Create a test user model that reproduces the issue
++            class TestUser(AbstractBaseUser):
++                username = models.CharField(max_length=30)
++                USERNAME_FIELD = "username"
++                
++                class Meta:
++                    app_label = 'testapp'
++                    constraints = [
++                        models.UniqueConstraint(fields=["username"], name="user_username_unq")
++                    ]
++            
++            return TestUser
++        return None
++
++# Test the check_user_model function with our test app config
++print("Testing check_user_model function with test app config...")
++test_app_config = TestAppConfig()
++errors = check_user_model(app_configs=[test_app_config])
++
++# Check for auth.E003 errors
++e003_errors = [error for error in errors if error.id == 'auth.E003']
++
++if e003_errors:
++    print("❌ Issue reproduced: auth.E003 error found:")
++    for error in e003_errors:
++        print(f"   - {error.msg}")
++else:
++    print("✅ No auth.E003 errors found")
++
++print(f"\nTotal errors found: {len(errors)}")
+\ No newline at end of file

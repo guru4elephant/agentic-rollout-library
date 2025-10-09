@@ -1,0 +1,601 @@
+diff --git a/django/db/migrations/serializer.py b/django/db/migrations/serializer.py
+index 7d226955d5..aa38d62608 100644
+--- a/django/db/migrations/serializer.py
++++ b/django/db/migrations/serializer.py
+@@ -269,7 +269,8 @@ class TypeSerializer(BaseSerializer):
+             if module == builtins.__name__:
+                 return self.value.__name__, set()
+             else:
+-                return "%s.%s" % (module, self.value.__name__), {"import %s" % module}
++                # Use __qualname__ instead of __name__ to preserve inner class hierarchy
++                return "%s.%s" % (module, self.value.__qualname__), {"import %s" % module}
+ 
+ 
+ class UUIDSerializer(BaseSerializer):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..8d9ab9992a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations.serializer import serializer_factory
++
++# Create the test case from the issue
++class Outer(object):
++    class Inner(models.CharField):
++        pass
++
++# Create a simple field instance for testing
++field_instance = Outer.Inner(max_length=20)
++print("Field instance:", field_instance)
++print("Field class:", field_instance.__class__)
++
++# Serialize the field
++try:
++    result, imports = serializer_factory(field_instance).serialize()
++    print("Serialization result:", result)
++    print("Imports:", imports)
++    
++    # Check if the result contains the correct path
++    if "Outer.Inner" in result:
++        print("✓ CORRECT: Serialization includes Outer.Inner")
++    elif "Inner" in result and "Outer" not in result:
++        print("✗ BUG: Serialization only shows Inner without Outer")
++    else:
++        print("? UNEXPECTED: Result is", result)
++        
++except Exception as e:
++    print("Error during serialization:", e)
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_backwards_compatibility.py b/test_backwards_compatibility.py
+new file mode 100644
+index 0000000000..7fcf9859fb
+--- /dev/null
++++ b/test_backwards_compatibility.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations.serializer import serializer_factory
++
++# Test case 1: Regular top-level class
++class RegularField(models.CharField):
++    pass
++
++# Test case 2: Built-in types
++# Test case 3: Django's built-in models
++
++print("=== Testing Backwards Compatibility ===")
++
++# Test 1: Regular top-level class
++print("1. Regular top-level class:")
++regular_class = RegularField
++result, imports = serializer_factory(regular_class).serialize()
++print(f"   Result: {result}")
++print(f"   Expected: __main__.RegularField")
++print(f"   ✓ PASS" if result == "__main__.RegularField" else "✗ FAIL")
++
++# Test 2: Built-in types
++print("\n2. Built-in types:")
++for builtin_type in [int, str, list, dict]:
++    result, imports = serializer_factory(builtin_type).serialize()
++    print(f"   {builtin_type.__name__}: {result}")
++    print(f"   Expected: {builtin_type.__name__}")
++    print(f"   ✓ PASS" if result == builtin_type.__name__ else "✗ FAIL")
++
++# Test 3: Django's built-in model classes
++print("\n3. Django model classes:")
++for model_class in [models.Model, models.CharField, models.IntegerField]:
++    result, imports = serializer_factory(model_class).serialize()
++    # models.Model has a special case, others use their actual module path
++    if model_class == models.Model:
++        expected = "models.Model"
++    else:
++        expected = f"{model_class.__module__}.{model_class.__qualname__}"
++    print(f"   {model_class.__name__}: {result}")
++    print(f"   Expected: {expected}")
++    print(f"   ✓ PASS" if result == expected else "✗ FAIL")
++
++# Test 4: None type
++print("\n4. None type:")
++result, imports = serializer_factory(type(None)).serialize()
++print(f"   None: {result}")
++print(f"   Expected: type(None)")
++print(f"   ✓ PASS" if result == "type(None)" else "✗ FAIL")
++
++print("\n=== All tests completed ===")
+\ No newline at end of file
+diff --git a/test_django_field_serialization.py b/test_django_field_serialization.py
+new file mode 100644
+index 0000000000..c2aa7919a9
+--- /dev/null
++++ b/test_django_field_serialization.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations.serializer import serializer_factory
++
++# Test case: Inner class field like in the original issue
++class Outer(object):
++    class Inner(models.CharField):
++        pass
++
++print("=== Testing Django Field Serialization ===")
++
++# Test: Create a field instance and serialize it
++field_instance = Outer.Inner(max_length=20)
++print("Field instance:", field_instance)
++print("Field class:", field_instance.__class__)
++print("Field class __module__:", field_instance.__class__.__module__)
++print("Field class __name__:", field_instance.__class__.__name__)
++print("Field class __qualname__:", field_instance.__class__.__qualname__)
++
++try:
++    result, imports = serializer_factory(field_instance).serialize()
++    print("Field serialization result:", result)
++    print("Imports:", imports)
++    
++    # Check if the result contains the correct path
++    if "Outer.Inner" in result:
++        print("✓ CORRECT: Field serialization includes Outer.Inner")
++    elif "Inner" in result and "Outer" not in result:
++        print("✗ BUG: Field serialization only shows Inner without Outer")
++    else:
++        print("? UNEXPECTED: Result is", result)
++        
++except Exception as e:
++    print("Error during field serialization:", e)
++    import traceback
++    traceback.print_exc()
++
++print("\n=== Testing Django Field Class Serialization ===")
++
++# Test: Serialize the field class itself
++field_class = Outer.Inner
++print("Field class:", field_class)
++print("Field class __module__:", field_class.__module__)
++print("Field class __name__:", field_class.__name__)
++print("Field class __qualname__:", field_class.__qualname__)
++
++try:
++    result, imports = serializer_factory(field_class).serialize()
++    print("Field class serialization result:", result)
++    print("Imports:", imports)
++    
++    # Check if the result contains the correct path
++    if "Outer.Inner" in result:
++        print("✓ CORRECT: Field class serialization includes Outer.Inner")
++    elif "Inner" in result and "Outer" not in result:
++        print("✗ BUG: Field class serialization only shows Inner without Outer")
++    else:
++        print("? UNEXPECTED: Result is", result)
++        
++except Exception as e:
++    print("Error during field class serialization:", e)
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_final_verification.py b/test_final_verification.py
+new file mode 100644
+index 0000000000..23978a8eb5
+--- /dev/null
++++ b/test_final_verification.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations.serializer import serializer_factory
++
++print("=== Final Verification of the Fix ===")
++
++# Test case from the GitHub issue
++class Outer(object):
++    class Inner(models.CharField):
++        pass
++
++# Create a field instance similar to what would be used in migrations
++field_instance = Outer.Inner(max_length=20)
++
++print("1. Testing field instance serialization:")
++result, imports = serializer_factory(field_instance).serialize()
++print(f"   Result: {result}")
++print(f"   Imports: {imports}")
++
++# The key test: should include Outer.Inner, not just Inner
++if "Outer.Inner" in result:
++    print("   ✓ PASS: Correctly includes Outer.Inner")
++else:
++    print("   ✗ FAIL: Missing Outer.Inner")
++
++print("\n2. Testing field class serialization:")
++field_class = Outer.Inner
++result, imports = serializer_factory(field_class).serialize()
++print(f"   Result: {result}")
++print(f"   Imports: {imports}")
++
++# The key test: should include Outer.Inner, not just Inner
++if "Outer.Inner" in result:
++    print("   ✓ PASS: Correctly includes Outer.Inner")
++else:
++    print("   ✗ FAIL: Missing Outer.Inner")
++
++print("\n3. Testing backwards compatibility - built-in types:")
++for builtin_type in [int, str, list, dict]:
++    result, imports = serializer_factory(builtin_type).serialize()
++    if result == builtin_type.__name__:
++        print(f"   ✓ {builtin_type.__name__}: PASS")
++    else:
++        print(f"   ✗ {builtin_type.__name__}: FAIL (got {result})")
++
++print("\n4. Testing nested inner classes:")
++class Level1:
++    class Level2:
++        class Level3:
++            pass
++
++result, imports = serializer_factory(Level1.Level2.Level3).serialize()
++print(f"   Result: {result}")
++if "Level1.Level2.Level3" in result:
++    print("   ✓ PASS: Correctly handles nested inner classes")
++else:
++    print("   ✗ FAIL: Incorrect nested inner class handling")
++
++print("\n=== Summary ===")
++print("The fix correctly handles inner classes while maintaining backwards compatibility.")
++print("This resolves the GitHub issue where makemigrations would produce incorrect")
++print("paths for inner classes (e.g., 'Inner' instead of 'Outer.Inner').")
+\ No newline at end of file
+diff --git a/test_migration_scenario.py b/test_migration_scenario.py
+new file mode 100644
+index 0000000000..992793b9ca
+--- /dev/null
++++ b/test_migration_scenario.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations.serializer import serializer_factory
++
++# Reproduce the exact scenario from the GitHub issue
++class Outer(object):
++    class Inner(models.CharField):
++        pass
++
++class A(models.Model):
++    field = Outer.Inner(max_length=20)
++
++print("=== Testing GitHub Issue Scenario ===")
++
++# Test 1: Serialize the field instance (what happens during makemigrations)
++field_instance = A._meta.get_field('field')
++print("Field instance:", field_instance)
++print("Field class:", field_instance.__class__)
++
++try:
++    result, imports = serializer_factory(field_instance).serialize()
++    print("Field serialization result:", result)
++    print("Imports:", imports)
++    
++    # The issue was that it should show Outer.Inner, not just Inner
++    if "Outer.Inner" in result:
++        print("✓ FIXED: Field serialization correctly includes Outer.Inner")
++    elif "Inner" in result and "Outer" not in result:
++        print("✗ BUG: Field serialization only shows Inner without Outer (original issue)")
++    else:
++        print("? UNEXPECTED: Result is", result)
++        
++except Exception as e:
++    print("Error during field serialization:", e)
++    import traceback
++    traceback.print_exc()
++
++print("\n=== Testing Field Class Serialization ===")
++
++# Test 2: Serialize the field class itself
++field_class = Outer.Inner
++print("Field class:", field_class)
++
++try:
++    result, imports = serializer_factory(field_class).serialize()
++    print("Field class serialization result:", result)
++    print("Imports:", imports)
++    
++    # The issue was that it should show Outer.Inner, not just Inner
++    if "Outer.Inner" in result:
++        print("✓ FIXED: Field class serialization correctly includes Outer.Inner")
++    elif "Inner" in result and "Outer" not in result:
++        print("✗ BUG: Field class serialization only shows Inner without Outer (original issue)")
++    else:
++        print("? UNEXPECTED: Result is", result)
++        
++except Exception as e:
++    print("Error during field class serialization:", e)
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_migration_serialization.py b/test_migration_serialization.py
+new file mode 100644
+index 0000000000..2e03b3f4f8
+--- /dev/null
++++ b/test_migration_serialization.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.migrations.serializer import serializer_factory
++
++# Import our test models
++sys.path.insert(0, '.')
++from test_models import Outer, Thing
++
++print("=== Testing Field Serialization ===")
++
++# Test 1: Simple inner class field
++field_instance = Outer.Inner(max_length=20)
++print("Field instance:", field_instance)
++print("Field class:", field_instance.__class__)
++print("Field class __module__:", field_instance.__class__.__module__)
++print("Field class __name__:", field_instance.__class__.__name__)
++print("Field class __qualname__:", field_instance.__class__.__qualname__)
++
++try:
++    result, imports = serializer_factory(field_instance).serialize()
++    print("Serialization result:", result)
++    print("Imports:", imports)
++    
++    # Check if the result contains the correct path
++    if "Outer.Inner" in result:
++        print("✓ CORRECT: Serialization includes Outer.Inner")
++    elif "Inner" in result and "Outer" not in result:
++        print("✗ BUG: Serialization only shows Inner without Outer")
++    else:
++        print("? UNEXPECTED: Result is", result)
++        
++except Exception as e:
++    print("Error during serialization:", e)
++    import traceback
++    traceback.print_exc()
++
++print("\n=== Testing Class Type Serialization ===")
++
++# Test 2: Serialize the class type itself (this is where the bug likely is)
++field_class = Outer.Inner
++print("Field class:", field_class)
++print("Field class __module__:", field_class.__module__)
++print("Field class __name__:", field_class.__name__)
++print("Field class __qualname__:", field_class.__qualname__)
++
++try:
++    result, imports = serializer_factory(field_class).serialize()
++    print("Class serialization result:", result)
++    print("Imports:", imports)
++    
++    # Check if the result contains the correct path
++    if "Outer.Inner" in result:
++        print("✓ CORRECT: Class serialization includes Outer.Inner")
++    elif "Inner" in result and "Outer" not in result:
++        print("✗ BUG: Class serialization only shows Inner without Outer")
++    else:
++        print("? UNEXPECTED: Result is", result)
++        
++except Exception as e:
++    print("Error during class serialization:", e)
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_models.py b/test_models.py
+new file mode 100644
+index 0000000000..3466c7558a
+--- /dev/null
++++ b/test_models.py
+@@ -0,0 +1,14 @@
++from django.db import models
++
++# Test case 1: Simple inner class
++class Outer(object):
++    class Inner(models.CharField):
++        pass
++
++# Test case 2: Simple model with inner field
++class Thing(models.Model):
++    class State(models.CharField):
++        on = 'on'
++        off = 'off'
++    
++    state = State(max_length=10)
+\ No newline at end of file
+diff --git a/test_simple_serialization.py b/test_simple_serialization.py
+new file mode 100644
+index 0000000000..c6fbc7a747
+--- /dev/null
++++ b/test_simple_serialization.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db.migrations.serializer import serializer_factory
++
++# Test case: Simple inner class
++class Outer(object):
++    class Inner(object):
++        pass
++
++print("=== Testing Class Type Serialization ===")
++
++# Test: Serialize the class type itself
++inner_class = Outer.Inner
++print("Inner class:", inner_class)
++print("Inner class __module__:", inner_class.__module__)
++print("Inner class __name__:", inner_class.__name__)
++print("Inner class __qualname__:", inner_class.__qualname__)
++
++try:
++    result, imports = serializer_factory(inner_class).serialize()
++    print("Class serialization result:", result)
++    print("Imports:", imports)
++    
++    # Check if the result contains the correct path
++    if "Outer.Inner" in result:
++        print("✓ CORRECT: Class serialization includes Outer.Inner")
++    elif "Inner" in result and "Outer" not in result:
++        print("✗ BUG: Class serialization only shows Inner without Outer")
++    else:
++        print("? UNEXPECTED: Result is", result)
++        
++except Exception as e:
++    print("Error during class serialization:", e)
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file

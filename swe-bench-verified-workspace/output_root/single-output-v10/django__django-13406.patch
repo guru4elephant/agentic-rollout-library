@@ -1,0 +1,356 @@
+diff --git a/debug_queries.py b/debug_queries.py
+new file mode 100644
+index 0000000000..77125db923
+--- /dev/null
++++ b/debug_queries.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python
++import django
++from django.conf import settings
++
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes'],
++    USE_TZ=True,
++)
++django.setup()
++
++from django.db import models
++import pickle
++from django.db.models import Sum
++
++# Define the model
++class Toy(models.Model):
++    name = models.CharField(max_length=16)
++    material = models.CharField(max_length=16)
++    price = models.PositiveIntegerField()
++
++    class Meta:
++        app_label = 'contenttypes'
++
++# Create table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Toy)
++
++# Create test data
++Toy.objects.create(name='foo', price=10, material='wood')
++Toy.objects.create(name='bar', price=20, material='plastic')
++Toy.objects.create(name='baz', price=100, material='wood')
++
++# Test different query types
++values_query = Toy.objects.values('material', 'price').query
++values_list_query = Toy.objects.values_list('material', 'price').query
++values_list_flat_query = Toy.objects.values_list('price', flat=True).query
++values_list_named_query = Toy.objects.values_list('material', 'price', named=True).query
++
++print("Values query attributes:")
++print("  values_select:", values_query.values_select)
++print("  extra_select:", values_query.extra_select)
++print("  annotation_select:", values_query.annotation_select)
++print()
++
++print("Values list query attributes:")
++print("  values_select:", values_list_query.values_select)
++print("  extra_select:", values_list_query.extra_select)
++print("  annotation_select:", values_list_query.annotation_select)
++print()
++
++print("Values list flat query attributes:")
++print("  values_select:", values_list_flat_query.values_select)
++print("  extra_select:", values_list_flat_query.extra_select)
++print("  annotation_select:", values_list_flat_query.annotation_select)
++print()
++
++print("Values list named query attributes:")
++print("  values_select:", values_list_named_query.values_select)
++print("  extra_select:", values_list_named_query.extra_select)
++print("  annotation_select:", values_list_named_query.annotation_select)
+\ No newline at end of file
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index b48d0df9c0..68a26bea69 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -211,6 +211,9 @@ class QuerySet:
+     @query.setter
+     def query(self, value):
+         self._query = value
++        # If the query has values_select set, use ValuesIterable
++        if hasattr(value, 'values_select') and value.values_select:
++            self._iterable_class = ValuesIterable
+ 
+     def as_manager(cls):
+         # Address the circular dependency between `Queryset` and `Manager`.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..62bf99daa6
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python
++import os
++import sys
++sys.path.insert(0, '/testbed')
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++import pickle
++from django.db.models import Sum
++
++# Define the model
++class Toy(models.Model):
++    name = models.CharField(max_length=16)
++    material = models.CharField(max_length=16)
++    price = models.PositiveIntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++# Create database tables
++from django.core.management import execute_from_command_line
++execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++
++# Create test data
++Toy.objects.create(name='foo', price=10, material='wood')
++Toy.objects.create(name='bar', price=20, material='plastic')
++Toy.objects.create(name='baz', price=100, material='wood')
++
++# Test the issue
++prices = Toy.objects.values('material').annotate(total_price=Sum('price'))
++print("Original prices:")
++print(prices)
++print("Type of prices[0]:", type(prices[0]))
++
++# Pickle and unpickle the query
++prices2 = Toy.objects.all()
++prices2.query = pickle.loads(pickle.dumps(prices.query))
++
++print("After unpickling:")
++print("Type of prices2[0]:", type(prices2[0]))
++print("prices2 result:")
++try:
++    print(prices2)
++except Exception as e:
++    print("Error:", e)
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..740af36b9b
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python
++import django
++from django.conf import settings
++
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes'],
++    USE_TZ=True,
++)
++django.setup()
++
++from django.db import models
++import pickle
++from django.db.models import Sum
++
++# Define the model
++class Toy(models.Model):
++    name = models.CharField(max_length=16)
++    material = models.CharField(max_length=16)
++    price = models.PositiveIntegerField()
++
++    class Meta:
++        app_label = 'contenttypes'
++
++# Create table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Toy)
++
++# Create test data
++Toy.objects.create(name='foo', price=10, material='wood')
++Toy.objects.create(name='bar', price=20, material='plastic')
++Toy.objects.create(name='baz', price=100, material='wood')
++
++# Test the issue
++prices = Toy.objects.values('material').annotate(total_price=Sum('price'))
++print('Original prices:', list(prices))
++print('Type of prices[0]:', type(prices[0]))
++
++# Pickle and unpickle the query
++prices2 = Toy.objects.all()
++prices2.query = pickle.loads(pickle.dumps(prices.query))
++
++print('After unpickling:')
++print('Type of prices2[0]:', type(prices2[0]))
++try:
++    result = list(prices2)
++    print('prices2 result:', result)
++except Exception as e:
++    print('Error:', e)
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..56e7318d33
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python
++import django
++from django.conf import settings
++
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes'],
++    USE_TZ=True,
++)
++django.setup()
++
++from django.db import models
++import pickle
++from django.db.models import Sum
++
++# Define the model
++class Toy(models.Model):
++    name = models.CharField(max_length=16)
++    material = models.CharField(max_length=16)
++    price = models.PositiveIntegerField()
++
++    class Meta:
++        app_label = 'contenttypes'
++
++# Create table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Toy)
++
++# Create test data
++Toy.objects.create(name='foo', price=10, material='wood')
++Toy.objects.create(name='bar', price=20, material='plastic')
++Toy.objects.create(name='baz', price=100, material='wood')
++
++# Test 1: Normal queryset (should still work)
++print("Test 1: Normal queryset")
++normal_qs = Toy.objects.all()
++normal_qs2 = Toy.objects.all()
++normal_qs2.query = pickle.loads(pickle.dumps(normal_qs.query))
++print("Type:", type(normal_qs2[0]))
++print("Result:", list(normal_qs2))
++print()
++
++# Test 2: Values query (should work with our fix)
++print("Test 2: Values query")
++values_qs = Toy.objects.values('material', 'price')
++values_qs2 = Toy.objects.all()
++values_qs2.query = pickle.loads(pickle.dumps(values_qs.query))
++print("Type:", type(values_qs2[0]))
++print("Result:", list(values_qs2))
++print()
++
++# Test 3: Values list query (should return dictionaries instead of crashing)
++print("Test 3: Values list query")
++values_list_qs = Toy.objects.values_list('material', 'price')
++values_list_qs2 = Toy.objects.all()
++values_list_qs2.query = pickle.loads(pickle.dumps(values_list_qs.query))
++print("Type:", type(values_list_qs2[0]))
++print("Result:", list(values_list_qs2))
++print()
++
++# Test 4: Empty values select (should not affect normal queries)
++print("Test 4: Query with empty values_select")
++empty_values_qs = Toy.objects.all()
++empty_values_qs.query.values_select = ()  # Manually set empty values_select
++empty_values_qs2 = Toy.objects.all()
++empty_values_qs2.query = pickle.loads(pickle.dumps(empty_values_qs.query))
++print("Type:", type(empty_values_qs2[0]))
++print("Result:", list(empty_values_qs2))
+\ No newline at end of file
+diff --git a/test_values_list.py b/test_values_list.py
+new file mode 100644
+index 0000000000..3eeb57357e
+--- /dev/null
++++ b/test_values_list.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python
++import django
++from django.conf import settings
++
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes'],
++    USE_TZ=True,
++)
++django.setup()
++
++from django.db import models
++import pickle
++from django.db.models import Sum
++
++# Define the model
++class Toy(models.Model):
++    name = models.CharField(max_length=16)
++    material = models.CharField(max_length=16)
++    price = models.PositiveIntegerField()
++
++    class Meta:
++        app_label = 'contenttypes'
++
++# Create table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Toy)
++
++# Create test data
++Toy.objects.create(name='foo', price=10, material='wood')
++Toy.objects.create(name='bar', price=20, material='plastic')
++Toy.objects.create(name='baz', price=100, material='wood')
++
++# Test values_list
++prices = Toy.objects.values_list('material', 'price')
++print('Original prices:', list(prices))
++print('Type of prices[0]:', type(prices[0]))
++
++# Pickle and unpickle the query
++prices2 = Toy.objects.all()
++prices2.query = pickle.loads(pickle.dumps(prices.query))
++
++print('After unpickling:')
++print('Type of prices2[0]:', type(prices2[0]))
++try:
++    result = list(prices2)
++    print('prices2 result:', result)
++except Exception as e:
++    print('Error:', e)
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file

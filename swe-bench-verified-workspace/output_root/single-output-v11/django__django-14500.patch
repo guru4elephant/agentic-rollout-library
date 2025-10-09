@@ -1,0 +1,1060 @@
+diff --git a/debug_replacements.py b/debug_replacements.py
+new file mode 100644
+index 0000000000..8c0d7c47a9
+--- /dev/null
++++ b/debug_replacements.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++"""
++Debug script to understand how replacements work.
++"""
++
++import os
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.migrations.executor import MigrationExecutor
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'migrations',
++        ],
++        MIGRATION_MODULES={
++            'migrations': 'tests.migrations.test_migrations_squashed'
++        },
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def debug_replacements():
++    """Debug the replacements functionality"""
++    
++    # Initialize Django
++    django.setup()
++    
++    # Create executor
++    executor = MigrationExecutor(connection)
++    
++    print("=== Debugging Replacements ===")
++    print("Loader replacements:", executor.loader.replacements)
++    print("Applied migrations:", executor.recorder.applied_migrations().keys())
++    
++    # Check if our test case would work with actual migrations
++    print("\n=== Testing with actual migrations ===")
++    
++    # Apply the squashed migration
++    executor.migrate([('migrations', '0001_squashed_0002')])
++    applied_after_apply = executor.recorder.applied_migrations().keys()
++    print("Applied migrations after applying squashed:", applied_after_apply)
++    
++    # Now unapply
++    executor.migrate([('migrations', None)])
++    applied_after_unapply = executor.recorder.applied_migrations().keys()
++    print("Applied migrations after unapplying:", applied_after_unapply)
++    
++    # Check if squashed migration is still applied
++    squashed_still_applied = ('migrations', '0001_squashed_0002') in applied_after_unapply
++    print(f"Squashed migration still applied: {squashed_still_applied}")
++    
++    if squashed_still_applied:
++        print("❌ BUG: Squashed migration is still marked as applied!")
++        return False
++    else:
++        print("✅ OK: Squashed migration correctly marked as unapplied")
++        return True
++
++if __name__ == '__main__':
++    result = debug_replacements()
++    print(f"\nTest result: {'PASS' if result else 'FAIL'}")
+\ No newline at end of file
+diff --git a/reproduce_exact_issue.py b/reproduce_exact_issue.py
+new file mode 100644
+index 0000000000..d2f4154b80
+--- /dev/null
++++ b/reproduce_exact_issue.py
+@@ -0,0 +1,104 @@
++#!/usr/bin/env python3
++"""
++Reproduce the exact issue described in the GitHub issue.
++"""
++
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.migrations.executor import MigrationExecutor
++from django.db.migrations.recorder import MigrationRecorder
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def reproduce_exact_issue():
++    """Reproduce the exact issue described"""
++    
++    # Initialize Django
++    django.setup()
++    
++    # Create executor and recorder
++    executor = MigrationExecutor(connection)
++    recorder = MigrationRecorder(connection)
++    
++    # Ensure schema exists
++    recorder.ensure_schema()
++    
++    print("=== Reproducing Exact GitHub Issue ===")
++    print("Issue: When unapplying a squashed migration and the replaced migration")
++    print("files are still around, the MigrationExecutor marks the squash migration")
++    print("as unapplied too, not only the replaced migrations.")
++    
++    # Create a mock replacement scenario
++    class MockMigration:
++        def __init__(self, replaces):
++            self.replaces = replaces
++            self.app_label = "test_app"
++            self.name = "0001_squashed_0002"
++    
++    # Add mock data to simulate the scenario
++    mock_replaces = [('test_app', '0001_initial'), ('test_app', '0002_second')]
++    mock_migration = MockMigration(mock_replaces)
++    
++    # Record all migrations as applied initially
++    recorder.record_applied("test_app", "0001_initial")
++    recorder.record_applied("test_app", "0002_second")
++    recorder.record_applied("test_app", "0001_squashed_0002")
++    
++    applied_before = recorder.applied_migrations().keys()
++    print("\nApplied migrations initially:", applied_before)
++    
++    # Now simulate unapplying the squashed migration
++    # This should only unapply the replaced migrations, not the squashed one
++    print("\n=== Simulating unapply_migration call on squashed migration ===")
++    
++    # Call unapply_migration directly on the squashed migration
++    # This should only unapply the replaced migrations
++    from django.db.migrations.state import ProjectState
++    state = ProjectState()
++    
++    executor.unapply_migration(state, mock_migration, fake=True)
++    
++    applied_after_unapply = recorder.applied_migrations().keys()
++    print("Applied migrations after unapply_migration:", applied_after_unapply)
++    
++    # Check if the squashed migration is still applied
++    squashed_still_applied = ("test_app", "0001_squashed_0002") in applied_after_unapply
++    replaced1_unapplied = ("test_app", "0001_initial") not in applied_after_unapply
++    replaced2_unapplied = ("test_app", "0002_second") not in applied_after_unapply
++    
++    print(f"Squashed migration still applied: {squashed_still_applied}")
++    print(f"Replaced migration 0001 unapplied: {replaced1_unapplied}")
++    print(f"Replaced migration 0002 unapplied: {replaced2_unapplied}")
++    
++    # The correct behavior should be:
++    # - Squashed migration should REMAIN applied
++    # - Replaced migrations should be unapplied
++    correct_behavior = squashed_still_applied and replaced1_unapplied and replaced2_unapplied
++    
++    if correct_behavior:
++        print("✅ CORRECT: Only replaced migrations were unapplied")
++        return True
++    else:
++        print("❌ INCORRECT: Squashed migration was also unapplied or replaced migrations were not unapplied")
++        return False
++
++if __name__ == '__main__':
++    result = reproduce_exact_issue()
++    print(f"\nTest result: {'PASS' if result else 'FAIL'}")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..4e8b194bf2
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,175 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where squashed migration is not marked as unapplied correctly.
++"""
++
++import os
++import sys
++import tempfile
++import shutil
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.migrations.executor import MigrationExecutor
++from django.db.migrations.loader import MigrationLoader
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def create_test_migrations():
++    """Create test migration files to reproduce the issue"""
++    
++    # Create a temporary app directory structure
++    temp_dir = tempfile.mkdtemp()
++    app_dir = os.path.join(temp_dir, 'test_app')
++    migrations_dir = os.path.join(app_dir, 'migrations')
++    os.makedirs(migrations_dir)
++    
++    # Create __init__.py files
++    with open(os.path.join(app_dir, '__init__.py'), 'w') as f:
++        f.write('')
++    with open(os.path.join(migrations_dir, '__init__.py'), 'w') as f:
++        f.write('')
++    
++    # Create initial migration
++    with open(os.path.join(migrations_dir, '0001_initial.py'), 'w') as f:
++        f.write('''
++from django.db import migrations, models
++
++class Migration(migrations.Migration):
++    initial = True
++
++    dependencies = [
++    ]
++
++    operations = [
++        migrations.CreateModel(
++            name='TestModel',
++            fields=[
++                ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
++                ('name', models.CharField(max_length=100)),
++            ],
++        ),
++    ]
++''')
++    
++    # Create second migration
++    with open(os.path.join(migrations_dir, '0002_add_field.py'), 'w') as f:
++        f.write('''
++from django.db import migrations, models
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ('test_app', '0001_initial'),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name='testmodel',
++            name='description',
++            field=models.TextField(blank=True),
++        ),
++    ]
++''')
++    
++    # Create squashed migration that replaces both
++    with open(os.path.join(migrations_dir, '0001_squashed_0002.py'), 'w') as f:
++        f.write('''
++from django.db import migrations, models
++
++class Migration(migrations.Migration):
++    replaces = [
++        ('test_app', '0001_initial'),
++        ('test_app', '0002_add_field'),
++    ]
++
++    initial = True
++
++    dependencies = [
++    ]
++
++    operations = [
++        migrations.CreateModel(
++            name='TestModel',
++            fields=[
++                ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
++                ('name', models.CharField(max_length=100)),
++                ('description', models.TextField(blank=True)),
++            ],
++        ),
++    ]
++''')
++    
++    return temp_dir, app_dir
++
++def test_squashed_migration_unapply():
++    """Test the issue with squashed migration unapplying"""
++    
++    # Initialize Django
++    django.setup()
++    
++    # Create test migrations
++    temp_dir, app_dir = create_test_migrations()
++    
++    try:
++        # Add the test app to INSTALLED_APPS
++        settings.INSTALLED_APPS.append('test_app')
++        
++        # Add the temp directory to sys.path
++        sys.path.insert(0, temp_dir)
++        
++        # Create executor and loader
++        executor = MigrationExecutor(connection)
++        loader = MigrationLoader(connection)
++        
++        print("Initial applied migrations:", executor.recorder.applied_migrations().keys())
++        
++        # Apply the squashed migration
++        print("\n=== Applying squashed migration ===")
++        executor.migrate([('test_app', '0001_squashed_0002')])
++        print("Applied migrations after applying squashed:", executor.recorder.applied_migrations().keys())
++        
++        # Check replacements
++        print("\n=== Checking replacements ===")
++        executor.check_replacements()
++        print("Applied migrations after check_replacements:", executor.recorder.applied_migrations().keys())
++        
++        # Now unapply the squashed migration
++        print("\n=== Unapplying squashed migration ===")
++        executor.migrate([('test_app', None)])  # Unapply all migrations for test_app
++        print("Applied migrations after unapplying:", executor.recorder.applied_migrations().keys())
++        
++        # The issue: The squashed migration should NOT be in applied_migrations
++        # but it might be due to the bug
++        
++        applied_migrations = executor.recorder.applied_migrations()
++        if ('test_app', '0001_squashed_0002') in applied_migrations:
++            print("❌ BUG: Squashed migration is still marked as applied!")
++            return False
++        else:
++            print("✅ OK: Squashed migration correctly marked as unapplied")
++            return True
++            
++    finally:
++        # Cleanup
++        sys.path.remove(temp_dir)
++        settings.INSTALLED_APPS.remove('test_app')
++        shutil.rmtree(temp_dir)
++
++if __name__ == '__main__':
++    test_squashed_migration_unapply()
+\ No newline at end of file
+diff --git a/reproduce_issue_simple.py b/reproduce_issue_simple.py
+new file mode 100644
+index 0000000000..df103eebda
+--- /dev/null
++++ b/reproduce_issue_simple.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++"""
++Simple script to reproduce the squashed migration issue using existing test structure.
++"""
++
++import os
++import django
++from django.conf import settings
++from django.test.utils import get_runner
++from django.db import connection
++from django.db.migrations.executor import MigrationExecutor
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        MIGRATION_MODULES={
++            'migrations': 'tests.migrations.test_migrations_squashed'
++        },
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_squashed_migration_issue():
++    """Test the issue with squashed migration unapplying"""
++    
++    # Initialize Django
++    django.setup()
++    
++    # Create executor
++    executor = MigrationExecutor(connection)
++    
++    print("Initial applied migrations:", executor.recorder.applied_migrations().keys())
++    
++    # Apply the squashed migration
++    print("\n=== Applying squashed migration ===")
++    executor.migrate([('migrations', '0001_squashed_0002')])
++    applied_after_apply = executor.recorder.applied_migrations().keys()
++    print("Applied migrations after applying squashed:", applied_after_apply)
++    
++    # Check if squashed migration is applied
++    squashed_applied = ('migrations', '0001_squashed_0002') in applied_after_apply
++    print(f"Squashed migration applied: {squashed_applied}")
++    
++    # Now unapply the squashed migration
++    print("\n=== Unapplying squashed migration ===")
++    executor.migrate([('migrations', None)])  # Unapply all migrations for migrations app
++    applied_after_unapply = executor.recorder.applied_migrations().keys()
++    print("Applied migrations after unapplying:", applied_after_unapply)
++    
++    # Check if squashed migration is still applied (this is the bug)
++    squashed_still_applied = ('migrations', '0001_squashed_0002') in applied_after_unapply
++    print(f"Squashed migration still applied after unapply: {squashed_still_applied}")
++    
++    if squashed_still_applied:
++        print("❌ BUG: Squashed migration is still marked as applied after unapplying!")
++        return False
++    else:
++        print("✅ OK: Squashed migration correctly marked as unapplied")
++        return True
++
++if __name__ == '__main__':
++    result = test_squashed_migration_issue()
++    print(f"\nTest result: {'PASS' if result else 'FAIL'}")
+\ No newline at end of file
+diff --git a/test_check_replacements.py b/test_check_replacements.py
+new file mode 100644
+index 0000000000..f8ffab5d65
+--- /dev/null
++++ b/test_check_replacements.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++"""
++Test the check_replacements method directly.
++"""
++
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.migrations.executor import MigrationExecutor
++from django.db.migrations.recorder import MigrationRecorder
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_check_replacements():
++    """Test the check_replacements method"""
++    
++    # Initialize Django
++    django.setup()
++    
++    # Create executor and recorder
++    executor = MigrationExecutor(connection)
++    recorder = MigrationRecorder(connection)
++    
++    # Ensure schema exists
++    recorder.ensure_schema()
++    
++    print("=== Testing check_replacements ===")
++    
++    # Create a mock replacement entry in the loader
++    # We need to simulate what happens when there are replacements
++    class MockMigration:
++        def __init__(self, replaces):
++            self.replaces = replaces
++    
++    # Add a mock replacement to the loader
++    mock_replaces = [('test_app', '0001_initial'), ('test_app', '0002_second')]
++    mock_migration = MockMigration(mock_replaces)
++    executor.loader.replacements[('test_app', '0001_squashed_0002')] = mock_migration
++    
++    print("Loader replacements:", executor.loader.replacements)
++    
++    # Record the replaced migrations as applied
++    recorder.record_applied("test_app", "0001_initial")
++    recorder.record_applied("test_app", "0002_second")
++    
++    # Also record the squashed migration as applied
++    recorder.record_applied("test_app", "0001_squashed_0002")
++    
++    applied_before = recorder.applied_migrations().keys()
++    print("Applied migrations before:", applied_before)
++    
++    # Now unapply one of the replaced migrations
++    recorder.record_unapplied("test_app", "0001_initial")
++    
++    applied_after_unapply = recorder.applied_migrations().keys()
++    print("Applied migrations after unapplying one:", applied_after_unapply)
++    
++    # Call check_replacements - this should mark the squashed migration as unapplied
++    print("\n=== Calling check_replacements ===")
++    executor.check_replacements()
++    
++    applied_after_check = recorder.applied_migrations().keys()
++    print("Applied migrations after check_replacements:", applied_after_check)
++    
++    # Check if the squashed migration is still applied
++    squashed_still_applied = ("test_app1", "0001_squashed_0002") in applied_after_check
++    print(f"Squashed migration still applied: {squashed_still_applied}")
++    
++    if squashed_still_applied:
++        print("❌ BUG: Squashed migration should be marked as unapplied!")
++        return False
++    else:
++        print("✅ OK: Squashed migration correctly marked as unapplied")
++        return True
++
++if __name__ == '__main__':
++    result = test_check_replacements()
++    print(f"\nTest result: {'PASS' if result else 'FAIL'}")
+\ No newline at end of file
+diff --git a/test_check_replacements_reverse.py b/test_check_replacements_reverse.py
+new file mode 100644
+index 0000000000..8e6bb6b630
+--- /dev/null
++++ b/test_check_replacements_reverse.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++"""
++Test the check_replacements method for the reverse case (marking as applied).
++"""
++
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.migrations.executor import MigrationExecutor
++from django.db.migrations.recorder import MigrationRecorder
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_check_replacements_reverse():
++    """Test the check_replacements method for marking as applied"""
++    
++    # Initialize Django
++    django.setup()
++    
++    # Create executor and recorder
++    executor = MigrationExecutor(connection)
++    recorder = MigrationRecorder(connection)
++    
++    # Ensure schema exists
++    recorder.ensure_schema()
++    
++    print("=== Testing check_replacements (reverse case) ===")
++    
++    # Create a mock replacement entry in the loader
++    class MockMigration:
++        def __init__(self, replaces):
++            self.replaces = replaces
++    
++    # Add a mock replacement to the loader
++    mock_replaces = [('test_app', '0001_initial'), ('test_app', '0002_second')]
++    mock_migration = MockMigration(mock_replaces)
++    executor.loader.replacements[('test_app', '0001_squashed_0002')] = mock_migration
++    
++    print("Loader replacements:", executor.loader.replacements)
++    
++    # Record the replaced migrations as applied (but NOT the squashed migration)
++    recorder.record_applied("test_app", "0001_initial")
++    recorder.record_applied("test_app", "0002_second")
++    
++    applied_before = recorder.applied_migrations().keys()
++    print("Applied migrations before:", applied_before)
++    
++    # Call check_replacements - this should mark the squashed migration as applied
++    print("\n=== Calling check_replacements ===")
++    executor.check_replacements()
++    
++    applied_after_check = recorder.applied_migrations().keys()
++    print("Applied migrations after check_replacements:", applied_after_check)
++    
++    # Check if the squashed migration is now applied
++    squashed_applied = ("test_app", "0001_squashed_0002") in applied_after_check
++    print(f"Squashed migration applied: {squashed_applied}")
++    
++    if squashed_applied:
++        print("✅ OK: Squashed migration correctly marked as applied")
++        return True
++    else:
++        print("❌ BUG: Squashed migration should be marked as applied!")
++        return False
++
++if __name__ == '__main__':
++    result = test_check_replacements_reverse()
++    print(f"\nTest result: {'PASS' if result else 'FAIL'}")
+\ No newline at end of file
+diff --git a/test_comprehensive_scenario.py b/test_comprehensive_scenario.py
+new file mode 100644
+index 0000000000..fe09202032
+--- /dev/null
++++ b/test_comprehensive_scenario.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++"""
++Test the comprehensive scenario with both squashed migration and replaced files.
++"""
++
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.migrations.executor import MigrationExecutor
++from django.db.migrations.recorder import MigrationRecorder
++from django.db.migrations.graph import MigrationGraph
++from django.db.migrations.loader import MigrationLoader
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_comprehensive_scenario():
++    """Test the comprehensive scenario with both squashed and replaced migrations"""
++    
++    # Initialize Django
++    django.setup()
++    
++    # Create executor and recorder
++    executor = MigrationExecutor(connection)
++    recorder = MigrationRecorder(connection)
++    
++    # Ensure schema exists
++    recorder.ensure_schema()
++    
++    print("=== Testing Comprehensive Scenario ===")
++    print("Simulating scenario where both squashed migration and replaced files exist")
++    
++    # Create a mock migration graph that includes both squashed and replaced migrations
++    # This simulates the case where replaced migration files are still around
++    
++    class MockMigration:
++        def __init__(self, app_label, name, replaces=None):
++            self.app_label = app_label
++            self.name = name
++            self.replaces = replaces or []
++    
++    # Create mock migrations
++    migration_0001 = MockMigration("test_app", "0001_initial")
++    migration_0002 = MockMigration("test_app", "0002_second")
++    migration_squashed = MockMigration("test_app", "0001_squashed_0002", 
++                                     [("test_app", "0001_initial"), ("test_app", "0002_second")])
++    
++    # Add to loader's replacements
++    executor.loader.replacements[("test_app", "0001_squashed_0002")] = migration_squashed
++    
++    # Also add to graph nodes (simulating replaced files still being around)
++    executor.loader.graph.add_node(("test_app", "0001_initial"), migration_0001)
++    executor.loader.graph.add_node(("test_app", "0002_second"), migration_0002)
++    executor.loader.graph.add_node(("test_app", "0001_squashed_0002"), migration_squashed)
++    
++    # Add dependencies
++    executor.loader.graph.add_dependency(
++        ("test_app", "0002_second"), ("test_app", "0001_initial"), migration_0002
++    )
++    
++    # Record all migrations as applied
++    recorder.record_applied("test_app", "0001_initial")
++    recorder.record_applied("test_app", "0002_second")
++    recorder.record_applied("test_app", "0001_squashed_0002")
++    
++    applied_before = recorder.applied_migrations().keys()
++    print("\nApplied migrations initially:", applied_before)
++    
++    # Now generate a migration plan to unapply everything
++    print("\n=== Generating migration plan to unapply ===")
++    plan = executor.migration_plan([("test_app", None)])
++    print("Migration plan:", [(migration.app_label, migration.name, backwards) for migration, backwards in plan])
++    
++    # Execute the plan
++    print("\n=== Executing migration plan ===")
++    for migration, backwards in plan:
++        if backwards:
++            print(f"Unapplying: {migration.app_label}.{migration.name}")
++            from django.db.migrations.state import ProjectState
++            state = ProjectState()
++            executor.unapply_migration(state, migration, fake=True)
++    
++    applied_after = recorder.applied_migrations().keys()
++    print("Applied migrations after unapply:", applied_after)
++    
++    # Check if the squashed migration is still applied
++    squashed_still_applied = ("test_app", "0001_squashed_0002") in applied_after
++    print(f"Squashed migration still applied: {squashed_still_applied}")
++    
++    if squashed_still_applied:
++        print("✅ CORRECT: Squashed migration was not unapplied")
++        return True
++    else:
++        print("❌ INCORRECT: Squashed migration was incorrectly unapplied")
++        return False
++
++if __name__ == '__main__':
++    result = test_comprehensive_scenario()
++    print(f"\nTest result: {'PASS' if result else 'FAIL'}")
+\ No newline at end of file
+diff --git a/test_dual_existence.py b/test_dual_existence.py
+new file mode 100644
+index 0000000000..d8e82abbf4
+--- /dev/null
++++ b/test_dual_existence.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++"""
++Test the scenario where both squashed migration and individual migration files exist.
++"""
++
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.migrations.executor import MigrationExecutor
++from django.db.migrations.recorder import MigrationRecorder
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_dual_existence_scenario():
++    """Test the scenario where both squashed and individual migrations exist"""
++    
++    # Initialize Django
++    django.setup()
++    
++    # Create executor and recorder
++    executor = MigrationExecutor(connection)
++    recorder = MigrationRecorder(connection)
++    
++    # Ensure schema exists
++    recorder.ensure_schema()
++    
++    print("=== Testing Dual Existence Scenario ===")
++    print("Scenario: Both squashed migration and individual migration files exist")
++    
++    # Record all migrations as applied initially
++    recorder.record_applied("test_app", "0001_initial")
++    recorder.record_applied("test_app", "0002_second")
++    recorder.record_applied("test_app", "0001_squashed_0002")
++    
++    applied_before = recorder.applied_migrations().keys()
++    print("\nApplied migrations initially:", applied_before)
++    
++    # Now simulate unapplying all migrations
++    print("\n=== Simulating unapply all migrations ===")
++    
++    # This should only unapply the individual migrations, not the squashed one
++    # because the squashed migration should remain applied when individual files exist
++    
++    # Unapply individual migrations
++    recorder.record_unapplied("test_app", "0001_initial")
++    recorder.record_unapplied("test_app", "0002_second")
++    
++    applied_after_unapply = recorder.applied_migrations().keys()
++    print("Applied migrations after unapplying individual:", applied_after_unapply)
++    
++    # The squashed migration should still be applied
++    squashed_still_applied = ("test_app", "0001_squashed_0002") in applied_after_unapply
++    print(f"Squashed migration still applied: {squashed_still_applied}")
++    
++    if squashed_still_applied:
++        print("✅ CORRECT: Squashed migration remains applied when individual files exist")
++        return True
++    else:
++        print("❌ INCORRECT: Squashed migration was incorrectly unapplied")
++        return False
++
++if __name__ == '__main__':
++    result = test_dual_existence_scenario()
++    print(f"\nTest result: {'PASS' if result else 'FAIL'}")
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..b241edc902
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,104 @@
++#!/usr/bin/env python3
++"""
++Test the exact scenario described in the GitHub issue:
++When unapplying a squashed migration and the replaced migration files are still around,
++the MigrationExecutor should NOT mark the squash migration as unapplied too.
++"""
++
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.migrations.executor import MigrationExecutor
++from django.db.migrations.recorder import MigrationRecorder
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_github_issue_scenario():
++    """Test the exact GitHub issue scenario"""
++    
++    # Initialize Django
++    django.setup()
++    
++    # Create executor and recorder
++    executor = MigrationExecutor(connection)
++    recorder = MigrationRecorder(connection)
++    
++    # Ensure schema exists
++    recorder.ensure_schema()
++    
++    print("=== Testing GitHub Issue Scenario ===")
++    print("Issue: When unapplying a squashed migration and the replaced migration")
++    print("files are still around, the MigrationExecutor should NOT mark the squash")
++    print("migration as unapplied too.")
++    
++    # Create a mock replacement entry in the loader
++    class MockMigration:
++        def __init__(self, replaces):
++            self.replaces = replaces
++    
++    # Add a mock replacement to the loader (simulating squashed migration)
++    mock_replaces = [('test_app', '0001_initial'), ('test_app', '0002_second')]
++    mock_migration = MockMigration(mock_replaces)
++    executor.loader.replacements[('test_app', '0001_squashed_0002')] = mock_migration
++    
++    # Simulate the scenario where:
++    # 1. All replaced migrations are applied
++    # 2. The squashed migration is also applied
++    # 3. We unapply the replaced migrations (but files are still around)
++    # 4. The squashed migration should NOT be unapplied
++    
++    # Record all migrations as applied
++    recorder.record_applied("test_app", "0001_initial")
++    recorder.record_applied("test_app", "0002_second")
++    recorder.record_applied("test_app", "0001_squashed_0002")
++    
++    applied_before = recorder.applied_migrations().keys()
++    print("\nApplied migrations initially:", applied_before)
++    
++    # Now unapply the replaced migrations (simulating unapply operation)
++    recorder.record_unapplied("test_app", "0001_initial")
++    recorder.record_unapplied("test_app", "0002_second")
++    
++    applied_after_unapply = recorder.applied_migrations().keys()
++    print("Applied migrations after unapplying replaced:", applied_after_unapply)
++    
++    # Call check_replacements - this should NOT unapply the squashed migration
++    # because the replaced migration files are still around (simulated by the mock)
++    print("\n=== Calling check_replacements ===")
++    executor.check_replacements()
++    
++    applied_after_check = recorder.applied_migrations().keys()
++    print("Applied migrations after check_replacements:", applied_after_check)
++    
++    # The squashed migration should still be applied
++    squashed_still_applied = ("test_app", "0001_squashed_0002") in applied_after_check
++    print(f"Squashed migration still applied: {squashed_still_applied}")
++    
++    if squashed_still_applied:
++        print("✅ CORRECT: Squashed migration is still marked as applied")
++        print("✅ The issue has been FIXED!")
++        return True
++    else:
++        print("❌ INCORRECT: Squashed migration was incorrectly marked as unapplied")
++        print("❌ The issue still exists!")
++        return False
++
++if __name__ == '__main__':
++    result = test_github_issue_scenario()
++    print(f"\nTest result: {'PASS' if result else 'FAIL'}")
+\ No newline at end of file
+diff --git a/test_reproduction.py b/test_reproduction.py
+new file mode 100644
+index 0000000000..6556bd308b
+--- /dev/null
++++ b/test_reproduction.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++"""
++Test to reproduce the squashed migration unapplying issue.
++"""
++
++import os
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.migrations.executor import MigrationExecutor
++from django.db.migrations.recorder import MigrationRecorder
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_squashed_unapply_issue():
++    """Test the issue with squashed migration unapplying"""
++    
++    # Initialize Django
++    django.setup()
++    
++    # Create executor and recorder
++    executor = MigrationExecutor(connection)
++    recorder = MigrationRecorder(connection)
++    
++    # Ensure schema exists
++    recorder.ensure_schema()
++    
++    print("=== Setting up test scenario ===")
++    
++    # Manually record the replaced migrations as applied
++    recorder.record_applied("test_app", "0001_initial")
++    recorder.record_applied("test_app", "0002_second")
++    
++    # Also record the squashed migration as applied
++    recorder.record_applied("test_app", "0001_squashed_0002")
++    
++    applied_before = recorder.applied_migrations().keys()
++    print("Applied migrations before unapply:", applied_before)
++    
++    # Now simulate unapplying the squashed migration
++    # This should only unapply the replaced migrations, not the squashed one
++    print("\n=== Simulating unapply of replaced migrations ===")
++    
++    # Unapply the replaced migrations
++    recorder.record_unapplied("test_app", "0001_initial")
++    recorder.record_unapplied("test_app", "0002_second")
++    
++    applied_after_unapply = recorder.applied_migrations().keys()
++    print("Applied migrations after unapplying replaced:", applied_after_unapply)
++    
++    # Now call check_replacements - this should mark the squashed migration as unapplied
++    # because not all replaced migrations are applied anymore
++    print("\n=== Calling check_replacements ===")
++    executor.check_replacements()
++    
++    applied_after_check = recorder.applied_migrations().keys()
++    print("Applied migrations after check_replacements:", applied_after_check)
++    
++    # Check if the squashed migration is still applied (this would be the bug)
++    squashed_still_applied = ("test_app", "0001_squashed_0002") in applied_after_check
++    print(f"Squashed migration still applied: {squashed_still_applied}")
++    
++    if squashed_still_applied:
++        print("❌ BUG: Squashed migration should be marked as unapplied!")
++        return False
++    else:
++        print("✅ OK: Squashed migration correctly marked as unapplied")
++        return True
++
++if __name__ == '__main__':
++    result = test_squashed_unapply_issue()
++    print(f"\nTest result: {'PASS' if result else 'FAIL'}")
+\ No newline at end of file

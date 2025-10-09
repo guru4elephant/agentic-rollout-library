@@ -1,0 +1,466 @@
+diff --git a/debug_autodetector.py b/debug_autodetector.py
+new file mode 100644
+index 0000000000..1a477213bd
+--- /dev/null
++++ b/debug_autodetector.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++"""
++Debug script to see what the autodetector is generating.
++"""
++
++from django.conf import settings
++from django.db import models
++from django.db.migrations.state import ProjectState, ModelState
++from django.db.migrations.autodetector import MigrationAutodetector
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=['__main__'],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def debug_autodetector():
++    """Debug what the autodetector generates"""
++    
++    # Initial state: Readable with title field
++    initial_state = ProjectState()
++    
++    readable_initial = ModelState(
++        app_label='test_app',
++        name='Readable',
++        fields={
++            'title': models.CharField(max_length=200),
++        },
++        bases=(models.Model,),
++    )
++    initial_state.add_model(readable_initial)
++    
++    # Final state: Empty Readable + Book inheriting from Readable with title field
++    final_state = ProjectState()
++    
++    readable_final = ModelState(
++        app_label='test_app',
++        name='Readable',
++        fields={},
++        bases=(models.Model,),
++    )
++    final_state.add_model(readable_final)
++    
++    book_final = ModelState(
++        app_label='test_app',
++        name='Book',
++        fields={
++            'title': models.CharField(max_length=200),
++        },
++        bases=('test_app.Readable',),
++    )
++    final_state.add_model(book_final)
++    
++    # Create autodetector and detect changes
++    autodetector = MigrationAutodetector(initial_state, final_state)
++    changes = autodetector._detect_changes()
++    
++    print("All changes:")
++    for app_label, app_changes in changes.items():
++        print(f"App: {app_label}")
++        for operation in app_changes:
++            print(f"  Operation: {operation}")
++            print(f"  Operation type: {type(operation).__name__}")
++            if hasattr(operation, 'operations'):
++                print(f"  Contains sub-operations: {len(operation.operations)}")
++                for sub_op in operation.operations:
++                    print(f"    Sub-operation: {sub_op}")
++                    print(f"    Sub-operation type: {type(sub_op).__name__}")
++    
++    return changes
++
++if __name__ == '__main__':
++    import django
++    django.setup()
++    
++    print("=" * 50)
++    print("Debugging autodetector output")
++    print("=" * 50)
++    
++    changes = debug_autodetector()
+\ No newline at end of file
+diff --git a/django/db/migrations/autodetector.py b/django/db/migrations/autodetector.py
+index 30616c0172..4932f84ad7 100644
+--- a/django/db/migrations/autodetector.py
++++ b/django/db/migrations/autodetector.py
+@@ -165,7 +165,6 @@ class MigrationAutodetector:
+ 
+         # Generate non-rename model operations
+         self.generate_deleted_models()
+-        self.generate_created_models()
+         self.generate_deleted_proxies()
+         self.generate_created_proxies()
+         self.generate_altered_options()
+@@ -191,6 +190,10 @@ class MigrationAutodetector:
+         self.generate_altered_db_table()
+         self.generate_altered_order_with_respect_to()
+ 
++        # Generate created models after field operations to avoid field clashes
++        # when moving fields from base class to subclass
++        self.generate_created_models()
++
+         self._sort_migrations()
+         self._build_migration_list(graph)
+         self._optimize_migrations()
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..fe6b98e195
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python3
++"""
++Simple script to reproduce the FieldError when migrating field to new model subclass.
++"""
++
++import os
++import tempfile
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=['test_app'],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++# Create a simple test case
++def create_test_case():
++    """Create test models files to reproduce the issue"""
++    
++    # Create a temporary directory for our test app
++    temp_dir = tempfile.mkdtemp()
++    app_dir = os.path.join(temp_dir, 'test_app')
++    os.makedirs(app_dir)
++    
++    # Create __init__.py
++    with open(os.path.join(app_dir, '__init__.py'), 'w') as f:
++        f.write('')
++    
++    # Create models.py with initial state
++    with open(os.path.join(app_dir, 'models.py'), 'w') as f:
++        f.write('''from django.db import models
++
++class Readable(models.Model):
++    title = models.CharField(max_length=200)
++''')
++    
++    # Create models2.py with final state (after migration)
++    with open(os.path.join(app_dir, 'models2.py'), 'w') as f:
++        f.write('''from django.db import models
++
++class Readable(models.Model):
++    pass
++
++class Book(Readable):
++    title = models.CharField(max_length=200)
++''')
++    
++    return temp_dir
++
++def run_makemigrations(test_dir):
++    """Run makemigrations to see what operations are generated"""
++    os.chdir(test_dir)
++    
++    # First, create the initial migration
++    os.system('python -m django makemigrations test_app --name initial')
++    
++    # Now replace models.py with models2.py to simulate the change
++    os.remove('test_app/models.py')
++    os.rename('test_app/models2.py', 'test_app/models.py')
++    
++    # Create the migration that should detect the field move
++    os.system('python -m django makemigrations test_app --name move_field')
++    
++    # Show the generated migration
++    migration_file = None
++    for f in os.listdir('test_app/migrations'):
++        if f.startswith('0002') and 'move_field' in f:
++            migration_file = os.path.join('test_app/migrations', f)
++            break
++    
++    if migration_file:
++        print("Generated migration:")
++        with open(migration_file, 'r') as f:
++            print(f.read())
++    
++    return migration_file
++
++def run_migrate(test_dir):
++    """Run migrate to see if it fails"""
++    os.chdir(test_dir)
++    result = os.system('python -m django migrate test_app')
++    return result == 0
++
++if __name__ == '__main__':
++    import django
++    django.setup()
++    
++    print("=" * 50)
++    print("Reproducing FieldError issue")
++    print("=" * 50)
++    
++    test_dir = create_test_case()
++    migration_file = run_makemigrations(test_dir)
++    
++    if migration_file:
++        print("\nRunning migration...")
++        success = run_migrate(test_dir)
++        
++        if success:
++            print("✓ Migration succeeded")
++        else:
++            print("✗ Migration failed with FieldError")
++    else:
++        print("No migration file generated")
++    
++    # Cleanup
++    import shutil
++    shutil.rmtree(test_dir)
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..8654641f69
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++"""
++Direct reproduction of the FieldError issue by examining migration operations.
++"""
++
++from django.conf import settings
++from django.db import models
++from django.db.migrations.state import ProjectState
++from django.db.migrations.autodetector import MigrationAutodetector
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=['__main__'],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_autodetector():
++    """Test the migration autodetector directly"""
++    
++    # Initial state: Readable with title field
++    initial_state = ProjectState()
++    from django.db.migrations.state import ModelState
++    
++    readable_initial = ModelState(
++        app_label='__main__',
++        name='Readable',
++        fields={
++            'title': models.CharField(max_length=200),
++        },
++        bases=(models.Model,),
++    )
++    initial_state.add_model(readable_initial)
++    
++    # Final state: Empty Readable + Book inheriting from Readable with title field
++    final_state = ProjectState()
++    
++    readable_final = ModelState(
++        app_label='__main__',
++        name='Readable',
++        fields={},
++        bases=(models.Model,),
++    )
++    final_state.add_model(readable_final)
++    
++    book_final = ModelState(
++        app_label='__main__',
++        name='Book',
++        fields={
++            'title': models.CharField(max_length=200),
++        },
++        bases=('__main__.Readable',),
++    )
++    final_state.add_model(book_final)
++    
++    # Create autodetector and detect changes
++    autodetector = MigrationAutodetector(initial_state, final_state)
++    changes = autodetector._detect_changes()
++    
++    print("Detected changes:")
++    for app_label, app_changes in changes.items():
++        print(f"App: {app_label}")
++        for operation in app_changes:
++            print(f"  Operation: {operation}")
++    
++    return changes
++
++if __name__ == '__main__':
++    import django
++    django.setup()
++    
++    print("Testing migration autodetector...")
++    changes = test_autodetector()
++    
++    # Check if the operations are in the wrong order
++    operations = list(changes.get('__main__', []))
++    print(f"\nNumber of operations: {len(operations)}")
++    
++    for i, op in enumerate(operations):
++        print(f"Operation {i}: {op}")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..83a6b37020
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,120 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for FieldError when migrating field to new model subclass.
++"""
++
++import os
++import tempfile
++import shutil
++from django.conf import settings
++from django.db import models
++from django.db.migrations.state import ProjectState, ModelState
++from django.db.migrations.autodetector import MigrationAutodetector
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=['__main__'],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_autodetector_order():
++    """Test that the autodetector generates operations in the correct order"""
++    
++    # Initial state: Readable with title field
++    initial_state = ProjectState()
++    
++    readable_initial = ModelState(
++        app_label='test_app',
++        name='Readable',
++        fields={
++            'title': models.CharField(max_length=200),
++        },
++        bases=(models.Model,),
++    )
++    initial_state.add_model(readable_initial)
++    
++    # Final state: Empty Readable + Book inheriting from Readable with title field
++    final_state = ProjectState()
++    
++    readable_final = ModelState(
++        app_label='test_app',
++        name='Readable',
++        fields={},
++        bases=(models.Model,),
++    )
++    final_state.add_model(readable_final)
++    
++    book_final = ModelState(
++        app_label='test_app',
++        name='Book',
++        fields={
++            'title': models.CharField(max_length=200),
++        },
++        bases=('test_app.Readable',),
++    )
++    final_state.add_model(book_final)
++    
++    # Create autodetector and detect changes
++    autodetector = MigrationAutodetector(initial_state, final_state)
++    changes = autodetector._detect_changes()
++    
++    print("Detected changes for test_app:")
++    operations = list(changes.get('test_app', []))
++    
++    # Check the order of operations
++    operation_types = [type(op).__name__ for op in operations]
++    print(f"Operation types: {operation_types}")
++    
++    # The correct order should be:
++    # 1. RemoveField from Readable
++    # 2. CreateModel for Book
++    remove_field_found = False
++    create_model_found = False
++    
++    for i, op in enumerate(operations):
++        op_type = type(op).__name__
++        if op_type == 'RemoveField' and op.model_name == 'Readable' and op.name == 'title':
++            remove_field_found = True
++            remove_field_index = i
++        elif op_type == 'CreateModel' and op.name == 'Book':
++            create_model_found = True
++            create_model_index = i
++    
++    if remove_field_found and create_model_found:
++        print(f"RemoveField operation index: {remove_field_index}")
++        print(f"CreateModel operation index: {create_model_index}")
++        
++        # The RemoveField should come before CreateModel
++        if remove_field_index < create_model_index:
++            print("✓ CORRECT ORDER: RemoveField comes before CreateModel")
++            return True
++        else:
++            print("✗ WRONG ORDER: CreateModel comes before RemoveField")
++            return False
++    else:
++        print("✗ Required operations not found")
++        return False
++
++if __name__ == '__main__':
++    import django
++    django.setup()
++    
++    print("=" * 50)
++    print("Testing the fix for FieldError issue")
++    print("=" * 50)
++    
++    success = test_autodetector_order()
++    
++    if success:
++        print("\n✓ Fix verified: Operations are in correct order")
++    else:
++        print("\n✗ Fix failed: Operations are in wrong order")
+\ No newline at end of file

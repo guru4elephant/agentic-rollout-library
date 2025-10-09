@@ -1,0 +1,151 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..24ba5f8d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where accessing chunks on zarr-backed xarray 
++loads entire array into memory.
++"""
++
++import xarray as xr
++import numpy as np
++import tempfile
++import os
++import zarr
++
++def create_test_zarr():
++    """Create a test zarr dataset to reproduce the issue"""
++    # Create a temporary directory for zarr store
++    temp_dir = tempfile.mkdtemp()
++    zarr_path = os.path.join(temp_dir, "test.zarr")
++    
++    # Create some test data
++    data = np.random.rand(100, 100)
++    
++    # Create zarr group and array with proper structure
++    store = zarr.DirectoryStore(zarr_path)
++    root = zarr.group(store=store)
++    
++    # Create array with chunks
++    z = root.create_dataset('test_var', shape=data.shape, chunks=(50, 50), dtype=data.dtype)
++    z[:] = data
++    
++    # Set dimensions attribute
++    z.attrs['_ARRAY_DIMENSIONS'] = ['x', 'y']
++    
++    return zarr_path
++
++def test_chunks_issue():
++    """Test the chunks issue"""
++    print("Creating test zarr dataset...")
++    zarr_path = create_test_zarr()
++    
++    try:
++        print("Opening zarr dataset with xarray...")
++        ds = xr.open_dataset(zarr_path, engine='zarr')
++        
++        print("Dataset created successfully")
++        print(f"Dataset dimensions: {ds.dims}")
++        print(f"Dataset variables: {list(ds.data_vars.keys())}")
++        
++        # This should trigger the issue - accessing chunks loads entire array
++        print("Accessing chunks property...")
++        
++        # Debug: check what type of data we have
++        var = ds.data_vars['test_var']
++        print(f"Variable data type: {type(var.data)}")
++        print(f"Variable variable type: {type(var.variable)}")
++        print(f"Variable variable data type: {type(var.variable.data)}")
++        print(f"Variable variable _data type: {type(var.variable._data)}")
++        print(f"Variable data has chunks attribute: {hasattr(var.data, 'chunks')}")
++        print(f"Variable variable _data has chunks attribute: {hasattr(var.variable._data, 'chunks')}")
++        if hasattr(var.variable._data, 'chunks'):
++            print(f"Variable variable _data chunks: {var.variable._data.chunks}")
++        
++        chunks = ds.chunks
++        print(f"Dataset chunks: {chunks}")
++        
++        print("Test completed - if you see this, the issue might be fixed!")
++        
++    except KeyboardInterrupt:
++        print("KeyboardInterrupt caught - this indicates the issue is present!")
++        print("The entire array was loaded into memory when accessing chunks.")
++    except Exception as e:
++        print(f"Error occurred: {e}")
++    finally:
++        # Clean up
++        import shutil
++        shutil.rmtree(os.path.dirname(zarr_path))
++
++if __name__ == "__main__":
++    test_chunks_issue()
+\ No newline at end of file
+diff --git a/xarray/backends/zarr.py b/xarray/backends/zarr.py
+index a73483b4..68fa032e 100644
+--- a/xarray/backends/zarr.py
++++ b/xarray/backends/zarr.py
+@@ -55,7 +55,7 @@ def encode_zarr_attr_value(value):
+ 
+ 
+ class ZarrArrayWrapper(BackendArray):
+-    __slots__ = ("datastore", "dtype", "shape", "variable_name")
++    __slots__ = ("datastore", "dtype", "shape", "variable_name", "_chunks")
+ 
+     def __init__(self, variable_name, datastore):
+         self.datastore = datastore
+@@ -66,6 +66,9 @@ class ZarrArrayWrapper(BackendArray):
+ 
+         dtype = array.dtype
+         self.dtype = dtype
++        
++        # Store chunk information to avoid loading data when accessed
++        self._chunks = array.chunks
+ 
+     def get_array(self):
+         return self.datastore.zarr_group[self.variable_name]
+@@ -84,6 +87,11 @@ class ZarrArrayWrapper(BackendArray):
+         # if self.ndim == 0:
+         # could possibly have a work-around for 0d data here
+ 
++    @property
++    def chunks(self):
++        """Return the chunk sizes of the underlying zarr array."""
++        return self._chunks
++
+ 
+ def _determine_zarr_chunks(enc_chunks, var_chunks, ndim, name, safe_chunks):
+     """
+diff --git a/xarray/core/indexing.py b/xarray/core/indexing.py
+index cbbd507e..014a27a5 100644
+--- a/xarray/core/indexing.py
++++ b/xarray/core/indexing.py
+@@ -655,6 +655,11 @@ class MemoryCachedArray(ExplicitlyIndexedNDArrayMixin):
+     def __setitem__(self, key, value):
+         self.array[key] = value
+ 
++    @property
++    def chunks(self):
++        """Return the chunks attribute from the wrapped array, if available."""
++        return getattr(self.array, "chunks", None)
++
+ 
+ def as_indexable(array):
+     """
+diff --git a/xarray/core/variable.py b/xarray/core/variable.py
+index 2d115ff0..3a847601 100644
+--- a/xarray/core/variable.py
++++ b/xarray/core/variable.py
+@@ -1014,8 +1014,9 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+         Variable.chunks
+         xarray.unify_chunks
+         """
+-        if hasattr(self._data, "chunks"):
+-            return Frozen({dim: c for dim, c in zip(self.dims, self.data.chunks)})
++        chunks = getattr(self._data, "chunks", None)
++        if chunks is not None:
++            return Frozen({dim: c for dim, c in zip(self.dims, chunks)})
+         else:
+             return {}

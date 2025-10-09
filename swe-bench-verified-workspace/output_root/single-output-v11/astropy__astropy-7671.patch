@@ -1,0 +1,259 @@
+diff --git a/astropy/utils/introspection.py b/astropy/utils/introspection.py
+index 3e784f9fc3..ccbf1ad8d2 100644
+--- a/astropy/utils/introspection.py
++++ b/astropy/utils/introspection.py
+@@ -4,6 +4,7 @@
+ 
+ 
+ import inspect
++import re
+ import types
+ import importlib
+ from distutils.version import LooseVersion
+@@ -139,10 +140,32 @@ def minversion(module, version, inclusive=True, version_path='__version__'):
+     else:
+         have_version = resolve_name(module.__name__, version_path)
+ 
+-    if inclusive:
+-        return LooseVersion(have_version) >= LooseVersion(version)
++    # LooseVersion raises a TypeError when strings like dev, rc1 are part
++    # of the version number. Match the dotted numbers only. Regex taken
++    # from PEP440, https://www.python.org/dev/peps/pep-0440/, Appendix B
++    expr = '^([1-9]\\d*!)?(0|[1-9]\\d*)(\\.(0|[1-9]\\d*))*'
++    
++    # Extract the numeric part of the version strings for comparison
++    have_version_match = re.match(expr, str(have_version))
++    version_match = re.match(expr, str(version))
++    
++    if have_version_match and version_match:
++        # Both versions have numeric parts, compare them using LooseVersion
++        have_version_numeric = have_version_match.group(0)
++        version_numeric = version_match.group(0)
++        
++        if inclusive:
++            return LooseVersion(have_version_numeric) >= LooseVersion(version_numeric)
++        else:
++            return LooseVersion(have_version_numeric) > LooseVersion(version_numeric)
+     else:
+-        return LooseVersion(have_version) > LooseVersion(version)
++        # Fallback: if we can't extract numeric parts, use string comparison
++        have_version_str = str(have_version)
++        version_str = str(version)
++        if inclusive:
++            return have_version_str >= version_str
++        else:
++            return have_version_str > version_str
+ 
+ 
+ def find_current_module(depth=1, finddiff=False):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..99ebedb153
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,27 @@
++#!/usr/bin/env python3
++"""Script to reproduce the minversion issue."""
++
++from astropy.utils import minversion
++
++# Test case from the GitHub issue
++try:
++    result = minversion('numpy', '1.14dev')
++    print(f"minversion('numpy', '1.14dev') = {result}")
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
++
++# Additional test cases mentioned in the issue
++from distutils.version import LooseVersion
++
++print("\nTesting LooseVersion comparisons:")
++try:
++    result = LooseVersion('1.14.3') >= LooseVersion('1.14dev')
++    print(f"LooseVersion('1.14.3') >= LooseVersion('1.14dev') = {result}")
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
++
++try:
++    result = LooseVersion('1.14') >= LooseVersion('1.14dev')
++    print(f"LooseVersion('1.14') >= LooseVersion('1.14dev') = {result}")
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
+\ No newline at end of file
+diff --git a/test_comprehensive_fix.py b/test_comprehensive_fix.py
+new file mode 100644
+index 0000000000..a02342f98d
+--- /dev/null
++++ b/test_comprehensive_fix.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++"""Comprehensive test for the minversion fix."""
++
++from astropy.utils import minversion
++
++# Test cases that should trigger the TypeError fallback
++test_cases = [
++    # From the GitHub issue
++    ('numpy', '1.14dev'),
++    
++    # Various dev versions
++    ('numpy', '1.14.0dev'),
++    ('numpy', '1.14.0.dev'),
++    ('numpy', '1.14.0-dev'),
++    
++    # rc versions
++    ('numpy', '1.14.0rc1'),
++    ('numpy', '1.14.0.rc1'),
++    ('numpy', '1.14.0-rc1'),
++    
++    # alpha/beta versions
++    ('numpy', '1.14.0alpha'),
++    ('numpy', '1.14.0.beta'),
++    ('numpy', '1.14.0-beta'),
++]
++
++print("Testing minversion with various development versions:")
++for module, version in test_cases:
++    try:
++        result = minversion(module, version)
++        print(f"minversion('{module}', '{version}') = {result}")
++    except Exception as e:
++        print(f"minversion('{module}', '{version}') = Error: {type(e).__name__}: {e}")
++
++# Test with a mock module to control the version
++from types import ModuleType
++
++print("\nTesting with mock modules:")
++mock_module = ModuleType("test_module")
++mock_module.__version__ = '1.14.3'
++
++test_cases_mock = [
++    ('1.14dev', True),
++    ('1.14.0dev', True),
++    ('1.14.3dev', True),  # 1.14.3 > 1.14.3dev (development versions are pre-releases)
++    ('1.15dev', False),
++]
++
++for version, expected in test_cases_mock:
++    try:
++        result = minversion(mock_module, version)
++        print(f"minversion(mock_module, '{version}') = {result} (expected: {expected})")
++        if result != expected:
++            print(f"  WARNING: Expected {expected}, got {result}")
++    except Exception as e:
++        print(f"minversion(mock_module, '{version}') = Error: {type(e).__name__}: {e}")
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..81d929a0ce
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,30 @@
++#!/usr/bin/env python3
++"""Test the exact GitHub issue scenario."""
++
++from astropy.utils import minversion
++
++# Test the exact case from the GitHub issue
++print("Testing the exact GitHub issue case:")
++try:
++    result = minversion('numpy', '1.14dev')
++    print(f"minversion('numpy', '1.14dev') = {result}")
++    print("SUCCESS: No TypeError raised!")
++except TypeError as e:
++    print(f"FAILED: TypeError still occurs: {e}")
++except Exception as e:
++    print(f"FAILED: Unexpected error: {type(e).__name__}: {e}")
++
++# Test additional cases mentioned in the issue
++print("\nTesting additional cases from the issue:")
++test_cases = [
++    ('numpy', '1.14dev'),
++    ('numpy', '1.14.0dev'),
++    ('numpy', '1.14.0.rc1'),
++]
++
++for module, version in test_cases:
++    try:
++        result = minversion(module, version)
++        print(f"minversion('{module}', '{version}') = {result}")
++    except Exception as e:
++        print(f"minversion('{module}', '{version}') = Error: {type(e).__name__}: {e}")
+\ No newline at end of file
+diff --git a/test_looseversion_issue.py b/test_looseversion_issue.py
+new file mode 100644
+index 0000000000..93b065d4f2
+--- /dev/null
++++ b/test_looseversion_issue.py
+@@ -0,0 +1,37 @@
++#!/usr/bin/env python3
++"""Test to reproduce the specific LooseVersion issue."""
++
++from distutils.version import LooseVersion
++
++# Test the exact case from the GitHub issue
++print("Testing LooseVersion comparison that should fail:")
++try:
++    result = LooseVersion('1.14.3') >= LooseVersion('1.14dev')
++    print(f"LooseVersion('1.14.3') >= LooseVersion('1.14dev') = {result}")
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
++
++# Test the case that works
++print("\nTesting LooseVersion comparison that should work:")
++try:
++    result = LooseVersion('1.14') >= LooseVersion('1.14dev')
++    print(f"LooseVersion('1.14') >= LooseVersion('1.14dev') = {result}")
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
++
++# Let's also test what happens with different version formats
++print("\nTesting various version comparisons:")
++test_cases = [
++    ('1.14.3', '1.14dev'),
++    ('1.14.0', '1.14dev'),
++    ('1.14.0', '1.14.0dev'),
++    ('1.14.0', '1.14.0.dev'),
++    ('1.14.0', '1.14.0-dev'),
++]
++
++for v1, v2 in test_cases:
++    try:
++        result = LooseVersion(v1) >= LooseVersion(v2)
++        print(f"LooseVersion('{v1}') >= LooseVersion('{v2}') = {result}")
++    except Exception as e:
++        print(f"LooseVersion('{v1}') >= LooseVersion('{v2}') = Error: {type(e).__name__}: {e}")
+\ No newline at end of file
+diff --git a/test_regex.py b/test_regex.py
+new file mode 100644
+index 0000000000..97076fe29f
+--- /dev/null
++++ b/test_regex.py
+@@ -0,0 +1,9 @@
++#!/usr/bin/env python3
++import re
++
++expr = '^([1-9]\\d*!)?(0|[1-9]\\d*)(\\.(0|[1-9]\\d*))*'
++test_cases = ['1.14dev', '1.14.0dev', '1.14.3', '1.14.0.rc1']
++
++for case in test_cases:
++    m = re.match(expr, case)
++    print(f'{case}: {m.group(0) if m else None}')
+\ No newline at end of file
+diff --git a/test_version_semantics.py b/test_version_semantics.py
+new file mode 100644
+index 0000000000..8779a81eaf
+--- /dev/null
++++ b/test_version_semantics.py
+@@ -0,0 +1,10 @@
++#!/usr/bin/env python3
++import re
++
++expr = '^([1-9]\\d*!)?(0|[1-9]\\d*)(\\.(0|[1-9]\\d*))*'
++cases = [('1.14.3', '1.14dev'), ('1.14.3', '1.14.3dev')]
++
++for v1, v2 in cases:
++    m1 = re.match(expr, v1)
++    m2 = re.match(expr, v2)
++    print(f'{v1} >= {v2}: {m1.group(0)} >= {m2.group(0)} = {m1.group(0) >= m2.group(0)}')
+\ No newline at end of file

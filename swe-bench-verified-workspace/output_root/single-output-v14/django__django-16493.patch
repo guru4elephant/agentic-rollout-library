@@ -1,0 +1,350 @@
+diff --git a/django/db/models/fields/files.py b/django/db/models/fields/files.py
+index 7a99b12691..0569ec31a3 100644
+--- a/django/db/models/fields/files.py
++++ b/django/db/models/fields/files.py
+@@ -295,8 +295,10 @@ class FileField(Field):
+         if kwargs.get("max_length") == 100:
+             del kwargs["max_length"]
+         kwargs["upload_to"] = self.upload_to
+-        if self.storage is not default_storage:
+-            kwargs["storage"] = getattr(self, "_storage_callable", self.storage)
++        if hasattr(self, '_storage_callable'):
++            kwargs["storage"] = self._storage_callable
++        elif self.storage is not default_storage:
++            kwargs["storage"] = self.storage
+         return name, path, args, kwargs
+ 
+     def get_internal_type(self):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..35cd3e2d57
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++import os
++import sys
++import random
++
++# Add the testbed to Python path
++sys.path.insert(0, '/testbed')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++import django
++django.setup()
++
++from django.core.files.storage import FileSystemStorage, default_storage
++from django.db import models
++
++# Create test storage objects
++other_storage = FileSystemStorage(location='/media/other')
++
++def get_storage():
++    return random.choice([default_storage, other_storage])
++
++class MyModel(models.Model):
++    my_file = models.FileField(storage=get_storage)
++
++    class Meta:
++        app_label = 'test_app'
++
++def test_deconstruct():
++    """Test that deconstruct properly handles callable storage that returns default_storage"""
++    field = MyModel._meta.get_field('my_file')
++    
++    print("Original storage callable:", get_storage)
++    print("Current storage object:", field.storage)
++    print("Is current storage default_storage?", field.storage is default_storage)
++    
++    # Test deconstruction
++    name, path, args, kwargs = field.deconstruct()
++    
++    print("\nDeconstructed kwargs:")
++    for k, v in kwargs.items():
++        print(f"  {k}: {v}")
++    
++    # Check if storage is included in deconstructed kwargs
++    if 'storage' in kwargs:
++        print("✓ Storage included in deconstructed kwargs")
++        if kwargs['storage'] == get_storage:
++            print("✓ Storage points to the original callable")
++        else:
++            print("✗ Storage does not point to the original callable")
++    else:
++        print("✗ Storage NOT included in deconstructed kwargs (this is the bug!)")
++    
++    return 'storage' in kwargs and kwargs['storage'] == get_storage
++
++if __name__ == '__main__':
++    print("Testing FileField deconstruction with callable storage...")
++    print("=" * 60)
++    
++    # Run multiple tests to account for randomness
++    successes = 0
++    total_tests = 10
++    
++    for i in range(total_tests):
++        print(f"\nTest {i+1}:")
++        print("-" * 20)
++        if test_deconstruct():
++            successes += 1
++    
++    print(f"\nResults: {successes}/{total_tests} tests passed")
++    
++    if successes < total_tests:
++        print("BUG CONFIRMED: Storage is sometimes omitted from deconstruction")
++        sys.exit(1)
++    else:
++        print("All tests passed - no bug detected")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..89798a6fb1
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,120 @@
++#!/usr/bin/env python3
++import os
++import sys
++
++# Add the testbed to Python path
++sys.path.insert(0, '/testbed')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++import django
++django.setup()
++
++from django.core.files.storage import FileSystemStorage, default_storage
++from django.db import models
++
++# Test 1: Callable that returns default_storage
++def get_default_storage():
++    return default_storage
++
++# Test 2: Callable that returns other storage
++other_storage = FileSystemStorage(location='/media/other')
++def get_other_storage():
++    return other_storage
++
++# Test 3: Direct default_storage
++# Test 4: Direct other storage
++
++class TestModel1(models.Model):
++    field1 = models.FileField(storage=get_default_storage)
++    
++    class Meta:
++        app_label = 'test_app'
++    
++class TestModel2(models.Model):
++    field2 = models.FileField(storage=get_other_storage)
++    
++    class Meta:
++        app_label = 'test_app'
++    
++class TestModel3(models.Model):
++    field3 = models.FileField(storage=default_storage)
++    
++    class Meta:
++        app_label = 'test_app'
++    
++class TestModel4(models.Model):
++    field4 = models.FileField(storage=other_storage)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_case(field, description):
++    """Test a specific field case"""
++    print(f"\n{description}:")
++    print("-" * len(description))
++    
++    name, path, args, kwargs = field.deconstruct()
++    
++    print(f"Field storage: {field.storage}")
++    print(f"Is default_storage: {field.storage is default_storage}")
++    print(f"Has _storage_callable: {hasattr(field, '_storage_callable')}")
++    if hasattr(field, '_storage_callable'):
++        print(f"_storage_callable: {field._storage_callable}")
++    
++    print("Deconstructed kwargs:")
++    for k, v in kwargs.items():
++        print(f"  {k}: {v}")
++    
++    # Check if storage is correctly handled
++    if hasattr(field, '_storage_callable'):
++        # Should include the callable in deconstruction
++        if 'storage' in kwargs and kwargs['storage'] == field._storage_callable:
++            print("✓ PASS: Callable storage correctly included")
++            return True
++        else:
++            print("✗ FAIL: Callable storage not correctly included")
++            return False
++    else:
++        # Should only include storage if it's not default_storage
++        if field.storage is default_storage:
++            if 'storage' not in kwargs:
++                print("✓ PASS: Default storage correctly omitted")
++                return True
++            else:
++                print("✗ FAIL: Default storage incorrectly included")
++                return False
++        else:
++            if 'storage' in kwargs and kwargs['storage'] is field.storage:
++                print("✓ PASS: Non-default storage correctly included")
++                return True
++            else:
++                print("✗ FAIL: Non-default storage incorrectly handled")
++                return False
++
++if __name__ == '__main__':
++    print("Testing edge cases for FileField deconstruction...")
++    print("=" * 60)
++    
++    # Get the fields
++    field1 = TestModel1._meta.get_field('field1')
++    field2 = TestModel2._meta.get_field('field2') 
++    field3 = TestModel3._meta.get_field('field3')
++    field4 = TestModel4._meta.get_field('field4')
++    
++    results = []
++    
++    results.append(test_case(field1, "Callable returning default_storage"))
++    results.append(test_case(field2, "Callable returning other storage"))
++    results.append(test_case(field3, "Direct default_storage"))
++    results.append(test_case(field4, "Direct other storage"))
++    
++    print(f"\nResults: {sum(results)}/{len(results)} tests passed")
++    
++    if all(results):
++        print("✓ All edge case tests passed!")
++        sys.exit(0)
++    else:
++        print("✗ Some edge case tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..156819a8bf
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for the GitHub issue:
++Callable storage on FileField fails to deconstruct when it returns default_storage
++"""
++
++import os
++import sys
++import random
++
++# Add the testbed to Python path
++sys.path.insert(0, '/testbed')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++import django
++django.setup()
++
++from django.core.files.storage import FileSystemStorage, default_storage
++from django.db import models
++
++# Reproduce the exact scenario from the GitHub issue
++other_storage = FileSystemStorage(location='/media/other')
++
++def get_storage():
++    return random.choice([default_storage, other_storage])
++
++class MyModel(models.Model):
++    my_file = models.FileField(storage=get_storage)
++
++    class Meta:
++        app_label = 'test_app'
++
++def test_repeated_deconstruction():
++    """Test that repeated deconstruction consistently includes the callable"""
++    print("Testing repeated deconstruction of FileField with callable storage...")
++    print("=" * 70)
++    
++    field = MyModel._meta.get_field('my_file')
++    
++    print(f"Original storage callable: {get_storage}")
++    print(f"Has _storage_callable attribute: {hasattr(field, '_storage_callable')}")
++    if hasattr(field, '_storage_callable'):
++        print(f"_storage_callable value: {field._storage_callable}")
++    
++    results = []
++    num_tests = 20
++    
++    for i in range(num_tests):
++        # Deconstruct the field
++        name, path, args, kwargs = field.deconstruct()
++        
++        # Check if storage is included and points to the original callable
++        if 'storage' in kwargs:
++            if kwargs['storage'] == get_storage:
++                results.append(True)
++                print(f"Test {i+1:2d}: ✓ Storage included and points to callable")
++            else:
++                results.append(False)
++                print(f"Test {i+1:2d}: ✗ Storage included but wrong value: {kwargs['storage']}")
++        else:
++            results.append(False)
++            print(f"Test {i+1:2d}: ✗ Storage NOT included")
++    
++    success_count = sum(results)
++    print(f"\nResults: {success_count}/{num_tests} tests passed")
++    
++    if success_count == num_tests:
++        print("✓ SUCCESS: All deconstructions consistently include the callable storage")
++        return True
++    else:
++        print("✗ FAILURE: Inconsistent deconstruction behavior")
++        return False
++
++def test_migration_scenario():
++    """Test the migration scenario described in the issue"""
++    print("\nTesting migration scenario...")
++    print("=" * 40)
++    
++    field = MyModel._meta.get_field('my_file')
++    
++    # Simulate what makemigrations would do
++    name, path, args, kwargs = field.deconstruct()
++    
++    print("Deconstructed field:")
++    print(f"  name: {name}")
++    print(f"  path: {path}")
++    print(f"  args: {args}")
++    print(f"  kwargs: {kwargs}")
++    
++    # Check if storage is properly included
++    if 'storage' in kwargs and kwargs['storage'] == get_storage:
++        print("✓ SUCCESS: Storage callable properly included in deconstruction")
++        print("✓ This would prevent alternating migrations in makemigrations")
++        return True
++    else:
++        print("✗ FAILURE: Storage callable not properly handled")
++        return False
++
++if __name__ == '__main__':
++    print("Testing fix for GitHub issue #...")
++    print("Issue: Callable storage on FileField fails to deconstruct when it returns default_storage")
++    print()
++    
++    success1 = test_repeated_deconstruction()
++    success2 = test_migration_scenario()
++    
++    if success1 and success2:
++        print("\n🎉 ALL TESTS PASSED! The issue has been fixed.")
++        sys.exit(0)
++    else:
++        print("\n❌ SOME TESTS FAILED! The issue is not fully resolved.")
++        sys.exit(1)
+\ No newline at end of file

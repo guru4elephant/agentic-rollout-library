@@ -1,0 +1,592 @@
+diff --git a/django/contrib/admin/helpers.py b/django/contrib/admin/helpers.py
+index 83719f4346..e6d5747e31 100644
+--- a/django/contrib/admin/helpers.py
++++ b/django/contrib/admin/helpers.py
+@@ -260,13 +260,13 @@ class InlineAdminFormSet:
+         for form in self.formset.extra_forms:
+             yield InlineAdminForm(
+                 self.formset, form, self.fieldsets, self.prepopulated_fields,
+-                None, self.readonly_fields, model_admin=self.opts,
++                None, readonly_fields_for_editing, model_admin=self.opts,
+             )
+         if self.has_add_permission:
+             yield InlineAdminForm(
+                 self.formset, self.formset.empty_form,
+                 self.fieldsets, self.prepopulated_fields, None,
+-                self.readonly_fields, model_admin=self.opts,
++                readonly_fields_for_editing, model_admin=self.opts,
+             )
+ 
+     def fields(self):
+diff --git a/final_test_issue.py b/final_test_issue.py
+new file mode 100644
+index 0000000000..d40bfec4fd
+--- /dev/null
++++ b/final_test_issue.py
+@@ -0,0 +1,174 @@
++#!/usr/bin/env python3
++"""
++Final comprehensive test to verify the fix for the GitHub issue:
++"Admin inlines for auto-created ManyToManyFields are editable if the user only has the view permission"
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++            'django.contrib.messages',
++            'django.contrib.sessions',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib import admin
++from django.test import RequestFactory
++
++# Reproduce the exact scenario from the GitHub issue
++class Photo(models.Model):
++    """Photo model as described in the issue"""
++    name = models.CharField(max_length=100, default='Test Photo')
++    
++    def __str__(self):
++        return self.name
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Report(models.Model):
++    """Report model with ManyToManyField to Photo as described in the issue"""
++    title = models.CharField(max_length=100, default='Test Report')
++    photos = models.ManyToManyField(Photo)
++    
++    def __str__(self):
++        return self.title
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Reproduce the exact admin configuration from the issue
++class ReportPhotoInlineModelAdmin(admin.TabularInline):
++    """Inline admin for the ManyToMany through model as described in the issue"""
++    model = Report.photos.through
++    show_change_link = True
++    # Add some fields to make the test more realistic
++    fields = ['photo']
++
++class ReportAdmin(admin.ModelAdmin):
++    """Report admin with the inline as described in the issue"""
++    inlines = [ReportPhotoInlineModelAdmin]
++
++admin.site.register(Report, ReportAdmin)
++
++def test_github_issue_fix():
++    """
++    Test that reproduces and verifies the fix for the GitHub issue.
++    The issue was that admin inlines for ManyToManyFields were editable
++    even when the user only had view permission.
++    """
++    print("Testing fix for GitHub issue: ManyToMany inline permission bug")
++    print("=" * 70)
++    
++    from django.contrib.admin import helpers
++    from django.forms.models import inlineformset_factory
++    
++    # Create a mock user with only view permission (no change permission)
++    class MockViewOnlyUser:
++        def __init__(self):
++            self.is_active = True
++            self.is_authenticated = True
++        
++        def has_perm(self, perm):
++            # User only has view permission, not change permission
++            return perm == 'test_app.view_report'  # Only view permission
++    
++    user = MockViewOnlyUser()
++    
++    # Create a request with the view-only user
++    factory = RequestFactory()
++    request = factory.get('/admin/test_app/report/1/change/')
++    request.user = user
++    
++    # Create the inline admin instance
++    inline = ReportPhotoInlineModelAdmin(Report, admin.site)
++    
++    # Check that the inline correctly reports no change permission
++    has_change_permission = inline.has_change_permission(request)
++    print(f"Inline has_change_permission: {has_change_permission}")
++    
++    if has_change_permission:
++        print("❌ BUG: Inline should not have change permission for view-only user!")
++        return False
++    
++    # Create a formset for the ManyToMany through model
++    FormSet = inlineformset_factory(Report, Report.photos.through, fields='__all__')
++    formset = FormSet()
++    
++    # Test the InlineAdminFormSet with has_change_permission=False
++    # This simulates the scenario where user only has view permission
++    inline_admin_formset = helpers.InlineAdminFormSet(
++        inline, formset, 
++        fieldsets=[('Photos', {'fields': ['photo']})],
++        prepopulated_fields={}, 
++        readonly_fields=[], 
++        model_admin=None,
++        has_add_permission=False, 
++        has_change_permission=False,  # User only has view permission
++        has_delete_permission=False, 
++        has_view_permission=True
++    )
++    
++    print(f"InlineAdminFormSet has_change_permission: {inline_admin_formset.has_change_permission}")
++    
++    # Check that readonly_fields_for_editing includes all fields when has_change_permission is False
++    if not inline_admin_formset.has_change_permission:
++        readonly_fields_for_editing = (inline_admin_formset.readonly_fields + 
++                                      helpers.flatten_fieldsets(inline_admin_formset.fieldsets))
++    else:
++        readonly_fields_for_editing = inline_admin_formset.readonly_fields
++    
++    print(f"readonly_fields_for_editing: {readonly_fields_for_editing}")
++    
++    # Iterate through all forms and verify they are properly readonly
++    forms = list(inline_admin_formset)
++    print(f"Number of forms generated: {len(forms)}")
++    
++    all_forms_readonly = True
++    for i, form in enumerate(forms):
++        print(f"Form {i} readonly_fields: {form.readonly_fields}")
++        
++        # When has_change_permission is False, all forms should have readonly fields
++        if not inline_admin_formset.has_change_permission:
++            if form.readonly_fields:  # Should contain field names from fieldsets
++                print(f"✓ Form {i} correctly has readonly fields")
++            else:
++                print(f"❌ Form {i} should have readonly fields but doesn't!")
++                all_forms_readonly = False
++        else:
++            print(f"Form {i} has change permission (expected behavior)")
++    
++    if not all_forms_readonly:
++        print("❌ FAIL: Not all forms are readonly for view-only user!")
++        return False
++    
++    print("✅ SUCCESS: All forms are correctly readonly for view-only user!")
++    print("✅ The GitHub issue has been fixed!")
++    return True
++
++if __name__ == '__main__':
++    success = test_github_issue_fix()
++    print(f"\nFinal test result: {'PASS' if success else 'FAIL'}")
++    if not success:
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..0dd02c6a6a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where admin inlines for auto-created ManyToManyFields
++are editable even when the user only has view permission.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++            'django.contrib.messages',
++            'django.contrib.sessions',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        ROOT_URLCONF='reproduce_issue',
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib import admin
++from django.contrib.auth.models import User
++from django.test import RequestFactory
++
++# Create the models as described in the issue
++class Photo(models.Model):
++    class Meta:
++        app_label = 'test_app'
++
++class Report(models.Model):
++    photos = models.ManyToManyField(Photo)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Create the admin configuration as described in the issue
++class ReportPhotoInlineModelAdmin(admin.TabularInline):
++    model = Report.photos.through
++    show_change_link = True
++
++class ReportAdmin(admin.ModelAdmin):
++    inlines = [ReportPhotoInlineModelAdmin]
++
++admin.site.register(Report, ReportAdmin)
++
++def test_view_permission_inline_editable():
++    """
++    Test that demonstrates the issue: inline should not be editable when user
++    only has view permission.
++    """
++    # Create a mock user with only view permission
++    class MockUser:
++        def __init__(self):
++            self.is_active = True
++            self.is_authenticated = True
++        
++        def has_perm(self, perm):
++            # Simulate user with only view permission
++            return perm == 'test_app.view_report'
++    
++    user = MockUser()
++    
++    # Create a request with the view-only user
++    factory = RequestFactory()
++    request = factory.get(f'/admin/test_app/report/1/change/')
++    request.user = user
++    
++    # Check if the inline has change permission (this should be False)
++    inline = ReportPhotoInlineModelAdmin(Report, admin.site)
++    has_change_permission = inline.has_change_permission(request)
++    
++    print(f"Inline has change permission: {has_change_permission}")
++    
++    # Test the InlineAdminFormSet behavior directly
++    from django.contrib.admin import helpers
++    from django.forms.models import inlineformset_factory
++    
++    # Create a formset for the inline
++    FormSet = inlineformset_factory(Report, Report.photos.through, fields='__all__')
++    formset = FormSet()
++    
++    # Create InlineAdminFormSet with has_change_permission=False
++    inline_admin_formset = helpers.InlineAdminFormSet(
++        inline, formset, [], {}, [], model_admin=None,
++        has_add_permission=False, has_change_permission=False,
++        has_delete_permission=False, has_view_permission=True
++    )
++    
++    # Check if readonly_fields_for_editing includes all fields
++    readonly_fields_for_editing = inline_admin_formset.readonly_fields + helpers.flatten_fieldsets(inline_admin_formset.fieldsets)
++    print(f"Readonly fields for editing: {readonly_fields_for_editing}")
++    
++    # Iterate through the forms to see if they're properly handled
++    for form in inline_admin_formset:
++        print(f"Form readonly fields: {form.readonly_fields}")
++    
++    # This should be False but currently might be True due to the bug
++    if has_change_permission:
++        print("BUG: Inline has change permission even though user only has view permission!")
++        return False
++    else:
++        print("OK: Inline correctly does not have change permission")
++        return True
++
++if __name__ == '__main__':
++    result = test_view_permission_inline_editable()
++    print(f"Test result: {'PASS' if result else 'FAIL'}")
+\ No newline at end of file
+diff --git a/test_inline_fix.py b/test_inline_fix.py
+new file mode 100644
+index 0000000000..54ca646b8b
+--- /dev/null
++++ b/test_inline_fix.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python3
++"""
++Test to verify the fix for the ManyToMany inline permission issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++            'django.contrib.messages',
++            'django.contrib.sessions',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib import admin
++from django.test import RequestFactory
++
++# Create the models as described in the issue
++class Photo(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Report(models.Model):
++    photos = models.ManyToManyField(Photo)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Create the admin configuration as described in the issue
++class ReportPhotoInlineModelAdmin(admin.TabularInline):
++    model = Report.photos.through
++    show_change_link = True
++
++class ReportAdmin(admin.ModelAdmin):
++    inlines = [ReportPhotoInlineModelAdmin]
++
++admin.site.register(Report, ReportAdmin)
++
++def test_inline_formset_readonly_behavior():
++    """
++    Test that verifies the fix: when has_change_permission is False,
++    all fields should be treated as readonly in the inline formset.
++    """
++    from django.contrib.admin import helpers
++    from django.forms.models import inlineformset_factory
++    
++    # Create a formset for the ManyToMany through model
++    FormSet = inlineformset_factory(Report, Report.photos.through, fields='__all__')
++    formset = FormSet()
++    
++    # Create the inline admin instance
++    inline = ReportPhotoInlineModelAdmin(Report, admin.site)
++    
++    print("Testing inline formset behavior with has_change_permission=False")
++    print("=" * 60)
++    
++    # Test with has_change_permission=False (user only has view permission)
++    inline_admin_formset = helpers.InlineAdminFormSet(
++        inline, formset, 
++        fieldsets=[('Test', {'fields': ['photo']})],  # Add some fieldsets
++        prepopulated_fields={}, 
++        readonly_fields=[], 
++        model_admin=None,
++        has_add_permission=False, 
++        has_change_permission=False,  # This is the key - user only has view permission
++        has_delete_permission=False, 
++        has_view_permission=True
++    )
++    
++    # Check the readonly_fields_for_editing logic
++    if not inline_admin_formset.has_change_permission:
++        readonly_fields_for_editing = (inline_admin_formset.readonly_fields + 
++                                      helpers.flatten_fieldsets(inline_admin_formset.fieldsets))
++    else:
++        readonly_fields_for_editing = inline_admin_formset.readonly_fields
++    
++    print(f"has_change_permission: {inline_admin_formset.has_change_permission}")
++    print(f"readonly_fields (original): {inline_admin_formset.readonly_fields}")
++    print(f"fieldsets: {inline_admin_formset.fieldsets}")
++    print(f"readonly_fields_for_editing: {readonly_fields_for_editing}")
++    
++    # Iterate through all forms and check their readonly_fields
++    forms = list(inline_admin_formset)
++    print(f"Number of forms: {len(forms)}")
++    
++    for i, form in enumerate(forms):
++        print(f"Form {i} readonly_fields: {form.readonly_fields}")
++        # For forms when has_change_permission is False, all fields should be readonly
++        if not inline_admin_formset.has_change_permission:
++            if form.readonly_fields:  # Should contain all field names from fieldsets
++                print(f"✓ Form {i} correctly has readonly fields")
++            else:
++                print(f"✗ Form {i} should have readonly fields but doesn't")
++                return False
++        else:
++            print(f"✓ Form {i} has change permission, readonly fields as expected")
++    
++    return True
++
++if __name__ == '__main__':
++    result = test_inline_formset_readonly_behavior()
++    print(f"\nTest result: {'PASS' if result else 'FAIL'}")
+\ No newline at end of file
+diff --git a/test_inline_normal_behavior.py b/test_inline_normal_behavior.py
+new file mode 100644
+index 0000000000..2214d360f9
+--- /dev/null
++++ b/test_inline_normal_behavior.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python3
++"""
++Test to verify that normal inline behavior still works when has_change_permission is True.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++            'django.contrib.messages',
++            'django.contrib.sessions',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib import admin
++from django.test import RequestFactory
++
++# Create the models as described in the issue
++class Photo(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Report(models.Model):
++    photos = models.ManyToManyField(Photo)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Create the admin configuration as described in the issue
++class ReportPhotoInlineModelAdmin(admin.TabularInline):
++    model = Report.photos.through
++    show_change_link = True
++
++class ReportAdmin(admin.ModelAdmin):
++    inlines = [ReportPhotoInlineModelAdmin]
++
++admin.site.register(Report, ReportAdmin)
++
++def test_inline_formset_normal_behavior():
++    """
++    Test that verifies normal inline behavior still works when has_change_permission is True.
++    """
++    from django.contrib.admin import helpers
++    from django.forms.models import inlineformset_factory
++    
++    # Create a formset for the ManyToMany through model
++    FormSet = inlineformset_factory(Report, Report.photos.through, fields='__all__')
++    formset = FormSet()
++    
++    # Create the inline admin instance
++    inline = ReportPhotoInlineModelAdmin(Report, admin.site)
++    
++    print("Testing inline formset behavior with has_change_permission=True")
++    print("=" * 60)
++    
++    # Test with has_change_permission=True (user has change permission)
++    inline_admin_formset = helpers.InlineAdminFormSet(
++        inline, formset, 
++        fieldsets=[('Test', {'fields': ['photo']})],  # Add some fieldsets
++        prepopulated_fields={}, 
++        readonly_fields=[], 
++        model_admin=None,
++        has_add_permission=True, 
++        has_change_permission=True,  # User has change permission
++        has_delete_permission=True, 
++        has_view_permission=True
++    )
++    
++    # Check the readonly_fields_for_editing logic
++    if not inline_admin_formset.has_change_permission:
++        readonly_fields_for_editing = (inline_admin_formset.readonly_fields + 
++                                      helpers.flatten_fieldsets(inline_admin_formset.fieldsets))
++    else:
++        readonly_fields_for_editing = inline_admin_formset.readonly_fields
++    
++    print(f"has_change_permission: {inline_admin_formset.has_change_permission}")
++    print(f"readonly_fields (original): {inline_admin_formset.readonly_fields}")
++    print(f"fieldsets: {inline_admin_formset.fieldsets}")
++    print(f"readonly_fields_for_editing: {readonly_fields_for_editing}")
++    
++    # Iterate through all forms and check their readonly_fields
++    forms = list(inline_admin_formset)
++    print(f"Number of forms: {len(forms)}")
++    
++    for i, form in enumerate(forms):
++        print(f"Form {i} readonly_fields: {form.readonly_fields}")
++        # For forms when has_change_permission is True, readonly_fields should be empty
++        if inline_admin_formset.has_change_permission:
++            if not form.readonly_fields:  # Should be empty since user has change permission
++                print(f"✓ Form {i} correctly has no readonly fields (user has change permission)")
++            else:
++                print(f"✗ Form {i} should not have readonly fields but does")
++                return False
++        else:
++            print(f"✓ Form {i} has no change permission, readonly fields as expected")
++    
++    return True
++
++if __name__ == '__main__':
++    result = test_inline_formset_normal_behavior()
++    print(f"\nTest result: {'PASS' if result else 'FAIL'}")
+\ No newline at end of file

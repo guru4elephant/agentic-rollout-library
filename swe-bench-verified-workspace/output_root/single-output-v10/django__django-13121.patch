@@ -1,0 +1,339 @@
+diff --git a/django/db/backends/base/operations.py b/django/db/backends/base/operations.py
+index 2e283a3193..6e7ef7118b 100644
+--- a/django/db/backends/base/operations.py
++++ b/django/db/backends/base/operations.py
+@@ -580,7 +580,39 @@ class BaseDatabaseOperations:
+ 
+     def convert_durationfield_value(self, value, expression, connection):
+         if value is not None:
+-            return datetime.timedelta(0, 0, value)
++            # Handle both integer and string representations of microseconds
++            try:
++                microseconds = int(value)
++            except (ValueError, TypeError):
++                # If value can't be converted to int, try to parse as timedelta string
++                # This might happen with some database backends or custom expressions
++                try:
++                    # Parse timedelta string format (e.g., "1 day, 0:00:00")
++                    if isinstance(value, str):
++                        # Handle simple timedelta string format
++                        if 'day' in value or ':' in value:
++                            parts = value.split(', ')
++                            if len(parts) == 2:
++                                days = int(parts[0].split()[0])
++                                time_parts = parts[1].split(':')
++                                hours = int(time_parts[0])
++                                minutes = int(time_parts[1])
++                                seconds = int(time_parts[2].split('.')[0])
++                                microseconds = int(time_parts[2].split('.')[1]) if '.' in time_parts[2] else 0
++                                return datetime.timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds, microseconds=microseconds)
++                            else:
++                                time_parts = value.split(':')
++                                if len(time_parts) == 3:
++                                    hours = int(time_parts[0])
++                                    minutes = int(time_parts[1])
++                                    seconds = int(time_parts[2].split('.')[0])
++                                    microseconds = int(time_parts[2].split('.')[1]) if '.' in time_parts[2] else 0
++                                    return datetime.timedelta(hours=hours, minutes=minutes, seconds=seconds, microseconds=microseconds)
++                    # If we can't parse it as a timedelta string, fall back to original behavior
++                    return datetime.timedelta(0, 0, value)
++                except (ValueError, TypeError):
++                    return datetime.timedelta(0, 0, value)
++            return datetime.timedelta(0, 0, microseconds)
+ 
+     def check_expression_support(self, expression):
+         """
+diff --git a/django/db/backends/sqlite3/base.py b/django/db/backends/sqlite3/base.py
+index 31e8a55a43..e3339c1ca5 100644
+--- a/django/db/backends/sqlite3/base.py
++++ b/django/db/backends/sqlite3/base.py
+@@ -561,6 +561,9 @@ def _sqlite_format_dtdelta(conn, lhs, rhs):
+         return None
+     # typecast_timestamp returns a date or a datetime without timezone.
+     # It will be formatted as "%Y-%m-%d" or "%Y-%m-%d %H:%M:%S[.%f]"
++    # For duration arithmetic, return the result in microseconds
++    if isinstance(out, datetime.timedelta):
++        return duration_microseconds(out)
+     return str(out)
+ 
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..761a73cac8
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++    
++# Enable SQL logging
++import logging
++logging.basicConfig(level=logging.DEBUG)
++logger = logging.getLogger('django.db.backends')
++logger.setLevel(logging.DEBUG)
++
++django.setup()
++
++from django.db import models
++import datetime
++from django.db.models import F
++
++class Experiment(models.Model):
++    estimated_time = models.DurationField()
++
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Experiment)
++
++# Insert some test data
++experiment = Experiment(estimated_time=datetime.timedelta(hours=1))
++experiment.save()
++
++# Try to reproduce the issue
++delta = datetime.timedelta(1)
++try:
++    query = Experiment.objects.annotate(duration=F('estimated_time') + delta)
++    print("SQL Query:", str(query.query))
++    result = list(query)
++    print("Success:", result)
++except Exception as e:
++    print("Error:", e)
++    import traceback
++    traceback.print_exc()
++
++# Let's also check what the raw value looks like
++from django.db import connection
++cursor = connection.cursor()
++cursor.execute("SELECT estimated_time FROM test_experiment")
++row = cursor.fetchone()
++print("Raw value from DB:", row[0], type(row[0]))
+\ No newline at end of file
+diff --git a/reproduce_issue_mysql.py b/reproduce_issue_mysql.py
+new file mode 100644
+index 0000000000..98b9f8892a
+--- /dev/null
++++ b/reproduce_issue_mysql.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings for MySQL
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.mysql',
++                'NAME': 'test',
++                'USER': 'root',
++                'PASSWORD': '',
++                'HOST': 'localhost',
++                'PORT': '3306',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++import datetime
++from django.db.models import F
++
++class Experiment(models.Model):
++    estimated_time = models.DurationField()
++
++    class Meta:
++        app_label = 'test'
++
++# Try to reproduce the issue with MySQL
++delta = datetime.timedelta(1)
++try:
++    query = Experiment.objects.annotate(duration=F('estimated_time') + delta)
++    print("SQL Query:", str(query.query))
++    result = list(query)
++    print("Success:", result)
++except Exception as e:
++    print("Error:", e)
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..9609cd5b7b
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python3
++
++import datetime
++from django.db.backends.base.operations import BaseDatabaseOperations
++
++# Test the base convert_durationfield_value method with various inputs
++base_ops = BaseDatabaseOperations(None)
++
++test_cases = [
++    # Integer values (microseconds)
++    3600000000,  # 1 hour
++    86400000000,  # 1 day
++    60000000,     # 1 minute
++    1000000,      # 1 second
++    
++    # String representations of microseconds
++    "3600000000",
++    "86400000000", 
++    "60000000",
++    "1000000",
++    
++    # Edge cases
++    None,
++    0,
++    "0",
++    
++    # Invalid cases that should fall back to original behavior
++    "invalid_string",
++    [],
++    {},
++]
++
++print("Testing convert_durationfield_value with various inputs:")
++for i, value in enumerate(test_cases):
++    try:
++        result = base_ops.convert_durationfield_value(value, None, None)
++        print(f"Test {i+1}: {repr(value)} -> {result}")
++    except Exception as e:
++        print(f"Test {i+1}: {repr(value)} -> ERROR: {e}")
+\ No newline at end of file
+diff --git a/test_mysql_duration.py b/test_mysql_duration.py
+new file mode 100644
+index 0000000000..7440686844
+--- /dev/null
++++ b/test_mysql_duration.py
+@@ -0,0 +1,29 @@
++#!/usr/bin/env python3
++
++import datetime
++from django.db.backends.mysql.operations import DatabaseOperations
++from django.db.backends.base.operations import BaseDatabaseOperations
++
++# Test the MySQL operations
++ops = DatabaseOperations(None)
++
++# Test format_for_duration_arithmetic
++result = ops.format_for_duration_arithmetic("3600000000")
++print("MySQL format_for_duration_arithmetic result:", result)
++
++# Test the base convert_durationfield_value method
++base_ops = BaseDatabaseOperations(None)
++
++# Test with integer (should work)
++try:
++    result = base_ops.convert_durationfield_value(3600000000, None, None)
++    print("Base convert_durationfield_value with integer:", result)
++except Exception as e:
++    print("Base convert_durationfield_value with integer failed:", e)
++
++# Test with string (this is what might fail)
++try:
++    result = base_ops.convert_durationfield_value("3600000000", None, None)
++    print("Base convert_durationfield_value with string:", result)
++except Exception as e:
++    print("Base convert_durationfield_value with string failed:", e)
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..896b98aa8a
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++import datetime
++from django.db.models import F
++
++class Experiment(models.Model):
++    estimated_time = models.DurationField()
++
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Experiment)
++
++# Insert some test data
++experiment = Experiment(estimated_time=datetime.timedelta(hours=1))
++experiment.save()
++
++# Test the exact case from the original issue
++delta = datetime.timedelta(1)
++try:
++    result = list(Experiment.objects.annotate(duration=F('estimated_time') + delta))
++    print("SUCCESS: Original issue is fixed!")
++    print("Result:", result)
++    print("Duration value:", result[0].duration)
++except Exception as e:
++    print("FAILED: Original issue still exists")
++    print("Error:", e)
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file

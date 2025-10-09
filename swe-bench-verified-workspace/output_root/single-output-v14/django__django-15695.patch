@@ -1,0 +1,556 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index d17232e4ec..ea7828b64f 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -967,22 +967,48 @@ class RenameIndex(IndexOperation):
+ 
+     def database_backwards(self, app_label, schema_editor, from_state, to_state):
+         if self.old_fields:
+-            # Backward operation with unnamed index is a no-op.
+-            return
+-
+-        self.new_name_lower, self.old_name_lower = (
+-            self.old_name_lower,
+-            self.new_name_lower,
+-        )
+-        self.new_name, self.old_name = self.old_name, self.new_name
++            # For unnamed indexes, we need to restore the original auto-generated name
++            model = to_state.apps.get_model(app_label, self.model_name)
++            if not self.allow_migrate_model(schema_editor.connection.alias, model):
++                return
++            
++            # Find the current index (which has the new name)
++            columns = [
++                model._meta.get_field(field).column for field in self.old_fields
++            ]
++            matching_index_name = schema_editor._constraint_names(
++                model, column_names=columns, index=True
++            )
++            if len(matching_index_name) != 1:
++                # This shouldn't happen if the forward operation succeeded
++                return
++            
++            current_index = models.Index(
++                fields=self.old_fields,
++                name=matching_index_name[0],
++            )
++            
++            # Find what the original auto-generated name would be
++            # We need to simulate the original index creation to get the auto-generated name
++            original_index = models.Index(fields=self.old_fields)
++            original_index.set_name_with_model(model)
++            
++            # Rename back to the original auto-generated name
++            schema_editor.rename_index(model, current_index, original_index)
++        else:
++            self.new_name_lower, self.old_name_lower = (
++                self.old_name_lower,
++                self.new_name_lower,
++            )
++            self.new_name, self.old_name = self.old_name, self.new_name
+ 
+-        self.database_forwards(app_label, schema_editor, from_state, to_state)
++            self.database_forwards(app_label, schema_editor, from_state, to_state)
+ 
+-        self.new_name_lower, self.old_name_lower = (
+-            self.old_name_lower,
+-            self.new_name_lower,
+-        )
+-        self.new_name, self.old_name = self.old_name, self.new_name
++            self.new_name_lower, self.old_name_lower = (
++                self.old_name_lower,
++                self.new_name_lower,
++            )
++            self.new_name, self.old_name = self.old_name, self.new_name
+ 
+     def describe(self):
+         if self.old_name:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..a3e429546f
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the RenameIndex crash issue with unnamed indexes.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connection, models
++from django.db.migrations.operations.models import RenameIndex
++from django.db.migrations.state import ProjectState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.postgresql',
++                'NAME': 'test_db',
++                'USER': 'postgres',
++                'PASSWORD': 'postgres',
++                'HOST': 'localhost',
++                'PORT': '5432',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a simple test model
++class TestModel(models.Model):
++    field1 = models.IntegerField()
++    field2 = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++        unique_together = [('field1', 'field2')]
++
++def test_rename_index_crash():
++    """Test that reproduces the RenameIndex crash with unnamed indexes."""
++    
++    # Create initial project state
++    project_state = ProjectState()
++    project_state.add_model(
++        ModelState(
++            'test_app',
++            'TestModel',
++            [
++                ('id', models.AutoField(primary_key=True)),
++                ('field1', models.IntegerField()),
++                ('field2', models.IntegerField()),
++            ],
++            {
++                'unique_together': [('field1', 'field2')],
++            },
++            (models.Model,),
++            [],
++        )
++    )
++    
++    # Create RenameIndex operation for unnamed index
++    operation = RenameIndex(
++        model_name='TestModel',
++        new_name='new_test_idx',
++        old_fields=['field1', 'field2']
++    )
++    
++    # Apply state forwards
++    new_state = project_state.clone()
++    operation.state_forwards('test_app', new_state)
++    
++    # Create database table
++    with connection.schema_editor() as editor:
++        editor.create_model(TestModel)
++    
++    # Apply database forwards (rename index)
++    print("Applying database forwards...")
++    with connection.schema_editor() as editor:
++        operation.database_forwards('test_app', editor, project_state, new_state)
++    
++    # Apply database backwards (should restore original name)
++    print("Applying database backwards...")
++    with connection.schema_editor() as editor:
++        operation.database_backwards('test_app', editor, new_state, project_state)
++    
++    # Try to apply database forwards again (this should crash)
++    print("Applying database forwards again...")
++    try:
++        with connection.schema_editor() as editor:
++            operation.database_forwards('test_app', editor, project_state, new_state)
++        print("SUCCESS: No crash occurred!")
++    except Exception as e:
++        print(f"CRASH: {type(e).__name__}: {e}")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    from django.db.migrations.state import ModelState
++    success = test_rename_index_crash()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/reproduce_issue2.py b/reproduce_issue2.py
+new file mode 100644
+index 0000000000..bcf335cf7b
+--- /dev/null
++++ b/reproduce_issue2.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the RenameIndex crash issue with unnamed indexes.
++This follows the exact scenario described in the GitHub issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connection, models
++from django.db.migrations.operations.models import RenameIndex
++from django.db.migrations.state import ProjectState, ModelState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_rename_index_crash():
++    """Test that reproduces the RenameIndex crash with unnamed indexes."""
++    
++    # Create a simple test model similar to the test case
++    app_label = "test_app"
++    
++    # Create initial project state with a model that has index_together
++    project_state = ProjectState()
++    project_state.add_model(
++        ModelState(
++            app_label,
++            'Pony',
++            [
++                ('id', models.AutoField(primary_key=True)),
++                ('weight', models.IntegerField()),
++                ('pink', models.IntegerField()),
++            ],
++            {
++                'index_together': [('weight', 'pink')],
++            },
++            (models.Model,),
++            [],
++        )
++    )
++    
++    # Create RenameIndex operation for unnamed index
++    operation = RenameIndex(
++        model_name='Pony',
++        new_name='new_pony_test_idx',
++        old_fields=('weight', 'pink')
++    )
++    
++    # Apply state forwards
++    new_state = project_state.clone()
++    operation.state_forwards(app_label, new_state)
++    
++    # Create database table
++    with connection.schema_editor() as editor:
++        # Create the model
++        from django.db.migrations import RunPython
++        from django.db import migrations
++        
++        # Create a simple migration to set up the model
++        class Migration(migrations.Migration):
++            operations = [
++                migrations.CreateModel(
++                    name='Pony',
++                    fields=[
++                        ('id', models.AutoField(primary_key=True)),
++                        ('weight', models.IntegerField()),
++                        ('pink', models.IntegerField()),
++                    ],
++                    options={
++                        'index_together': {('weight', 'pink')},
++                    },
++                ),
++            ]
++        
++        # Apply the migration
++        migration = Migration('test', app_label)
++        for op in migration.operations:
++            op.database_forwards(app_label, editor, project_state, new_state)
++    
++    print("Initial setup complete")
++    
++    # Rename index (database forwards)
++    print("Applying database forwards (rename index)...")
++    with connection.schema_editor() as editor:
++        operation.database_forwards(app_label, editor, project_state, new_state)
++    print("Index renamed successfully")
++    
++    # Reverse is a no-op (database backwards)
++    print("Applying database backwards (should be no-op)...")
++    with connection.schema_editor() as editor:
++        operation.database_backwards(app_label, editor, new_state, project_state)
++    print("Backward operation completed")
++    
++    # Re-apply renaming (this should crash according to the issue)
++    print("Re-applying database forwards (this should crash)...")
++    try:
++        with connection.schema_editor() as editor:
++            operation.database_forwards(app_label, editor, project_state, new_state)
++        print("SUCCESS: No crash occurred!")
++        return True
++    except Exception as e:
++        print(f"CRASH: {type(e).__name__}: {e}")
++        return False
++
++if __name__ == '__main__':
++    success = test_rename_index_crash()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_reapply_forward.py b/test_reapply_forward.py
+new file mode 100644
+index 0000000000..301ad681e2
+--- /dev/null
++++ b/test_reapply_forward.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python3
++"""
++Test to verify that re-applying forward operation after backward doesn't crash.
++This reproduces the exact scenario from the GitHub issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connection, models
++from django.db.migrations.operations.models import RenameIndex
++from django.db.migrations.state import ProjectState, ModelState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_reapply_forward_after_backward():
++    """Test that re-applying forward operation after backward doesn't crash."""
++    
++    app_label = "test_app"
++    
++    # Create initial project state with a model that has index_together
++    project_state = ProjectState()
++    project_state.add_model(
++        ModelState(
++            app_label,
++            'TestModel',
++            [
++                ('id', models.AutoField(primary_key=True)),
++                ('field1', models.IntegerField()),
++                ('field2', models.IntegerField()),
++            ],
++            {
++                'index_together': [('field1', 'field2')],
++            },
++            (models.Model,),
++            [],
++        )
++    )
++    
++    # Create RenameIndex operation for unnamed index
++    operation = RenameIndex(
++        model_name='TestModel',
++        new_name='new_test_idx',
++        old_fields=['field1', 'field2']
++    )
++    
++    # Apply state forwards
++    new_state = project_state.clone()
++    operation.state_forwards(app_label, new_state)
++    
++    # Create the table
++    with connection.schema_editor() as editor:
++        editor.create_model(project_state.apps.get_model(app_label, 'TestModel'))
++    
++    # Step 1: Apply database forwards (rename index)
++    print("Step 1: Applying database forwards (rename index)...")
++    with connection.schema_editor() as editor:
++        operation.database_forwards(app_label, editor, project_state, new_state)
++    
++    # Verify the index was renamed
++    with connection.cursor() as cursor:
++        cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='test_app_testmodel'")
++        indexes = [row[0] for row in cursor.fetchall()]
++        assert 'new_test_idx' in indexes, "New index name should exist after forward operation"
++        print(f"✓ Index renamed to: {indexes}")
++    
++    # Step 2: Apply database backwards (should restore original name)
++    print("Step 2: Applying database backwards (restore original name)...")
++    with connection.schema_editor() as editor:
++        operation.database_backwards(app_label, editor, new_state, project_state)
++    
++    # Verify the index name was restored
++    with connection.cursor() as cursor:
++        cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='test_app_testmodel'")
++        indexes = [row[0] for row in cursor.fetchall()]
++        print(f"✓ Index restored to: {indexes}")
++    
++    # Step 3: Re-apply database forwards (this should NOT crash)
++    print("Step 3: Re-applying database forwards (should not crash)...")
++    try:
++        with connection.schema_editor() as editor:
++            operation.database_forwards(app_label, editor, project_state, new_state)
++        print("✓ SUCCESS: No crash occurred when re-applying forward operation!")
++        
++        # Verify the index was renamed again
++        with connection.cursor() as cursor:
++            cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='test_app_testmodel'")
++            indexes = [row[0] for row in cursor.fetchall()]
++            assert 'new_test_idx' in indexes, "New index name should exist after re-applying forward operation"
++            print(f"✓ Index renamed again to: {indexes}")
++            
++        return True
++        
++    except Exception as e:
++        print(f"✗ CRASH: {type(e).__name__}: {e}")
++        return False
++
++if __name__ == '__main__':
++    success = test_reapply_forward_after_backward()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_rename_index_fix.py b/test_rename_index_fix.py
+new file mode 100644
+index 0000000000..536f33094e
+--- /dev/null
++++ b/test_rename_index_fix.py
+@@ -0,0 +1,111 @@
++#!/usr/bin/env python3
++"""
++Test to verify the RenameIndex fix works correctly.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connection, models
++from django.db.migrations.operations.models import RenameIndex
++from django.db.migrations.state import ProjectState, ModelState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_rename_index_unnamed_backwards():
++    """Test that RenameIndex database_backwards works correctly for unnamed indexes."""
++    
++    app_label = "test_app"
++    
++    # Create initial project state with a model that has index_together
++    project_state = ProjectState()
++    project_state.add_model(
++        ModelState(
++            app_label,
++            'TestModel',
++            [
++                ('id', models.AutoField(primary_key=True)),
++                ('field1', models.IntegerField()),
++                ('field2', models.IntegerField()),
++            ],
++            {
++                'index_together': [('field1', 'field2')],
++            },
++            (models.Model,),
++            [],
++        )
++    )
++    
++    # Create RenameIndex operation for unnamed index
++    operation = RenameIndex(
++        model_name='TestModel',
++        new_name='new_test_idx',
++        old_fields=['field1', 'field2']
++    )
++    
++    # Apply state forwards
++    new_state = project_state.clone()
++    operation.state_forwards(app_label, new_state)
++    
++    # Create the table
++    with connection.schema_editor() as editor:
++        # Create the table
++        editor.create_model(project_state.apps.get_model(app_label, 'TestModel'))
++    
++    # Get the original index name (auto-generated)
++    model = project_state.apps.get_model(app_label, 'TestModel')
++    original_index = models.Index(fields=['field1', 'field2'])
++    original_index.set_name_with_model(model)
++    original_name = original_index.name
++    
++    print(f"Original auto-generated index name: {original_name}")
++    
++    # Apply database forwards (rename index)
++    with connection.schema_editor() as editor:
++        operation.database_forwards(app_label, editor, project_state, new_state)
++    
++    # Verify the index was renamed
++    with connection.cursor() as cursor:
++        cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='test_app_testmodel'")
++        indexes = [row[0] for row in cursor.fetchall()]
++        print(f"Indexes after forward: {indexes}")
++        assert 'new_test_idx' in indexes, "New index name should exist after forward operation"
++    
++    # Apply database backwards (should restore original name)
++    with connection.schema_editor() as editor:
++        operation.database_backwards(app_label, editor, new_state, project_state)
++    
++    # Verify the index name was restored
++    with connection.cursor() as cursor:
++        cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='test_app_testmodel'")
++        indexes = [row[0] for row in cursor.fetchall()]
++        print(f"Indexes after backward: {indexes}")
++        
++        # The original auto-generated name should be restored
++        assert original_name in indexes, f"Original auto-generated name '{original_name}' should be restored"
++        assert 'new_test_idx' not in indexes, "New index name should not exist after backward operation"
++    
++    print("SUCCESS: RenameIndex database_backwards works correctly for unnamed indexes!")
++    return True
++
++if __name__ == '__main__':
++    success = test_rename_index_unnamed_backwards()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

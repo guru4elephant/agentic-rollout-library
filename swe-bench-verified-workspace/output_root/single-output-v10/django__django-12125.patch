@@ -1,0 +1,192 @@
+diff --git a/debug_deconstruct.py b/debug_deconstruct.py
+new file mode 100644
+index 0000000000..a65d1e57c1
+--- /dev/null
++++ b/debug_deconstruct.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++import os
++import sys
++from django.conf import settings
++from django.db import models
++
++# Configure minimal Django settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    SECRET_KEY='test-secret-key',
++)
++
++# Setup Django
++import django
++django.setup()
++
++# Create test models with inner classes
++class Outer(object):
++    class Inner(models.CharField):
++        pass
++
++# Create an instance of the inner class field
++field_instance = Outer.Inner(max_length=20)
++
++# Check what deconstruct returns
++attr_name, path, args, kwargs = field_instance.deconstruct()
++
++print(f"attr_name: {attr_name}")
++print(f"path: {path}")
++print(f"args: {args}")
++print(f"kwargs: {kwargs}")
++
++# Check the class information
++print(f"Field class: {field_instance.__class__}")
++print(f"Field class module: {field_instance.__class__.__module__}")
++print(f"Field class name: {field_instance.__class__.__name__}")
++print(f"Field class qualname: {field_instance.__class__.__qualname__}")
++
++# Check the outer class
++print(f"Outer class: {Outer}")
++print(f"Outer class module: {Outer.__module__}")
++print(f"Outer class name: {Outer.__name__}")
+\ No newline at end of file
+diff --git a/django/db/migrations/serializer.py b/django/db/migrations/serializer.py
+index 7d226955d5..a23b68de4b 100644
+--- a/django/db/migrations/serializer.py
++++ b/django/db/migrations/serializer.py
+@@ -96,7 +96,19 @@ class DeconstructableSerializer(BaseSerializer):
+             name = "models.%s" % name
+         else:
+             imports = {"import %s" % module}
+-            name = path
++            # For inner classes, we need to reconstruct the qualified class name
++            # from the module and name parts. The module part from rsplit
++            # might contain additional class names.
++            if "." in module:
++                # The module contains class names, so we need to extract
++                # the qualified class name properly
++                # Example: module="__main__.Outer", name="Inner" -> "Outer.Inner"
++                class_parts = module.split(".")
++                qualified_name = class_parts[-1] + "." + name
++            else:
++                # Regular case, no inner classes
++                qualified_name = name
++            name = qualified_name
+         return name, imports
+ 
+     def serialize(self):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..0dda4e06c1
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++import os
++import sys
++import tempfile
++import shutil
++from django.conf import settings
++from django.db import models
++
++# Configure minimal Django settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    SECRET_KEY='test-secret-key',
++)
++
++# Setup Django
++import django
++django.setup()
++
++from django.db.migrations.writer import MigrationWriter
++from django.db.migrations.migration import Migration
++
++# Create test models with inner classes
++class Outer(object):
++    class Inner(models.CharField):
++        pass
++
++class A(models.Model):
++    field = Outer.Inner(max_length=20)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create a migration operation
++from django.db.migrations.operations import CreateModel
++
++operation = CreateModel(
++    name='A',
++    fields=[
++        ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
++        ('field', Outer.Inner(max_length=20)),
++    ],
++)
++
++# Create a migration
++migration = Migration('test', 'test')
++migration.operations = [operation]
++
++# Write the migration
++writer = MigrationWriter(migration)
++migration_string = writer.as_string()
++
++print("Generated migration:")
++print(migration_string)
++
++# Check if the issue exists
++if 'test1.models.Inner' in migration_string:
++    print("\n❌ ISSUE CONFIRMED: Found 'test1.models.Inner' instead of 'test1.models.Outer.Inner'")
++else:
++    print("\n✅ Issue not found - migration generated correctly")
+\ No newline at end of file
+diff --git a/test1 b/test1
+new file mode 100644
+index 0000000000..e5acc55927
+--- /dev/null
++++ b/test1
+@@ -0,0 +1,2 @@
++import os
++os.makedirs('test1', exist_ok=True)
+\ No newline at end of file
+diff --git a/test_serialize_path.py b/test_serialize_path.py
+new file mode 100644
+index 0000000000..f878477869
+--- /dev/null
++++ b/test_serialize_path.py
+@@ -0,0 +1,16 @@
++#!/usr/bin/env python3
++from django.db.migrations.serializer import DeconstructableSerializer
++
++# Test cases for inner classes
++test_cases = [
++    "__main__.Outer.Inner",  # Inner class case
++    "django.db.models.CharField",  # Regular Django field
++    "myapp.models.MyField",  # Custom field
++    "myapp.models.Outer.Inner",  # Another inner class case
++]
++
++for path in test_cases:
++    result = DeconstructableSerializer._serialize_path(path)
++    print(f"Input: {path}")
++    print(f"Output: {result}")
++    print()
+\ No newline at end of file

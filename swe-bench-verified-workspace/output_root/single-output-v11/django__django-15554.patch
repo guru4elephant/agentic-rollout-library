@@ -1,0 +1,227 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..6fab04141c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.filtered_relation',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db.models import FilteredRelation, Q, F, Case, When
++from tests.filtered_relation.models import Author, Book
++
++def test_filtered_relation_issue():
++    print("Testing FilteredRelation issue...")
++    
++    # Create test data using existing models
++    author = Author.objects.create(name="Test Author")
++    editor = Author.objects.create(name="Test Editor")
++    book1 = Book.objects.create(title="Book 1", author=author, editor=editor)
++    book2 = Book.objects.create(title="Book 2", author=author, editor=editor)
++    
++    # Create query with multiple FilteredRelation on same relation
++    # This should demonstrate the issue where only one JOIN is created
++    qs = Author.objects.filter(pk=author.pk).alias(
++        book_title1=FilteredRelation(
++            "book",
++            condition=Q(book__title="Book 1")
++        ),
++        book_title2=FilteredRelation(
++            "book", 
++            condition=Q(book__title="Book 2")
++        )
++    )
++    
++    # Print the SQL query to see if both JOINs are present
++    print("Generated SQL:")
++    print(str(qs.query))
++    
++    # Check if both filtered relations are present in the query
++    sql = str(qs.query)
++    book_title1_count = sql.count('book_title1')
++    book_title2_count = sql.count('book_title2')
++    
++    print(f"book_title1 references in SQL: {book_title1_count}")
++    print(f"book_title2 references in SQL: {book_title2_count}")
++    
++    if book_title1_count > 0 and book_title2_count > 0:
++        print("SUCCESS: Both filtered relations are present in the SQL")
++    else:
++        print("ISSUE: Only one filtered relation is present in the SQL")
++
++if __name__ == "__main__":
++    test_filtered_relation_issue()
+\ No newline at end of file
+diff --git a/test_multiple_filtered_relations.py b/test_multiple_filtered_relations.py
+new file mode 100644
+index 0000000000..5c2ee17b43
+--- /dev/null
++++ b/test_multiple_filtered_relations.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.filtered_relation',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db.models import FilteredRelation, Q, F, Case, When
++from django.db import connection
++from tests.filtered_relation.models import Author, Book, Editor
++
++def test_multiple_filtered_relations_same_relation():
++    """Test the issue where multiple FilteredRelation with same relation are ignored"""
++    print("Testing multiple FilteredRelation with same relation...")
++    
++    # Create database tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Author)
++        schema_editor.create_model(Editor)
++        schema_editor.create_model(Book)
++    
++    # Create test data
++    author = Author.objects.create(name="Test Author")
++    editor = Editor.objects.create(name="Test Editor")
++    book1 = Book.objects.create(title="Book 1", author=author, editor=editor, state=Book.AVAILABLE)
++    book2 = Book.objects.create(title="Book 2", author=author, editor=editor, state=Book.RENTED)
++    
++    # Create query with multiple FilteredRelation on the same relation but different conditions
++    qs = Author.objects.filter(pk=author.pk).alias(
++        available_books=FilteredRelation(
++            "book",
++            condition=Q(book__state=Book.AVAILABLE)
++        ),
++        rented_books=FilteredRelation(
++            "book", 
++            condition=Q(book__state=Book.RENTED)
++        )
++    )
++    
++    # Print the SQL query to see if both JOINs are present
++    print("Generated SQL:")
++    sql = str(qs.query)
++    print(sql)
++    
++    # Check if both filtered relations are present in the query
++    available_count = sql.count('available_books')
++    rented_count = sql.count('rented_books')
++    
++    print(f"available_books references in SQL: {available_count}")
++    print(f"rented_books references in SQL: {rented_count}")
++    
++    if available_count > 0 and rented_count > 0:
++        print("SUCCESS: Both filtered relations are present in the SQL")
++        return True
++    else:
++        print("ISSUE: Only one filtered relation is present in the SQL")
++        return False
++
++def test_original_issue_case():
++    """Test the exact case from the GitHub issue"""
++    print("\nTesting original GitHub issue case...")
++    
++    # Create test data that mimics the issue
++    author = Author.objects.create(name="Test Author")
++    editor = Editor.objects.create(name="Test Editor")
++    
++    # Create books with different states to mimic the "is_all" and "zone" scenario
++    book_all = Book.objects.create(title="All Book", author=author, editor=editor, state=Book.AVAILABLE)
++    book_zone = Book.objects.create(title="Zone Book", author=author, editor=editor, state=Book.RENTED)
++    
++    # Create the query as described in the issue
++    qs = Author.objects.filter(pk=author.pk).alias(
++        relation_zone=FilteredRelation(
++            "book",
++            condition=Q(book__state=Book.RENTED)  # Simulating zone condition
++        ),
++        relation_all=FilteredRelation(
++            "book", 
++            condition=Q(book__state=Book.AVAILABLE)  # Simulating is_all condition
++        ),
++        price_zone=F("relation_zone__pk")  # Using pk instead of price for simplicity
++    ).annotate(
++        price_final=Case(
++            When(
++                price_zone__isnull=True,
++                then=F("relation_all__pk"),  # Using pk instead of price
++            ),
++            default=F("price_zone")
++        )
++    )
++    
++    # Print the SQL query
++    print("Generated SQL for original issue:")
++    sql = str(qs.query)
++    print(sql)
++    
++    # Check if both filtered relations are present
++    zone_count = sql.count('relation_zone')
++    all_count = sql.count('relation_all')
++    
++    print(f"relation_zone references in SQL: {zone_count}")
++    print(f"relation_all references in SQL: {all_count}")
++    
++    if zone_count > 0 and all_count > 0:
++        print("SUCCESS: Both filtered relations are present for original issue")
++        return True
++    else:
++        print("ISSUE: Only one filtered relation is present for original issue")
++        return False
++
++if __name__ == "__main__":
++    success1 = test_multiple_filtered_relations_same_relation()
++    success2 = test_original_issue_case()
++    
++    if not success1 or not success2:
++        print("\nISSUE CONFIRMED: Multiple FilteredRelation with same relation are being ignored!")
++        sys.exit(1)
++    else:
++        print("\nSUCCESS: All tests passed!")
++        sys.exit(0)
+\ No newline at end of file

@@ -1,0 +1,841 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..8b12920ca2
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++import os
++from django.db.backends.postgresql.client import DatabaseClient
++
++# Set a test environment variable to verify it's passed through
++os.environ['TEST_ENV_VAR'] = 'from_os_environ'
++
++def test_comprehensive_scenarios():
++    """Test all scenarios to ensure the fix works correctly"""
++    
++    test_cases = [
++        {
++            'name': 'No environment variables needed',
++            'settings': {
++                'NAME': 'testdb',
++                'USER': None,
++                'PASSWORD': None,
++                'HOST': None,
++                'PORT': None,
++                'OPTIONS': {}
++            },
++            'expected_env': None
++        },
++        {
++            'name': 'With password only',
++            'settings': {
++                'NAME': 'testdb',
++                'USER': 'user',
++                'PASSWORD': 'secret',
++                'HOST': None,
++                'PORT': None,
++                'OPTIONS': {}
++            },
++            'expected_env': {'PGPASSWORD': 'secret'}
++        },
++        {
++            'name': 'With SSL options only',
++            'settings': {
++                'NAME': 'testdb',
++                'USER': None,
++                'PASSWORD': None,
++                'HOST': None,
++                'PORT': None,
++                'OPTIONS': {
++                    'sslmode': 'verify-ca',
++                    'sslrootcert': 'root.crt'
++                }
++            },
++            'expected_env': {'PGSSLMODE': 'verify-ca', 'PGSSLROOTCERT': 'root.crt'}
++        },
++        {
++            'name': 'With password and SSL options',
++            'settings': {
++                'NAME': 'testdb',
++                'USER': 'user',
++                'PASSWORD': 'secret',
++                'HOST': None,
++                'PORT': None,
++                'OPTIONS': {
++                    'sslmode': 'verify-ca',
++                    'sslrootcert': 'root.crt'
++                }
++            },
++            'expected_env': {'PGPASSWORD': 'secret', 'PGSSLMODE': 'verify-ca', 'PGSSLROOTCERT': 'root.crt'}
++        },
++        {
++            'name': 'With passfile',
++            'settings': {
++                'NAME': 'testdb',
++                'USER': None,
++                'PASSWORD': None,
++                'HOST': None,
++                'PORT': None,
++                'OPTIONS': {
++                    'passfile': '/path/to/passfile'
++                }
++            },
++            'expected_env': {'PGPASSFILE': '/path/to/passfile'}
++        }
++    ]
++    
++    for i, test_case in enumerate(test_cases, 1):
++        print(f"\nTest {i}: {test_case['name']}")
++        
++        args, env = DatabaseClient.settings_to_cmd_args_env(test_case['settings'], [])
++        
++        print(f"  Expected env: {test_case['expected_env']}")
++        print(f"  Actual env: {env}")
++        
++        if env == test_case['expected_env']:
++            print(f"  ✓ PASS: Environment matches expected value")
++        else:
++            print(f"  ✗ FAIL: Environment does not match expected value")
++        
++        # Test base client behavior
++        if env:
++            final_env = {**os.environ, **env}
++            print(f"  Base client merges with os.environ")
++            if 'TEST_ENV_VAR' in final_env:
++                print(f"  ✓ TEST_ENV_VAR is available: {final_env['TEST_ENV_VAR']}")
++            else:
++                print(f"  ✗ TEST_ENV_VAR is NOT available")
++        else:
++            print(f"  Base client uses os.environ (env=None)")
++            print(f"  ✓ TEST_ENV_VAR will be available")
++
++if __name__ == '__main__':
++    test_comprehensive_scenarios()
+\ No newline at end of file
+diff --git a/django/db/backends/base/client.py b/django/db/backends/base/client.py
+index 339f1e863c..34573a2228 100644
+--- a/django/db/backends/base/client.py
++++ b/django/db/backends/base/client.py
+@@ -23,4 +23,7 @@ class BaseDatabaseClient:
+         args, env = self.settings_to_cmd_args_env(self.connection.settings_dict, parameters)
+         if env:
+             env = {**os.environ, **env}
++        elif env == {}:
++            # Handle empty dict by using os.environ
++            env = None
+         subprocess.run(args, env=env, check=True)
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..f2958b5e38
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++import os
++import subprocess
++from django.db.backends.postgresql.client import DatabaseClient
++
++# Set a test environment variable to verify it's passed through
++os.environ['TEST_ENV_VAR'] = 'from_os_environ'
++
++def test_original_issue():
++    """Test the original issue: PostgreSQL client returns empty dict instead of None"""
++    
++    # Test case that reproduces the original issue
++    settings = {
++        'NAME': 'testdb',
++        'USER': None,
++        'PASSWORD': None,
++        'HOST': None,
++        'PORT': None,
++        'OPTIONS': {}
++    }
++    
++    # Get args and env from PostgreSQL client
++    args, env = DatabaseClient.settings_to_cmd_args_env(settings, [])
++    
++    print("Original PostgreSQL client behavior:")
++    print(f"  Args: {args}")
++    print(f"  Env: {env}")
++    print(f"  Env type: {type(env)}")
++    print(f"  Env is None: {env is None}")
++    print(f"  Env is empty dict: {env == {}}")
++    
++    # Simulate the OLD base client behavior (before fix)
++    print("\nOLD behavior (before fix):")
++    if env:  # This would be True for empty dict!
++        old_final_env = {**os.environ, **env}
++        print(f"  if env: condition evaluates to: {bool(env)}")
++        print(f"  Final env: {old_final_env}")
++        print(f"  TEST_ENV_VAR available: {'TEST_ENV_VAR' in old_final_env}")
++    else:
++        old_final_env = None
++        print(f"  if env: condition evaluates to: {bool(env)}")
++        print(f"  Final env: {old_final_env}")
++        print(f"  TEST_ENV_VAR available: True (os.environ used)")
++    
++    # Simulate the NEW base client behavior (after fix)
++    print("\nNEW behavior (after fix):")
++    if env:
++        new_final_env = {**os.environ, **env}
++        print(f"  if env: condition evaluates to: {bool(env)}")
++        print(f"  Final env: {new_final_env}")
++        print(f"  TEST_ENV_VAR available: {'TEST_ENV_VAR' in new_final_env}")
++    else:
++        new_final_env = None
++        print(f"  if env: condition evaluates to: {bool(env)}")
++        print(f"  Final env: {new_final_env}")
++        print(f"  TEST_ENV_VAR available: True (os.environ used)")
++    
++    # Test what subprocess would actually receive
++    print("\nSubprocess behavior:")
++    
++    # Test with empty dict (OLD behavior)
++    try:
++        result = subprocess.run(
++            ['python3', '-c', 'import os; print("TEST_ENV_VAR:", os.environ.get("TEST_ENV_VAR", "NOT_SET"))'],
++            env={},  # Empty dict (OLD behavior)
++            capture_output=True, text=True, check=True
++        )
++        print(f"  With empty dict: TEST_ENV_VAR={result.stdout.strip()}")
++    except Exception as e:
++        print(f"  With empty dict: Error - {e}")
++    
++    # Test with None (NEW behavior)
++    try:
++        result = subprocess.run(
++            ['python3', '-c', 'import os; print("TEST_ENV_VAR:", os.environ.get("TEST_ENV_VAR", "NOT_SET"))'],
++            env=None,  # None (NEW behavior)
++            capture_output=True, text=True, check=True
++        )
++        print(f"  With None: TEST_ENV_VAR={result.stdout.strip()}")
++    except Exception as e:
++        print(f"  With None: Error - {e}")
++
++if __name__ == '__main__':
++    test_original_issue()
+\ No newline at end of file
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..c2432c628b
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++import os
++import subprocess
++from django.db.backends.base.client import BaseDatabaseClient
++from django.db.backends.postgresql.client import DatabaseClient
++
++# Set a test environment variable to verify it's passed through
++os.environ['TEST_ENV_VAR'] = 'from_os_environ'
++
++def test_final_verification():
++    """Final verification that the fix works correctly"""
++    
++    print("=== Final Verification ===\n")
++    
++    # Test case that reproduces the original issue
++    settings = {
++        'NAME': 'testdb',
++        'USER': None,
++        'PASSWORD': None,
++        'HOST': None,
++        'PORT': None,
++        'OPTIONS': {}
++    }
++    
++    # Get args and env from PostgreSQL client
++    args, env = DatabaseClient.settings_to_cmd_args_env(settings, [])
++    
++    print("1. PostgreSQL client behavior:")
++    print(f"   Returns: args={args}, env={env}")
++    print(f"   Env type: {type(env)}")
++    print(f"   Env is empty dict: {env == {}}")
++    print(f"   Env is None: {env is None}")
++    
++    # Test base client behavior
++    print("\n2. Base client behavior:")
++    if env:
++        final_env = {**os.environ, **env}
++        print(f"   Merges with os.environ: {final_env}")
++    elif env == {}:
++        final_env = None
++        print(f"   Converts empty dict to None (will use os.environ)")
++    else:
++        final_env = env
++        print(f"   Uses as-is: {final_env}")
++    
++    # Test what subprocess actually receives
++    print("\n3. Subprocess behavior:")
++    try:
++        result = subprocess.run(
++            ['python3', '-c', 'import os; print("TEST_ENV_VAR:", os.environ.get("TEST_ENV_VAR", "NOT_SET"))'],
++            env=final_env,
++            capture_output=True, text=True, check=True
++        )
++        print(f"   TEST_ENV_VAR: {result.stdout.strip()}")
++        if "from_os_environ" in result.stdout:
++            print("   ✓ SUCCESS: TEST_ENV_VAR is available from os.environ")
++        else:
++            print("   ✗ FAILURE: TEST_ENV_VAR is NOT available")
++    except Exception as e:
++        print(f"   Error: {e}")
++    
++    print("\n4. Summary:")
++    if final_env is None:
++        print("   ✓ FIXED: Empty dict converted to None, os.environ will be used")
++    elif isinstance(final_env, dict) and not final_env:
++        print("   ✗ NOT FIXED: Empty dict passed to subprocess")
++    else:
++        print(f"   ? UNEXPECTED: final_env = {final_env}")
++    
++    print("\n=== Verification Complete ===")
++
++if __name__ == '__main__':
++    test_final_verification()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..f50730a9a6
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,45 @@
++#!/usr/bin/env python3
++import os
++import subprocess
++from django.db.backends.postgresql.client import DatabaseClient
++
++# Mock settings that don't require any PostgreSQL environment variables
++settings_dict = {
++    'NAME': 'testdb',
++    'USER': None,
++    'PASSWORD': None,
++    'HOST': None,
++    'PORT': None,
++    'OPTIONS': {}
++}
++
++# Get the args and env from the PostgreSQL client
++args, env = DatabaseClient.settings_to_cmd_args_env(settings_dict, [])
++
++print("Args:", args)
++print("Env:", env)
++print("Env type:", type(env))
++print("Env is None:", env is None)
++print("Env is empty dict:", env == {})
++print("Bool(env):", bool(env))
++
++# Simulate what happens in base client's runshell method
++if env:
++    print("if env: condition is True")
++    final_env = {**os.environ, **env}
++else:
++    print("if env: condition is False") 
++    final_env = None
++
++print("Final env:", final_env)
++print("Final env type:", type(final_env))
++
++# Test what subprocess would get
++print("\nTesting subprocess behavior:")
++try:
++    # This should fail since we don't have a real PostgreSQL connection
++    # but we can see what environment would be passed
++    result = subprocess.run(args, env=final_env, capture_output=True, check=False)
++    print("Exit code:", result.returncode)
++except Exception as e:
++    print("Error:", e)
+\ No newline at end of file
+diff --git a/test_base_client_fix.py b/test_base_client_fix.py
+new file mode 100644
+index 0000000000..f8e1a11f1e
+--- /dev/null
++++ b/test_base_client_fix.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++import os
++from django.db.backends.base.client import BaseDatabaseClient
++from django.db.backends.postgresql.client import DatabaseClient
++
++# Set a test environment variable to verify it's passed through
++os.environ['TEST_ENV_VAR'] = 'from_os_environ'
++
++class MockConnection:
++    def __init__(self, settings_dict):
++        self.settings_dict = settings_dict
++
++# Test the base client's runshell logic
++def test_base_client_env_handling():
++    # Test case 1: Empty env dict (should be treated as None)
++    settings1 = {
++        'NAME': 'testdb',
++        'USER': None,
++        'PASSWORD': None,
++        'HOST': None,
++        'PORT': None,
++        'OPTIONS': {}
++    }
++    
++    # Simulate what the base client does
++    args1, env1 = DatabaseClient.settings_to_cmd_args_env(settings1, [])
++    print(f"Test 1 - Empty env dict:")
++    print(f"  PostgreSQL returns: env={env1}")
++    
++    # Apply the base client logic
++    if env1:
++        final_env1 = {**os.environ, **env1}
++        print(f"  Base client merges: final_env={final_env1}")
++    else:
++        final_env1 = None
++        print(f"  Base client sets: final_env=None (will use os.environ)")
++    
++    # Test case 2: Non-empty env dict (should be merged with os.environ)
++    settings2 = {
++        'NAME': 'testdb',
++        'USER': 'user',
++        'PASSWORD': 'password',
++        'HOST': None,
++        'PORT': None,
++        'OPTIONS': {}
++    }
++    
++    args2, env2 = DatabaseClient.settings_to_cmd_args_env(settings2, [])
++    print(f"\nTest 2 - Non-empty env dict:")
++    print(f"  PostgreSQL returns: env={env2}")
++    
++    # Apply the base client logic
++    if env2:
++        final_env2 = {**os.environ, **env2}
++        print(f"  Base client merges: final_env={final_env2}")
++    else:
++        final_env2 = None
++        print(f"  Base client sets: final_env=None (will use os.environ)")
++    
++    # Verify TEST_ENV_VAR is preserved
++    print(f"\nEnvironment variable preservation:")
++    if final_env1 is None:
++        print(f"  Test 1: TEST_ENV_VAR will be available (os.environ used)")
++    elif 'TEST_ENV_VAR' in final_env1:
++        print(f"  Test 1: TEST_ENV_VAR is available: {final_env1['TEST_ENV_VAR']}")
++    else:
++        print(f"  Test 1: TEST_ENV_VAR is NOT available")
++    
++    if 'TEST_ENV_VAR' in final_env2:
++        print(f"  Test 2: TEST_ENV_VAR is available: {final_env2['TEST_ENV_VAR']}")
++    else:
++        print(f"  Test 2: TEST_ENV_VAR is NOT available")
++
++if __name__ == '__main__':
++    test_base_client_env_handling()
+\ No newline at end of file
+diff --git a/test_base_client_fix_final.py b/test_base_client_fix_final.py
+new file mode 100644
+index 0000000000..23aaa7d066
+--- /dev/null
++++ b/test_base_client_fix_final.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++import os
++from django.db.backends.base.client import BaseDatabaseClient
++from django.db.backends.postgresql.client import DatabaseClient
++
++# Set a test environment variable to verify it's passed through
++os.environ['TEST_ENV_VAR'] = 'from_os_environ'
++
++class MockConnection:
++    def __init__(self, settings_dict):
++        self.settings_dict = settings_dict
++
++def test_base_client_behavior():
++    """Test the base client's handling of empty dict vs None"""
++    
++    # Test case 1: Empty env dict from PostgreSQL client
++    settings1 = {
++        'NAME': 'testdb',
++        'USER': None,
++        'PASSWORD': None,
++        'HOST': None,
++        'PORT': None,
++        'OPTIONS': {}
++    }
++    
++    # Get args and env from PostgreSQL client
++    args1, env1 = DatabaseClient.settings_to_cmd_args_env(settings1, [])
++    print(f"Test 1 - Empty env dict:")
++    print(f"  PostgreSQL returns: env={env1}")
++    
++    # Simulate base client logic
++    if env1:
++        final_env1 = {**os.environ, **env1}
++        print(f"  Base client merges: final_env={final_env1}")
++    elif env1 == {}:
++        final_env1 = None
++        print(f"  Base client handles empty dict: final_env=None")
++    else:
++        final_env1 = env1
++        print(f"  Base client uses as-is: final_env={final_env1}")
++    
++    # Test case 2: Non-empty env dict from PostgreSQL client
++    settings2 = {
++        'NAME': 'testdb',
++        'USER': 'user',
++        'PASSWORD': 'password',
++        'HOST': None,
++        'PORT': None,
++        'OPTIONS': {}
++    }
++    
++    args2, env2 = DatabaseClient.settings_to_cmd_args_env(settings2, [])
++    print(f"\nTest 2 - Non-empty env dict:")
++    print(f"  PostgreSQL returns: env={env2}")
++    
++    # Simulate base client logic
++    if env2:
++        final_env2 = {**os.environ, **env2}
++        print(f"  Base client merges: final_env={final_env2}")
++    elif env2 == {}:
++        final_env2 = None
++        print(f"  Base client handles empty dict: final_env=None")
++    else:
++        final_env2 = env2
++        print(f"  Base client uses as-is: final_env={final_env2}")
++    
++    # Test what subprocess would receive
++    print(f"\nSubprocess would receive:")
++    print(f"  Test 1: env={final_env1}")
++    print(f"  Test 2: env={final_env2}")
++    
++    # Verify TEST_ENV_VAR is preserved
++    print(f"\nEnvironment variable preservation:")
++    if final_env1 is None:
++        print(f"  Test 1: TEST_ENV_VAR will be available (os.environ used)")
++    elif 'TEST_ENV_VAR' in final_env1:
++        print(f"  Test 1: TEST_ENV_VAR is available: {final_env1['TEST_ENV_VAR']}")
++    else:
++        print(f"  Test 1: TEST_ENV_VAR is NOT available")
++    
++    if final_env2 is None:
++        print(f"  Test 2: TEST_ENV_VAR will be available (os.environ used)")
++    elif 'TEST_ENV_VAR' in final_env2:
++        print(f"  Test 2: TEST_ENV_VAR is available: {final_env2['TEST_ENV_VAR']}")
++    else:
++        print(f"  Test 2: TEST_ENV_VAR is NOT available")
++
++if __name__ == '__main__':
++    test_base_client_behavior()
+\ No newline at end of file
+diff --git a/test_env_behavior.py b/test_env_behavior.py
+new file mode 100644
+index 0000000000..807a82f254
+--- /dev/null
++++ b/test_env_behavior.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++import os
++from django.db.backends.postgresql.client import DatabaseClient
++
++# Test different scenarios
++test_cases = [
++    {
++        'name': 'No password, no SSL',
++        'settings': {
++            'NAME': 'testdb',
++            'USER': None,
++            'PASSWORD': None,
++            'HOST': None,
++            'PORT': None,
++            'OPTIONS': {}
++        },
++        'expected_env': {}
++    },
++    {
++        'name': 'With password',
++        'settings': {
++            'NAME': 'testdb',
++            'USER': 'user',
++            'PASSWORD': 'pass',
++            'HOST': None,
++            'PORT': None,
++            'OPTIONS': {}
++        },
++        'expected_env': {'PGPASSWORD': 'pass'}
++    },
++    {
++        'name': 'With SSL options',
++        'settings': {
++            'NAME': 'testdb',
++            'USER': None,
++            'PASSWORD': None,
++            'HOST': None,
++            'PORT': None,
++            'OPTIONS': {
++                'sslmode': 'verify-ca',
++                'sslrootcert': 'root.crt'
++            }
++        },
++        'expected_env': {'PGSSLMODE': 'verify-ca', 'PGSSLROOTCERT': 'root.crt'}
++    }
++]
++
++for i, test_case in enumerate(test_cases):
++    print(f"\nTest {i+1}: {test_case['name']}")
++    args, env = DatabaseClient.settings_to_cmd_args_env(test_case['settings'], [])
++    
++    print(f"  Expected env: {test_case['expected_env']}")
++    print(f"  Actual env: {env}")
++    print(f"  Env is None: {env is None}")
++    print(f"  Env is empty: {env == {}}")
++    print(f"  Bool(env): {bool(env)}")
++    
++    # Simulate base client behavior
++    if env:
++        final_env = {**os.environ, **env}
++        print(f"  Final env (merged): {final_env}")
++        print(f"  OS environ keys in final: {[k for k in os.environ.keys() if k in final_env]}")
++    else:
++        final_env = None
++        print(f"  Final env (None): {final_env}")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..ffae927abe
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++import os
++from django.db.backends.base.client import BaseDatabaseClient
++from django.db.backends.postgresql.client import DatabaseClient
++
++# Set a test environment variable to verify it's passed through
++os.environ['TEST_ENV_VAR'] = 'from_os_environ'
++
++class MockConnection:
++    def __init__(self, settings_dict):
++        self.settings_dict = settings_dict
++
++# Test different scenarios
++test_cases = [
++    {
++        'name': 'No password, no SSL (empty env dict)',
++        'settings': {
++            'NAME': 'testdb',
++            'USER': None,
++            'PASSWORD': None,
++            'HOST': None,
++            'PORT': None,
++            'OPTIONS': {}
++        }
++    },
++    {
++        'name': 'With password (non-empty env dict)',
++        'settings': {
++            'NAME': 'testdb',
++            'USER': 'user',
++            'PASSWORD': 'pass',
++            'HOST': None,
++            'PORT': None,
++            'OPTIONS': {}
++        }
++    }
++]
++
++for test_case in test_cases:
++    print(f"\nTesting: {test_case['name']}")
++    
++    # Get the args and env from PostgreSQL client
++    args, env = DatabaseClient.settings_to_cmd_args_env(test_case['settings'], [])
++    print(f"  PostgreSQL client returns: args={args}, env={env}")
++    
++    # Simulate what the base client does now
++    if env:
++        final_env = {**os.environ, **env}
++        print(f"  Base client merges with os.environ: {final_env}")
++    else:
++        final_env = None
++        print(f"  Base client sets env to None (will use os.environ)")
++    
++    # Check if TEST_ENV_VAR would be available in subprocess
++    if final_env is None:
++        print(f"  TEST_ENV_VAR would be available: Yes (os.environ used)")
++    elif 'TEST_ENV_VAR' in final_env:
++        print(f"  TEST_ENV_VAR would be available: Yes (value: {final_env['TEST_ENV_VAR']})")
++    else:
++        print(f"  TEST_ENV_VAR would be available: No")
+\ No newline at end of file
+diff --git a/test_postgresql_client.py b/test_postgresql_client.py
+new file mode 100644
+index 0000000000..3707d25613
+--- /dev/null
++++ b/test_postgresql_client.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++import os
++from django.db.backends.postgresql.client import DatabaseClient
++
++# Test the specific functionality that was broken
++def test_postgresql_client_env():
++    # Test case 1: No password, no SSL options (should return empty env dict)
++    settings1 = {
++        'NAME': 'testdb',
++        'USER': None,
++        'PASSWORD': None,
++        'HOST': None,
++        'PORT': None,
++        'OPTIONS': {}
++    }
++    
++    args1, env1 = DatabaseClient.settings_to_cmd_args_env(settings1, [])
++    print(f"Test 1 - No password, no SSL:")
++    print(f"  Args: {args1}")
++    print(f"  Env: {env1}")
++    print(f"  Env is empty: {env1 == {}}")
++    print(f"  Env is None: {env1 is None}")
++    
++    # Test case 2: With password (should return non-empty env dict)
++    settings2 = {
++        'NAME': 'testdb',
++        'USER': 'user',
++        'PASSWORD': 'password',
++        'HOST': None,
++        'PORT': None,
++        'OPTIONS': {}
++    }
++    
++    args2, env2 = DatabaseClient.settings_to_cmd_args_env(settings2, [])
++    print(f"\nTest 2 - With password:")
++    print(f"  Args: {args2}")
++    print(f"  Env: {env2}")
++    print(f"  Env is empty: {env2 == {}}")
++    print(f"  Env is None: {env2 is None}")
++    
++    # Test case 3: With SSL options (should return non-empty env dict)
++    settings3 = {
++        'NAME': 'testdb',
++        'USER': None,
++        'PASSWORD': None,
++        'HOST': None,
++        'PORT': None,
++        'OPTIONS': {
++            'sslmode': 'verify-ca',
++            'sslrootcert': 'root.crt'
++        }
++    }
++    
++    args3, env3 = DatabaseClient.settings_to_cmd_args_env(settings3, [])
++    print(f"\nTest 3 - With SSL options:")
++    print(f"  Args: {args3}")
++    print(f"  Env: {env3}")
++    print(f"  Env is empty: {env3 == {}}")
++    print(f"  Env is None: {env3 is None}")
++
++if __name__ == '__main__':
++    test_postgresql_client_env()
+\ No newline at end of file
+diff --git a/test_subprocess_env.py b/test_subprocess_env.py
+new file mode 100644
+index 0000000000..8d66ebe15b
+--- /dev/null
++++ b/test_subprocess_env.py
+@@ -0,0 +1,42 @@
++#!/usr/bin/env python3
++import os
++import subprocess
++
++# Test subprocess behavior with different env values
++print("Testing subprocess env behavior:")
++
++# Test with env=None (should use os.environ)
++print("\n1. env=None:")
++try:
++    result = subprocess.run(['echo', 'test'], env=None, capture_output=True, text=True, check=True)
++    print(f"   Exit code: {result.returncode}")
++    print(f"   Output: {result.stdout}")
++except Exception as e:
++    print(f"   Error: {e}")
++
++# Test with env={} (empty dict - should use empty environment)
++print("\n2. env={}:")
++try:
++    result = subprocess.run(['echo', 'test'], env={}, capture_output=True, text=True, check=True)
++    print(f"   Exit code: {result.returncode}")
++    print(f"   Output: {result.stdout}")
++except Exception as e:
++    print(f"   Error: {e}")
++
++# Test with env=os.environ (should use os.environ)
++print("\n3. env=os.environ:")
++try:
++    result = subprocess.run(['echo', 'test'], env=os.environ, capture_output=True, text=True, check=True)
++    print(f"   Exit code: {result.returncode}")
++    print(f"   Output: {result.stdout}")
++except Exception as e:
++    print(f"   Error: {e}")
++
++# Test with env={'TEST_VAR': 'test_value'} (should use custom env)
++print("\n4. env={'TEST_VAR': 'test_value'}:")
++try:
++    result = subprocess.run(['echo', 'test'], env={'TEST_VAR': 'test_value'}, capture_output=True, text=True, check=True)
++    print(f"   Exit code: {result.returncode}")
++    print(f"   Output: {result.stdout}")
++except Exception as e:
++    print(f"   Error: {e}")
+\ No newline at end of file
+diff --git a/test_subprocess_env_detailed.py b/test_subprocess_env_detailed.py
+new file mode 100644
+index 0000000000..b6d1c14bc4
+--- /dev/null
++++ b/test_subprocess_env_detailed.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++import os
++import subprocess
++
++# Set a test environment variable
++os.environ['TEST_ENV_VAR'] = 'from_os_environ'
++
++# Test subprocess behavior with different env values
++print("Testing subprocess env behavior:")
++
++# Test with env=None (should use os.environ)
++print("\n1. env=None:")
++try:
++    result = subprocess.run(['python3', '-c', 'import os; print("PATH:", os.environ.get("PATH", "NOT_SET")); print("TEST_ENV_VAR:", os.environ.get("TEST_ENV_VAR", "NOT_SET"))'], 
++                          env=None, capture_output=True, text=True, check=True)
++    print(f"   Exit code: {result.returncode}")
++    print(f"   Output: {result.stdout}")
++except Exception as e:
++    print(f"   Error: {e}")
++
++# Test with env={} (empty dict - should use empty environment)
++print("\n2. env={}:")
++try:
++    result = subprocess.run(['python3', '-c', 'import os; print("PATH:", os.environ.get("PATH", "NOT_SET")); print("TEST_ENV_VAR:", os.environ.get("TEST_ENV_VAR", "NOT_SET"))'], 
++                          env={}, capture_output=True, text=True, check=True)
++    print(f"   Exit code: {result.returncode}")
++    print(f"   Output: {result.stdout}")
++except Exception as e:
++    print(f"   Error: {e}")
++
++# Test with env=os.environ (should use os.environ)
++print("\n3. env=os.environ:")
++try:
++    result = subprocess.run(['python3', '-c', 'import os; print("PATH:", os.environ.get("PATH", "NOT_SET")); print("TEST_ENV_VAR:", os.environ.get("TEST_ENV_VAR", "NOT_SET"))'], 
++                          env=os.environ, capture_output=True, text=True, check=True)
++    print(f"   Exit code: {result.returncode}")
++    print(f"   Output: {result.stdout}")
++except Exception as e:
++    print(f"   Error: {e}")
++
++# Test with env={'TEST_VAR': 'test_value'} (should use custom env)
++print("\n4. env={'TEST_VAR': 'test_value'}:")
++try:
++    result = subprocess.run(['python3', '-c', 'import os; print("PATH:", os.environ.get("PATH", "NOT_SET")); print("TEST_ENV_VAR:", os.environ.get("TEST_ENV_VAR", "NOT_SET")); print("TEST_VAR:", os.environ.get("TEST_VAR", "NOT_SET"))'], 
++                          env={'TEST_VAR': 'test_value'}, capture_output=True, text=True, check=True)
++    print(f"   Exit code: {result.returncode}")
++    print(f"   Output: {result.stdout}")
++except Exception as e:
++    print(f"   Error: {e}")
+\ No newline at end of file

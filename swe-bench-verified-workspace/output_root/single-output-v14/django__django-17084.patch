@@ -1,0 +1,262 @@
+diff --git a/django/db/models/aggregates.py b/django/db/models/aggregates.py
+index a778cd413b..7e947270cd 100644
+--- a/django/db/models/aggregates.py
++++ b/django/db/models/aggregates.py
+@@ -2,7 +2,7 @@
+ Classes to represent the definitions of aggregate functions.
+ """
+ from django.core.exceptions import FieldError, FullResultSet
+-from django.db.models.expressions import Case, Func, Star, Value, When
++from django.db.models.expressions import Case, Func, Star, Value, When, Window
+ from django.db.models.fields import IntegerField
+ from django.db.models.functions.comparison import Coalesce
+ from django.db.models.functions.mixins import (
+@@ -77,7 +77,13 @@ class Aggregate(Func):
+             # returning self.filter and including that in this loop.
+             expressions = super(Aggregate, c).get_source_expressions()
+             for index, expr in enumerate(expressions):
+-                if expr.contains_aggregate:
++                # Check if the expression contains an aggregate, or if it's a Window
++                # expression that contains an aggregate in its source expression
++                contains_aggregate = expr.contains_aggregate
++                if isinstance(expr, Window) and expr.source_expression.contains_aggregate:
++                    contains_aggregate = True
++                
++                if contains_aggregate:
+                     before_resolved = self.get_source_expressions()[index]
+                     name = (
+                         before_resolved.name
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..f38a685d0a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import F, Sum, Window
++from django.db.models.functions import Coalesce
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a simple test model
++class TestModel(models.Model):
++    date = models.DateField()
++    DJR = models.FloatField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the query construction
++queryset = TestModel.objects.all()
++queryset = queryset.annotate(
++    cumul_DJR=Coalesce(Window(Sum("DJR"), order_by=F("date").asc()), 0.0)
++)
++
++print("Query construction:")
++print(queryset.query)
++
++print("\nAttempting aggregate over window function...")
++try:
++    aggregate = queryset.aggregate(
++        DJR_total=Sum("DJR"),
++        cumul_DJR_total=Sum("cumul_DJR")
++    )
++    print("Success:", aggregate)
++except Exception as e:
++    print("Error:", e)
++    print("Error type:", type(e))
+\ No newline at end of file
+diff --git a/test_aggregate_validation.py b/test_aggregate_validation.py
+new file mode 100644
+index 0000000000..2cd344b878
+--- /dev/null
++++ b/test_aggregate_validation.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import F, Sum, Window
++from django.db.models.functions import Coalesce
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a simple test model
++class TestModel(models.Model):
++    date = models.DateField()
++    DJR = models.FloatField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the aggregate validation directly
++queryset = TestModel.objects.all()
++queryset = queryset.annotate(
++    cumul_DJR=Coalesce(Window(Sum("DJR"), order_by=F("date").asc()), 0.0)
++)
++
++# Try to create the aggregate query
++try:
++    aggregate_query = queryset.query.clone()
++    aggregate_query.add_annotation(Sum("cumul_DJR"), 'cumul_DJR_total')
++    aggregate_query.add_annotation(Sum("DJR"), 'DJR_total')
++    
++    # This should trigger the resolve_expression method
++    compiler = aggregate_query.get_compiler()
++    print("Aggregate query compilation successful!")
++    print("SQL:", compiler.as_sql())
++    
++except Exception as e:
++    print("Error during aggregate query compilation:", e)
++    print("Error type:", type(e))
+\ No newline at end of file
+diff --git a/test_resolve_expression.py b/test_resolve_expression.py
+new file mode 100644
+index 0000000000..e96cf88256
+--- /dev/null
++++ b/test_resolve_expression.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import F, Sum, Window
++from django.db.models.functions import Coalesce
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a simple test model
++class TestModel(models.Model):
++    date = models.DateField()
++    DJR = models.FloatField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the expressions
++window_expr = Window(Sum("DJR"), order_by=F("date").asc())
++coalesce_expr = Coalesce(window_expr, 0.0)
++
++# Create the Sum aggregate that should trigger the error
++sum_aggregate = Sum("cumul_DJR")
++
++# Test resolve_expression directly
++try:
++    # This should trigger the error in resolve_expression
++    resolved = sum_aggregate.resolve_expression()
++    print("resolve_expression succeeded:", resolved)
++except Exception as e:
++    print("Error in resolve_expression:", e)
++    print("Error type:", type(e))
+\ No newline at end of file
+diff --git a/test_window_aggregate.py b/test_window_aggregate.py
+new file mode 100644
+index 0000000000..150068a2bc
+--- /dev/null
++++ b/test_window_aggregate.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import F, Sum, Window
++from django.db.models.functions import Coalesce
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a simple test model
++class TestModel(models.Model):
++    date = models.DateField()
++    DJR = models.FloatField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the contains_aggregate property
++window_expr = Window(Sum("DJR"), order_by=F("date").asc())
++print("Window contains_aggregate:", window_expr.contains_aggregate)
++print("Window source expression contains_aggregate:", window_expr.source_expression.contains_aggregate)
++
++# Test with Coalesce
++coalesce_expr = Coalesce(window_expr, 0.0)
++print("Coalesce contains_aggregate:", coalesce_expr.contains_aggregate)
+\ No newline at end of file

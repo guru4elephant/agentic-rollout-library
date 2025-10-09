@@ -1,0 +1,284 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..0b9623ed7
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,25 @@
++import pandas as pd
++from sklearn.base import BaseEstimator, TransformerMixin
++from sklearn import set_config
++from sklearn.pipeline import make_union
++
++index = pd.date_range(start="2020-01-01", end="2020-01-05", inclusive="left", freq="H")
++data = pd.DataFrame(index=index, data=[10] * len(index), columns=["value"])
++data["date"] = index.date
++
++
++class MyTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None, **kwargs):
++        return self
++
++    def transform(self, X, y=None):
++        return X["value"].groupby(X["date"]).sum()
++
++
++# This works.
++set_config(transform_output="default")
++print(make_union(MyTransformer()).fit_transform(data))
++
++# This does not work.
++set_config(transform_output="pandas")
++print(make_union(MyTransformer()).fit_transform(data))
+\ No newline at end of file
+diff --git a/sklearn/utils/_set_output.py b/sklearn/utils/_set_output.py
+index 335773c6a..d27df0005 100644
+--- a/sklearn/utils/_set_output.py
++++ b/sklearn/utils/_set_output.py
+@@ -55,7 +55,7 @@ def _wrap_in_pandas_container(
+     if isinstance(data_to_wrap, pd.DataFrame):
+         if columns is not None:
+             data_to_wrap.columns = columns
+-        if index is not None:
++        if index is not None and len(index) == len(data_to_wrap):
+             data_to_wrap.index = index
+         return data_to_wrap
+ 
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..c478a42a2
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,96 @@
++import pandas as pd
++import numpy as np
++from sklearn.base import BaseEstimator, TransformerMixin
++from sklearn import set_config
++from sklearn.pipeline import make_union
++
++# Test edge cases for the fix
++
++print("Testing edge cases...")
++
++# Test case 1: Empty DataFrame as input
++print("Test 1: Empty DataFrame")
++empty_data = pd.DataFrame(columns=["value"])
++class EmptyTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None, **kwargs):
++        return self
++    def transform(self, X, y=None):
++        return X
++
++set_config(transform_output="pandas")
++try:
++    result = make_union(EmptyTransformer()).fit_transform(empty_data)
++    print("✓ Empty DataFrame test passed")
++except Exception as e:
++    print(f"✗ Empty DataFrame test failed: {e}")
++
++# Test case 2: Single row DataFrame
++print("Test 2: Single row DataFrame")
++single_data = pd.DataFrame({"value": [10]})
++class SingleTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None, **kwargs):
++        return self
++    def transform(self, X, y=None):
++        return X
++
++try:
++    result = make_union(SingleTransformer()).fit_transform(single_data)
++    print("✓ Single row test passed")
++except Exception as e:
++    print(f"✗ Single row test failed: {e}")
++
++# Test case 3: Transformer that returns empty DataFrame
++print("Test 3: Transformer returns empty DataFrame")
++class EmptyOutputTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None, **kwargs):
++        return self
++    def transform(self, X, y=None):
++        return pd.DataFrame()
++
++data = pd.DataFrame({"value": [10, 20, 30]})
++try:
++    result = make_union(EmptyOutputTransformer()).fit_transform(data)
++    print("✓ Empty output test passed")
++except Exception as e:
++    print(f"✗ Empty output test failed: {e}")
++
++# Test case 4: Multiple transformers with mixed index lengths
++print("Test 4: Mixed index lengths")
++index = pd.date_range(start="2020-01-01", end="2020-01-03", inclusive="left", freq="H")
++data = pd.DataFrame(index=index, data=[10] * len(index), columns=["value"])
++data["date"] = index.date
++
++class IdentityTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None, **kwargs):
++        return self
++    def transform(self, X, y=None):
++        return X[["value"]]
++
++class AggregationTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None, **kwargs):
++        return self
++    def transform(self, X, y=None):
++        return X["value"].groupby(X["date"]).sum()
++
++try:
++    result = make_union(IdentityTransformer(), AggregationTransformer()).fit_transform(data)
++    print("✓ Mixed index lengths test passed")
++    print(f"  Result shape: {result.shape}")
++except Exception as e:
++    print(f"✗ Mixed index lengths test failed: {e}")
++
++# Test case 5: Transformer that returns numpy array (should still work)
++print("Test 5: Transformer returns numpy array")
++class NumpyTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None, **kwargs):
++        return self
++    def transform(self, X, y=None):
++        return X.values
++
++try:
++    result = make_union(NumpyTransformer()).fit_transform(data)
++    print("✓ Numpy array test passed")
++except Exception as e:
++    print(f"✗ Numpy array test failed: {e}")
++
++print("\nAll edge case tests completed!")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 000000000..ef3a925b4
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,66 @@
++import pandas as pd
++import numpy as np
++from sklearn.base import BaseEstimator, TransformerMixin
++from sklearn import set_config
++from sklearn.pipeline import make_union
++
++# Test case 1: Original issue - aggregation transformer
++print("Test 1: Aggregation transformer")
++index = pd.date_range(start="2020-01-01", end="2020-01-05", inclusive="left", freq="H")
++data = pd.DataFrame(index=index, data=[10] * len(index), columns=["value"])
++data["date"] = index.date
++
++class AggregationTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None, **kwargs):
++        return self
++
++    def transform(self, X, y=None):
++        return X["value"].groupby(X["date"]).sum()
++
++set_config(transform_output="pandas")
++result = make_union(AggregationTransformer()).fit_transform(data)
++print("Result shape:", result.shape)
++print("Result index:", result.index.tolist())
++print("Result columns:", result.columns.tolist())
++print()
++
++# Test case 2: Transformer that returns same shape but different index
++print("Test 2: Transformer with same shape but different index")
++class SameShapeTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None, **kwargs):
++        return self
++
++    def transform(self, X, y=None):
++        # Return same shape but with different index
++        return pd.DataFrame({"transformed": X["value"] * 2}, index=X.index + pd.Timedelta(hours=1))
++
++result2 = make_union(SameShapeTransformer()).fit_transform(data)
++print("Result shape:", result2.shape)
++print("Result index length:", len(result2.index))
++print("Original index length:", len(data.index))
++print("Result columns:", result2.columns.tolist())
++print()
++
++# Test case 3: Multiple transformers with different output shapes
++print("Test 3: Multiple transformers with different output shapes")
++class IdentityTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None, **kwargs):
++        return self
++
++    def transform(self, X, y=None):
++        return X[["value"]]
++
++result3 = make_union(IdentityTransformer(), AggregationTransformer()).fit_transform(data)
++print("Result shape:", result3.shape)
++print("Result columns:", result3.columns.tolist())
++print()
++
++# Test case 4: Default output (should still work)
++print("Test 4: Default output")
++set_config(transform_output="default")
++result4 = make_union(AggregationTransformer()).fit_transform(data)
++print("Result type:", type(result4))
++print("Result shape:", result4.shape)
++print()
++
++print("All tests passed!")
+\ No newline at end of file
+diff --git a/test_normal_case.py b/test_normal_case.py
+new file mode 100644
+index 000000000..9bc12570c
+--- /dev/null
++++ b/test_normal_case.py
+@@ -0,0 +1,56 @@
++import pandas as pd
++import numpy as np
++from sklearn.base import BaseEstimator, TransformerMixin
++from sklearn import set_config
++from sklearn.pipeline import make_union
++from sklearn.preprocessing import StandardScaler
++
++# Test that normal transformers still work correctly with pandas output
++
++print("Testing normal transformers with pandas output...")
++
++# Create test data
++data = pd.DataFrame({
++    'feature1': [1, 2, 3, 4, 5],
++    'feature2': [10, 20, 30, 40, 50]
++}, index=['a', 'b', 'c', 'd', 'e'])
++
++print("Original data:")
++print(data)
++print()
++
++# Test case 1: StandardScaler (should preserve index)
++print("Test 1: StandardScaler with pandas output")
++set_config(transform_output="pandas")
++scaler = StandardScaler()
++result = scaler.fit_transform(data)
++print("StandardScaler result:")
++print(result)
++print("Index preserved:", np.array_equal(result.index, data.index))
++print()
++
++# Test case 2: FeatureUnion with normal transformers
++print("Test 2: FeatureUnion with normal transformers")
++class IdentityTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None, **kwargs):
++        return self
++    def transform(self, X, y=None):
++        return X
++
++class MultiplierTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None, **kwargs):
++        return self
++    def transform(self, X, y=None):
++        return X * 2
++
++try:
++    union = make_union(IdentityTransformer(), MultiplierTransformer())
++    result = union.fit_transform(data)
++    print("FeatureUnion result shape:", result.shape)
++    print("FeatureUnion result index preserved:", np.array_equal(result.index, data.index))
++    print("FeatureUnion result columns:", result.columns.tolist())
++    print("✓ Normal transformers work correctly")
++except Exception as e:
++    print(f"✗ Normal transformers failed: {e}")
++
++print("\nNormal case testing completed!")
+\ No newline at end of file

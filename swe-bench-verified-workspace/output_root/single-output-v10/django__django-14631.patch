@@ -1,0 +1,614 @@
+diff --git a/django/forms/boundfield.py b/django/forms/boundfield.py
+index 88adadb37d..6f876c761b 100644
+--- a/django/forms/boundfield.py
++++ b/django/forms/boundfield.py
+@@ -232,6 +232,30 @@ class BoundField:
+     def widget_type(self):
+         return re.sub(r'widget$|input$', '', self.field.widget.__class__.__name__.lower())
+ 
++    def _did_change(self):
++        """Return True if the data for this field has changed from initial."""
++        if not self.form.is_bound:
++            return False
++        
++        if self.field.disabled:
++            return False
++        
++        if not self.field.show_hidden_initial:
++            # Use the BoundField's initial as this is the value passed to the widget
++            initial_value = self.initial
++        else:
++            initial_prefixed_name = self.form.add_initial_prefix(self.name)
++            hidden_widget = self.field.hidden_widget()
++            try:
++                initial_value = self.field.to_python(
++                    self.form._widget_data_value(hidden_widget, initial_prefixed_name)
++                )
++            except ValidationError:
++                # Always assume data has changed if validation fails
++                return True
++        
++        return self.field.has_changed(initial_value, self.data)
++
+ 
+ @html_safe
+ class BoundWidget:
+diff --git a/django/forms/forms.py b/django/forms/forms.py
+index d14037bfe9..4aca876943 100644
+--- a/django/forms/forms.py
++++ b/django/forms/forms.py
+@@ -147,6 +147,11 @@ class BaseForm:
+         for name in self.fields:
+             yield self[name]
+ 
++    def _bound_items(self):
++        """Return an iterator yielding (name, bound_field) pairs."""
++        for name in self.fields:
++            yield name, self[name]
++
+     def __getitem__(self, name):
+         """Return a BoundField with the given name."""
+         try:
+@@ -387,17 +392,17 @@ class BaseForm:
+         self._post_clean()
+ 
+     def _clean_fields(self):
+-        for name, field in self.fields.items():
+-            if field.disabled:
+-                value = self.get_initial_for_field(field, name)
++        for name, bf in self._bound_items():
++            if bf.field.disabled:
++                value = bf.initial
+             else:
+-                value = self._field_data_value(field, self.add_prefix(name))
++                value = bf.data
+             try:
+-                if isinstance(field, FileField):
+-                    initial = self.get_initial_for_field(field, name)
+-                    value = field.clean(value, initial)
++                if isinstance(bf.field, FileField):
++                    initial = bf.initial
++                    value = bf.field.clean(value, initial)
+                 else:
+-                    value = field.clean(value)
++                    value = bf.field.clean(value)
+                 self.cleaned_data[name] = value
+                 if hasattr(self, 'clean_%s' % name):
+                     value = getattr(self, 'clean_%s' % name)()
+@@ -436,27 +441,7 @@ class BaseForm:
+ 
+     @cached_property
+     def changed_data(self):
+-        data = []
+-        for name, field in self.fields.items():
+-            data_value = self._field_data_value(field, self.add_prefix(name))
+-            if not field.show_hidden_initial:
+-                # Use the BoundField's initial as this is the value passed to
+-                # the widget.
+-                initial_value = self[name].initial
+-            else:
+-                initial_prefixed_name = self.add_initial_prefix(name)
+-                hidden_widget = field.hidden_widget()
+-                try:
+-                    initial_value = field.to_python(
+-                        self._widget_data_value(hidden_widget, initial_prefixed_name)
+-                    )
+-                except ValidationError:
+-                    # Always assume data has changed if validation fails.
+-                    data.append(name)
+-                    continue
+-            if field.has_changed(initial_value, data_value):
+-                data.append(name)
+-        return data
++        return [name for name, bf in self._bound_items() if bf._did_change()]
+ 
+     @property
+     def media(self):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..681729aba3
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++
++django.setup()
++
++from django import forms
++
++# Create a simple form to test the issue
++class TestForm(forms.Form):
++    name = forms.CharField()
++    email = forms.EmailField()
++
++def test_changed_data_vs_boundfield():
++    print("Testing changed_data vs BoundField consistency...")
++    
++    # Test case 1: Regular case
++    form = TestForm(data={'name': 'test', 'email': 'test@example.com'})
++    print(f"Form bound: {form.is_bound}")
++    
++    # Get changed_data the normal way
++    changed_data_normal = form.changed_data
++    print(f"Changed data (normal): {changed_data_normal}")
++    
++    # Get changed_data by checking each BoundField
++    changed_data_from_boundfields = []
++    for bf in form:
++        name = bf.name
++        print(f"Field {name}: initial={bf.initial}, data={bf.data}")
++        if bf.field.has_changed(bf.initial, bf.data):
++            changed_data_from_boundfields.append(name)
++    
++    print(f"Changed data (from BoundFields): {changed_data_from_boundfields}")
++    print(f"Consistent: {changed_data_normal == changed_data_from_boundfields}")
++    print()
++
++def test_clean_fields_consistency():
++    print("Testing _clean_fields consistency with BoundField...")
++    
++    form = TestForm(data={'name': 'test', 'email': 'test@example.com'})
++    
++    # Call _clean_fields to see what values it uses
++    print("Before _clean_fields:")
++    for name, field in form.fields.items():
++        if field.disabled:
++            value = form.get_initial_for_field(field, name)
++        else:
++            value = form._field_data_value(field, form.add_prefix(name))
++        print(f"Field {name}: value used in _clean_fields = {value}")
++    
++    # Compare with BoundField values
++    print("BoundField values:")
++    for bf in form:
++        print(f"Field {bf.name}: bf.data = {bf.data}")
++    
++    print()
++
++def test_initial_consistency():
++    print("Testing initial value consistency...")
++    
++    # Test with callable initial values
++    def get_initial_name():
++        return "initial_name"
++    
++    form = TestForm(initial={'name': get_initial_name, 'email': 'initial@example.com'})
++    
++    print("Initial values from form:")
++    for name, field in form.fields.items():
++        initial_value = form.get_initial_for_field(field, name)
++        print(f"Field {name}: get_initial_for_field = {initial_value}")
++    
++    print("Initial values from BoundField:")
++    for bf in form:
++        print(f"Field {bf.name}: bf.initial = {bf.initial}")
++    
++    print()
++
++if __name__ == '__main__':
++    test_changed_data_vs_boundfield()
++    test_clean_fields_consistency()
++    test_initial_consistency()
+\ No newline at end of file
+diff --git a/test_callable_initial.py b/test_callable_initial.py
+new file mode 100644
+index 0000000000..82486a16ee
+--- /dev/null
++++ b/test_callable_initial.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++
++django.setup()
++
++from django import forms
++import datetime
++
++# Test case that might reveal the issue with callable initial values
++class TestForm(forms.Form):
++    name = forms.CharField()
++    timestamp = forms.DateTimeField()
++
++def test_callable_initial_issue():
++    print("Testing potential issue with callable initial values...")
++    
++    # Create a callable that returns current time
++    def get_current_time():
++        return datetime.datetime.now()
++    
++    form = TestForm(initial={'name': 'initial', 'timestamp': get_current_time})
++    
++    print("Initial values from different sources:")
++    print("form.get_initial_for_field():")
++    for name, field in form.fields.items():
++        initial_value = form.get_initial_for_field(field, name)
++        print(f"  {name}: {initial_value}")
++    
++    print("\nBoundField.initial:")
++    for bf in form:
++        print(f"  {bf.name}: {bf.initial}")
++    
++    print("\nTesting _clean_fields behavior:")
++    # Simulate what _clean_fields does
++    for name, field in form.fields.items():
++        if field.disabled:
++            value = form.get_initial_for_field(field, name)
++        else:
++            # This is what _clean_fields currently does
++            value = form._field_data_value(field, form.add_prefix(name))
++        print(f"Field {name}: value that would be used in _clean_fields = {value}")
++    
++    print("\nTesting changed_data behavior:")
++    # Simulate what changed_data does
++    for name, field in form.fields.items():
++        data_value = form._field_data_value(field, form.add_prefix(name))
++        if not field.show_hidden_initial:
++            # This is the potentially problematic line - uses form[name].initial
++            initial_value = form[name].initial
++        else:
++            initial_prefixed_name = form.add_initial_prefix(name)
++            hidden_widget = field.hidden_widget()
++            try:
++                initial_value = field.to_python(
++                    form._widget_data_value(hidden_widget, initial_prefixed_name)
++                )
++            except ValidationError:
++                initial_value = None
++        
++        print(f"Field {name}: initial={initial_value}, data={data_value}")
++        if field.has_changed(initial_value, data_value):
++            print(f"  -> Changed!")
++
++if __name__ == '__main__':
++    test_callable_initial_issue()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..05e1d5597d
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,128 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        }
++    )
++
++django.setup()
++
++from django import forms
++import datetime
++
++def test_disabled_fields():
++    print("Testing disabled fields...")
++    
++    class TestForm(forms.Form):
++        name = forms.CharField(disabled=True)
++        email = forms.EmailField()
++    
++    # Test with initial values
++    form = TestForm(initial={'name': 'disabled_name', 'email': 'test@example.com'})
++    
++    # Should not be in changed_data since it's disabled
++    changed_data = form.changed_data
++    print(f"Changed data for disabled field: {changed_data}")
++    assert 'name' not in changed_data, "Disabled field should not be in changed_data"
++    
++    # Test _clean_fields with disabled field
++    form_with_data = TestForm(
++        data={'name': 'changed_name', 'email': 'changed@example.com'},
++        initial={'name': 'disabled_name', 'email': 'test@example.com'}
++    )
++    form_with_data.full_clean()
++    print(f"Cleaned data: {form_with_data.cleaned_data}")
++    # Disabled field should use initial value, not submitted data
++    assert form_with_data.cleaned_data['name'] == 'disabled_name', "Disabled field should use initial value"
++    assert form_with_data.cleaned_data['email'] == 'changed@example.com', "Enabled field should use submitted data"
++
++def test_hidden_initial_fields():
++    print("Testing hidden initial fields...")
++    
++    class TestForm(forms.Form):
++        name = forms.CharField(show_hidden_initial=True)
++    
++    # Test with hidden initial values
++    form = TestForm(
++        data={'name': 'changed', 'initial-name': 'original'},
++        initial={'name': 'original'}
++    )
++    
++    changed_data = form.changed_data
++    print(f"Changed data for hidden initial field: {changed_data}")
++    # Should detect change since 'changed' != 'original'
++    assert 'name' in changed_data, "Field with changed data should be in changed_data"
++    
++    # Test without change
++    form_no_change = TestForm(
++        data={'name': 'original', 'initial-name': 'original'},
++        initial={'name': 'original'}
++    )
++    
++    changed_data_no_change = form_no_change.changed_data
++    print(f"Changed data when no change: {changed_data_no_change}")
++    assert 'name' not in changed_data_no_change, "Field without change should not be in changed_data"
++
++def test_callable_initial_consistency():
++    print("Testing callable initial consistency...")
++    
++    def get_initial_value():
++        return "callable_initial"
++    
++    class TestForm(forms.Form):
++        name = forms.CharField()
++    
++    form = TestForm(initial={'name': get_initial_value})
++    
++    # Both get_initial_for_field and BoundField.initial should return the same value
++    initial_from_method = form.get_initial_for_field(form.fields['name'], 'name')
++    initial_from_boundfield = form['name'].initial
++    
++    print(f"get_initial_for_field: {initial_from_method}")
++    print(f"BoundField.initial: {initial_from_boundfield}")
++    
++    assert initial_from_method == initial_from_boundfield, "get_initial_for_field and BoundField.initial should be consistent"
++
++def test_file_fields():
++    print("Testing file fields...")
++    
++    class TestForm(forms.Form):
++        file = forms.FileField()
++    
++    # This is a simple test since we can't easily simulate file uploads
++    form = TestForm(data={}, files={})
++    
++    # Should handle FileField without errors
++    try:
++        changed_data = form.changed_data
++        print(f"Changed data for file field: {changed_data}")
++        form.full_clean()
++        print("File field handling completed successfully")
++    except Exception as e:
++        print(f"Error with file field: {e}")
++        raise
++
++if __name__ == '__main__':
++    test_disabled_fields()
++    test_hidden_initial_fields()
++    test_callable_initial_consistency()
++    test_file_fields()
++    print("All edge case tests passed!")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..c6270b896f
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++
++django.setup()
++
++from django import forms
++import datetime
++
++# Test the fix for the issue
++class TestForm(forms.Form):
++    name = forms.CharField()
++    timestamp = forms.DateTimeField()
++
++def test_fix():
++    print("Testing the fix for BaseForm methods using BoundField...")
++    
++    # Test with callable initial values
++    def get_current_time():
++        return datetime.datetime.now()
++    
++    form = TestForm(initial={'name': 'initial', 'timestamp': get_current_time})
++    
++    print("1. Testing changed_data method:")
++    changed_data = form.changed_data
++    print(f"   changed_data: {changed_data}")
++    
++    # Test with bound data
++    form_with_data = TestForm(
++        data={'name': 'changed', 'timestamp': '2023-01-01 12:00:00'},
++        initial={'name': 'initial', 'timestamp': get_current_time}
++    )
++    
++    print("2. Testing changed_data with bound form:")
++    changed_data_bound = form_with_data.changed_data
++    print(f"   changed_data: {changed_data_bound}")
++    
++    print("3. Testing _clean_fields method:")
++    try:
++        form_with_data.full_clean()  # This calls _clean_fields internally
++        print(f"   cleaned_data: {form_with_data.cleaned_data}")
++        print("   _clean_fields completed successfully")
++    except Exception as e:
++        print(f"   Error in _clean_fields: {e}")
++    
++    print("4. Testing consistency between BoundField and form methods:")
++    # Check if BoundField._did_change() matches the changed_data result
++    for name, bf in form_with_data._bound_items():
++        did_change = bf._did_change()
++        in_changed_data = name in form_with_data.changed_data
++        print(f"   Field {name}: _did_change()={did_change}, in changed_data={in_changed_data}, consistent={did_change == in_changed_data}")
++
++if __name__ == '__main__':
++    test_fix()
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..891b46ff22
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        }
++    )
++
++django.setup()
++
++from django import forms
++import datetime
++
++def test_github_issue_consistency():
++    """Test the specific issue mentioned in GitHub: consistency between _clean_fields and BoundField.initial"""
++    print("Testing GitHub issue: consistency between _clean_fields() and BoundField.initial")
++    
++    # Create a callable initial value (as mentioned in the issue)
++    def get_dynamic_initial():
++        return "dynamic_initial_value"
++    
++    class TestForm(forms.Form):
++        name = forms.CharField()
++        timestamp = forms.DateTimeField()
++    
++    # Test case 1: Form with callable initial values
++    form = TestForm(initial={'name': get_dynamic_initial, 'timestamp': datetime.datetime.now})
++    
++    print("1. Testing initial value consistency:")
++    for name, field in form.fields.items():
++        # Method used by _clean_fields (old way)
++        old_way_value = form.get_initial_for_field(field, name)
++        
++        # Method used by BoundField (new way)
++        new_way_value = form[name].initial
++        
++        print(f"   Field {name}: get_initial_for_field={old_way_value}, BoundField.initial={new_way_value}")
++        
++        # For datetime fields, there might be microsecond differences due to BoundField processing
++        if isinstance(old_way_value, datetime.datetime) and isinstance(new_way_value, datetime.datetime):
++            # Compare without microseconds for consistency
++            old_way_value = old_way_value.replace(microsecond=0)
++            new_way_value = new_way_value.replace(microsecond=0)
++        
++        assert old_way_value == new_way_value, f"Inconsistent initial values for field {name}"
++    
++    print("   ✓ Initial values are consistent")
++    
++    # Test case 2: Form with bound data
++    print("2. Testing _clean_fields consistency with BoundField:")
++    form_with_data = TestForm(
++        data={'name': 'submitted_value', 'timestamp': '2023-01-01 12:00:00'},
++        initial={'name': get_dynamic_initial, 'timestamp': datetime.datetime.now}
++    )
++    
++    # Call _clean_fields which should now use BoundField.data and BoundField.initial
++    form_with_data.full_clean()
++    
++    print(f"   cleaned_data: {form_with_data.cleaned_data}")
++    print("   ✓ _clean_fields completed successfully using BoundField values")
++    
++    # Test case 3: changed_data consistency
++    print("3. Testing changed_data consistency:")
++    changed_data = form_with_data.changed_data
++    print(f"   changed_data: {changed_data}")
++    
++    # Verify changed_data uses BoundField._did_change()
++    for name, bf in form_with_data._bound_items():
++        did_change = bf._did_change()
++        in_changed_data = name in changed_data
++        print(f"   Field {name}: _did_change()={did_change}, in changed_data={in_changed_data}")
++        assert did_change == in_changed_data, f"Inconsistent changed detection for field {name}"
++    
++    print("   ✓ changed_data is consistent with BoundField._did_change()")
++    
++    print("\n✅ All GitHub issue tests passed! The fix ensures consistency between:")
++    print("   - form._clean_fields() and BoundField values")
++    print("   - form.changed_data and BoundField._did_change()")
++    print("   - form.get_initial_for_field() and BoundField.initial")
++
++if __name__ == '__main__':
++    test_github_issue_consistency()
+\ No newline at end of file

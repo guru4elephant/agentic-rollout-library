@@ -1,0 +1,192 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..64d08741eb
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,100 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the _unregister_lookup cache clearing fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Field
++from django.db.models.lookups import Exact, IContains
++
++def test_comprehensive_lookup_cache():
++    """Test various scenarios to ensure cache clearing works properly"""
++    
++    print("Running comprehensive lookup cache tests...")
++    
++    # Test 1: Basic unregistration
++    print("\n1. Testing basic lookup unregistration:")
++    TestField.register_lookup(Exact, 'custom_exact')
++    lookups_before = TestField.get_lookups()
++    TestField._unregister_lookup(Exact, 'custom_exact')
++    lookups_after = TestField.get_lookups()
++    
++    if 'custom_exact' in lookups_after:
++        print("   FAIL: custom_exact still in cache")
++        return False
++    else:
++        print("   PASS: custom_exact properly removed from cache")
++    
++    # Test 2: Multiple lookups
++    print("\n2. Testing multiple lookups:")
++    TestField.register_lookup(Exact, 'custom_exact1')
++    TestField.register_lookup(IContains, 'custom_icontains')
++    
++    lookups_before = TestField.get_lookups()
++    TestField._unregister_lookup(Exact, 'custom_exact1')
++    lookups_after = TestField.get_lookups()
++    
++    if 'custom_exact1' in lookups_after:
++        print("   FAIL: custom_exact1 still in cache after unregistration")
++        return False
++    elif 'custom_icontains' not in lookups_after:
++        print("   FAIL: custom_icontains removed when it shouldn't be")
++        return False
++    else:
++        print("   PASS: Only custom_exact1 removed, custom_icontains remains")
++    
++    # Clean up the second lookup
++    TestField._unregister_lookup(IContains, 'custom_icontains')
++    
++    # Test 3: Verify cache is actually cleared (not just the specific lookup)
++    print("\n3. Testing cache invalidation:")
++    TestField.register_lookup(Exact, 'custom_exact2')
++    
++    # Get lookups to populate cache
++    cached_lookups = TestField.get_lookups()
++    
++    # Unregister
++    TestField._unregister_lookup(Exact, 'custom_exact2')
++    
++    # Get lookups again - should not contain the unregistered lookup
++    fresh_lookups = TestField.get_lookups()
++    
++    if 'custom_exact2' in fresh_lookups:
++        print("   FAIL: Cache not properly cleared, custom_exact2 still present")
++        return False
++    else:
++        print("   PASS: Cache properly cleared after unregistration")
++    
++    print("\nAll tests passed!")
++    return True
++
++# Create a simple test field
++class TestField(Field):
++    pass
++
++if __name__ == "__main__":
++    success = test_comprehensive_lookup_cache()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/django/db/models/query_utils.py b/django/db/models/query_utils.py
+index 0caa165e15..6917820604 100644
+--- a/django/db/models/query_utils.py
++++ b/django/db/models/query_utils.py
+@@ -217,6 +217,7 @@ class RegisterLookupMixin:
+         if lookup_name is None:
+             lookup_name = lookup.lookup_name
+         del cls.class_lookups[lookup_name]
++        cls._clear_cached_lookups()
+ 
+ 
+ def select_related_descend(field, restricted, requested, load_fields, reverse=False):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..8241c630ae
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with _unregister_lookup() not clearing cache.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Field
++from django.db.models.lookups import Exact
++
++# Create a simple test field to work with
++class TestField(Field):
++    pass
++
++def test_lookup_cache_issue():
++    """Test that demonstrates the issue with _unregister_lookup not clearing cache"""
++    
++    print("Testing lookup registration and unregistration...")
++    
++    # Register a custom lookup
++    TestField.register_lookup(Exact, 'custom_exact')
++    
++    # Check that the lookup is registered
++    lookups_before = TestField.get_lookups()
++    print(f"Lookups after registration: {list(lookups_before.keys())}")
++    
++    # Unregister the lookup
++    TestField._unregister_lookup(Exact, 'custom_exact')
++    
++    # Check lookups again - this should show the cache issue
++    lookups_after = TestField.get_lookups()
++    print(f"Lookups after unregistration: {list(lookups_after.keys())}")
++    
++    # The issue: lookups_after might still contain 'custom_exact' due to cache
++    if 'custom_exact' in lookups_after:
++        print("BUG: 'custom_exact' lookup still found in cache after unregistration!")
++        return False
++    else:
++        print("SUCCESS: 'custom_exact' lookup properly removed from cache")
++        return True
++
++if __name__ == "__main__":
++    success = test_lookup_cache_issue()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

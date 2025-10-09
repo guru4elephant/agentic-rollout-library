@@ -1,0 +1,492 @@
+diff --git a/django/db/backends/base/schema.py b/django/db/backends/base/schema.py
+index f2ca8c8df9..93caebca34 100644
+--- a/django/db/backends/base/schema.py
++++ b/django/db/backends/base/schema.py
+@@ -562,11 +562,18 @@ class BaseDatabaseSchemaEditor:
+         }
+         meta_index_names = {constraint.name for constraint in model._meta.indexes}
+         columns = [model._meta.get_field(field).column for field in fields]
++        
++        # For unique constraints, exclude primary key constraints since they serve
++        # a different purpose even though they are also unique
++        constraint_kwargs_filtered = constraint_kwargs.copy()
++        if constraint_kwargs.get('unique') and not constraint_kwargs.get('primary_key'):
++            constraint_kwargs_filtered['primary_key'] = False
++        
+         constraint_names = self._constraint_names(
+             model,
+             columns,
+             exclude=meta_constraint_names | meta_index_names,
+-            **constraint_kwargs,
++            **constraint_kwargs_filtered,
+         )
+         if len(constraint_names) != 1:
+             raise ValueError(
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..de3f908fd0
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++
++def test_delete_composed_index_method():
++    """Test the _delete_composed_index method directly to reproduce the issue"""
++    print("Testing _delete_composed_index method with conflicting constraints...")
++    
++    # Create a simple model class that simulates the problematic scenario
++    class MockMeta:
++        def __init__(self):
++            self.db_table = 'test_table'
++            self.constraints = []
++            self.indexes = []
++        
++        def get_field(self, field_name):
++            # Return a mock field object
++            return type('MockField', (), {
++                'column': field_name
++            })()
++    
++    class MockModel:
++        def __init__(self):
++            self._meta = MockMeta()
++    
++    # Mock the introspection to return multiple constraints on the same column
++    class MockIntrospection:
++        def get_constraints(self, cursor, table_name):
++            # Simulate the scenario where we have both a primary key and unique constraint on 'id'
++            return {
++                'test_table_pkey': {
++                    'columns': ['id'],
++                    'primary_key': True,
++                    'unique': True,
++                    'index': False,
++                    'check': False,
++                    'foreign_key': False,
++                    'type': 'p'
++                },
++                'test_table_id_unique': {
++                    'columns': ['id'],
++                    'primary_key': False,
++                    'unique': True,
++                    'index': False,
++                    'check': False,
++                    'foreign_key': False,
++                    'type': 'u'
++                }
++            }
++        
++        def identifier_converter(self, name):
++            return name  # Simple identity converter
++    
++    # Mock schema editor
++    class MockSchemaEditor(BaseDatabaseSchemaEditor):
++        def __init__(self):
++            # Create a mock cursor with context manager methods
++            mock_cursor = type('MockCursor', (), {
++                '__enter__': lambda self: self,
++                '__exit__': lambda self, *args: None,
++                'execute': lambda *args, **kwargs: None
++            })()
++            # Create mock ops with required methods
++            mock_ops = type('MockOps', (), {
++                'max_name_length': lambda: 255,
++                'deferrable_sql': lambda: '',
++                'tablespace_sql': lambda *args: '',
++                'quote_name': lambda self, name: f'"{name}"',
++                'autoinc_sql': lambda *args: '',
++            })()
++            # Create mock features
++            mock_features = type('MockFeatures', (), {
++                'can_rollback_ddl': False,
++            })()
++            mock_connection = type('MockConnection', (), {
++                'introspection': MockIntrospection(),
++                'cursor': lambda *args, **kwargs: mock_cursor,
++                'ops': mock_ops,
++                'features': mock_features,
++                'in_atomic_block': False,
++            })()
++            # Initialize the BaseDatabaseSchemaEditor properly
++            super().__init__(mock_connection, collect_sql=False)
++            self.sql_delete_unique = "ALTER TABLE %(table)s DROP CONSTRAINT %(name)s"
++    
++    schema_editor = MockSchemaEditor()
++    
++    # Test the _delete_composed_index method
++    try:
++        # This should trigger the ValueError when it finds multiple constraints
++        schema_editor._delete_composed_index(
++            MockModel(),
++            ['id'],
++            {'unique': True},
++            schema_editor.sql_delete_unique
++        )
++        print("No error occurred - issue might be fixed or not reproduced")
++        return False
++        
++    except ValueError as e:
++        if "wrong number" in str(e):
++            print(f"Error reproduced: {e}")
++            return True
++        else:
++            print(f"Different ValueError: {e}")
++            return False
++    except Exception as e:
++        print(f"Unexpected error: {e}")
++        return False
++
++if __name__ == '__main__':
++    if test_delete_composed_index_method():
++        print("Issue reproduced successfully!")
++        sys.exit(1)
++    else:
++        print("Issue not reproduced")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..f16cc5873a
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,163 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++
++def test_edge_cases():
++    """Test edge cases to ensure the fix doesn't break normal functionality"""
++    print("Testing edge cases for the unique_together constraint fix...")
++    
++    # Test Case 1: Normal case with only one unique constraint
++    class MockIntrospectionNormal:
++        def get_constraints(self, cursor, table_name):
++            return {
++                'normal_unique_constraint': {
++                    'columns': ['id'],
++                    'primary_key': False,
++                    'unique': True,
++                    'index': False,
++                    'check': False,
++                    'foreign_key': False,
++                    'type': 'u'
++                }
++            }
++        
++        def identifier_converter(self, name):
++            return name
++    
++    # Test Case 2: Multiple unique constraints (should still raise error)
++    class MockIntrospectionMultipleUnique:
++        def get_constraints(self, cursor, *args):
++            return {
++                'unique_constraint_1': {
++                    'columns': ['id'],
++                    'primary_key': False,
++                    'unique': True,
++                    'index': False,
++                    'check': False,
++                    'foreign_key': False,
++                    'type': 'u'
++                },
++                'unique_constraint_2': {
++                    'columns': ['id'],
++                    'primary_key': False,
++                    'unique': True,
++                    'index': False,
++                    'check': False,
++                    'foreign_key': False,
++                    'type': 'u'
++                }
++            }
++        
++        def identifier_converter(self, name):
++            return name
++    
++    class MockMeta:
++        def __init__(self, db_table='test_table'):
++            self.db_table = db_table
++            self.constraints = []
++            self.indexes = []
++        
++        def get_field(self, field_name):
++            return type('MockField', (), {'column': field_name})()
++    
++    class MockModel:
++        def __init__(self, db_table='test_table'):
++            self._meta = MockMeta(db_table)
++    
++    class MockSchemaEditor(BaseDatabaseSchemaEditor):
++        def __init__(self, introspection_class):
++            mock_cursor = type('MockCursor', (), {
++                '__enter__': lambda self: self,
++                '__exit__': lambda self, *args: None,
++                'execute': lambda *args, **kwargs: None
++            })()
++            mock_ops = type('MockOps', (), {
++                'max_name_length': lambda: 255,
++                'deferrable_sql': lambda: '',
++                'tablespace_sql': lambda *args: '',
++                'quote_name': lambda self, name: f'"{name}"',
++                'autoinc_sql': lambda *args: '',
++            })()
++            mock_features = type('MockFeatures', (), {'can_rollback_ddl': False})
++            mock_connection = type('MockConnection', (), {
++                'introspection': introspection_class(),
++                'cursor': lambda *args, **kwargs: mock_cursor,
++                'ops': mock_ops,
++                'features': mock_features,
++                'in_atomic_block': False,
++            })()
++            super().__init__(mock_connection, collect_sql=False)
++            self.sql_delete_unique = "ALTER TABLE %(table)s DROP CONSTRAINT %(name)s"
++    
++    # Test Case 1: Normal case with only one unique constraint
++    print("Testing normal case with single unique constraint...")
++    try:
++        schema_editor_normal = MockSchemaEditor(MockIntrospectionNormal)
++        schema_editor_normal._delete_composed_index(
++            MockModel(),
++            ['id'],
++            {'unique': True},
++            schema_editor_normal.sql_delete_unique
++        )
++        print("✓ Normal case works correctly")
++        normal_case_ok = True
++    except Exception as e:
++        print(f"✗ Normal case failed: {e}")
++        normal_case_ok = False
++    
++    # Test Case 2: Multiple unique constraints (should still raise error)
++    print("Testing case with multiple unique constraints...")
++    try:
++        schema_editor_multiple = MockSchemaEditor(MockIntrospectionMultipleUnique)
++        schema_editor_multiple._delete_composed_index(
++            MockModel(),
++            ['id'],
++            {'unique': True},
++            schema_editor_multiple.sql_delete_unique
++        )
++        print("✗ Multiple unique constraints case should have failed but didn't")
++        multiple_case_ok = False
++    except ValueError as e:
++        if "wrong number" in str(e):
++            print("✓ Multiple unique constraints correctly raises ValueError")
++            multiple_case_ok = True
++        else:
++            print(f"✗ Multiple unique constraints case failed with wrong error: {e}")
++            multiple_case_ok = False
++    except Exception as e:
++        print(f"✗ Multiple unique constraints case failed unexpectedly: {e}")
++        multiple_case_ok = False
++    
++    return normal_case_ok and multiple_case_ok
++
++if __name__ == '__main__':
++    if test_edge_cases():
++        print("All edge cases passed!")
++        sys.exit(0)
++    else:
++        print("Some edge cases failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..8ac075a9e2
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++
++def test_fix_comprehensive():
++    """Test the fix comprehensively to ensure it handles the GitHub issue scenario"""
++    print("Testing comprehensive fix for the unique_together constraint issue...")
++    
++    # Create a mock introspection that returns both primary key and unique constraints
++    class MockIntrospection:
++        def get_constraints(self, cursor, table_name):
++            # Simulate the exact scenario from the GitHub issue:
++            # Both a primary key constraint and a unique_together constraint on the same field
++            return {
++                'foo_bar_pkey': {  # Primary key constraint
++                    'columns': ['id'],
++                    'primary_key': True,
++                    'unique': True,
++                    'index': False,
++                    'check': False,
++                    'foreign_key': False,
++                    'type': 'p'
++                },
++                'foo_bar_id_1c3b3088c74c3b17_uniq': {  # Unique_together constraint
++                    'columns': ['id'],
++                    'primary_key': False,
++                    'unique': True,
++                    'index': False,
++                    'check': False,
++                    'foreign_key': False,
++                    'type': 'u'
++                }
++            }
++        
++        def identifier_converter(self, name):
++            return name  # Simple identity converter
++    
++    # Create mock model meta
++    class MockMeta:
++        def __init__(self):
++            self.db_table = 'foo_bar'
++            self.constraints = []
++            self.indexes = []
++        
++        def get_field(self, field_name):
++            # Return a mock field object
++            return type('MockField', (), {
++                'column': field_name
++            })()
++    
++    class MockModel:
++        def __init__(self):
++            self._meta = MockMeta()
++    
++    # Mock schema editor
++    class MockSchemaEditor(BaseDatabaseSchemaEditor):
++        def __init__(self):
++            # Create a mock cursor with context manager methods
++            mock_cursor = type('MockCursor', (), {
++                '__enter__': lambda self: self,
++                '__exit__': lambda self, *args: None,
++                'execute': lambda *args, **kwargs: None
++            })()
++            # Create mock ops with required methods
++            mock_ops = type('MockOps', (), {
++                'max_name_length': lambda: 255,
++                'deferrable_sql': lambda: '',
++                'tablespace_sql': lambda *args: '',
++                'quote_name': lambda self, name: f'"{name}"',
++                'autoinc_sql': lambda *args: '',
++            })()
++            # Create mock features
++            mock_features = type('MockFeatures', (), {
++                'can_rollback_ddl': False,
++            })()
++            mock_connection = type('MockConnection', (), {
++                'introspection': MockIntrospection(),
++                'cursor': lambda *args, **kwargs: mock_cursor,
++                'ops': mock_ops,
++                'features': mock_features,
++                'in_atomic_block': False,
++            })()
++            # Initialize the BaseDatabaseSchemaEditor properly
++            super().__init__(mock_connection, collect_sql=False)
++            self.sql_delete_unique = "ALTER TABLE %(table)s DROP CONSTRAINT %(name)s"
++    
++    schema_editor = MockSchemaEditor()
++    
++    # Test the _delete_composed_index method with the exact scenario from the issue
++    try:
++        # This should work now without raising a ValueError
++        schema_editor._delete_composed_index(
++            MockModel(),
++            ['id'],  # Single field unique_together constraint
++            {'unique': True},  # Looking for unique constraints
++            schema_editor.sql_delete_unique
++        )
++        print("SUCCESS: The fix works! No ValueError was raised.")
++        return True
++        
++    except ValueError as e:
++        if "wrong number" in str(e):
++            print(f"FAIL: The fix didn't work. Error: {e}")
++            return False
++        else:
++            print(f"FAIL: Different ValueError occurred: {e}")
++            return False
++    except Exception as e:
++        print(f"FAIL: Unexpected error: {e}")
++        return False
++
++if __name__ == '__main__':
++    if test_fix_comprehensive():
++        print("Fix verified successfully!")
++        sys.exit(0)
++    else:
++        print("Fix failed!")
++        sys.exit(1)
+\ No newline at end of file

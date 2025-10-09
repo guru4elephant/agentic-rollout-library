@@ -1,0 +1,417 @@
+diff --git a/debug_chain.py b/debug_chain.py
+new file mode 100644
+index 0000000000..47b8399cc3
+--- /dev/null
++++ b/debug_chain.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++"""
++Debug the middleware chain construction and execution.
++"""
++
++import os
++import sys
++import asyncio
++from pathlib import Path
++
++# Add the testbed to Python path
++testbed_path = Path(__file__).parent.absolute()
++sys.path.insert(0, str(testbed_path))
++
++# Set up minimal Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create minimal settings
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF='test_urls',
++        MIDDLEWARE=[
++            'test_middleware.DummyMiddleware',
++            'django.middleware.security.SecurityMiddleware',
++        ],
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        ALLOWED_HOSTS=['*'],
++    )
++
++# Import and patch to add debugging
++from django.core.handlers.base import BaseHandler
++from django.core.handlers.exception import convert_exception_to_response
++
++original_convert = convert_exception_to_response
++
++def debug_convert_exception_to_response(get_response):
++    print(f"convert_exception_to_response called with: {get_response}")
++    print(f"  is coroutine function: {asyncio.iscoroutinefunction(get_response)}")
++    wrapped = original_convert(get_response)
++    print(f"  returning: {wrapped}")
++    return wrapped
++
++# Monkey patch
++import django.core.handlers.exception
++django.core.handlers.exception.convert_exception_to_response = debug_convert_exception_to_response
++
++# Create test ASGI application
++from django.core.handlers.asgi import ASGIHandler
++
++async def test_asgi():
++    # Create ASGI handler
++    handler = ASGIHandler()
++    
++    # Create a simple ASGI scope for testing
++    scope = {
++        'type': 'http',
++        'method': 'GET',
++        'path': '/',
++        'query_string': b'',
++        'headers': [],
++        'client': ('127.0.0.1', 8000),
++        'server': ('testserver', 80),
++    }
++    
++    # Mock send function
++    async def send(message):
++        print(f"ASGI send: {message['type']}")
++    
++    # Mock receive function
++    async def receive():
++        return {'type': 'http.request', 'body': b'', 'more_body': False}
++    
++    # Call the ASGI handler
++    print("Testing ASGI handler with middleware...")
++    await handler(scope, receive, send)
++
++if __name__ == '__main__':
++    loop = asyncio.get_event_loop()
++    loop.run_until_complete(test_asgi())
++    loop.close()
+\ No newline at end of file
+diff --git a/debug_middleware.py b/debug_middleware.py
+new file mode 100644
+index 0000000000..a6a08bea31
+--- /dev/null
++++ b/debug_middleware.py
+@@ -0,0 +1,19 @@
++from django.utils.deprecation import MiddlewareMixin
++
++class DebugMiddleware(MiddlewareMixin):
++    def __init__(self, get_response):
++        print(f"DebugMiddleware initialized with get_response: {get_response}")
++        print(f"get_response is coroutine function: {hasattr(get_response, '__await__')}")
++        super().__init__(get_response)
++    
++    async def __call__(self, request):
++        print("DebugMiddleware.__call__ entered")
++        response = await self.get_response(request)
++        print(f"DebugMiddleware.__call__ response: {type(response)}")
++        return response
++    
++    def process_response(self, request, response):
++        print(f"DebugMiddleware.process_response: request={type(request).__name__}, response={type(response).__name__}")
++        if hasattr(response, '__await__'):
++            print("  -> Response is a coroutine!")
++        return response
+\ No newline at end of file
+diff --git a/debug_security_middleware.py b/debug_security_middleware.py
+new file mode 100644
+index 0000000000..f1a41bb4d1
+--- /dev/null
++++ b/debug_security_middleware.py
+@@ -0,0 +1,42 @@
++from django.utils.deprecation import MiddlewareMixin
++from django.conf import settings
++from django.http import HttpResponsePermanentRedirect
++import re
++
++class DebugSecurityMiddleware(MiddlewareMixin):
++    def __init__(self, get_response=None):
++        self._get_response_none_deprecation(get_response)
++        self.sts_seconds = settings.SECURE_HSTS_SECONDS
++        self.sts_include_subdomains = settings.SECURE_HSTS_INCLUDE_SUBDOMAINS
++        self.sts_preload = settings.SECURE_HSTS_PRELOAD
++        self.content_type_nosniff = settings.SECURE_CONTENT_TYPE_NOSNIFF
++        self.xss_filter = settings.SECURE_BROWSER_XSS_FILTER
++        self.redirect = settings.SECURE_SSL_REDIRECT
++        self.redirect_host = settings.SECURE_SSL_HOST
++        self.redirect_exempt = [re.compile(r) for r in settings.SECURE_REDIRECT_EXEMPT]
++        self.referrer_policy = settings.SECURE_REFERRER_POLICY
++        self.get_response = get_response
++        print(f"DebugSecurityMiddleware initialized with get_response: {get_response}")
++
++    def process_response(self, request, response):
++        print(f"SecurityMiddleware.process_response: request={type(request).__name__}, response={type(response).__name__}")
++        if hasattr(response, '__await__'):
++            print("  -> Response is a coroutine!")
++        
++        # Original security middleware logic
++        if (self.sts_seconds and request.is_secure() and
++                'Strict-Transport-Security' not in response):
++            sts_header = "max-age=%s" % self.sts_seconds
++            if self.sts_include_subdomains:
++                sts_header = sts_header + "; includeSubDomains"
++            if self.sts_preload:
++                sts_header = sts_header + "; preload"
++            response['Strict-Transport-Security'] = sts_header
++
++        if self.content_type_nosniff:
++            response.setdefault('X-Content-Type-Options', 'nosniff')
++
++        if self.xss_filter:
++            response.setdefault('X-XSS-Protection', '1; mode=block')
++
++        return response
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..c9c73aea87
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the middleware coroutine issue in ASGI mode.
++"""
++
++import os
++import sys
++import asyncio
++from pathlib import Path
++
++# Add the testbed to Python path
++testbed_path = Path(__file__).parent.absolute()
++sys.path.insert(0, str(testbed_path))
++
++# Set up minimal Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create minimal settings
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF='test_urls',
++        MIDDLEWARE=[
++            'test_middleware.DummyMiddleware',
++            'django.middleware.security.SecurityMiddleware',
++        ],
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        ALLOWED_HOSTS=['*'],
++    )
++
++# Create test URL patterns
++from django.urls import path
++from django.http import HttpResponse
++
++def simple_view(request):
++    return HttpResponse("Hello World")
++
++urlpatterns = [
++    path('', simple_view),
++]
++
++# Create test middleware
++from django.utils.deprecation import MiddlewareMixin
++
++class DummyMiddleware(MiddlewareMixin):
++    def process_response(self, request, response):
++        print(f"Middleware received: request={type(request).__name__}, response={type(response).__name__}")
++        if hasattr(response, '__await__'):
++            print("  -> Response is a coroutine!")
++        return response
++
++# Create test ASGI application
++from django.core.handlers.asgi import ASGIHandler
++
++async def test_asgi():
++    # Create ASGI handler
++    handler = ASGIHandler()
++    
++    # Create a simple ASGI scope for testing
++    scope = {
++        'type': 'http',
++        'method': 'GET',
++        'path': '/',
++        'query_string': b'',
++        'headers': [],
++        'client': ('127.0.0.1', 8000),
++        'server': ('testserver', 80),
++    }
++    
++    # Mock send function
++    async def send(message):
++        print(f"ASGI send: {message['type']}")
++    
++    # Mock receive function
++    async def receive():
++        return {'type': 'http.request', 'body': b'', 'more_body': False}
++    
++    # Call the ASGI handler
++    print("Testing ASGI handler with middleware...")
++    await handler(scope, receive, send)
++
++if __name__ == '__main__':
++    loop = asyncio.get_event_loop()
++    loop.run_until_complete(test_asgi())
++    loop.close()
+\ No newline at end of file
+diff --git a/test_first_middleware.py b/test_first_middleware.py
+new file mode 100644
+index 0000000000..f887da8520
+--- /dev/null
++++ b/test_first_middleware.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++"""
++Test specifically the first middleware in the chain.
++"""
++
++import os
++import sys
++import asyncio
++from pathlib import Path
++
++# Add the testbed to Python path
++testbed_path = Path(__file__).parent.absolute()
++sys.path.insert(0, str(testbed_path))
++
++# Set up minimal Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create minimal settings
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF='test_urls',
++        MIDDLEWARE=[
++            'test_middleware.DummyMiddleware',
++        ],
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        ALLOWED_HOSTS=['*'],
++    )
++
++# Create test ASGI application
++from django.core.handlers.asgi import ASGIHandler
++
++async def test_asgi():
++    # Create ASGI handler
++    handler = ASGIHandler()
++    
++    # Create a simple ASGI scope for testing
++    scope = {
++        'type': 'http',
++        'method': 'GET',
++        'path': '/',
++        'query_string': b'',
++        'headers': [],
++        'client': ('127.0.0.1', 8000),
++        'server': ('testserver', 80),
++    }
++    
++    # Mock send function
++    async def send(message):
++        print(f"ASGI send: {message['type']}")
++    
++    # Mock receive function
++    async def receive():
++        return {'type': 'http.request', 'body': b'', 'more_body': False}
++    
++    # Call the ASGI handler
++    print("Testing ASGI handler with only first middleware...")
++    await handler(scope, receive, send)
++
++if __name__ == '__main__':
++    loop = asyncio.get_event_loop()
++    loop.run_until_complete(test_asgi())
++    loop.close()
+\ No newline at end of file
+diff --git a/test_middleware.py b/test_middleware.py
+new file mode 100644
+index 0000000000..891d5b8826
+--- /dev/null
++++ b/test_middleware.py
+@@ -0,0 +1,8 @@
++from django.utils.deprecation import MiddlewareMixin
++
++class DummyMiddleware(MiddlewareMixin):
++    def process_response(self, request, response):
++        print(f"Middleware received: request={type(request).__name__}, response={type(response).__name__}")
++        if hasattr(response, '__await__'):
++            print("  -> Response is a coroutine!")
++        return response
+\ No newline at end of file
+diff --git a/test_sync_to_async.py b/test_sync_to_async.py
+new file mode 100644
+index 0000000000..dd0f40e11e
+--- /dev/null
++++ b/test_sync_to_async.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python3
++"""
++Test how sync_to_async handles coroutine parameters.
++"""
++
++import asyncio
++from asgiref.sync import sync_to_async
++
++async def async_coroutine():
++    return "Hello from coroutine"
++
++def sync_function(request, response):
++    print(f"sync_function called with request={type(request)}, response={type(response)}")
++    if hasattr(response, '__await__'):
++        print("Response is a coroutine!")
++    return response
++
++async def test():
++    # Create a mock request
++    request = "mock_request"
++    
++    # Test with regular response
++    print("Testing with regular response:")
++    result = await sync_to_async(sync_function)(request, "regular_response")
++    print(f"Result: {result}")
++    
++    print("\nTesting with coroutine response:")
++    # Test with coroutine response
++    coro = async_coroutine()
++    result = await sync_to_async(sync_function)(request, coro)
++    print(f"Result: {result}")
++
++if __name__ == '__main__':
++    loop = asyncio.get_event_loop()
++    loop.run_until_complete(test())
++    loop.close()
+\ No newline at end of file
+diff --git a/test_urls.py b/test_urls.py
+new file mode 100644
+index 0000000000..2e4ad63229
+--- /dev/null
++++ b/test_urls.py
+@@ -0,0 +1,9 @@
++from django.urls import path
++from django.http import HttpResponse
++
++def simple_view(request):
++    return HttpResponse("Hello World")
++
++urlpatterns = [
++    path('', simple_view),
++]
+\ No newline at end of file

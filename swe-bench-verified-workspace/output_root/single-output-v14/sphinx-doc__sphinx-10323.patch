@@ -1,0 +1,385 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..3b50239c2
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++
++import tempfile
++import os
++from sphinx.directives.code import LiteralIncludeReader
++from sphinx.config import Config
++
++# Create a temporary pom.xml file
++pom_content = '''<?xml version="1.0" encoding="UTF-8"?>
++<project>
++  <build>
++    <plugins>
++      <plugin>
++        <groupId>org.apache.maven.plugins</groupId>
++        <artifactId>maven-compiler-plugin</artifactId>
++        <version>3.8.0</version>
++        <configuration>
++          <source>1.8</source>
++          <target>1.8</target>
++          <debug>true</debug>
++          <encoding>UTF-8</encoding>
++        </configuration>
++      </plugin>
++      <plugin>
++        <groupId>com.github.ekryd.sortpom</groupId>
++        <artifactId>sortpom-maven-plugin</artifactId>
++        <version>2.15.0</version>
++        <configuration>
++          <verifyFailOn>strict</verifyFailOn>
++        </configuration>
++      </plugin>
++    </plugins>
++  </build>
++</project>'''
++
++with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as f:
++    f.write(pom_content)
++    pom_file = f.name
++
++# Create a mock config
++class MockConfig:
++    source_encoding = 'utf-8'
++
++config = MockConfig()
++
++# Test case 1: prepend without dedent (should work fine)
++options = {
++    'prepend': '      </plugin>',
++    'start-at': '<groupId>com.github.ekryd.sortpom</groupId>',
++    'end-at': '</plugin>'
++}
++
++reader = LiteralIncludeReader(pom_file, options, config)
++result, _ = reader.read()
++print("=== Test 1: prepend without dedent ===")
++print(result)
++print()
++
++# Test case 2: prepend with dedent (the problematic case)
++options_with_dedent = {
++    'prepend': '      </plugin>',
++    'start-at': '<groupId>com.github.ekryd.sortpom</groupId>',
++    'end-at': '</plugin>',
++    'dedent': 5
++}
++
++reader2 = LiteralIncludeReader(pom_file, options_with_dedent, config)
++result2, _ = reader2.read()
++print("=== Test 2: prepend with dedent (PROBLEMATIC) ===")
++print(result2)
++print()
++
++# Clean up
++os.unlink(pom_file)
+\ No newline at end of file
+diff --git a/sphinx/directives/code.py b/sphinx/directives/code.py
+index dc44ed314..512f4017a 100644
+--- a/sphinx/directives/code.py
++++ b/sphinx/directives/code.py
+@@ -356,7 +356,38 @@ class LiteralIncludeReader:
+ 
+     def dedent_filter(self, lines: List[str], location: Tuple[str, int] = None) -> List[str]:
+         if 'dedent' in self.options:
+-            return dedent_lines(lines, self.options.get('dedent'), location=location)
++            dedent = self.options.get('dedent')
++            
++            # If no prepend/append options, apply dedent normally
++            if 'prepend' not in self.options and 'append' not in self.options:
++                return dedent_lines(lines, dedent, location=location)
++            
++            # Separate prepend/append lines from main content
++            main_content_lines = lines.copy()
++            prepend_content = None
++            append_content = None
++            
++            # Check if we have prepend/append options
++            if 'prepend' in self.options:
++                # The first line is the prepended content
++                prepend_content = main_content_lines[0]
++                main_content_lines = main_content_lines[1:]
++            
++            if 'append' in self.options:
++                # The last line is the appended content
++                append_content = main_content_lines[-1]
++                main_content_lines = main_content_lines[:-1]
++            
++            # Apply dedent only to main content
++            dedented_lines = dedent_lines(main_content_lines, dedent, location=location)
++            
++            # Recombine with original prepend/append content
++            if prepend_content is not None:
++                dedented_lines.insert(0, prepend_content)
++            if append_content is not None:
++                dedented_lines.append(append_content)
++                
++            return dedented_lines
+         else:
+             return lines
+ 
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 000000000..f8be7bb82
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1,2 @@
++line1
++line2
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 000000000..37ac01248
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++
++import tempfile
++import os
++from sphinx.directives.code import LiteralIncludeReader
++
++# Create a temporary test file
++test_content = '''    line 1
++    line 2
++        line 3
++    line 4'''
++
++with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
++    f.write(test_content)
++    test_file = f.name
++
++# Create a mock config
++class MockConfig:
++    source_encoding = 'utf-8'
++
++config = MockConfig()
++
++# Test case 1: prepend only
++print("=== Test 1: prepend only ===")
++options = {
++    'prepend': '    PREPENDED LINE'
++}
++reader = LiteralIncludeReader(test_file, options, config)
++result, _ = reader.read()
++print(repr(result))
++print()
++
++# Test case 2: append only
++print("=== Test 2: append only ===")
++options = {
++    'append': '    APPENDED LINE'
++}
++reader = LiteralIncludeReader(test_file, options, config)
++result, _ = reader.read()
++print(repr(result))
++print()
++
++# Test case 3: prepend + dedent
++print("=== Test 3: prepend + dedent ===")
++options = {
++    'prepend': '    PREPENDED LINE',
++    'dedent': 4
++}
++reader = LiteralIncludeReader(test_file, options, config)
++result, _ = reader.read()
++print(repr(result))
++print()
++
++# Test case 4: append + dedent
++print("=== Test 4: append + dedent ===")
++options = {
++    'append': '    APPENDED LINE',
++    'dedent': 4
++}
++reader = LiteralIncludeReader(test_file, options, config)
++result, _ = reader.read()
++print(repr(result))
++print()
++
++# Test case 5: prepend + append + dedent
++print("=== Test 5: prepend + append + dedent ===")
++options = {
++    'prepend': '    PREPENDED LINE',
++    'append': '    APPENDED LINE',
++    'dedent': 4
++}
++reader = LiteralIncludeReader(test_file, options, config)
++result, _ = reader.read()
++print(repr(result))
++print()
++
++# Test case 6: no prepend/append, just dedent (should work as before)
++print("=== Test 6: no prepend/append, just dedent ===")
++options = {
++    'dedent': 4
++}
++reader = LiteralIncludeReader(test_file, options, config)
++result, _ = reader.read()
++print(repr(result))
++print()
++
++# Clean up
++os.unlink(test_file)
+\ No newline at end of file
+diff --git a/test_prepend_append_dedent.py b/test_prepend_append_dedent.py
+new file mode 100644
+index 000000000..99f0088f8
+--- /dev/null
++++ b/test_prepend_append_dedent.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++
++import tempfile
++import os
++from sphinx.directives.code import LiteralIncludeReader
++
++# Create a mock config
++class MockConfig:
++    source_encoding = 'utf-8'
++
++config = MockConfig()
++
++# Test content with indentation
++test_content = '''    def function():
++        print("hello")
++    return True'''
++
++with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++    f.write(test_content)
++    test_file = f.name
++
++try:
++    # Test 1: prepend + dedent
++    print("=== Test 1: prepend + dedent ===")
++    options = {
++        'prepend': '    # Prepended comment',
++        'dedent': 4
++    }
++    reader = LiteralIncludeReader(test_file, options, config)
++    result, _ = reader.read()
++    print(repr(result))
++    expected = '    # Prepended comment\ndef function():\n    print("hello")\nreturn True'
++    assert result == expected, f"Expected: {repr(expected)}, Got: {repr(result)}"
++    print("✓ PASS\n")
++
++    # Test 2: append + dedent
++    print("=== Test 2: append + dedent ===")
++    options = {
++        'append': '    # Appended comment',
++        'dedent': 4
++    }
++    reader = LiteralIncludeReader(Test_file, options, config)
++    result, _ = reader.read()
++    print(repr(result))
++    expected = 'def function():\n    print("hello")\nreturn True    # Appended comment\n'
++    assert result == expected, f"Expected: {repr(expected)}, Got: {repr(result)}"
++    print("✓ PASS\n")
++
++    # Test 3: prepend + append + dedent
++    print("=== Test 3: prepend + append + dedent ===")
++    options = {
++        'prepend': '    # Prepended comment',
++        'append': '    # Appended comment',
++        'dedent': 4
++    }
++    reader = LiteralIncludeReader(test_file, options, config)
++    result, _ = reader.read()
++    print(repr(Result))
++    expected = '    # Prepended comment\ndef function():\n    print("hello")\nreturn True    # Appended comment\n'
++    assert result == expected, f"Expected: {repr(expected)}, Got: {repr(result)}"
++    print("✓ PASS\n")
++
++    # Test 4: just dedent (should work as before)
++    print("=== Test 4: just dedent ===")
++    options = {
++        'dedent': 4
++    }
++    reader = LiteralIncludeReader(test_file, options, config)
++    result, _ = reader.read()
++    print(repr(result))
++    expected = 'defunction():\n    print("hello")\nreturn True'
++    assert result == expected, f"Expected: {repr(expected)}, Got: {repr(result)}"
++    print("✓ PASS\n")
++
++    print("All tests passed! ✅")
++
++finally:
++    # Clean up
++    os.unlink(test_file)
+\ No newline at end of file
+diff --git a/test_warning_case.py b/test_warning_case.py
+new file mode 100644
+index 000000000..642ead83b
+--- /dev/null
++++ b/test_warning_case.py
+@@ -0,0 +1,50 @@
++#!/usr/bin/env python3
++
++import tempfile
++import os
++from sphinx.directives.code import LiteralIncludeReader
++from sphinx.util import logging
++
++# Set up logging to capture warnings
++logging.setup(logging.NullHandler(), 2)
++
++# Create a temporary test file
++test_content = '''    line 1
++    line 2
++        line 3
++    line 4'''
++
++with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
++    f.write(test_content)
++    test_file = f.name
++
++# Create a mock config
++class MockConfig:
++    source_encoding = 'utf-8'
++
++config = MockConfig()
++
++# Test case that would previously cause a warning
++print("=== Test case that would cause warning ===")
++options = {
++    'prepend': '    PREPENDED LINE',
++    'dedent': 8  # This would strip non-whitespace from prepend if applied to it
++}
++reader = LiteralIncludeReader(test_file, options, config)
++result, _ = reader.read()
++print('Result:', repr(result))
++print()
++
++# Test case with append that would cause warning
++print("=== Test case with append that would cause warning ===")
++options = {
++    'append': '    APPENDED LINE',
++    'dedent': 8  # This would strip non-whitespace from append if applied to it
++}
++reader = LiteralIncludeReader(test_file, options, config)
++result, _ = reader.read()
++print('Result:', repr(result))
++print()
++
++# Clean up
++os.unlink(test_file)
+\ No newline at end of file
+diff --git a/tox.ini b/tox.ini
+index f0afd779b..30ca90275 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -28,7 +28,7 @@ setenv =
+     PYTHONWARNINGS = all
+     PYTEST_ADDOPTS = {env:PYTEST_ADDOPTS:} --color yes
+ commands=
+-    python -X dev -m pytest --durations 25 {posargs}
++    python -X dev -m pytest -rA --durations 25 {posargs}
+ 
+ [testenv:du-latest]
+ commands =

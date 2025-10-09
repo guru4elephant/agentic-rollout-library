@@ -1,0 +1,342 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index d69c24419b..8318da865b 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1666,6 +1666,8 @@ class Query(BaseExpression):
+             filter_expr = (filter_lhs, OuterRef(filter_rhs.name))
+         # Generate the inner query.
+         query = Query(self.model)
++        # Copy annotations from the original query to the new query
++        query.annotations = self.annotations.copy()
+         query.add_filter(filter_expr)
+         query.clear_ordering(True)
+         # Try to have as simple as possible subquery -> trim leading joins from
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..5816581075
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'tests.filtered_relation',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Q
++from django.db.models.query import QuerySet
++from django.db.models.sql.query import Query
++from django.db.models.query_utils import FilteredRelation
++
++print("Testing exclude on annotated FilteredRelation...")
++
++# Create a simple queryset to test the issue
++queryset = QuerySet(model=None)
++queryset.query = Query(model=None)
++
++# Add annotation manually to simulate the issue
++queryset.annotations = {'book_alice': FilteredRelation('book', condition=Q(book__title__iexact='poem by alice'))}
++
++print("Testing filter...")
++try:
++    # This should work
++    filtered = queryset.filter(book_alice__isnull=False)
++    print("✓ Filter works")
++except Exception as e:
++    print("✗ Filter failed:", e)
++
++print("Testing exclude...")
++try:
++    # This should fail - this is the issue
++    excluded = queryset.exclude(book_alice__isnull=False)
++    print("✓ Exclude works")
++except Exception as e:
++    print("✗ Exclude failed:", e)
++    print("Error type:", type(e).__name__)
++    print("Error message:", str(e))
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..4c288d86cf
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++"""
++Simple script to reproduce the FilteredRelation exclude issue
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++# Set Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Q
++from django.db.models.query import QuerySet
++from django.db.models.sql.query import Query
++from django.db.models.query_utils import FilteredRelation
++
++def test_split_exclude_issue():
++    """Test the split_exclude method with annotations"""
++    
++    # Create a query with annotations
++    query = Query(model=None)
++    query.annotations = {'book_alice': FilteredRelation('book', condition=Q(book__title__iexact='poem by alice'))}
++    
++    print("Original query annotations:", query.annotations.keys())
++    
++    # Test the split_exclude method
++    try:
++        # This should fail because the new query doesn't have annotations
++        condition, needed_inner = query.split_exclude(
++            filter_expr=('book_alice__isnull', False),
++            can_reuse=set(),
++            names_with_path=['book_alice']
++        )
++        print("✓ split_exclude worked")
++    except Exception as e:
++        print("✗ split_exclude failed:", e)
++        print("Error type:", type(e).__name__)
++
++if __name__ == '__main__':
++    test_split_exclude_issue()
+\ No newline at end of file
+diff --git a/test_annotation_copy.py b/test_annotation_copy.py
+new file mode 100644
+index 0000000000..afe9b557ab
+--- /dev/null
++++ b/test_annotation_copy.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++"""
++Test that annotations are properly copied in split_exclude
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.sql.query import Query
++from django.db.models import Q
++from django.db.models.query_utils import FilteredRelation
++
++def test_annotation_copy():
++    """Test that annotations are copied correctly in split_exclude"""
++    
++    # Create original query with annotations
++    original_query = Query(None)
++    original_query.annotations = {
++        'book_alice': FilteredRelation('book', condition=Q(book__title__iexact='poem by alice'))
++    }
++    
++    print("Original query annotations:", original_query.annotations.keys())
++    
++    # Create new query as split_exclude does
++    new_query = Query(original_query.model)
++    
++    # Apply our fix: copy annotations
++    new_query.annotations = original_query.annotations.copy()
++    
++    print("New query annotations:", new_query.annotations.keys())
++    
++    # Verify annotations are copied correctly
++    if new_query.annotations == original_query.annotations:
++        print("✓ Annotations copied successfully")
++        return True
++    else:
++        print("✗ Annotations not copied correctly")
++        return False
++
++if __name__ == '__main__':
++    success = test_annotation_copy()
++    if success:
++        print("✓ Test passed!")
++    else:
++        print("✗ Test failed!")
+\ No newline at end of file
+diff --git a/test_split_exclude.py b/test_split_exclude.py
+new file mode 100644
+index 0000000000..4180190b0c
+--- /dev/null
++++ b/test_split_exclude.py
+@@ -0,0 +1,100 @@
++#!/usr/bin/env python3
++"""
++Test the split_exclude method directly to verify the fix
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Q
++from django.db.models.sql.query import Query
++from django.db.models.query_utils import FilteredRelation
++
++def test_split_exclude_with_annotations():
++    """Test that split_exclude properly handles annotations"""
++    
++    # Create a mock model class
++    class MockModel:
++        class _meta:
++            pk = None
++    
++    # Create a query with annotations
++    query = Query(MockModel)
++    query.annotations = {'book_alice': FilteredRelation('book', condition=Q(book__title__iexact='poem by alice'))}
++    
++    print("Original query annotations:", query.annotations.keys())
++    
++    # Test the split_exclude method
++    try:
++        # This should work now with our fix
++        condition, needed_inner = query.split_exclude(
++            filter_expr=('book_alice__isnull', False),
++            can_reuse=set(),
++            names_with_path=['book_alice']
++        )
++        print("✓ split_exclude worked with annotations")
++        return True
++    except Exception as e:
++        print("✗ split_exclude failed:", e)
++        print("Error type:", type(e).__name__)
++        return False
++
++def test_split_exclude_without_annotations():
++    """Test that split_exclude works without annotations"""
++    
++    # Create a mock model class
++    class MockModel:
++        class _meta:
++            pk = None
++    
++    # Create a query without annotations
++    query = Query(MockModel)
++    
++    print("Query without annotations")
++    
++    # Test the split_exclude method
++    try:
++        condition, needed_inner = query.split_exclude(
++            filter_expr=('some_field', 'value'),
++            can_reuse=set(),
++            names_with_path=['some_field']
++        )
++        print("✓ split_exclude worked without annotations")
++        return True
++    except Exception as e:
++        print("✗ split_exclude failed:", e)
++        print("Error type:", type(e).__name__)
++        return False
++
++if __name__ == '__main__':
++    print("Testing split_exclude with annotations...")
++    success1 = test_split_exclude_with_annotations()
++    
++    print("\nTesting split_exclude without annotations...")
++    success2 = test_split_exclude_without_annotations()
++    
++    if success1 and success2:
++        print("\n✓ All tests passed!")
++    else:
++        print("\n✗ Some tests failed!")
+\ No newline at end of file
+diff --git a/tests/filtered_relation/tests.py b/tests/filtered_relation/tests.py
+index 5e85dff16c..b64f0fda21 100644
+--- a/tests/filtered_relation/tests.py
++++ b/tests/filtered_relation/tests.py
+@@ -98,6 +98,14 @@ class FilteredRelationTests(TestCase):
+             [self.author1]
+         )
+ 
++    def test_with_join_exclude(self):
++        self.assertSequenceEqual(
++            Author.objects.annotate(
++                book_alice=FilteredRelation('book', condition=Q(book__title__iexact='poem by alice')),
++            ).exclude(book_alice__isnull=False),
++            [self.author2]
++        )
++
+     def test_with_join_and_complex_condition(self):
+         self.assertSequenceEqual(
+             Author.objects.annotate(

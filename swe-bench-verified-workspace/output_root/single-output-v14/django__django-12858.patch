@@ -1,0 +1,302 @@
+diff --git a/app/__init__.py b/app/__init__.py
+new file mode 100644
+index 0000000000..a7506fdc94
+--- /dev/null
++++ b/app/__init__.py
+@@ -0,0 +1 @@
++# Empty init file
+\ No newline at end of file
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 6c9e9d3707..124db6eed0 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -1747,7 +1747,7 @@ class Model(metaclass=ModelBase):
+                     else:
+                         _cls = None
+                 except (FieldDoesNotExist, AttributeError):
+-                    if fld is None or fld.get_transform(part) is None:
++                    if fld is None or (fld.get_transform(part) is None and fld.get_lookup(part) is None):
+                         errors.append(
+                             checks.Error(
+                                 "'ordering' refers to the nonexistent field, "
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..25ec02b289
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'app',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create the models mentioned in the issue
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    parent = models.ForeignKey('self', models.CASCADE, null=True)
++    
++    class Meta:
++        app_label = 'app'
++
++class Supply(models.Model):
++    product = models.ForeignKey(Product, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'app'
++
++class Stock(models.Model):
++    supply = models.ForeignKey(Supply, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'app'
++        ordering = ['supply__product__parent__isnull']
++
++# Test the issue
++from django.core.checks import run_checks
++
++print("Running Django checks...")
++errors = run_checks()
++for error in errors:
++    if error.id == 'models.E015':
++        print(f"E015 Error found: {error.msg}")
++        break
++else:
++    print("No E015 errors found")
++
++# Test that the ordering actually works
++print("\nTesting that ordering works...")
++try:
++    # Create some test data
++    parent_product = Product.objects.create(name="Parent")
++    child_product = Product.objects.create(name="Child", parent=parent_product)
++    supply1 = Supply.objects.create(product=parent_product)
++    supply2 = Supply.objects.create(product=child_product)
++    stock1 = Stock.objects.create(supply=supply1)
++    stock2 = Stock.objects.create(supply=supply2)
++    
++    # Test ordering
++    result = list(Stock.objects.order_by('supply__product__parent__isnull').values_list('pk', flat=True)[:5])
++    print(f"Order by isnull result: {result}")
++    
++    result = list(Stock.objects.order_by('-supply__product__parent__isnull').values_list('pk', flat=True)[:5])
++    print(f"Order by -isnull result: {result}")
++    
++    print("Ordering works correctly!")
++except Exception as e:
++    print(f"Error during ordering test: {e}")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..87850fa73c
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'app',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create the models mentioned in the issue
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    parent = models.ForeignKey('self', models.CASCADE, null=True)
++    
++    class Meta:
++        app_label = 'app'
++
++class Supply(models.Model):
++    product = models.ForeignKey(Product, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'app'
++
++class Stock(models.Model):
++    supply = models.ForeignKey(Supply, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'app'
++
++# Test various ordering scenarios
++test_cases = [
++    # Valid cases (should not raise E015)
++    ('supply__product__parent__isnull', True, "isnull lookup"),
++    ('supply__product__name__exact', True, "exact lookup"), 
++    ('supply__product__name__iexact', True, "iexact lookup"),
++    ('supply__product__name__contains', True, "contains lookup"),
++    ('supply__product__name__icontains', True, "icontains lookup"),
++    ('supply__product__name__startswith', True, "startswith lookup"),
++    ('supply__product__name__endswith', True, "endswith lookup"),
++    
++    # Invalid cases (should raise E015)
++    ('supply__product__nonexistent__isnull', False, "nonexistent field with lookup"),
++    ('supply__product__parent__invalidlookup', False, "invalid lookup"),
++    ('supply__nonexistent__parent__isnull', False, "nonexistent related field"),
++]
++
++from django.core.checks import run_checks
++
++print("Testing various ordering scenarios...")
++
++for field_name, should_be_valid, description in test_cases:
++    # Set the ordering
++    Stock._meta.ordering = [field_name]
++    
++    # Run checks
++    errors = run_checks()
++    e015_errors = [error for error in errors if error.id == 'models.E015' and field_name in error.msg]
++    
++    if should_be_valid:
++        if e015_errors:
++            print(f"❌ FAIL: {description} - {field_name} should be valid but got E015 error")
++        else:
++            print(f"✅ PASS: {description} - {field_name} correctly recognized as valid")
++    else:
++        if e015_errors:
++            print(f"✅ PASS: {description} - {field_name} correctly recognized as invalid")
++        else:
++            print(f"❌ FAIL: {description} - {field_name} should be invalid but no E015 error")
++    
++    # Reset ordering
++    Stock._meta.ordering = []
++
++print("\nTest completed!")
+\ No newline at end of file
+diff --git a/test_fix_validation.py b/test_fix_validation.py
+new file mode 100644
+index 0000000000..45b72c6f47
+--- /dev/null
++++ b/test_fix_validation.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++        INSTALLED_APPS=['django.contrib.contenttypes'],
++        USE_TZ=True,
++        SECRET_KEY='test',
++    )
++
++django.setup()
++
++from django.db import models
++from django.core.checks import Error
++from django.test import SimpleTestCase
++
++class TestOrderingLookups(SimpleTestCase):
++    
++    def test_ordering_allows_builtin_lookups(self):
++        """Test that built-in lookups like isnull are allowed in ordering"""
++        class Product(models.Model):
++            name = models.CharField(max_length=100)
++            parent = models.ForeignKey('self', models.CASCADE, null=True)
++            
++            class Meta:
++                app_label = 'test'
++            
++        class Supply(models.Model):
++            product = models.ForeignKey(Product, on_delete=models.CASCADE)
++            
++            class Meta:
++                app_label = 'test'
++            
++        class Stock(models.Model):
++            supply = models.ForeignKey(Supply, on_delete=models.CASCADE)
++            
++            class Meta:
++                app_label = 'test'
++                ordering = ['supply__product__parent__isnull']
++        
++        # This should NOT produce an E015 error
++        errors = Stock.check()
++        e015_errors = [e for e in errors if e.id == 'models.E015']
++        
++        self.assertEqual(e015_errors, [], 
++            f"Expected no E015 errors for valid isnull lookup, but got: {e015_errors}")
++    
++    def test_ordering_still_rejects_invalid_lookups(self):
++        """Test that invalid lookups still produce E015 errors"""
++        class Model(models.Model):
++            name = models.CharField(max_length=100)
++            
++            class Meta:
++                app_label = 'test'
++                ordering = ['name__invalidlookup']
++        
++        # This should produce an E015 error
++        errors = Model.check()
++        e015_errors = [e for e in errors if e.id == 'models.E015' and 'invalidlookup' in e.msg]
++        
++        self.assertTrue(len(e015_errors) > 0,
++            "Expected E015 error for invalid lookup but none found")
++    
++    def test_ordering_still_rejects_nonexistent_fields(self):
++        """Test that nonexistent fields still produce E015 errors"""
++        class Model(models.Model):
++            class Meta:
++                ordering = ['nonexistent_field']
++        
++        # This should produce an E015 error
++        errors = Model.check()
++        e015_errors = [e for e in errors if e.id == 'models.E015' and 'nonexistent_field' in e.msg]
++        
++        self.assertTrue(len(e015_errors) > 0,
++            "Expected E015 error for nonexistent field but none found")
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file

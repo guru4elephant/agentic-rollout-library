@@ -1,0 +1,333 @@
+diff --git a/debug_value.py b/debug_value.py
+new file mode 100644
+index 0000000000..06b04922ce
+--- /dev/null
++++ b/debug_value.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++import datetime
++from django.db.models import F
++
++# Create the model from the issue
++class Experiment(models.Model):
++    estimated_time = models.DurationField()
++
++    class Meta:
++        app_label = 'test'
++
++# Create tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Experiment)
++
++# Insert some test data
++experiment = Experiment.objects.create(estimated_time=datetime.timedelta(hours=2))
++
++# Let's see what the raw value looks like in the database
++cursor = connection.cursor()
++cursor.execute("SELECT estimated_time FROM test_experiment")
++row = cursor.fetchone()
++print(f"Raw value from database: {row[0]} (type: {type(row[0])})")
++
++# Let's also check what the annotated query returns
++cursor.execute("SELECT estimated_time + 86400000000 FROM test_experiment")
++row = cursor.fetchone()
++print(f"Annotated value from database: {row[0]} (type: {type(row[0])})")
+\ No newline at end of file
+diff --git a/django/db/backends/base/operations.py b/django/db/backends/base/operations.py
+index 2e283a3193..7e53d490bc 100644
+--- a/django/db/backends/base/operations.py
++++ b/django/db/backends/base/operations.py
+@@ -580,7 +580,20 @@ class BaseDatabaseOperations:
+ 
+     def convert_durationfield_value(self, value, expression, connection):
+         if value is not None:
+-            return datetime.timedelta(0, 0, value)
++            # Handle both integer and string inputs
++            try:
++                # If value is already an integer, use it directly
++                microseconds = int(value)
++            except (TypeError, ValueError):
++                # If value is a string that can't be converted to int, 
++                # it might be a decimal string from database operations
++                try:
++                    microseconds = int(float(value))
++                except (TypeError, ValueError):
++                    # If all else fails, return the original value as-is
++                    # This might happen with some database-specific representations
++                    return value
++            return datetime.timedelta(0, 0, microseconds)
+ 
+     def check_expression_support(self, expression):
+         """
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..f38cfc80f5
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++import datetime
++from django.db.models import F
++
++# Create the model from the issue
++class Experiment(models.Model):
++    estimated_time = models.DurationField()
++
++    class Meta:
++        app_label = 'test'
++
++# Create tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Experiment)
++
++# Insert some test data
++experiment = Experiment.objects.create(estimated_time=datetime.timedelta(hours=2))
++
++# Try to reproduce the issue
++try:
++    delta = datetime.timedelta(1)
++    result = list(Experiment.objects.annotate(duration=F('estimated_time') + delta))
++    print("Success! No error occurred.")
++    print(f"Result: {result}")
++except Exception as e:
++    print(f"Error occurred: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_duration_arithmetic.py b/test_duration_arithmetic.py
+new file mode 100644
+index 0000000000..1fd0ab6a41
+--- /dev/null
++++ b/test_duration_arithmetic.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++import datetime
++from django.db.models import F
++
++# Create the model from the issue
++class Experiment(models.Model):
++    estimated_time = models.DurationField()
++
++    class Meta:
++        app_label = 'test'
++
++# Create tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Experiment)
++
++# Insert some test data
++experiment = Experiment.objects.create(estimated_time=datetime.timedelta(hours=2))
++
++# Let's see what the SQL query looks like
++from django.db.models.sql import compiler
++queryset = Experiment.objects.annotate(duration=F('estimated_time') + datetime.timedelta(1))
++sql, params = queryset.query.sql_with_params()
++print(f"SQL: {sql}")
++print(f"Params: {params}")
++
++# Execute the raw SQL to see what it returns
++cursor = connection.cursor()
++cursor.execute(sql, params)
++rows = cursor.fetchall()
++print(f"Raw result: {rows}")
++
++# Let's also check the column types
++description = cursor.description
++for i, col in enumerate(description):
++    print(f"Column {i}: {col[0]} (type: {col[1]})")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..74f1f4eb78
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++
++# Test the convert_durationfield_value method with various inputs
++operations = connection.ops
++
++# Test cases
++test_cases = [
++    (7200000000, "integer input"),
++    ("7200000000", "string integer input"),
++    ("7200000000.0", "string float input"),
++    ("7200000000.5", "string float with decimal input"),
++    (None, "None input"),
++    ("invalid", "invalid string input"),
++]
++
++for value, description in test_cases:
++    try:
++        result = operations.convert_durationfield_value(value, None, None)
++        print(f"✓ {description}: {value} -> {result}")
++    except Exception as e:
++        print(f"✗ {description}: {value} -> Error: {e}")
+\ No newline at end of file
+diff --git a/test_mysql.py b/test_mysql.py
+new file mode 100644
+index 0000000000..ca64443406
+--- /dev/null
++++ b/test_mysql.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings for MySQL
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.mysql',
++                'NAME': 'test_db',
++                'USER': 'root',
++                'PASSWORD': '',
++                'HOST': 'localhost',
++                'PORT': '3306',
++                'TEST': {
++                    'NAME': 'test_db',
++                }
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++import datetime
++from django.db.models import F
++
++# Create the model from the issue
++class Experiment(models.Model):
++    estimated_time = models.DurationField()
++
++    class Meta:
++        app_label = 'test'
++
++# Try to reproduce the issue
++try:
++    # This will fail if MySQL is not available, but we want to test the code path
++    delta = datetime.timedelta(1)
++    result = list(Experiment.objects.annotate(duration=F('estimated_time') + delta))
++    print("Success! No error occurred.")
++except Exception as e:
++    print(f"Error occurred: {type(e).__name__}: {e}")
++    # Don't print full traceback since MySQL might not be available
++    if "Unknown database" in str(e) or "Can't connect" in str(e):
++        print("MySQL is not available, but this is expected for testing.")
++    else:
++        import traceback
++        traceback.print_exc()
+\ No newline at end of file

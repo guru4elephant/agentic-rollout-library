@@ -1,0 +1,823 @@
+diff --git a/astropy/units/quantity.py b/astropy/units/quantity.py
+index ded609cbe9..5e7a3b6b2a 100644
+--- a/astropy/units/quantity.py
++++ b/astropy/units/quantity.py
+@@ -380,7 +380,9 @@ class Quantity(np.ndarray, metaclass=InheritDocstrings):
+         if dtype is None and (not (np.can_cast(np.float32, value.dtype)
+                                    or value.dtype.fields)
+                               or value.dtype.kind == 'O'):
+-            value = value.astype(float)
++            # Don't convert float types to float64, preserve their original dtype
++            if value.dtype.kind != 'f':
++                value = value.astype(float)
+ 
+         value = value.view(cls)
+         value._set_unit(value_unit)
+@@ -588,7 +590,11 @@ class Quantity(np.ndarray, metaclass=InheritDocstrings):
+         if obj is None:
+             obj = self.view(np.ndarray)
+         else:
+-            obj = np.array(obj, copy=False)
++            # Preserve the original dtype when converting numpy scalars to arrays
++            if hasattr(obj, 'dtype'):
++                obj = np.array(obj, copy=False, dtype=obj.dtype)
++            else:
++                obj = np.array(obj, copy=False)
+ 
+         # Take the view, set the unit, and update possible other properties
+         # such as ``info``, ``wrap_angle`` in `Longitude`, etc.
+diff --git a/debug_dtype_loss.py b/debug_dtype_loss.py
+new file mode 100644
+index 0000000000..12efc888c7
+--- /dev/null
++++ b/debug_dtype_loss.py
+@@ -0,0 +1,31 @@
++#!/usr/bin/env python3
++
++import numpy as np
++import astropy.units as u
++
++print("Debugging where np.float16 dtype is lost")
++print("=" * 50)
++
++# Test direct Quantity creation
++val = np.float16(1)
++print(f"np.float16(1) = {val}, dtype = {val.dtype}")
++
++# Test creating Quantity directly
++q = u.Quantity(val, u.km)
++print(f"u.Quantity(np.float16(1), u.km) = {q}, dtype = {q.dtype}")
++
++print()
++
++# Test multiplication
++result = val * u.km
++print(f"np.float16(1) * u.km = {result}, dtype = {result.dtype}")
++
++print()
++
++# Let's also test what happens when we create a unit first
++km = u.km
++print(f"u.km = {km}")
++
++# Test unit multiplication
++result2 = km * val
++print(f"u.km * np.float16(1) = {result2}, dtype = {result2.dtype}")
+\ No newline at end of file
+diff --git a/debug_rmul.py b/debug_rmul.py
+new file mode 100644
+index 0000000000..084ce70c6a
+--- /dev/null
++++ b/debug_rmul.py
+@@ -0,0 +1,30 @@
++#!/usr/bin/env python3
++
++import numpy as np
++import astropy.units as u
++
++print("Debugging __rmul__ path step by step")
++print("=" * 50)
++
++# Test the specific case
++val = np.float16(1)
++km = u.km
++
++print(f"np.float16(1) = {val}, dtype = {val.dtype}")
++print(f"u.km = {km}")
++print(f"hasattr(val, 'unit'): {hasattr(val, 'unit')}")
++
++# Let's trace what happens in the __rmul__ method
++# Since val doesn't have a unit attribute, it should go to line 717
++try:
++    from astropy.units.quantity import Quantity
++    result = Quantity(val, km)
++    print(f"Quantity(val, km) = {result}, dtype = {result.dtype}")
++except Exception as e:
++    print(f"Error in Quantity(val, km): {e}")
++
++print()
++
++# Test the actual multiplication
++result = km * val
++print(f"km * val = {result}, dtype = {result.dtype}")
+\ No newline at end of file
+diff --git a/debug_rmul_detailed.py b/debug_rmul_detailed.py
+new file mode 100644
+index 0000000000..e8517ea8d1
+--- /dev/null
++++ b/debug_rmul_detailed.py
+@@ -0,0 +1,42 @@
++#!/usr/bin/env python3
++
++import numpy as np
++import astropy.units as u
++
++# Monkey patch the __rmul__ method to add debug info
++original_rmul = u.UnitBase.__rmul__
++
++def debug_rmul(self, m):
++    print(f"__rmul__ called with self={self}, m={m}, type(m)={type(m)}")
++    print(f"hasattr(m, 'unit'): {hasattr(m, 'unit')}")
++    
++    if isinstance(m, (bytes, str)):
++        print("Taking string path")
++        return original_rmul(self, m)
++    
++    try:
++        from astropy.units.quantity import Quantity
++        if hasattr(m, 'unit'):
++            print("Taking hasattr(m, 'unit') path")
++            result = Quantity(m)
++            result *= self
++            return result
++        else:
++            print("Taking else path (Quantity(m, self))")
++            return Quantity(m, self)
++    except TypeError as e:
++        print(f"TypeError: {e}")
++        return NotImplemented
++
++# Apply the monkey patch
++u.UnitBase.__rmul__ = debug_rmul
++
++# Test the multiplication
++val = np.float16(1)
++km = u.km
++print(f"Testing km * val where val={val}, dtype={val.dtype}")
++result = km * val
++print(f"Result: {result}, dtype: {result.dtype}")
++
++# Restore original method
++u.UnitBase.__rmul__ = original_rmul
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..dafce81f54
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++
++import numpy as np
++import astropy.units as u
++
++print("Testing np.float16 dtype preservation in Quantity operations")
++
++# Test cases from the issue
++print("\n1. Testing np.float16:")
++val = np.float16(1)
++print(f"np.float16(1) = {val}")
++result = val * u.km
++print(f"(np.float16(1) * u.km) = {result}")
++print(f"(np.float16(1) * u.km).dtype = {result.dtype}")
++
++print("\n2. Testing np.float32:")
++val = np.float32(1)
++print(f"np.float32(1) = {val}")
++result = val * u.km
++print(f"(np.float32(1) * u.km) = {result}")
++print(f"(np.float32(1) * u.km).dtype = {result.dtype}")
++
++print("\n3. Testing np.float64:")
++val = np.float64(1)
++print(f"np.float64(1) = {val}")
++result = val * u.km
++print(f"(np.float64(1) * u.km) = {result}")
++print(f"(np.float64(1) * u.km).dtype = {result.dtype}")
++
++print("\n4. Testing np.float128 (if available):")
++try:
++    val = np.float128(1)
++    print(f"np.float128(1) = {val}")
++    result = val * u.km
++    print(f"(np.float128(1) * u.km) = {result}")
++    print(f"(np.float128(1) * u.km).dtype = {result.dtype}")
++except AttributeError:
++    print("np.float128 not available")
++
++print("\n5. Testing float (builtin):")
++val = float(1)
++print(f"float(1) = {val}")
++result = val * u.km
++print(f"(float(1) * u.km) = {result}")
++print(f"(float(1) * u.km).dtype = {result.dtype}")
++
++print("\n6. Testing np.float_:")
++val = np.float_(1)
++print(f"np.float_(1) = {val}")
++result = val * u.km
++print(f"(np.float_(1) * u.km) = {result}")
++print(f"(np.float_(1) * u.km).dtype = {result.dtype}")
+\ No newline at end of file
+diff --git a/test_can_cast.py b/test_can_cast.py
+new file mode 100644
+index 0000000000..1c9aa54341
+--- /dev/null
++++ b/test_can_cast.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python3
++
++import numpy as np
++
++print("Testing np.can_cast behavior")
++print("=" * 50)
++
++# Test different float types
++float16_dtype = np.dtype('float16')
++float32_dtype = np.dtype('float32')
++float64_dtype = np.dtype('float64')
++float128_dtype = np.dtype('float128')
++
++print(f"np.can_cast(np.float32, np.float16): {np.can_cast(np.float32, float16_dtype)}")
++print(f"np.can_cast(np.float32, np.float32): {np.can_cast(np.float32, float32_dtype)}")
++print(f"np.can_cast(np.float32, np.float64): {np.can_cast(np.float32, float64_dtype)}")
++print(f"np.can_cast(np.float32, np.float128): {np.can_cast(np.float32, float128_dtype)}")
++
++print()
++
++# Test with actual values
++val16 = np.float16(1)
++val32 = np.float32(1)
++val64 = np.float64(1)
++
++print(f"np.can_cast(np.float32, val16.dtype): {np.can_cast(np.float32, val16.dtype)}")
++print(f"np.can_cast(np.float32, val32.dtype): {np.can_cast(np.float32, val32.dtype)}")
++print(f"np.can_cast(np.float32, val64.dtype): {np.can_cast(np.float32, val64.dtype)}")
++
++print()
++
++# Test the specific condition from the code
++print("Testing the specific condition from Quantity.__new__:")
++print(f"not np.can_cast(np.float32, val16.dtype): {not np.can_cast(np.float32, val16.dtype)}")
++print(f"not np.can_cast(np.float32, val32.dtype): {not np.can_cast(np.float32, val32.dtype)}")
++print(f"not np.can_cast(np.float32, val64.dtype): {not np.can_cast(np.float32, val64.dtype)}")
+\ No newline at end of file
+diff --git a/test_deep_debug.py b/test_deep_debug.py
+new file mode 100644
+index 0000000000..21fba03356
+--- /dev/null
++++ b/test_deep_debug.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python3
++
++import numpy as np
++import astropy.units as u
++
++# Let's try to understand what's happening at a deeper level
++val = np.float16(1)
++km = u.km
++
++print("Deep debugging of operator behavior:")
++print(f"val = {val}, id(val) = {id(val)}")
++print(f"km = {km}, id(km) = {id(km)}")
++
++# Let's check if the issue is with the specific unit instance
++# by creating a completely new unit
++new_km = u.Unit('km')
++print(f"new_km = {new_km}, id(new_km) = {id(new_km)}")
++
++print(f"new_km.__rmul__(val) = {new_km.__rmul__(val)}, dtype = {new_km.__rmul__(val).dtype}")
++print(f"new_km * val = {new_km * val}, dtype = {(new_km * val).dtype}")
++
++print()
++
++# Let's also check if the issue is with the specific float16 value
++new_val = np.float16(1)
++print(f"new_val = {new_val}, id(new_val) = {id(new_val)}")
++print(f"km.__rmul__(new_val) = {km.__rmul__(new_val)}, dtype = {km.__rmul__(new_val).dtype}")
++print(f"km * new_val = {km * new_val}, dtype = {(km * new_val).dtype}")
++
++print()
++
++# Let's check if there's some kind of caching by testing with a different value
++val2 = np.float16(2)
++print(f"val2 = {val2}")
++print(f"km.__rmul__(val2) = {km.__rmul__(val2)}, dtype = {km.__rmul__(val2).dtype}")
++print(f"km * val2 = {km * val2}, dtype = {(km * val2).dtype}")
+\ No newline at end of file
+diff --git a/test_deep_investigation.py b/test_deep_investigation.py
+new file mode 100644
+index 0000000000..ded4b7b47f
+--- /dev/null
++++ b/test_deep_investigation.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++
++import numpy as np
++import astropy.units as u
++
++# Let's add some debug information to understand what's happening
++val = np.float16(1)
++km = u.km
++
++print("Deep investigation of the issue:")
++print(f"val = {val}, type = {type(val)}")
++print(f"km = {km}, type = {type(km)}")
++
++# Let's manually trace through what should happen in __rmul__
++# According to the code, it should call Quantity(m, self)
++print("\nManual trace of __rmul__ path:")
++try:
++    from astropy.units.quantity import Quantity
++    result = Quantity(val, km)
++    print(f"Quantity(val, km) = {result}, dtype = {result.dtype}")
++except Exception as e:
++    print(f"Quantity(val, km) failed: {e}")
++
++# Let's also check if there's some other path being taken
++# by looking at what happens with different types of multiplication
++print("\nTesting different multiplication approaches:")
++result1 = val * km
++result2 = km * val
++result3 = km.__rmul__(val)
++
++print(f"val * km = {result1}, dtype = {result1.dtype}")
++print(f"km * val = {result2}, dtype = {result2.dtype}") 
++print(f"km.__rmul__(val) = {result3}, dtype = {result3.dtype}")
++
++print(f"val * km is km.__rmul__(val): {result1 is result3}")
++print(f"km * val is km.__rmul__(val): {result2 is result3}")
++
++# Let's also check if the issue is with the specific unit instance
++print("\nTesting with a fresh unit instance:")
++fresh_km = u.Unit('km')
++result4 = fresh_km * val
++result5 = fresh_km.__rmul__(val)
++print(f"fresh_km * val = {result4}, dtype = {result4.dtype}")
++print(f"fresh_km.__rmul__(val) = {result5}, dtype = {result5.dtype}")
+\ No newline at end of file
+diff --git a/test_direct_rmul.py b/test_direct_rmul.py
+new file mode 100644
+index 0000000000..a2e4be5c51
+--- /dev/null
++++ b/test_direct_rmul.py
+@@ -0,0 +1,28 @@
++#!/usr/bin/env python3
++
++import numpy as np
++import astropy.units as u
++
++# Test calling __rmul__ directly
++val = np.float16(1)
++km = u.km
++
++print("Testing direct __rmul__ call:")
++print(f"val = {val}, dtype = {val.dtype}")
++print(f"km = {km}")
++
++# Call __rmul__ directly
++result = km.__rmul__(val)
++print(f"km.__rmul__(val) = {result}, dtype = {result.dtype}")
++
++print()
++
++# Compare with normal multiplication
++result2 = km * val
++print(f"km * val = {result2}, dtype = {result2.dtype}")
++
++print()
++
++# Check if they are the same
++print(f"Results are identical: {result is result2}")
++print(f"Result dtypes are equal: {result.dtype == result2.dtype}")
+\ No newline at end of file
+diff --git a/test_dtype_behavior.py b/test_dtype_behavior.py
+new file mode 100644
+index 0000000000..3a3b3276e6
+--- /dev/null
++++ b/test_dtype_behavior.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python3
++
++import numpy as np
++
++print("Testing np.array behavior with different dtypes")
++print("=" * 50)
++
++# Test np.float16
++val = np.float16(1)
++print(f"np.float16(1) = {val}, dtype = {val.dtype}")
++arr = np.array(val, copy=False)
++print(f"np.array(np.float16(1), copy=False) = {arr}, dtype = {arr.dtype}")
++
++print()
++
++# Test np.float32
++val = np.float32(1)
++print(f"np.float32(1) = {val}, dtype = {val.dtype}")
++arr = np.array(val, copy=False)
++print(f"np.array(np.float32(1), copy=False) = {arr}, dtype = {arr.dtype}")
++
++print()
++
++# Test np.float64
++val = np.float64(1)
++print(f"np.float64(1) = {val}, dtype = {val.dtype}")
++arr = np.array(val, copy=False)
++print(f"np.array(np.float64(1), copy=False) = {arr}, dtype = {arr.dtype}")
++
++print()
++
++# Test with explicit dtype
++val = np.float16(1)
++print(f"np.float16(1) = {val}, dtype = {val.dtype}")
++arr = np.array(val, dtype=val.dtype, copy=False)
++print(f"np.array(np.float16(1), dtype=val.dtype, copy=False) = {arr}, dtype = {arr.dtype}")
+\ No newline at end of file
+diff --git a/test_final_debug.py b/test_final_debug.py
+new file mode 100644
+index 0000000000..ebf4aa5de1
+--- /dev/null
++++ b/test_final_debug.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python3
++
++import numpy as np
++import astropy.units as u
++
++# Let's try to understand the exact difference
++val = np.float16(1)
++km = u.km
++
++print("Final debug:")
++print(f"val = {val}, type = {type(val)}")
++print(f"km = {km}, type = {type(km)}")
++
++# Let's manually trace through the exact code path
++print("\nManual trace:")
++# This is what should happen in __rmul__
++if hasattr(val, 'unit'):
++    print("Taking hasattr path (should not happen)")
++    result = u.Quantity(val)
++    result *= km
++else:
++    print("Taking else path (Quantity(m, self))")
++    result = u.Quantity(val, km)
++
++print(f"Manual result = {result}, dtype = {result.dtype}")
++
++# Compare with actual calls
++print(f"km.__rmul__(val) = {km.__rmul__(val)}, dtype = {km.__rmul__(val).dtype}")
++print(f"km * val = {km * val}, dtype = {(km * val).dtype}")
++
++# Let's also check if there's some issue with the unit multiplication
++print(f"km * u.dimensionless_unscaled = {km * u.dimensionless_unscaled}")
++
++# Let's check if the issue is with the specific multiplication operation
++dimless = u.dimensionless_unscaled
++result_dimless = val * dimless
++print(f"val * dimless = {result_dimless}, dtype = {result_dimless.dtype}")
++
++result_km_dimless = km * result_dimless
++print(f"km * (val * dimless) = {result_km_dimless}, dtype = {result_km_dimless.dtype}")
+\ No newline at end of file
+diff --git a/test_float_types.py b/test_float_types.py
+new file mode 100644
+index 0000000000..ab161dd2c0
+--- /dev/null
++++ b/test_float_types.py
+@@ -0,0 +1,22 @@
++#!/usr/bin/env python3
++
++import numpy as np
++
++print("Testing various float types and their behavior")
++print("=" * 50)
++
++# Test all numpy float types
++float_types = ['float16', 'float32', 'float64', 'float128']
++
++for float_type in float_types:
++    try:
++        dtype = np.dtype(float_type)
++        val = dtype.type(1)
++        print(f"{float_type}:")
++        print(f"  dtype.kind = {dtype.kind}")
++        print(f"  np.can_cast(np.float32, {float_type}) = {np.can_cast(np.float32, dtype)}")
++        print(f"  dtype.fields = {dtype.fields}")
++        print()
++    except Exception as e:
++        print(f"{float_type}: Not available - {e}")
++        print()
+\ No newline at end of file
+diff --git a/test_numpy_behavior.py b/test_numpy_behavior.py
+new file mode 100644
+index 0000000000..6310c72fa7
+--- /dev/null
++++ b/test_numpy_behavior.py
+@@ -0,0 +1,41 @@
++#!/usr/bin/env python3
++
++import numpy as np
++import astropy.units as u
++
++# Test if numpy has some special handling for units
++val = np.float16(1)
++km = u.km
++
++print("Testing numpy behavior with units:")
++print(f"val = {val}, dtype = {val.dtype}")
++print(f"km = {km}")
++
++# Check numpy's __mul__ behavior
++print(f"val.__mul__(km) = {val.__mul__(km)}")
++print(f"km.__rmul__(val) = {km.__rmul__(val)}")
++
++print()
++
++# Check what actually happens with the * operator
++print("Testing operator behavior:")
++try:
++    result1 = val * km
++    print(f"val * km = {result1}, dtype = {result1.dtype}")
++except Exception as e:
++    print(f"val * km failed: {e}")
++
++try:
++    result2 = km * val
++    print(f"km * val = {result2}, dtype = {result2.dtype}")
++except Exception as e:
++    print(f"km * val failed: {e}")
++
++print()
++
++# Check if there's some caching by testing multiple times
++print("Testing multiple times to check for consistency:")
++for i in range(3):
++    result1 = val * km
++    result2 = km * val
++    print(f"Run {i+1}: val * km = {result1.dtype}, km * val = {result2.dtype}")
+\ No newline at end of file
+diff --git a/test_numpy_scalars.py b/test_numpy_scalars.py
+new file mode 100644
+index 0000000000..5c792859cd
+--- /dev/null
++++ b/test_numpy_scalars.py
+@@ -0,0 +1,42 @@
++#!/usr/bin/env python3
++
++import numpy as np
++import astropy.units as u
++
++# Test if the issue is specific to numpy scalars vs arrays
++print("Testing numpy scalars vs arrays:")
++
++# Test with numpy scalar
++val_scalar = np.float16(1)
++print(f"val_scalar = {val_scalar}, type = {type(val_scalar)}")
++result1 = u.km * val_scalar
++print(f"km * val_scalar = {result1}, dtype = {result1.dtype}")
++
++# Test with numpy array
++val_array = np.array([1], dtype=np.float16)
++print(f"val_array = {val_array}, type = {type(val_array)}")
++result2 = u.km * val_array
++print(f"km * val_array = {result2}, dtype = {result2.dtype}")
++
++# Test with 0-dimensional array
++val_0d = np.array(1, dtype=np.float16)
++print(f"val_0d = {val_0d}, type = {type(val_0d)}")
++result3 = u.km * val_0d
++print(f"km * val_0d = {result3}, dtype = {result3.dtype}")
++
++print()
++
++# Test if the issue is with the specific multiplication path
++# Let's try to force the issue by using different approaches
++
++# Approach 1: Use explicit Quantity creation
++result4 = u.Quantity(val_scalar, u.km)
++print(f"Quantity(val_scalar, km) = {result4}, dtype = {result4.dtype}")
++
++# Approach 2: Use the unit multiplication method directly
++result5 = u.km.__rmul__(val_scalar)
++print(f"km.__rmul__(val_scalar) = {result5}, dtype = {result5.dtype}")
++
++# Approach 3: Use the reverse multiplication
++result6 = val_scalar * u.km
++print(f"val_scalar * km = {result6}, dtype = {result6.dtype}")
+\ No newline at end of file
+diff --git a/test_operator_mechanism.py b/test_operator_mechanism.py
+new file mode 100644
+index 0000000000..70867ce588
+--- /dev/null
++++ b/test_operator_mechanism.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++
++import numpy as np
++import astropy.units as u
++
++# Let's try to understand the operator mechanism
++val = np.float16(1)
++km = u.km
++
++print("Testing operator mechanism:")
++print(f"val = {val}")
++print(f"km = {km}")
++
++# Let's check what the actual operator does step by step
++# According to Python documentation, a * b tries:
++# 1. a.__mul__(b)
++# 2. b.__rmul__(a)
++# 3. TypeError
++
++print("Step 1: Try val.__mul__(km)")
++try:
++    result1 = val.__mul__(km)
++    print(f"val.__mul__(km) = {result1}")
++except Exception as e:
++    print(f"val.__mul__(km) failed: {e}")
++
++print("Step 2: Try km.__rmul__(val)")  
++try:
++    result2 = km.__rmul__(val)
++    print(f"km.__rmul__(val) = {result2}, dtype = {result2.dtype}")
++except Exception as e:
++    print(f"km.__rmul__(val) failed: {e}")
++
++print("Step 3: The * operator")
++try:
++    result3 = val * km
++    print(f"val * km = {result3}, dtype = {result3.dtype}")
++except Exception as e:
++    print(f"val * km failed: {e}")
++
++print("Step 4: The reverse * operator")
++try:
++    result4 = km * val
++    print(f"km * val = {result4}, dtype = {result4.dtype}")
++except Exception as e:
++    print(f"km * val failed: {e}")
++
++print()
++
++# Let's also check if there's some special handling for units
++# by looking at the actual unit multiplication
++print("Testing unit multiplication directly:")
++unit_result = km * u.dimensionless_unscaled
++print(f"km * u.dimensionless_unscaled = {unit_result}")
++
++# Test if multiplying by a dimensionless unit changes anything
++dimless_val = val * u.dimensionless_unscaled
++print(f"val * u.dimensionless_unscaled = {dimless_val}, dtype = {dimless_val.dtype}")
++
++result5 = km * dimless_val
++print(f"km * (val * u.dimensionless_unscaled) = {result5}, dtype = {result5.dtype}")
+\ No newline at end of file
+diff --git a/test_operator_resolution.py b/test_operator_resolution.py
+new file mode 100644
+index 0000000000..4131755e5f
+--- /dev/null
++++ b/test_operator_resolution.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++
++import numpy as np
++import astropy.units as u
++
++# Test operator resolution more deeply
++val = np.float16(1)
++km = u.km
++
++print("Testing operator resolution:")
++print(f"val = {val}, type(val) = {type(val)}")
++print(f"km = {km}, type(km) = {type(km)}")
++
++# Check what methods are available
++print(f"hasattr(val, '__mul__'): {hasattr(val, '__mul__')}")
++print(f"hasattr(km, '__rmul__'): {hasattr(km, '__rmul__')}")
++
++# Check the actual method resolution
++print(f"val.__mul__: {val.__mul__}")
++print(f"km.__rmul__: {km.__rmul__}")
++
++# Test what happens when we manually call the methods
++print("\nManual method calls:")
++try:
++    result1 = val.__mul__(km)
++    print(f"val.__mul__(km) = {result1}")
++except Exception as e:
++    print(f"val.__mul__(km) failed: {e}")
++
++try:
++    result2 = km.__rmul__(val)
++    print(f"km.__rmul__(val) = {result2}, dtype = {result2.dtype}")
++except Exception as e:
++    print(f"km.__rmul__(val) failed: {e}")
++
++# Test operator
++print("\nOperator calls:")
++try:
++    result3 = val * km
++    print(f"val * km = {result3}, dtype = {result3.dtype}")
++except Exception as e:
++    print(f"val * km failed: {e}")
++
++try:
++    result4 = km * val
++    print(f"km * val = {result4}, dtype = {result4.dtype}")
++except Exception as e:
++    print(f"km * val failed: {e}")
+\ No newline at end of file
+diff --git a/test_operator_trace.py b/test_operator_trace.py
+new file mode 100644
+index 0000000000..6e4ac1d1b1
+--- /dev/null
++++ b/test_operator_trace.py
+@@ -0,0 +1,38 @@
++#!/usr/bin/env python3
++
++import numpy as np
++import astropy.units as u
++import dis
++
++# Let's try to trace what's happening with the operator
++val = np.float16(1)
++km = u.km
++
++print("Tracing operator execution:")
++print(f"val = {val}")
++print(f"km = {km}")
++
++# Let's see the bytecode for the different operations
++print("\nBytecode for km.__rmul__(val):")
++dis.dis(compile("km.__rmul__(val)", "<string>", "eval"))
++
++print("\nBytecode for km * val:")
++dis.dis(compile("km * val", "<string>", "eval"))
++
++print("\nLet's also check if there are any differences in the actual calls")
++# Let's use a function to see if there's a difference
++def test_rmul():
++    return km.__rmul__(val)
++
++def test_mul():
++    return km * val
++
++print(f"test_rmul() = {test_rmul()}, dtype = {test_rmul().dtype}")
++print(f"test_mul() = {test_mul()}, dtype = {test_mul().dtype}")
++
++# Let's also check if there's some kind of caching by testing multiple times
++print("\nTesting multiple calls:")
++for i in range(3):
++    rmul_result = km.__rmul__(val)
++    mul_result = km * val
++    print(f"Call {i+1}: rmul_dtype = {rmul_result.dtype}, mul_dtype = {mul_result.dtype}")
+\ No newline at end of file
+diff --git a/test_rmul_path.py b/test_rmul_path.py
+new file mode 100644
+index 0000000000..2c5750a386
+--- /dev/null
++++ b/test_rmul_path.py
+@@ -0,0 +1,24 @@
++#!/usr/bin/env python3
++
++import numpy as np
++import astropy.units as u
++
++print("Testing the __rmul__ path specifically")
++print("=" * 50)
++
++# Test the specific case that's still failing
++val = np.float16(1)
++km = u.km
++
++print(f"np.float16(1) = {val}, dtype = {val.dtype}")
++print(f"u.km = {km}")
++
++# Test the multiplication
++result = km * val
++print(f"u.km * np.float16(1) = {result}, dtype = {result.dtype}")
++
++print()
++
++# Let's also test what happens if we manually create the Quantity
++manual_q = u.Quantity(val, km)
++print(f"u.Quantity(np.float16(1), u.km) = {manual_q}, dtype = {manual_q.dtype}")
+\ No newline at end of file
+diff --git a/test_simple_rmul.py b/test_simple_rmul.py
+new file mode 100644
+index 0000000000..9f08696aad
+--- /dev/null
++++ b/test_simple_rmul.py
+@@ -0,0 +1,18 @@
++#!/usr/bin/env python3
++
++import numpy as np
++import astropy.units as u
++
++# Test if the issue is with a specific unit or all units
++val = np.float16(1)
++
++# Test with different units
++units_to_test = [u.km, u.m, u.s, u.kg]
++
++for unit in units_to_test:
++    result1 = val * unit
++    result2 = unit * val
++    print(f"Unit: {unit}")
++    print(f"  val * unit: {result1.dtype}")
++    print(f"  unit * val: {result2.dtype}")
++    print()
+\ No newline at end of file

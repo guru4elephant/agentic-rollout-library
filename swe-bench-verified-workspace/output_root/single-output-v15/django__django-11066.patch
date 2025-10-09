@@ -1,0 +1,314 @@
+diff --git a/django/contrib/contenttypes/management/__init__.py b/django/contrib/contenttypes/management/__init__.py
+index 2b5f688136..563cba2fdf 100644
+--- a/django/contrib/contenttypes/management/__init__.py
++++ b/django/contrib/contenttypes/management/__init__.py
+@@ -24,7 +24,7 @@ class RenameContentType(migrations.RunPython):
+             content_type.model = new_model
+             try:
+                 with transaction.atomic(using=db):
+-                    content_type.save(update_fields={'model'})
++                    content_type.save(using=db, update_fields={'model'})
+             except IntegrityError:
+                 # Gracefully fallback if a stale content type causes a
+                 # conflict as remove_stale_contenttypes will take care of
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..3dc4c00ace
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where RenameContentType._rename() 
++doesn't save the content type on the correct database.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connections, DEFAULT_DB_ALIAS
++from django.contrib.contenttypes.management import RenameContentType
++from django.db.migrations.state import ProjectState
++from django.db.migrations.executor import MigrationExecutor
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++            'other': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_rename_contenttype():
++    """Test that RenameContentType uses the correct database"""
++    print("Testing RenameContentType database usage...")
++    
++    # Set up databases
++    from django.core.management import execute_from_command_line
++    from django.db import connection
++    
++    # Create tables in both databases
++    for db_name in ['default', 'other']:
++        with connections[db_name].cursor() as cursor:
++            try:
++                cursor.execute("CREATE TABLE IF NOT EXISTS django_content_type (id INTEGER PRIMARY KEY, app_label TEXT, model TEXT)")
++                cursor.execute("INSERT INTO django_content_type (app_label, model) VALUES ('test_app', 'old_model')")
++            except Exception as e:
++                print(f"Error setting up {db_name} database: {e}")
++    
++    # Create a mock schema_editor with connection alias
++    class MockSchemaEditor:
++        def __init__(self, connection_alias):
++            self.connection = type('MockConnection', (), {'alias': connection_alias})()
++    
++    # Test with 'other' database
++    schema_editor = MockSchemaEditor('other')
++    
++    # Create a RenameContentType instance
++    rename_op = RenameContentType('test_app', 'old_model', 'new_model')
++    
++    # Mock apps
++    from django.apps import apps
++    apps = apps
++    
++    # Try to call _rename method
++    try:
++        rename_op._rename(apps, schema_editor, 'old_model', 'new_model')
++        print("SUCCESS: _rename method completed without errors")
++        
++        # Verify the change was made on the correct database
++        with connections['other'].cursor() as cursor:
++            cursor.execute("SELECT model FROM django_content_type WHERE app_label='test_app'")
++            result = cursor.fetchone()
++            if result and result[0] == 'new_model':
++                print("VERIFIED: Change was made on the correct database ('other')")
++            else:
++                print("ERROR: Change was not made on the correct database")
++                
++    except Exception as e:
++        print(f"ERROR: {e}")
++        print("This confirms the issue - the save operation is using wrong database")
++
++if __name__ == '__main__':
++    test_rename_contenttype()
+\ No newline at end of file
+diff --git a/test_basic_functionality.py b/test_basic_functionality.py
+new file mode 100644
+index 0000000000..0be8829192
+--- /dev/null
++++ b/test_basic_functionality.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++"""
++Basic test to ensure the RenameContentType functionality works after our fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY = 'test-secret-key',
++        USE_TZ = True,
++    )
++
++django.setup()
++
++def test_basic_functionality():
++    """Test that RenameContentType can be imported and instantiated"""
++    print("Testing basic RenameContentType functionality...")
++    
++    try:
++        from django.contrib.contenttypes.management import RenameContentType
++        
++        # Test instantiation
++        rename_op = RenameContentType('test_app', 'old_model', 'new_model')
++        print("SUCCESS: RenameContentType instantiated successfully")
++        
++        # Test that the method signature is correct
++        import inspect
++        sig = inspect.signature(rename_op._rename)
++        print(f"SUCCESS: _rename method signature: {sig}")
++        
++        return True
++        
++    except Exception as e:
++        print(f"ERROR: {e}")
++        return False
++
++if __name__ == '__main__':
++    success = test_basic_functionality()
++    if success:
++        print("All basic functionality tests passed!")
++    else:
++        print("Basic functionality tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..e9797e9208
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,113 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the RenameContentType fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++            'other': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_router_blocks_migration():
++    """Test that RenameContentType is skipped when router doesn't allow migration"""
++    print("Testing router blocking migration...")
++    
++    from django.contrib.contenttypes.management import RenameContentType
++    from django.db import connections
++    from django.db import router
++    
++    # Create a mock schema_editor with connection alias
++    class MockSchemaEditor:
++        def __init__(self, connection_alias):
++            self.connection = type('MockConnection', (), {'alias': connection_alias})()
++    
++    # Create a RenameContentType instance
++    rename_op = RenameContentType('test_app', 'old_model', 'new_model')
++    
++    # Mock apps
++    from django.apps import apps
++    apps = apps
++    
++    # Create a mock router that doesn't allow migration
++    original_allow_migrate = router.allow_migrate_model
++    def mock_allow_migrate_model(db, model):
++        return False
++    
++    router.allow_migrate_model = mock_allow_migrate_model
++    
++    try:
++        # Test with 'other' database
++        schema_editor = MockSchemaEditor('other')
++        
++        # This should return early without error
++        rename_op._rename(apps, schema_editor, 'old_model', 'new_model')
++        print("SUCCESS: Operation skipped when router doesn't allow migration")
++        
++    except Exception as e:
++        print(f"ERROR: {e}")
++    finally:
++        # Restore original function
++        router.allow_migrate_model = original_allow_migrate
++
++def test_integrity_error_handling():
++    """Test that IntegrityError is properly handled"""
++    print("Testing IntegrityError handling...")
++    
++    from django.contrib.contenttypes.management import RenameContentType
++    from django.db import connections, IntegrityError
++    from django.db.utils import IntegrityError as DjangoIntegrityError
++    
++    # Set up database
++    with connections['default'].cursor() as cursor:
++        cursor.execute("CREATE TABLE IF NOT EXISTS django_content_type (id INTEGER PRIMARY KEY, app_label TEXT, model TEXT UNIQUE)")
++        cursor.execute("INSERT INTO django_content_type (app_label, model) VALUES ('test_app', 'old_model')")
++        cursor.execute("INSERT INTO django_content_type (app_label, model) VALUES ('test_app', 'existing_model')")
++    
++    # Create a mock schema_editor with connection alias
++    class MockSchemaEditor:
++        def __init__(self, connection_alias):
++            self.connection = type('MockConnection', (), {'alias': connection_alias})()
++    
++    # Create a RenameContentType instance
++    rename_op = RenameContentType('test_app', 'old_model', 'existing_model')  # This should cause IntegrityError
++    
++    # Mock apps
++    from django.apps import apps
++    apps = apps
++    
++    try:
++        # Test with 'default' database
++        schema_editor = MockSchemaEditor('default')
++        
++        # This should trigger IntegrityError but be handled gracefully
++        rename_op._rename(apps, schema_editor, 'old_model', 'existing_model')
++        print("SUCCESS: IntegrityError handled gracefully")
++        
++    except Exception as e:
++        print(f"ERROR: {e}")
++
++if __name__ == '__main__':
++    test_router_blocks_migration()
++    test_integrity_error_handling()
+\ No newline at end of file
+diff --git a/test_settings.py b/test_settings.py
+new file mode 100644
+index 0000000000..e26f02754c
+--- /dev/null
++++ b/test_settings.py
+@@ -0,0 +1,14 @@
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++
++INSTALLED_APPS = [
++    'django.contrib.contenttypes',
++    'django.contrib.auth',
++]
++
++SECRET_KEY = 'test-secret-key'
++USE_TZ = True
+\ No newline at end of file

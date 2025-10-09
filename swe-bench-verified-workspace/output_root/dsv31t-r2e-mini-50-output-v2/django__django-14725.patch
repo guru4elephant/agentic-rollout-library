@@ -1,0 +1,338 @@
+diff --git a/django/forms/formsets.py b/django/forms/formsets.py
+index 75b0646512..5ef057e80b 100644
+--- a/django/forms/formsets.py
++++ b/django/forms/formsets.py
+@@ -476,7 +476,7 @@ class BaseFormSet(RenderableFormMixin):
+ 
+ 
+ def formset_factory(form, formset=BaseFormSet, extra=1, can_order=False,
+-                    can_delete=False, max_num=None, validate_max=False,
++                    can_delete=False, can_add=True, max_num=None, validate_max=False,
+                     min_num=None, validate_min=False, absolute_max=None,
+                     can_delete_extra=True, renderer=None):
+     """Return a FormSet for the given form class."""
+@@ -498,6 +498,7 @@ def formset_factory(form, formset=BaseFormSet, extra=1, can_order=False,
+         'extra': extra,
+         'can_order': can_order,
+         'can_delete': can_delete,
++        'can_add': can_add,
+         'can_delete_extra': can_delete_extra,
+         'min_num': min_num,
+         'max_num': max_num,
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 7effb202e3..97718ec86b 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -568,6 +568,7 @@ class BaseModelFormSet(BaseFormSet):
+     A ``FormSet`` for editing a queryset and/or adding new objects to it.
+     """
+     model = None
++    can_add = True
+ 
+     # Set of fields that must be unique among forms of this set.
+     unique_fields = set()
+@@ -682,6 +683,13 @@ class BaseModelFormSet(BaseFormSet):
+ 
+     def clean(self):
+         self.validate_unique()
++        if not self.can_add and self.extra_forms:
++            # Check if any extra forms have changed data (indicating new object creation)
++            for form in self.extra_forms:
++                if form.has_changed():
++                    raise ValidationError(
++                        "New objects cannot be created in this formset."
++                    )
+ 
+     def validate_unique(self):
+         # Collect unique_checks and date_checks to run from all the forms.
+@@ -813,6 +821,8 @@ class BaseModelFormSet(BaseFormSet):
+ 
+     def save_new_objects(self, commit=True):
+         self.new_objects = []
++        if not self.can_add:
++            return self.new_objects
+         for form in self.extra_forms:
+             if not form.has_changed():
+                 continue
+@@ -871,7 +881,7 @@ class BaseModelFormSet(BaseFormSet):
+ 
+ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
+                          formset=BaseModelFormSet, extra=1, can_delete=False,
+-                         can_order=False, max_num=None, fields=None, exclude=None,
++                         can_order=False, can_add=True, max_num=None, fields=None, exclude=None,
+                          widgets=None, validate_max=False, localized_fields=None,
+                          labels=None, help_texts=None, error_messages=None,
+                          min_num=None, validate_min=False, field_classes=None,
+@@ -891,7 +901,7 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
+                              labels=labels, help_texts=help_texts,
+                              error_messages=error_messages, field_classes=field_classes)
+     FormSet = formset_factory(form, formset, extra=extra, min_num=min_num, max_num=max_num,
+-                              can_order=can_order, can_delete=can_delete,
++                              can_order=can_order, can_delete=can_delete, can_add=can_add,
+                               validate_min=validate_min, validate_max=validate_max,
+                               absolute_max=absolute_max, can_delete_extra=can_delete_extra,
+                               renderer=renderer)
+@@ -1072,7 +1082,7 @@ def _get_foreign_key(parent_model, model, fk_name=None, can_fail=False):
+ def inlineformset_factory(parent_model, model, form=ModelForm,
+                           formset=BaseInlineFormSet, fk_name=None,
+                           fields=None, exclude=None, extra=3, can_order=False,
+-                          can_delete=True, max_num=None, formfield_callback=None,
++                          can_delete=True, can_add=True, max_num=None, formfield_callback=None,
+                           widgets=None, validate_max=False, localized_fields=None,
+                           labels=None, help_texts=None, error_messages=None,
+                           min_num=None, validate_min=False, field_classes=None,
+@@ -1094,6 +1104,7 @@ def inlineformset_factory(parent_model, model, form=ModelForm,
+         'extra': extra,
+         'can_delete': can_delete,
+         'can_order': can_order,
++        'can_add': can_add,
+         'fields': fields,
+         'exclude': exclude,
+         'min_num': min_num,
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..dd16fdfabf
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,152 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with model formsets not providing a way to disallow new object creation.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms.models import modelformset_factory
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create database tables
++from django.db import connection
++connection.ensure_connection()
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create some test data
++TestModel.objects.create(name='Existing Object 1')
++TestModel.objects.create(name='Existing Object 2')
++
++# Create a formset with extra=0 (what users try to use for "edit only")
++TestFormSet = modelformset_factory(TestModel, fields='__all__', extra=0)
++
++# Create a formset with can_add=False (new feature)
++TestFormSetNoAdd = modelformset_factory(TestModel, fields='__all__', extra=0, can_add=False)
++
++print("=== Testing with extra=0 (current behavior) ===")
++
++# Test 1: Normal case - editing existing objects
++print("\n1. Testing normal edit case:")
++data = {
++    'form-TOTAL_FORMS': '2',
++    'form-INITIAL_FORMS': '2',
++    'form-MAX_NUM_FORMS': '',
++    'form-0-id': '1',
++    'form-0-name': 'Edited Object 1',
++    'form-1-id': '2', 
++    'form-1-name': 'Edited Object 2',
++}
++formset = TestFormSet(data, queryset=TestModel.objects.all())
++print(f"Formset is valid: {formset.is_valid()}")
++print(f"Formset has {len(formset.forms)} forms")
++print(f"Extra forms: {len(formset.extra_forms)}")
++
++# Test 2: Attempt to add new object by sending additional POST data
++print("\n2. Testing attempt to add new object with extra POST data:")
++data_with_extra = {
++    'form-TOTAL_FORMS': '3',  # Client-side JavaScript could change this
++    'form-INITIAL_FORMS': '2',
++    'form-MAX_NUM_FORMS': '',
++    'form-0-id': '1',
++    'form-0-name': 'Edited Object 1',
++    'form-1-id': '2',
++    'form-1-name': 'Edited Object 2',
++    'form-2-id': '',  # Empty ID for new object
++    'form-2-name': 'New Object',  # Data for new object
++}
++formset_with_extra = TestFormSet(data_with_extra, queryset=TestModel.objects.all())
++print(f"Formset is valid: {formset_with_extra.is_valid()}")
++print(f"Formset has {len(formset_with_extra.forms)} forms")
++print(f"Extra forms: {len(formset_with_extra.extra_forms)}")
++
++if formset_with_extra.is_valid():
++    print("WARNING: Formset accepted new object creation even with extra=0!")
++    saved_objects = formset_with_extra.save()
++    print(f"Saved objects: {len(saved_objects)}")
++    for obj in saved_objects:
++        print(f"  - {obj.name} (ID: {obj.id})")
++else:
++    print("Formset correctly rejected invalid data")
++    print(f"Errors: {formset_with_extra.errors}")
++
++print("\n=== Testing with can_add=False (new feature) ===")
++
++# Test 3: Normal case - editing existing objects with can_add=False
++print("\n3. Testing normal edit case with can_add=False:")
++data = {
++    'form-TOTAL_FORMS': '2',
++    'form-INITIAL_FORMS': '2',
++    'form-MAX_NUM_FORMS': '',
++    'form-0-id': '1',
++    'form-0-name': 'Edited Object 1',
++    'form-1-id': '2', 
++    'form-1-name': 'Edited Object 2',
++}
++formset_no_add = TestFormSetNoAdd(data, queryset=TestModel.objects.all())
++print(f"Formset is valid: {formset_no_add.is_valid()}")
++print(f"Formset has {len(formset_no_add.forms)} forms")
++print(f"Extra forms: {len(formset_no_add.extra_forms)}")
++
++# Test 4: Attempt to add new object with can_add=False
++print("\n4. Testing attempt to add new object with can_add=False:")
++data_with_extra = {
++    'form-TOTAL_FORMS': '3',  # Client-side JavaScript could change this
++    'form-INITIAL_FORMS': '2',
++    'form-MAX_NUM_FORMS': '',
++    'form-0-id': '1',
++    'form-0-name': 'Edited Object 1',
++    'form-1-id': '2',
++    'form-1-name': 'Edited Object 2',
++    'form-2-id': '',  # Empty ID for new object
++    'form-2-name': 'New Object',  # Data for new object
++}
++formset_no_add_with_extra = TestFormSetNoAdd(data_with_extra, queryset=TestModel.objects.all())
++print(f"Formset is valid: {formset_no_add_with_extra.is_valid()}")
++print(f"Formset has {len(formset_no_add_with_extra.forms)} forms")
++print(f"Extra forms: {len(formset_no_add_with_extra.extra_forms)}")
++
++if not formset_no_add_with_extra.is_valid():
++    print("SUCCESS: Formset correctly rejected new object creation!")
++    print(f"Non-form errors: {formset_no_add_with_extra.non_form_errors()}")
++else:
++    print("FAILURE: Formset incorrectly accepted new object creation!")
++    saved_objects = formset_no_add_with_extra.save()
++    print(f"Saved objects: {len(saved_objects)}")
++    for obj in saved_objects:
++        print(f"  - {obj.name} (ID: {obj.id})")
++
++print("\n=== Summary ===")
++print("The issue: extra=0 doesn't prevent new object creation")
++print("Users want a way to create 'edit only' formsets that disallow new object creation.")
++print("The current approach of using extra=0 is not reliable.")
++print("The new can_add=False parameter provides a reliable way to prevent new object creation.")
+\ No newline at end of file
+diff --git a/tests/model_formsets/tests.py b/tests/model_formsets/tests.py
+index bb1a8a8a5e..bd311d8942 100644
+--- a/tests/model_formsets/tests.py
++++ b/tests/model_formsets/tests.py
+@@ -132,6 +132,83 @@ class DeletionTests(TestCase):
+         self.assertEqual(poet.poem_set.count(), 1)
+         self.assertFalse(Poem.objects.filter(pk=poem.pk + 1).exists())
+ 
++    def test_can_add_false_disallows_new_objects(self):
++        """Test that can_add=False prevents creation of new objects."""
++        PoetFormSet = modelformset_factory(Poet, fields="__all__", can_add=False)
++        poet = Poet.objects.create(name='test')
++        
++        # Test normal edit case - should work fine
++        data = {
++            'form-TOTAL_FORMS': '1',
++            'form-INITIAL_FORMS': '1',
++            'form-MAX_NUM_FORMS': '0',
++            'form-0-id': str(poet.pk),
++            'form-0-name': 'edited name',
++        }
++        formset = PoetFormSet(data, queryset=Poet.objects.all())
++        self.assertTrue(formset.is_valid())
++        formset.save()
++        poet.refresh_from_db()
++        self.assertEqual(poet.name, 'edited name')
++
++        # Test attempt to add new object - should fail validation
++        data_with_extra = {
++            'form-TOTAL_FORMS': '2',
++            'form-INITIAL_FORMS': '1',
++            'form-MAX_NUM_FORMS': '0',
++            'form-0-id': str(poet.pk),
++            'form-0-name': 'edited name',
++            'form-1-id': '',  # Empty ID for new object
++            'form-1-name': 'new object',  # Data for new object
++        }
++        formset_with_extra = PoetFormSet(data_with_extra, queryset=Poet.objects.all())
++        self.assertFalse(formset_with_extra.is_valid())
++        self.assertIn('New objects cannot be created in this formset.', 
++                      str(formset_with_extra.non_form_errors()))
++
++        # Verify no new object was created
++        self.assertEqual(Poet.objects.count(), 1)
++
++    def test_can_add_false_disallows_new_objects_inline(self):
++        """Test that can_add=False prevents creation of new objects in inline formsets."""
++        poet = Poet.objects.create(name='test')
++        poem = Poem.objects.create(name='existing poem', poet=poet)
++        
++        PoemFormSet = inlineformset_factory(Poet, Poem, fields="__all__", can_add=False)
++        
++        # Test normal edit case - should work fine
++        # Inline formsets use a different prefix based on the accessor name
++        data = {
++            'poem_set-TOTAL_FORMS': '1',
++            'poem_set-INITIAL_FORMS': '1',
++            'poem_set-MAX_NUM_FORMS': '0',
++            'poem_set-0-id': str(poem.pk),
++            'poem_set-0-name': 'edited poem',
++        }
++        formset = PoemFormSet(data, instance=poet)
++        self.assertTrue(formset.is_valid(), f"Formset errors: {formset.errors} {formset.non_form_errors()}")
++        formset.save()
++        poem.refresh_from_db()
++        self.assertEqual(poem.name, 'edited poem')
++
++        # Test attempt to add new object - should fail validation
++        data_with_extra = {
++            'poem_set-TOTAL_FORMS': '2',
++            'poem_set-INITIAL_FORMS': '1',
++            'poem_set-MAX_NUM_FORMS': '0',
++            'poem_set-0-id': str(poem.pk),
++            'poem_set-0-name': 'edited poem',
++            'poem_set-1-id': '',  # Empty ID for new object
++            'poem_set-1-name': 'new poem',  # Data for new object
++        }
++        formset_with_extra = PoemFormSet(data_with_extra, instance=poet)
++        self.assertFalse(formset_with_extra.is_valid())
++        self.assertIn('New objects cannot be created in this formset.', 
++                      str(formset_with_extra.non_form_errors()))
++
++        # Verify no new object was created
++        self.assertEqual(Poem.objects.count(), 1)
++
+ 
+ class ModelFormsetTest(TestCase):
+     def test_modelformset_factory_without_fields(self):

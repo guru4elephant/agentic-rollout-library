@@ -1,0 +1,494 @@
+diff --git a/django/contrib/admin/helpers.py b/django/contrib/admin/helpers.py
+index dd154f72ee..209fecd6c8 100644
+--- a/django/contrib/admin/helpers.py
++++ b/django/contrib/admin/helpers.py
+@@ -209,7 +209,11 @@ class AdminReadonlyField:
+             remote_field.model._meta.model_name,
+         )
+         try:
+-            url = reverse(url_name, args=[quote(remote_obj.pk)])
++            url = reverse(
++                url_name,
++                args=[quote(remote_obj.pk)],
++                current_app=self.model_admin.admin_site.name if self.model_admin else None
++            )
+             return format_html('<a href="{}">{}</a>', url, remote_obj)
+         except NoReverseMatch:
+             return str(remote_obj)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..ee7184e5ef
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,148 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the issue with wrong URL generation for readonly fields
++in custom Admin Site.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++        ],
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF=__name__,
++        MIDDLEWARE=[
++            'django.contrib.sessions.middleware.SessionMiddleware',
++            'django.contrib.auth.middleware.AuthenticationMiddleware',
++            'django.contrib.messages.middleware.MessageMiddleware',
++        ],
++        TEMPLATES=[
++            {
++                'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                'APP_DIRS': True,
++                'OPTIONS': {
++                    'context_processors': [
++                        'django.template.context_processors.request',
++                        'django.contrib.auth.context_processors.auth',
++                        'django.contrib.messages.context_processors.messages',
++                    ],
++                },
++            },
++        ],
++    )
++
++django.setup()
++
++from django.contrib import admin
++from django.contrib.admin import AdminSite
++from django.db import models
++from django.urls import path, include
++from django.http import HttpResponse
++from django.contrib.admin.helpers import AdminReadonlyField
++from django import forms
++
++# Define test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    
++    def __str__(self):
++        return self.name
++
++    class Meta:
++        app_label = 'testapp'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    
++    def __str__(self):
++        return self.title
++
++    class Meta:
++        app_label = 'testapp'
++
++# Create custom admin site
++class CustomAdminSite(AdminSite):
++    name = 'custom-admin'
++    site_url = None
++
++custom_admin = CustomAdminSite(name='custom-admin')
++
++# Register models with custom admin
++@admin.register(Author, site=custom_admin)
++class AuthorAdmin(admin.ModelAdmin):
++    pass
++
++@admin.register(Book, site=custom_admin)
++class BookAdmin(admin.ModelAdmin):
++    readonly_fields = ['author']
++
++# URL patterns
++urlpatterns = [
++    path('admin/', admin.site.urls),
++    path('custom-admin/', custom_admin.urls),
++]
++
++def test_url_generation():
++    """Test that URLs are generated correctly for readonly fields"""
++    
++    # Create a simple mock object
++    class MockAuthor:
++        pk = 1
++        name = "Test Author"
++        
++        def __str__(self):
++            return self.name
++    
++    # Create a simple AdminReadonlyField instance
++    readonly_field = AdminReadonlyField(None, 'author', is_first=True, model_admin=None)
++    
++    # Mock the remote_field
++    class MockRemoteField:
++        class model:
++            class _meta:
++                app_label = 'testapp'
++                model_name = 'author'
++    
++    remote_field = MockRemoteField()
++    
++    # Test the get_admin_url method
++    url_result = readonly_field.get_admin_url(remote_field, MockAuthor())
++    
++    print("Generated URL result:")
++    print(url_result)
++    
++    # Check if the URL contains the custom admin prefix
++    # Since we're not passing a model_admin with admin_site, it should use default 'admin'
++    if 'admin' in str(url_result):
++        print("✓ SUCCESS: URL contains default 'admin' prefix (expected without custom admin site)")
++        return True
++    else:
++        print("? UNKNOWN: URL format not recognized")
++        return False
++
++if __name__ == '__main__':
++    # Create test database tables
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    # Run the test - we'll test URL generation without database objects
++    success = test_url_generation()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..e51365d40f
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python
++"""
++Simple script to reproduce the issue with wrong URL generation for readonly fields
++in custom Admin Site.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF='django.contrib.admin.urls',
++    )
++
++django.setup()
++
++from django.contrib.admin.helpers import AdminReadonlyField
++from django.contrib.admin.utils import quote
++from django.urls import reverse
++
++def test_get_admin_url():
++    """Test the get_admin_url method directly"""
++    
++    # Create a mock AdminReadonlyField instance
++    readonly_field = AdminReadonlyField.__new__(AdminReadonlyField)
++    readonly_field.model_admin = None
++    
++    # Mock remote_field and remote_obj
++    class MockRemoteField:
++        class model:
++            class _meta:
++                app_label = 'testapp'
++                model_name = 'author'
++    
++    class MockAuthor:
++        pk = 1
++        
++        def __str__(self):
++            return "Test Author"
++    
++    remote_field = MockRemoteField()
++    remote_obj = MockAuthor()
++    
++    # Test the current implementation (should generate /admin/ URL)
++    url_name = 'admin:%s_%s_change' % (
++        remote_field.model._meta.app_label,
++        remote_field.model._meta.model_name,
++    )
++    
++    current_url = reverse(url_name, args=[quote(remote_obj.pk)])
++    print("Current URL (without current_app):", current_url)
++    
++    # Test what the URL should be with current_app (if we had a custom admin site)
++    # For testing, let's simulate what should happen with a custom admin site named 'custom-admin'
++    try:
++        custom_url = reverse(url_name, args=[quote(remote_obj.pk)], current_app='custom-admin')
++        print("Custom URL (with current_app='custom-admin'):", custom_url)
++    except Exception as e:
++        print("Error generating custom URL:", e)
++        custom_url = None
++    
++    return current_url, custom_url
++
++if __name__ == '__main__':
++    current_url, custom_url = test_get_admin_url()
++    
++    # The issue is that the current implementation doesn't use current_app
++    # So even if we have a custom admin site, it will generate /admin/ URLs instead of /custom-admin/
++    if current_url and custom_url:
++        if current_url.startswith('/admin/') and custom_url.startswith('/custom-admin/'):
++            print("✓ CONFIRMED: Current implementation generates /admin/ URLs instead of custom admin URLs")
++            print("This confirms the issue described in the GitHub issue")
++        else:
++            print("? UNEXPECTED: URL patterns don't match expected format")
++    else:
++        print("✗ FAILED: Could not generate URLs for testing")
++    
++    sys.exit(0)
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..2dbbccbe2d
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python
++"""
++Simple test to verify the reverse function works with current_app parameter.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF='django.contrib.admin.urls',
++    )
++
++django.setup()
++
++from django.urls import reverse
++from django.contrib.admin.utils import quote
++
++def test_reverse_with_current_app():
++    """Test that reverse works with current_app parameter"""
++    
++    # Test reverse without current_app (should use default admin)
++    url_name = 'admin:testapp_author_change'
++    
++    try:
++        url_without_current_app = reverse(url_name, args=[quote(1)])
++        print("URL without current_app:", url_without_current_app)
++    except Exception as e:
++        print("Error generating URL without current_app:", e)
++        url_without_current_app = None
++    
++    # Test reverse with current_app (should use custom admin)
++    try:
++        url_with_current_app = reverse(url_name, args=[quote(1)], current_app='custom-admin')
++        print("URL with current_app='custom-admin':", url_with_current_app)
++    except Exception as e:
++        print("Error generating URL with current_app:", e)
++        url_with_current_app = None
++    
++    # The key insight is that current_app should affect the URL generation
++    if url_without_current_app and url_with_current_app:
++        if url_without_current_app.startswith('/admin/') and url_with_current_app.startswith('/custom-admin/'):
++            print("✓ SUCCESS: current_app parameter correctly changes the URL prefix")
++            return True
++        else:
++            print("✗ FAILURE: current_app parameter doesn't change URL as expected")
++            return False
++    else:
++        print("? Could not test URL generation due to errors")
++        return False
++
++if __name__ == '__main__':
++    success = test_reverse_with_current_app()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..70fe8a7c09
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,137 @@
++#!/usr/bin/env python
++"""
++Test script to verify the fix for the get_admin_url issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF='django.contrib.admin.site.urls',
++    )
++
++django.setup()
++
++from django.contrib.admin.helpers import AdminReadonlyField
++from django.contrib.admin import AdminSite
++from django import forms
++
++def test_get_admin_url_with_custom_admin():
++    """Test that get_admin_url uses the correct admin site name"""
++    
++    # Create a custom admin site
++    class CustomAdminSite(AdminSite):
++        name = 'custom-admin'
++    
++    custom_admin = CustomAdminSite()
++    
++    # Create a mock model admin with the custom admin site
++    class MockModelAdmin:
++        def __init__(self, admin_site):
++            self.admin_site = admin_site
++    
++    model_admin = MockModelAdmin(custom_admin)
++    
++    # Create a mock AdminReadonlyField instance
++    readonly_field = AdminReadonlyField.__new__(AdminReadonlyField)
++    readonly_field.model_admin = model_admin
++    
++    # Mock remote_field and remote_obj
++    class MockRemoteField:
++        class model:
++            class _meta:
++                app_label = 'testapp'
++                model_name = 'author'
++    
++    class MockAuthor:
++        pk = 1
++        
++        def __str__(self):
++            return "Test Author"
++    
++    remote_field = MockRemoteField()
++    remote_obj = MockAuthor()
++    
++    # Test the get_admin_url method
++    try:
++        result = readonly_field.get_admin_url(remote_field, remote_obj)
++        print("get_admin_url result:", result)
++        
++        # Check if the result contains the custom admin site name
++        if 'custom-admin' in str(result):
++            print("✓ SUCCESS: URL contains 'custom-admin' prefix")
++            return True
++        else:
++            print("✗ FAILURE: URL does not contain 'custom-admin' prefix")
++            return False
++            
++    except Exception as e:
++        print("Error in get_admin_url:", e)
++        return False
++
++def test_get_admin_url_without_model_admin():
++    """Test that get_admin_url works when model_admin is None"""
++    
++    # Create a mock AdminReadonlyField instance with no model_admin
++    readonly_field = AdminReadonlyField.__new__(AdminReadonlyField)
++    readonly_field.model_admin = None
++    
++    # Mock remote_field and remote_obj
++    class MockRemoteField:
++        class model:
++            class _meta:
++                app_label = 'testapp'
++                model_name = 'author'
++    
++    class MockAuthor:
++        pk = 1
++        
++        def __str__(self):
++            return "Test Author"
++    
++    remote_field = MockRemoteField()
++    remote_obj = MockAuthor()
++    
++    # Test the get_admin_url method
++    try:
++        result = readonly_field.get_admin_url(remote_field, remote_obj)
++        print("get_admin_url result (no model_admin):", result)
++        
++        # Should still work without throwing an error
++        print("✓ SUCCESS: get_admin_url works without model_admin")
++        return True
++            
++    except Exception as e:
++        print("Error in get_admin_url (no model_admin):", e)
++        return False
++
++if __name__ == '__main__':
++    print("Testing get_admin_url with custom admin site...")
++    test1_success = test_get_admin_url_with_custom_admin()
++    
++    print("\nTesting get_admin_url without model_admin...")
++    test2_success = test_get_admin_url_without_model_admin()
++    
++    if test1_success and test2_success:
++        print("\n✓ All tests passed! The fix appears to be working correctly.")
++        sys.exit(0)
++    else:
++        print("\n✗ Some tests failed.")
++        sys.exit(1)
+\ No newline at end of file

@@ -1,0 +1,289 @@
+diff --git a/django/db/models/sql/where.py b/django/db/models/sql/where.py
+index aaab1730b7..84dcfeae51 100644
+--- a/django/db/models/sql/where.py
++++ b/django/db/models/sql/where.py
+@@ -129,13 +129,13 @@ class WhereNode(tree.Node):
+             # Convert if the database doesn't support XOR:
+             #   a XOR b XOR c XOR ...
+             # to:
+-            #   (a OR b OR c OR ...) AND (a + b + c + ...) == 1
++            #   (a OR b OR c OR ...) AND (a + b + c + ...) % 2 == 1
+             lhs = self.__class__(self.children, OR)
+             rhs_sum = reduce(
+                 operator.add,
+                 (Case(When(c, then=1), default=0) for c in self.children),
+             )
+-            rhs = Exact(1, rhs_sum)
++            rhs = Exact(1, rhs_sum % 2)
+             return self.__class__([lhs, rhs], AND, self.negated).as_sql(
+                 compiler, connection
+             )
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..35406cd86a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Q
++from django.db import models
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create test data
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create a test record
++TestModel.objects.create(name='test')
++
++# Test the XOR behavior
++print("Testing XOR behavior:")
++print(f"Q(id=1) count: {TestModel.objects.filter(Q(id=1)).count()}")
++print(f"Q(id=1) ^ Q(id=1) count: {TestModel.objects.filter(Q(id=1) ^ Q(id=1)).count()}")
++print(f"Q(id=1) ^ Q(id=1) ^ Q(id=1) count: {TestModel.objects.filter(Q(id=1) ^ Q(id=1) ^ Q(id=1)).count()}")
++print(f"Q(id=1) ^ Q(id=1) ^ Q(id=1) ^ Q(id=1) count: {TestModel.objects.filter(Q(id=1) ^ Q(id=1) ^ Q(id=1) ^ Q(id=1)).count()}")
++print(f"Q(id=1) ^ Q(id=1) ^ Q(id=1) ^ Q(id=1) ^ Q(id=1) count: {TestModel.objects.filter(Q(id=1) ^ Q(id=1) ^ Q(id=1) ^ Q(id=1) ^ Q(id=1)).count()}")
++
++print("\nExpected results should be: 1, 0, 1, 0, 1")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..59cbab046b
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Q
++from django.db import connection
++from django.db import models
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Create database tables
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create test data
++TestModel.objects.create(name='test1', value=1)
++TestModel.objects.create(name='test2', value=2)
++TestModel.objects.create(name='test3', value=3)
++
++print("Testing edge cases for XOR fix:")
++
++# Test 1: Mixed conditions with different truth values
++print("\n1. Mixed conditions with different truth values:")
++q1 = Q(name='test1')  # True
++q2 = Q(name='nonexistent')  # False  
++q3 = Q(value=3)  # True
++
++result = TestModel.objects.filter(q1 ^ q2 ^ q3).count()
++print(f"Q(True) ^ Q(False) ^ Q(True): {result} (expected: 0)")
++
++# Test 2: All false conditions
++print("\n2. All false conditions:")
++q1 = Q(name='nonexistent1')
++q2 = Q(name='nonexistent2') 
++q3 = Q(name='nonexistent3')
++
++result = TestModel.objects.filter(q1 ^ q2 ^ q3).count()
++print(f"Q(False) ^ Q(False) ^ Q(False): {result} (expected: 0)")
++
++# Test 3: All true conditions (odd number)
++print("\n3. All true conditions (odd number):")
++q1 = Q(name='test1')
++q2 = Q(name='test2')
++q3 = Q(name='test3')
++
++result = TestModel.objects.filter(q1 ^ q2 ^ q3).count()
++print(f"Q(True) ^ Q(True) ^ Q(True): {result} (expected: 3)")
++
++# Test 4: All true conditions (even number)
++print("\n4. All true conditions (even number):")
++q1 = Q(name='test1')
++q2 = Q(name='test2')
++q3 = Q(name='test3')
++q4 = Q(value__gt=0)  # All records
++
++result = TestModel.objects.filter(q1 ^ q2 ^ q3 ^ q4).count()
++print(f"Q(True) ^ Q(True) ^ Q(True) ^ Q(True): {result} (expected: 0)")
++
++# Test 5: Complex nested XOR
++print("\n5. Complex nested XOR:")
++inner = Q(name='test1') ^ Q(name='test2')
++outer = inner ^ Q(value=3)
++
++result = TestModel.objects.filter(outer).count()
++print(f"(Q(True) ^ Q(True)) ^ Q(True): {result} (expected: 1)")
++
++print("\nAll edge case tests completed!")
+\ No newline at end of file
+diff --git a/test_xor_fix.py b/test_xor_fix.py
+new file mode 100644
+index 0000000000..58c1cd0a1e
+--- /dev/null
++++ b/test_xor_fix.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.xor_lookups',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.core.management import execute_from_command_line
++from django.db import connection
++from django.test import TestCase
++from tests.xor_lookups.tests import XorLookupsTests
++
++# Create database tables
++with connection.schema_editor() as schema_editor:
++    from tests.xor_lookups.models import Number
++    schema_editor.create_model(Number)
++
++# Run the XOR tests
++print("Running XOR lookup tests...")
++test_instance = XorLookupsTests()
++test_instance.setUpTestData()
++
++# Test the basic XOR functionality
++print("\nTesting basic XOR functionality:")
++try:
++    test_instance.test_filter()
++    print("✓ test_filter passed")
++except Exception as e:
++    print(f"✗ test_filter failed: {e}")
++
++try:
++    test_instance.test_filter_negated()
++    print("✓ test_filter_negated passed")
++except Exception as e:
++    print(f"✗ test_filter_negated failed: {e}")
++
++try:
++    test_instance.test_exclude()
++    print("✓ test_exclude passed")
++except Exception as e:
++    print(f"✗ test_exclude failed: {e}")
++
++try:
++    test_instance.test_stages()
++    print("✓ test_stages passed")
++except Exception as e:
++    print(f"✗ test_stages failed: {e}")
++
++try:
++    test_instance.test_pk_q()
++    print("✓ test_pk_q passed")
++except Exception as e:
++    print(f"✗ test_pk_q failed: {e}")
++
++try:
++    test_instance.test_empty_in()
++    print("✓ test_empty_in passed")
++except Exception as e:
++    print(f"✗ test_empty_in failed: {e}")
++
++# Test the specific issue from the GitHub issue
++print("\nTesting GitHub issue specific case:")
++from django.db.models import Q
++from tests.xor_lookups.models import Number
++
++# Create test data
++numbers = [Number.objects.create(num=i) for i in range(10)]
++
++# Test the specific case from the issue
++test_cases = [
++    (Q(id=numbers[0].pk), 1),
++    (Q(id=numbers[0].pk) ^ Q(id=numbers[0].pk), 0),
++    (Q(id=numbers[0].pk) ^ Q(id=numbers[0].pk) ^ Q(id=numbers[0].pk), 1),
++    (Q(id=numbers[0].pk) ^ Q(id=numbers[0].pk) ^ Q(id=numbers[0].pk) ^ Q(id=numbers[0].pk), 0),
++    (Q(id=numbers[0].pk) ^ Q(id=numbers[0].pk) ^ Q(id=numbers[0].pk) ^ Q(id=numbers[0].pk) ^ Q(id=numbers[0].pk), 1),
++]
++
++for i, (query, expected) in enumerate(test_cases):
++    result = Number.objects.filter(query).count()
++    status = "✓" if result == expected else "✗"
++    print(f"{status} Test case {i+1}: got {result}, expected {expected}")
++
++print("\nAll tests completed!")
+\ No newline at end of file

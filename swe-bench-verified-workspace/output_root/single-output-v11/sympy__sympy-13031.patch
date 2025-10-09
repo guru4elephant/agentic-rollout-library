@@ -1,0 +1,358 @@
+diff --git a/debug_sparse.py b/debug_sparse.py
+new file mode 100644
+index 0000000000..207456cde1
+--- /dev/null
++++ b/debug_sparse.py
+@@ -0,0 +1,43 @@
++import sympy as sy
++
++# Test to understand what's happening with sparse matrices
++print("=== Debugging Sparse Matrix hstack ===")
++
++M1 = sy.SparseMatrix.zeros(0, 0)
++M2 = sy.SparseMatrix.zeros(0, 1)
++M3 = sy.SparseMatrix.zeros(0, 2)
++M4 = sy.SparseMatrix.zeros(0, 3)
++
++print(f"M1: {M1.shape}")
++print(f"M2: {M2.shape}")
++print(f"M3: {M3.shape}")
++print(f"M4: {M4.shape}")
++
++# Test hstack
++result = sy.SparseMatrix.hstack(M1, M2, M3, M4)
++print(f"hstack result: {result.shape}")
++
++# Test individual row_join operations
++print("\n=== Individual row_join operations ===")
++join1 = M1.row_join(M2)
++print(f"M1.row_join(M2): {join1.shape}")
++
++join2 = join1.row_join(M3)
++print(f"join1.row_join(M3): {join2.shape}")
++
++join3 = join2.row_join(M4)
++print(f"join2.row_join(M4): {join3.shape}")
++
++# Check if the matrices are actually sparse
++print(f"\nM1 type: {type(M1)}")
++print(f"M2 type: {type(M2)}")
++print(f"join1 type: {type(join1)}")
++
++# Test if the issue is with the reduce operation
++from functools import reduce
++print("\n=== Testing reduce operation ===")
++try:
++    reduce_result = reduce(lambda x, y: x.row_join(y), [M1, M2, M3, M4])
++    print(f"reduce result: {reduce_result.shape}")
++except Exception as e:
++    print(f"Error in reduce: {e}")
+\ No newline at end of file
+diff --git a/debug_sparse_rowjoin.py b/debug_sparse_rowjoin.py
+new file mode 100644
+index 0000000000..4cd6a43aa9
+--- /dev/null
++++ b/debug_sparse_rowjoin.py
+@@ -0,0 +1,37 @@
++import sympy as sy
++
++# Debug the sparse row_join method step by step
++print("=== Debugging Sparse row_join ===")
++
++M1 = sy.SparseMatrix.zeros(0, 0)
++M2 = sy.SparseMatrix.zeros(0, 1)
++
++print(f"M1: {M1.shape}, M2: {M2.shape}")
++print(f"M1 is empty: {not M1}")
++print(f"M1.cols == 0: {M1.cols == 0}")
++print(f"M1.rows != M2.rows: {M1.rows != M2.rows}")
++
++# Test the current row_join implementation
++result = M1.row_join(M2)
++print(f"M1.row_join(M2): {result.shape}")
++
++# Test what happens if we manually create the intermediate matrix
++print("\n=== Testing manual fix ===")
++intermediate = sy.SparseMatrix(M2.rows, 0, [])
++print(f"Intermediate: {intermediate.shape}")
++manual_result = intermediate.row_join(M2)
++print(f"Intermediate.row_join(M2): {manual_result.shape}")
++
++# Test the second case: (0,1) joining with (0,2)
++print("\n=== Testing second join ===")
++M3 = sy.SparseMatrix.zeros(0, 2)
++join1 = M1.row_join(M2)  # This should be (0,1)
++print(f"join1: {join1.shape}")
++join2 = join1.row_join(M3)  # This should be (0,3)
++print(f"join2: {join2.shape}")
++
++# Check if join1 is actually sparse
++print(f"join1 type: {type(join1)}")
++print(f"join1 is empty: {not join1}")
++print(f"join1.cols == 0: {join1.cols == 0}")
++print(f"join1.rows != M3.rows: {join1.rows != M3.rows}")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..7354693d6c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,32 @@
++import sympy as sy
++
++# Test case from the issue
++print("Testing hstack with zero-row matrices:")
++M1 = sy.Matrix.zeros(0, 0)
++M2 = sy.Matrix.zeros(0, 1)
++M3 = sy.Matrix.zeros(0, 2)
++M4 = sy.Matrix.zeros(0, 3)
++
++result = sy.Matrix.hstack(M1, M2, M3, M4)
++print(f"Result shape: {result.shape}")
++print(f"Expected: (0, 6), Got: {result.shape}")
++
++print("\nTesting hstack with one-row matrices:")
++M1_1row = sy.Matrix.zeros(1, 0)
++M2_1row = sy.Matrix.zeros(1, 1)
++M3_1row = sy.Matrix.zeros(1, 2)
++M4_1row = sy.Matrix.zeros(1, 3)
++
++result_1row = sy.Matrix.hstack(M1_1row, M2_1row, M3_1row, M4_1row)
++print(f"Result shape: {result_1row.shape}")
++print(f"Expected: (1, 6), Got: {result_1row.shape}")
++
++print("\nTesting vstack with zero-column matrices:")
++N1 = sy.Matrix.zeros(0, 0)
++N2 = sy.Matrix.zeros(1, 0)
++N3 = sy.Matrix.zeros(2, 0)
++N4 = sy.Matrix.zeros(3, 0)
++
++result_v = sy.Matrix.vstack(N1, N2, N3, N4)
++print(f"Result shape: {result_v.shape}")
++print(f"Expected: (6, 0), Got: {result_v.shape}")
+\ No newline at end of file
+diff --git a/sympy/matrices/sparse.py b/sympy/matrices/sparse.py
+index e6f36cdf35..739a3f6a52 100644
+--- a/sympy/matrices/sparse.py
++++ b/sympy/matrices/sparse.py
+@@ -985,8 +985,10 @@ def col_join(self, other):
+         >>> C == A.row_insert(A.rows, Matrix(B))
+         True
+         """
+-        if not self:
+-            return type(self)(other)
++        # A null matrix can always be stacked (see  #10770)
++        if self.rows == 0 and self.cols != other.cols:
++            return type(self)(0, other.cols, []).col_join(other)
++        
+         A, B = self, other
+         if not A.cols == B.cols:
+             raise ShapeError()
+@@ -1191,8 +1193,10 @@ def row_join(self, other):
+         >>> C == A.col_insert(A.cols, B)
+         True
+         """
+-        if not self:
+-            return type(self)(other)
++        # A null matrix can always be stacked (see  #10770)
++        if self.cols == 0 and self.rows != other.rows:
++            return type(self)(other.rows, 0, []).row_join(other)
++        
+         A, B = self, other
+         if not A.rows == B.rows:
+             raise ShapeError()
+diff --git a/test_dense_vs_sparse.py b/test_dense_vs_sparse.py
+new file mode 100644
+index 0000000000..98aa5b436f
+--- /dev/null
++++ b/test_dense_vs_sparse.py
+@@ -0,0 +1,46 @@
++import sympy as sy
++
++print("=== Comparing Dense vs Sparse Matrix hstack ===")
++
++# Test with dense matrices
++M1_dense = sy.Matrix.zeros(0, 0)
++M2_dense = sy.Matrix.zeros(0, 1)
++M3_dense = sy.Matrix.zeros(0, 2)
++M4_dense = sy.Matrix.zeros(0, 3)
++
++result_dense = sy.Matrix.hstack(M1_dense, M2_dense, M3_dense, M4_dense)
++print(f"Dense hstack result: {result_dense.shape}")
++
++# Test with sparse matrices
++M1_sparse = sy.SparseMatrix.zeros(0, 0)
++M2_sparse = sy.SparseMatrix.zeros(0, 1)
++M3_sparse = sy.SparseMatrix.zeros(0, 2)
++M4_sparse = sy.SparseMatrix.zeros(0, 3)
++
++result_sparse = sy.SparseMatrix.hstack(M1_sparse, M2_sparse, M3_sparse, M4_sparse)
++print(f"Sparse hstack result: {result_sparse.shape}")
++
++print("\n=== Testing individual row_join operations ===")
++
++# Dense matrices
++join1_dense = M1_dense.row_join(M2_dense)
++join2_dense = join1_dense.row_join(M3_dense)
++join3_dense = join2_dense.row_join(M4_dense)
++print(f"Dense row_join chain: {join3_dense.shape}")
++
++# Sparse matrices
++join1_sparse = M1_sparse.row_join(M2_sparse)
++join2_sparse = join1_sparse.row_join(M3_sparse)
++join3_sparse = join2_sparse.row_join(M4_sparse)
++print(f"Sparse row_join chain: {join3_sparse.shape}")
++
++print("\n=== Testing the reduce operation ===")
++from functools import reduce
++
++# Dense reduce
++reduce_dense = reduce(lambda x, y: x.row_join(y), [M1_dense, M2_dense, M3_dense, M4_dense])
++print(f"Dense reduce: {reduce_dense.shape}")
++
++# Sparse reduce
++reduce_sparse = reduce(lambda x, y: x.row_join(y), [M1_sparse, M2_sparse, M3_sparse, M4_sparse])
++print(f"Sparse reduce: {reduce_sparse.shape}")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..c294b53844
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,25 @@
++import sympy as sy
++
++# Test if the fix is working by creating a simple test case
++print("=== Testing the fix ===")
++
++# Create a simple case: 0x0 matrix joined with 0x1 matrix
++M1 = sy.SparseMatrix.zeros(0, 0)
++M2 = sy.SparseMatrix.zeros(0, 1)
++
++print(f"M1: {M1.shape}")
++print(f"M2: {M2.shape}")
++
++# This should trigger the fix
++result = M1.row_join(M2)
++print(f"M1.row_join(M2): {result.shape}")
++print(f"Expected: (0, 1), Got: {result.shape}")
++
++# Test the specific condition in the fix
++print(f"M1.cols == 0: {M1.cols == 0}")
++print(f"M1.rows != M2.rows: {M1.rows != M2.rows}")
++print(f"Both conditions: {M1.cols == 0 and M1.rows != M2.rows}")
++
++# Test creating the intermediate matrix
++intermediate = sy.SparseMatrix(M2.rows, 0, [])
++print(f"Intermediate matrix: {intermediate.shape}")
+\ No newline at end of file
+diff --git a/test_sparse_issue.py b/test_sparse_issue.py
+new file mode 100644
+index 0000000000..9a4ba43472
+--- /dev/null
++++ b/test_sparse_issue.py
+@@ -0,0 +1,51 @@
++import sympy as sy
++
++# Test sparse matrix hstack with zero-row matrices
++print("Testing SparseMatrix.hstack with zero-row matrices:")
++M1 = sy.SparseMatrix.zeros(0, 0)
++M2 = sy.SparseMatrix.zeros(0, 1)
++M3 = sy.SparseMatrix.zeros(0, 2)
++M4 = sy.SparseMatrix.zeros(0, 3)
++
++result = sy.SparseMatrix.hstack(M1, M2, M3, M4)
++print(f"Result shape: {result.shape}")
++print(f"Expected: (0, 6), Got: {result.shape}")
++
++# Test individual row_join operations for sparse matrices
++print("\nTesting individual SparseMatrix row_join operations:")
++try:
++    join1 = M1.row_join(M2)
++    print(f"M1.row_join(M2) shape: {join1.shape}")
++    
++    join2 = join1.row_join(M3)
++    print(f"join1.row_join(M3) shape: {join2.shape}")
++    
++    join3 = join2.row_join(M4)
++    print(f"join2.row_join(M4) shape: {join3.shape}")
++except Exception as e:
++    print(f"Error in sparse row_join: {e}")
++
++# Test sparse matrix vstack with zero-column matrices
++print("\nTesting SparseMatrix.vstack with zero-column matrices:")
++N1 = sy.SparseMatrix.zeros(0, 0)
++N2 = sy.SparseMatrix.zeros(1, 0)
++N3 = sy.SparseMatrix.zeros(2, 0)
++N4 = sy.SparseMatrix.zeros(3, 0)
++
++result_v = sy.SparseMatrix.vstack(N1, N2, N3, N4)
++print(f"Result shape: {result_v.shape}")
++print(f"Expected: (6, 0), Got: {result_v.shape}")
++
++# Test individual col_join operations for sparse matrices
++print("\nTesting individual SparseMatrix col_join operations:")
++try:
++    join1_v = N1.col_join(N2)
++    print(f"N1.col_join(N2) shape: {join1_v.shape}")
++    
++    join2_v = join1_v.col_join(N3)
++    print(f"join1_v.col_join(N3) shape: {join2_v.shape}")
++    
++    join3_v = join2_v.col_join(N4)
++    print(f"join2_v.col_join(N4) shape: {join3_v.shape}")
++except Exception as e:
++    print(f"Error in sparse col_join: {e}")
+\ No newline at end of file
+diff --git a/test_specific_issue.py b/test_specific_issue.py
+new file mode 100644
+index 0000000000..77ac2bf16b
+--- /dev/null
++++ b/test_specific_issue.py
+@@ -0,0 +1,45 @@
++import sympy as sy
++
++# Test the specific case from the issue
++print("Testing Matrix.hstack with zero-row matrices:")
++M1 = sy.Matrix.zeros(0, 0)
++M2 = sy.Matrix.zeros(0, 1)
++M3 = sy.Matrix.zeros(0, 2)
++M4 = sy.Matrix.zeros(0, 3)
++
++result = sy.Matrix.hstack(M1, M2, M3, M4)
++print(f"Result shape: {result.shape}")
++print(f"Expected: (0, 6), Got: {result.shape}")
++print(f"Result: {result}")
++
++# Test with ShapingOnlyMatrix to see if it behaves differently
++print("\nTesting ShapingOnlyMatrix.hstack with zero-row matrices:")
++from sympy.matrices.common import _MinimalMatrix, MatrixShaping
++from sympy.matrices import zeros
++
++class ShapingOnlyMatrix(_MinimalMatrix, MatrixShaping):
++    pass
++
++S1 = zeros(0, 0)
++S2 = zeros(0, 1)
++S3 = zeros(0, 2)
++S4 = zeros(0, 3)
++
++result_shaping = ShapingOnlyMatrix.hstack(S1, S2, S3, S4)
++print(f"Result shape: {result_shaping.shape}")
++print(f"Expected: (0, 6), Got: {result_shaping.shape}")
++print(f"Result: {result_shaping}")
++
++# Test row_join individually to see where the issue might be
++print("\nTesting individual row_join operations:")
++try:
++    join1 = M1.row_join(M2)
++    print(f"M1.row_join(M2) shape: {join1.shape}")
++    
++    join2 = join1.row_join(M3)
++    print(f"join1.row_join(M3) shape: {join2.shape}")
++    
++    join3 = join2.row_join(M4)
++    print(f"join2.row_join(M4) shape: {join3.shape}")
++except Exception as e:
++    print(f"Error in row_join: {e}")
+\ No newline at end of file

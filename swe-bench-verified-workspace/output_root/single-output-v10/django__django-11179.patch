@@ -1,0 +1,596 @@
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index 92fe4affb9..0bb9c5636e 100644
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -277,6 +277,8 @@ class Collector:
+             if self.can_fast_delete(instance):
+                 with transaction.mark_for_rollback_on_error():
+                     count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)
++                # Clear the PK of the deleted instance
++                setattr(instance, model._meta.pk.attname, None)
+                 return count, {model._meta.label: count}
+ 
+         with transaction.atomic(using=self.using, savepoint=False):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..1e4ffc9b99
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++import os
++import sys
++
++# Add the Django project to the Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings using the same approach as runtests.py
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django test environment
++settings.configure(
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    SECRET_KEY='test-secret-key',
++    USE_TZ=True,
++)
++
++django.setup()
++
++# Create a simple model without any dependencies
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_delete_clears_pk():
++    """Test that delete() clears the PK on instances without dependencies"""
++    # Create an instance
++    obj = SimpleModel.objects.create(name="test")
++    original_pk = obj.pk
++    print(f"Created object with PK: {original_pk}")
++    
++    # Delete the object
++    obj.delete()
++    
++    # Check if PK is cleared
++    print(f"PK after delete(): {obj.pk}")
++    
++    if obj.pk is None:
++        print("SUCCESS: PK was cleared after delete()")
++        return True
++    else:
++        print("FAILURE: PK was not cleared after delete()")
++        return False
++
++if __name__ == "__main__":
++    # Create database tables
++    from django.db import connection
++    connection.creation.create_test_db(verbosity=0)
++    
++    # Create the table for our test model
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SimpleModel)
++    
++    # Run the test
++    success = test_delete_clears_pk()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..c74c2c4802
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,113 @@
++#!/usr/bin/env python3
++import os
++import sys
++
++# Add the Django project to the Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings using the same approach as runtests.py
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django test environment
++settings.configure(
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    SECRET_KEY='test-secret-key',
++    USE_TZ=True,
++)
++
++django.setup()
++
++# Create a simple model without any dependencies
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_fast_delete_path():
++    """Test that fast delete path clears PK (the main issue)"""
++    # Create an instance that should use the fast delete path
++    obj = SimpleModel.objects.create(name="test")
++    original_pk = obj.pk
++    print(f"Created object with PK: {original_pk}")
++    
++    # Delete the object (should use fast delete path)
++    obj.delete()
++    
++    # Check if PK is cleared
++    pk_cleared = obj.pk is None
++    print(f"PK after delete(): {obj.pk}")
++    
++    return pk_cleared
++
++def test_multiple_fast_deletes():
++    """Test multiple individual deletes using fast path"""
++    objects = []
++    for i in range(3):
++        obj = SimpleModel.objects.create(name=f"test{i}")
++        objects.append(obj)
++    
++    print(f"Created objects with PKs: {[obj.pk for obj in objects]}")
++    
++    # Delete all objects individually (should use fast delete path)
++    for obj in objects:
++        obj.delete()
++    
++    # Check if all PKs are cleared
++    all_pks_cleared = all(obj.pk is None for obj in objects)
++    print(f"PKs after deletes: {[obj.pk for obj in objects]}")
++    
++    return all_pks_cleared
++
++def test_object_still_usable():
++    """Test that the object can still be used after deletion"""
++    obj = SimpleModel.objects.create(name="test")
++    original_pk = obj.pk
++    print(f"Created object with PK: {original_pk}")
++    
++    # Delete the object
++    obj.delete()
++    
++    # The object should have PK cleared but other attributes intact
++    pk_cleared = obj.pk is None
++    name_intact = obj.name == "test"
++    
++    print(f"PK after delete: {obj.pk}, Name intact: {name_intact}")
++    
++    return pk_cleared and name_intact
++
++if __name__ == "__main__":
++    # Create database tables
++    from django.db import connection
++    connection.creation.create_test_db(verbosity=0)
++    
++    # Create the table for our test model
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SimpleModel)
++    
++    # Run all tests
++    test1_success = test_fast_delete_path()
++    test2_success = test_multiple_fast_deletes()
++    test3_success = test_object_still_usable()
++    
++    all_success = test1_success and test2_success and test3_success
++    
++    if all_success:
++        print("\nALL TESTS PASSED: The fix correctly handles all scenarios!")
++    else:
++        print("\nSOME TESTS FAILED!")
++    
++    sys.exit(0 if all_success else 1)
+\ No newline at end of file
+diff --git a/test_debug.py b/test_debug.py
+new file mode 100644
+index 0000000000..f79c00facc
+--- /dev/null
++++ b/test_debug.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python3
++import os
++import sys
++
++# Add the Django project to the Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings using the same approach as runtests.py
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django test environment
++settings.configure(
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    SECRET_KEY='test-secret-key',
++    USE_TZ=True,
++)
++
++django.setup()
++
++# Create a simple model without any dependencies
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_individual_deletes():
++    """Test individual delete() calls"""
++    # Create multiple instances
++    obj1 = SimpleModel.objects.create(name="test1")
++    obj2 = SimpleModel.objects.create(name="test2")
++    obj3 = SimpleModel.objects.create(name="test3")
++    
++    print(f"Created objects with PKs: {obj1.pk}, {obj2.pk}, {obj3.pk}")
++    
++    # Delete the objects individually
++    obj1.delete()
++    obj2.delete()
++    obj3.delete()
++    
++    # Check if PKs are cleared
++    print(f"PKs after individual deletes(): {obj1.pk}, {obj2.pk}, {obj3.pk}")
++    
++    if obj1.pk is None and obj2.pk is None and obj3.pk is None:
++        print("SUCCESS: All PKs were cleared after individual deletes()")
++        return True
++    else:
++        print("FAILURE: Not all PKs were cleared after individual deletes()")
++        return False
++
++def test_bulk_delete():
++    """Test bulk delete() call"""
++    # Create multiple instances
++    obj1 = SimpleModel.objects.create(name="test1")
++    obj2 = SimpleModel.objects.create(name="test2")
++    obj3 = SimpleModel.objects.create(name="test3")
++    
++    print(f"Created objects with PKs: {obj1.pk}, {obj2.pk}, {obj3.pk}")
++    
++    # Delete the objects using bulk delete
++    SimpleModel.objects.all().delete()
++    
++    # Check if PKs are cleared
++    print(f"PKs after bulk delete(): {obj1.pk}, {obj2.pk}, {obj3.pk}")
++    
++    if obj1.pk is None and obj2.pk is None and obj3.pk is None:
++        print("SUCCESS: All PKs were cleared after bulk delete()")
++        return True
++    else:
++        print("FAILURE: Not all PKs were cleared after bulk delete()")
++        return False
++
++if __name__ == "__main__":
++    # Create database tables
++    from django.db import connection
++    connection.creation.create_test_db(verbosity=0)
++    
++    # Create the table for our test model
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SimpleModel)
++    
++    # Run the tests
++    success1 = test_individual_deletes()
++    success2 = test_bulk_delete()
++    
++    sys.exit(0 if (success1 and success2) else 1)
+\ No newline at end of file
+diff --git a/test_deletion_integration.py b/test_deletion_integration.py
+new file mode 100644
+index 0000000000..dcf2108216
+--- /dev/null
++++ b/test_deletion_integration.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++import os
++import sys
++
++# Add the Django project to the Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings using the same approach as runtests.py
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django test environment
++settings.configure(
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    SECRET_KEY='test-secret-key',
++    USE_TZ=True,
++)
++
++django.setup()
++
++# Create a simple model without any dependencies
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_deletion_integration():
++    """Test that our fix doesn't break basic deletion functionality"""
++    # Create an instance
++    obj = SimpleModel.objects.create(name="test")
++    original_pk = obj.pk
++    print(f"Created object with PK: {original_pk}")
++    
++    # Verify the object exists in the database
++    exists_before = SimpleModel.objects.filter(pk=original_pk).exists()
++    print(f"Object exists in DB before delete: {exists_before}")
++    
++    # Delete the object
++    obj.delete()
++    
++    # Verify the object no longer exists in the database
++    exists_after = SimpleModel.objects.filter(pk=original_pk).exists()
++    print(f"Object exists in DB after delete: {exists_after}")
++    
++    # Check if PK is cleared in memory
++    print(f"PK after delete(): {obj.pk}")
++    
++    # All checks should pass
++    success = (
++        exists_before == True and
++        exists_after == False and
++        obj.pk is None
++    )
++    
++    if success:
++        print("SUCCESS: Deletion works correctly and PK is cleared")
++        return True
++    else:
++        print("FAILURE: Deletion is broken")
++        return False
++
++if __name__ == "__main__":
++    # Create database tables
++    from django.db import connection
++    connection.creation.create_test_db(verbosity=0)
++    
++    # Create the table for our test model
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SimpleModel)
++    
++    # Run the test
++    success = test_deletion_integration()
++    
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..1cb1d29e91
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++import os
++import sys
++
++# Add the Django project to the Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings using the same approach as runtests.py
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django test environment
++settings.configure(
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    SECRET_KEY='test-secret-key',
++    USE_TZ=True,
++)
++
++django.setup()
++
++# Create a simple model without any dependencies
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_multiple_objects():
++    """Test that delete() clears PKs for multiple objects"""
++    # Create multiple instances
++    obj1 = SimpleModel.objects.create(name="test1")
++    obj2 = SimpleModel.objects.create(name="test2")
++    obj3 = SimpleModel.objects.create(name="test3")
++    
++    print(f"Created objects with PKs: {obj1.pk}, {obj2.pk}, {obj3.pk}")
++    
++    # Delete the objects using bulk delete (should use the general path)
++    SimpleModel.objects.all().delete()
++    
++    # Check if PKs are cleared
++    print(f"PKs after delete(): {obj1.pk}, {obj2.pk}, {obj3.pk}")
++    
++    if obj1.pk is None and obj2.pk is None and obj3.pk is None:
++        print("SUCCESS: All PKs were cleared after bulk delete()")
++        return True
++    else:
++        print("FAILURE: Not all PKs were cleared after bulk delete()")
++        return False
++
++def test_single_object_fast_delete():
++    """Test that delete() clears PK for single object (fast delete path)"""
++    # Create an instance
++    obj = SimpleModel.objects.create(name="test")
++    original_pk = obj.pk
++    print(f"Created object with PK: {original_pk}")
++    
++    # Delete the object (should use fast delete path)
++    obj.delete()
++    
++    # Check if PK is cleared
++    print(f"PK after delete(): {obj.pk}")
++    
++    if obj.pk is None:
++        print("SUCCESS: PK was cleared after single object delete()")
++        return True
++    else:
++        print("FAILURE: PK was not cleared after single object delete()")
++        return False
++
++if __name__ == "__main__":
++    # Create database tables
++    from django.db import connection
++    connection.creation.create_test_db(verbosity=0)
++    
++    # Create the table for our test model
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SimpleModel)
++    
++    # Run the tests
++    success1 = test_single_object_fast_delete()
++    success2 = test_multiple_objects()
++    
++    sys.exit(0 if (success1 and success2) else 1)
+\ No newline at end of file
+diff --git a/test_final.py b/test_final.py
+new file mode 100644
+index 0000000000..9521d4a448
+--- /dev/null
++++ b/test_final.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++import os
++import sys
++
++# Add the Django project to the Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings using the same approach as runtests.py
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django test environment
++settings.configure(
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    SECRET_KEY='test-secret-key',
++    USE_TZ=True,
++)
++
++django.setup()
++
++# Create a simple model without any dependencies
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_individual_delete_fast_path():
++    """Test individual delete() calls that use the fast-delete path"""
++    # Create multiple instances
++    obj1 = SimpleModel.objects.create(name="test1")
++    obj2 = SimpleModel.objects.create(name="test2")
++    obj3 = SimpleModel.objects.create(name="test3")
++    
++    print(f"Created objects with PKs: {obj1.pk}, {obj2.pk}, {obj3.pk}")
++    
++    # Delete the objects individually (should use fast-delete path)
++    obj1.delete()
++    obj2.delete()
++    obj3.delete()
++    
++    # Check if PKs are cleared
++    print(f"PKs after individual deletes(): {obj1.pk}, {obj2.pk}, {obj3.pk}")
++    
++    if obj1.pk is None and obj2.pk is None and obj3.pk is None:
++        print("SUCCESS: All PKs were cleared after individual deletes()")
++        return True
++    else:
++        print("FAILURE: Not all PKs were cleared after individual deletes()")
++        return False
++
++if __name__ == "__main__":
++    # Create database tables
++    from django.db import connection
++    connection.creation.create_test_db(verbosity=0)
++    
++    # Create the table for our test model
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SimpleModel)
++    
++    # Run the test
++    success = test_individual_delete_fast_path()
++    
++    sys.exit(0 if success else 1)
+\ No newline at end of file

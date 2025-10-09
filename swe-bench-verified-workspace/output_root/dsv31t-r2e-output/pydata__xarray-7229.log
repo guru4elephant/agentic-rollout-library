@@ -1,0 +1,2846 @@
+=== Starting task for instance: pydata__xarray-7229 ===
+Task ID: 317
+Pod name: r2e-pydata-xarray-7229
+
+=== Iteration 1/50 ===
+Calling LLM...
+LLM Response: I'll help you implement the necessary changes to fix the issue where `xr.where(..., keep_attrs=True)` overwrites coordinate attributes. Let's start by exploring the repository structure and reproducin...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "find . -type f -name \"*.py\" | grep -E \"(where|merge)\" | head -20"
+}
+Tool execution status: success
+Tool stdout:
+[STDOUT]
+./asv_bench/benchmarks/merge.py
+./xarray/tests/test_merge.py
+./xarray/core/merge.py
+
+
+=== Iteration 2/50 ===
+Calling LLM...
+LLM Response: Let me explore the repository structure more broadly to understand how `xr.where` is implemented:
+
+<function=execute_bash>
+<parameter=command>find . -type f -name "*.py" | grep -v test | grep -v asv |...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "find . -type f -name \"*.py\" | grep -v test | grep -v asv | head -20"
+}
+Tool execution status: success
+Tool stdout:
+[STDOUT]
+./.github/workflows/parse_logs.py
+./ci/min_deps_check.py
+./doc/conf.py
+./doc/examples/_code/accessor_example.py
+./doc/gallery/plot_cartopy_facetgrid.py
+./doc/gallery/plot_rasterio_rgb.py
+./doc/gallery/plot_lines_from_2d.py
+./doc/gallery/plot_colorbar_center.py
+./doc/gallery/plot_control_colorbar.py
+./doc/gallery/plot_rasterio.py
+./xarray/convert.py
+./xarray/indexes/__init__.py
+./xarray/coding/calendar_ops.py
+./xarray/coding/times.py
+./xarray/coding/variables.py
+./xarray/coding/cftimeindex.py
+./xarray/coding/frequencies.py
+./xarray/coding/cftime_offsets.py
+./xarray/coding/strings.py
+./xarray/coding/__init__.py
+
+
+=== Iteration 3/50 ===
+Calling LLM...
+LLM Response: Let me look for the `where` function specifically:
+
+<function=search>
+<parameter=search_term>def where</parameter>
+<parameter>.</parameter>
+</function>...
+Executing tool: r2e_search
+Tool parameters: {
+  "search_term": "def where"
+}
+Tool execution status: success
+Tool stdout:
+Found 7 matches for "def where" in /testbed:
+./xarray/core/computation.py (1 matches)
+./xarray/core/variable.py (1 matches)
+./xarray/core/common.py (1 matches)
+./xarray/core/duck_array_ops.py (2 matches)
+./xarray/core/groupby.py (1 matches)
+./xarray/core/ops.py (1 matches)
+End of matches for "def where" in /testbed
+
+
+=== Iteration 4/50 ===
+Calling LLM...
+LLM Response: Let me check the main `where` function in `computation.py` since that's likely where the issue is:
+
+<function=file_editor>
+<parameter=command>view</parameter>
+<parameter=path>/testbed/xarray/core/comp...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "view",
+  "path": "/testbed/xarray/core/computation.py"
+}
+Tool execution status: success
+Tool stdout:
+Here's the result of running `cat -n` on /testbed/xarray/core/computation.py:
+     1	"""
+     2	Functions for applying functions that act on arrays to xarray's labeled data.
+     3	"""
+     4	from __future__ import annotations
+     5	
+     6	import functools
+     7	import itertools
+     8	import operator
+     9	import warnings
+    10	from collections import Counter
+    11	from typing import (
+    12	    TYPE_CHECKING,
+    13	    AbstractSet,
+    14	    Any,
+    15	    Callable,
+    16	    Hashable,
+    17	    Iterable,
+    18	    Mapping,
+    19	    Sequence,
+    20	    TypeVar,
+    21	    Union,
+    22	    overload,
+    23	)
+    24	
+    25	import numpy as np
+    26	
+    27	from . import dtypes, duck_array_ops, utils
+    28	from .alignment import align, deep_align
+    29	from .common import zeros_like
+    30	from .duck_array_ops import datetime_to_numeric
+    31	from .indexes import Index, filter_indexes_from_coords
+    32	from .merge import merge_attrs, merge_coordinates_without_align
+    33	from .options import OPTIONS, _get_keep_attrs
+    34	from .pycompat import is_duck_dask_array
+    35	from .types import T_DataArray
+    36	from .utils import is_dict_like, is_scalar
+    37	from .variable import Variable
+    38	
+    39	if TYPE_CHECKING:
+    40	    from .coordinates import Coordinates
+    41	    from .dataarray import DataArray
+    42	    from .dataset import Dataset
+    43	    from .types import CombineAttrsOptions, JoinOptions
+    44	
+    45	_NO_FILL_VALUE = utils.ReprObject("<no-fill-value>")
+    46	_DEFAULT_NAME = utils.ReprObject("<default-name>")
+    47	_JOINS_WITHOUT_FILL_VALUES = frozenset({"inner", "exact"})
+    48	
+    49	
+    50	def _first_of_type(args, kind):
+    51	    """Return either first object of type 'kind' or raise if not found."""
+    52	    for arg in args:
+    53	        if isinstance(arg, kind):
+    54	            return arg
+    55	    raise ValueError("This should be unreachable.")
+    56	
+    57	
+    58	def _all_of_type(args, kind):
+    59	    """Return all objects of type 'kind'"""
+    60	    return [arg for arg in args if isinstance(arg, kind)]
+    61	
+    62	
+    63	class _UFuncSignature:
+    64	    """Core dimensions signature for a given function.
+    65	
+    66	    Based on the signature provided by generalized ufuncs in NumPy.
+    67	
+    68	    Attributes
+    69	    ----------
+    70	    input_core_dims : tuple[tuple]
+    71	        Core dimension names on each input variable.
+    72	    output_core_dims : tuple[tuple]
+    73	        Core dimension names on each output variable.
+    74	    """
+    75	
+    76	    __slots__ = (
+    77	        "input_core_dims",
+    78	        "output_core_dims",
+    79	        "_all_input_core_dims",
+    80	        "_all_output_core_dims",
+    81	        "_all_core_dims",
+    82	    )
+    83	
+    84	    def __init__(self, input_core_dims, output_core_dims=((),)):
+    85	        self.input_core_dims = tuple(tuple(a) for a in input_core_dims)
+    86	        self.output_core_dims = tuple(tuple(a) for a in output_core_dims)
+    87	        self._all_input_core_dims = None
+    88	        self._all_output_core_dims = None
+    89	        self._all_core_dims = None
+    90	
+    91	    @property
+    92	    def all_input_core_dims(self):
+    93	        if self._all_input_core_dims is None:
+    94	            self._all_input_core_dims = frozenset(
+    95	                dim for dims in self.input_core_dims for dim in dims
+    96	            )
+    97	        return self._all_input_core_dims
+    98	
+    99	    @property
+   100	    def all_output_core_dims(self):
+   101	        if self._all_output_core_dims is None:
+   102	            self._all_output_core_dims = frozenset(
+   103	                dim for dims in self.output_core_dims for dim in dims
+   104	            )
+   105	        return self._all_output_core_dims
+   106	
+   107	    @property
+   108	    def all_core_dims(self):
+   109	        if self._all_core_dims is None:
+   110	            self._all_core_dims = self.all_input_core_dims | self.all_output_core_dims
+   111	        return self._all_core_dims
+   112	
+   113	    @property
+   114	    def dims_map(self):
+   115	        return {
+   116	            core_dim: f"dim{n}" for n, core_dim in enumerate(sorted(self.all_core_dims))
+   117	        }
+   118	
+   119	    @property
+   120	    def num_inputs(self):
+   121	        return len(self.input_core_dims)
+   122	
+   123	    @property
+   124	    def num_outputs(self):
+   125	        return len(self.output_core_dims)
+   126	
+   127	    def __eq__(self, other):
+   128	        try:
+   129	            return (
+   130	                self.input_core_dims == other.input_core_dims
+   131	                and self.output_core_dims == other.output_core_dims
+   132	            )
+   133	        except AttributeError:
+   134	            return False
+   135	
+   136	    def __ne__(self, other):
+   137	        return not self == other
+   138	
+   139	    def __repr__(self):
+   140	        return "{}({!r}, {!r})".format(
+   141	            type(self).__name__,
+   142	            list(self.input_core_dims),
+   143	            list(self.output_core_dims),
+   144	        )
+   145	
+   146	    def __str__(self):
+   147	        lhs = ",".join("({})".format(",".join(dims)) for dims in self.input_core_dims)
+   148	        rhs = ",".join("({})".format(",".join(dims)) for dims in self.output_core_dims)
+   149	        return f"{lhs}->{rhs}"
+   150	
+   151	    def to_gufunc_string(self, exclude_dims=frozenset()):
+   152	        """Create an equivalent signature string for a NumPy gufunc.
+   153	
+   154	        Unlike __str__, handles dimensions that don't map to Python
+   155	        identifiers.
+   156	
+   157	        Also creates unique names for input_core_dims contained in exclude_dims.
+   158	        """
+   159	        input_core_dims = [
+   160	            [self.dims_map[dim] for dim in core_dims]
+   161	            for core_dims in self.input_core_dims
+   162	        ]
+   163	        output_core_dims = [
+   164	            [self.dims_map[dim] for dim in core_dims]
+   165	            for core_dims in self.output_core_dims
+   166	        ]
+   167	
+   168	        # enumerate input_core_dims contained in exclude_dims to make them unique
+   169	        if exclude_dims:
+   170	
+   171	            exclude_dims = [self.dims_map[dim] for dim in exclude_dims]
+   172	
+   173	            counter = Counter()
+   174	
+   175	            def _enumerate(dim):
+   176	                if dim in exclude_dims:
+   177	                    n = counter[dim]
+   178	                    counter.update([dim])
+   179	                    dim = f"{dim}_{n}"
+   180	                return dim
+   181	
+   182	            input_core_dims = [
+   183	                [_enumerate(dim) for dim in arg] for arg in input_core_dims
+   184	            ]
+   185	
+   186	        alt_signature = type(self)(input_core_dims, output_core_dims)
+   187	        return str(alt_signature)
+   188	
+   189	
+   190	def result_name(objects: Iterable[Any]) -> Any:
+   191	    # use the same naming heuristics as pandas:
+   192	    # https://github.com/blaze/blaze/issues/458#issuecomment-51936356
+   193	    names = {getattr(obj, "name", _DEFAULT_NAME) for obj in objects}
+   194	    names.discard(_DEFAULT_NAME)
+   195	    if len(names) == 1:
+   196	        (name,) = names
+   197	    else:
+   198	        name = None
+   199	    return name
+   200	
+   201	
+   202	def _get_coords_list(args: Iterable[Any]) -> list[Coordinates]:
+   203	    coords_list = []
+   204	    for arg in args:
+   205	        try:
+   206	            coords = arg.coords
+   207	        except AttributeError:
+   208	            pass  # skip this argument
+   209	        else:
+   210	            coords_list.append(coords)
+   211	    return coords_list
+   212	
+   213	
+   214	def build_output_coords_and_indexes(
+   215	    args: Iterable[Any],
+   216	    signature: _UFuncSignature,
+   217	    exclude_dims: AbstractSet = frozenset(),
+   218	    combine_attrs: CombineAttrsOptions = "override",
+   219	) -> tuple[list[dict[Any, Variable]], list[dict[Any, Index]]]:
+   220	    """Build output coordinates and indexes for an operation.
+   221	
+   222	    Parameters
+   223	    ----------
+   224	    args : Iterable
+   225	        List of raw operation arguments. Any valid types for xarray operations
+   226	        are OK, e.g., scalars, Variable, DataArray, Dataset.
+   227	    signature : _UfuncSignature
+   228	        Core dimensions signature for the operation.
+   229	    exclude_dims : set, optional
+   230	        Dimensions excluded from the operation. Coordinates along these
+   231	        dimensions are dropped.
+   232	    combine_attrs : {"drop", "identical", "no_conflicts", "drop_conflicts", \
+   233	                     "override"} or callable, default: "drop"
+   234	        A callable or a string indicating how to combine attrs of the objects being
+   235	        merged:
+   236	
+   237	        - "drop": empty attrs on returned Dataset.
+   238	        - "identical": all attrs must be the same on every object.
+   239	        - "no_conflicts": attrs from all objects are combined, any that have
+   240	          the same name must also have the same value.
+   241	        - "drop_conflicts": attrs from all objects are combined, any that have
+   242	          the same name but different values are dropped.
+   243	        - "override": skip comparing and copy attrs from the first dataset to
+   244	          the result.
+   245	
+   246	        If a callable, it must expect a sequence of ``attrs`` dicts and a context object
+   247	        as its only parameters.
+   248	
+   249	    Returns
+   250	    -------
+   251	    Dictionaries of Variable and Index objects with merged coordinates.
+   252	    """
+   253	    coords_list = _get_coords_list(args)
+   254	
+   255	    if len(coords_list) == 1 and not exclude_dims:
+   256	        # we can skip the expensive merge
+   257	        (unpacked_coords,) = coords_list
+   258	        merged_vars = dict(unp
+<response clipped>
+
+
+=== Iteration 5/50 ===
+Calling LLM...
+LLM Response: Let me search for the `where` function specifically in this file:
+
+<function=search>
+<parameter=search_term>def where</parameter>
+<parameter>./xarray/core/computation.py</parameter>
+</function>...
+Executing tool: r2e_search
+Tool parameters: {
+  "search_term": "def where"
+}
+Tool execution status: success
+Tool stdout:
+Found 7 matches for "def where" in /testbed:
+./xarray/core/computation.py (1 matches)
+./xarray/core/variable.py (1 matches)
+./xarray/core/common.py (1 matches)
+./xarray/core/duck_array_ops.py (2 matches)
+./xarray/core/groupby.py (1 matches)
+./xarray/core/ops.py (1 matches)
+End of matches for "def where" in /testbed
+
+
+=== Iteration 6/50 ===
+Calling LLM...
+LLM Response: Let me view the `where` function in computation.py:
+
+<function=file_editor>
+<parameter=command>view</parameter>
+<parameter=path>/testbed/xarray/core/computation.py</parameter>
+<parameter=view_range>[5...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "view",
+  "path": "/testbed/xarray/core/computation.py",
+  "view_range": "[500, 700]"
+}
+Tool execution status: success
+Tool stdout:
+Here's the result of running `cat -n` on /testbed/xarray/core/computation.py:
+   500	        out.attrs = attrs
+   501	
+   502	    return out
+   503	
+   504	
+   505	def _iter_over_selections(obj, dim, values):
+   506	    """Iterate over selections of an xarray object in the provided order."""
+   507	    from .groupby import _dummy_copy
+   508	
+   509	    dummy = None
+   510	    for value in values:
+   511	        try:
+   512	            obj_sel = obj.sel(**{dim: value})
+   513	        except (KeyError, IndexError):
+   514	            if dummy is None:
+   515	                dummy = _dummy_copy(obj)
+   516	            obj_sel = dummy
+   517	        yield obj_sel
+   518	
+   519	
+   520	def apply_groupby_func(func, *args):
+   521	    """Apply a dataset or datarray level function over GroupBy, Dataset,
+   522	    DataArray, Variable and/or ndarray objects.
+   523	    """
+   524	    from .groupby import GroupBy, peek_at
+   525	    from .variable import Variable
+   526	
+   527	    groupbys = [arg for arg in args if isinstance(arg, GroupBy)]
+   528	    assert groupbys, "must have at least one groupby to iterate over"
+   529	    first_groupby = groupbys[0]
+   530	    if any(not first_groupby._group.equals(gb._group) for gb in groupbys[1:]):
+   531	        raise ValueError(
+   532	            "apply_ufunc can only perform operations over "
+   533	            "multiple GroupBy objects at once if they are all "
+   534	            "grouped the same way"
+   535	        )
+   536	
+   537	    grouped_dim = first_groupby._group.name
+   538	    unique_values = first_groupby._unique_coord.values
+   539	
+   540	    iterators = []
+   541	    for arg in args:
+   542	        if isinstance(arg, GroupBy):
+   543	            iterator = (value for _, value in arg)
+   544	        elif hasattr(arg, "dims") and grouped_dim in arg.dims:
+   545	            if isinstance(arg, Variable):
+   546	                raise ValueError(
+   547	                    "groupby operations cannot be performed with "
+   548	                    "xarray.Variable objects that share a dimension with "
+   549	                    "the grouped dimension"
+   550	                )
+   551	            iterator = _iter_over_selections(arg, grouped_dim, unique_values)
+   552	        else:
+   553	            iterator = itertools.repeat(arg)
+   554	        iterators.append(iterator)
+   555	
+   556	    applied = (func(*zipped_args) for zipped_args in zip(*iterators))
+   557	    applied_example, applied = peek_at(applied)
+   558	    combine = first_groupby._combine
+   559	    if isinstance(applied_example, tuple):
+   560	        combined = tuple(combine(output) for output in zip(*applied))
+   561	    else:
+   562	        combined = combine(applied)
+   563	    return combined
+   564	
+   565	
+   566	def unified_dim_sizes(
+   567	    variables: Iterable[Variable], exclude_dims: AbstractSet = frozenset()
+   568	) -> dict[Hashable, int]:
+   569	
+   570	    dim_sizes: dict[Hashable, int] = {}
+   571	
+   572	    for var in variables:
+   573	        if len(set(var.dims)) < len(var.dims):
+   574	            raise ValueError(
+   575	                "broadcasting cannot handle duplicate "
+   576	                f"dimensions on a variable: {list(var.dims)}"
+   577	            )
+   578	        for dim, size in zip(var.dims, var.shape):
+   579	            if dim not in exclude_dims:
+   580	                if dim not in dim_sizes:
+   581	                    dim_sizes[dim] = size
+   582	                elif dim_sizes[dim] != size:
+   583	                    raise ValueError(
+   584	                        "operands cannot be broadcast together "
+   585	                        "with mismatched lengths for dimension "
+   586	                        f"{dim}: {dim_sizes[dim]} vs {size}"
+   587	                    )
+   588	    return dim_sizes
+   589	
+   590	
+   591	SLICE_NONE = slice(None)
+   592	
+   593	
+   594	def broadcast_compat_data(
+   595	    variable: Variable,
+   596	    broadcast_dims: tuple[Hashable, ...],
+   597	    core_dims: tuple[Hashable, ...],
+   598	) -> Any:
+   599	    data = variable.data
+   600	
+   601	    old_dims = variable.dims
+   602	    new_dims = broadcast_dims + core_dims
+   603	
+   604	    if new_dims == old_dims:
+   605	        # optimize for the typical case
+   606	        return data
+   607	
+   608	    set_old_dims = set(old_dims)
+   609	    missing_core_dims = [d for d in core_dims if d not in set_old_dims]
+   610	    if missing_core_dims:
+   611	        raise ValueError(
+   612	            "operand to apply_ufunc has required core dimensions {}, but "
+   613	            "some of these dimensions are absent on an input variable: {}".format(
+   614	                list(core_dims), missing_core_dims
+   615	            )
+   616	        )
+   617	
+   618	    set_new_dims = set(new_dims)
+   619	    unexpected_dims = [d for d in old_dims if d not in set_new_dims]
+   620	    if unexpected_dims:
+   621	        raise ValueError(
+   622	            "operand to apply_ufunc encountered unexpected "
+   623	            f"dimensions {unexpected_dims!r} on an input variable: these are core "
+   624	            "dimensions on other input or output variables"
+   625	        )
+   626	
+   627	    # for consistency with numpy, keep broadcast dimensions to the left
+   628	    old_broadcast_dims = tuple(d for d in broadcast_dims if d in set_old_dims)
+   629	    reordered_dims = old_broadcast_dims + core_dims
+   630	    if reordered_dims != old_dims:
+   631	        order = tuple(old_dims.index(d) for d in reordered_dims)
+   632	        data = duck_array_ops.transpose(data, order)
+   633	
+   634	    if new_dims != reordered_dims:
+   635	        key_parts: list[slice | None] = []
+   636	        for dim in new_dims:
+   637	            if dim in set_old_dims:
+   638	                key_parts.append(SLICE_NONE)
+   639	            elif key_parts:
+   640	                # no need to insert new axes at the beginning that are already
+   641	                # handled by broadcasting
+   642	                key_parts.append(np.newaxis)
+   643	        data = data[tuple(key_parts)]
+   644	
+   645	    return data
+   646	
+   647	
+   648	def _vectorize(func, signature, output_dtypes, exclude_dims):
+   649	    if signature.all_core_dims:
+   650	        func = np.vectorize(
+   651	            func,
+   652	            otypes=output_dtypes,
+   653	            signature=signature.to_gufunc_string(exclude_dims),
+   654	        )
+   655	    else:
+   656	        func = np.vectorize(func, otypes=output_dtypes)
+   657	
+   658	    return func
+   659	
+   660	
+   661	def apply_variable_ufunc(
+   662	    func,
+   663	    *args,
+   664	    signature: _UFuncSignature,
+   665	    exclude_dims=frozenset(),
+   666	    dask="forbidden",
+   667	    output_dtypes=None,
+   668	    vectorize=False,
+   669	    keep_attrs="override",
+   670	    dask_gufunc_kwargs=None,
+   671	) -> Variable | tuple[Variable, ...]:
+   672	    """Apply a ndarray level function over Variable and/or ndarray objects."""
+   673	    from .variable import Variable, as_compatible_data
+   674	
+   675	    dim_sizes = unified_dim_sizes(
+   676	        (a for a in args if hasattr(a, "dims")), exclude_dims=exclude_dims
+   677	    )
+   678	    broadcast_dims = tuple(
+   679	        dim for dim in dim_sizes if dim not in signature.all_core_dims
+   680	    )
+   681	    output_dims = [broadcast_dims + out for out in signature.output_core_dims]
+   682	
+   683	    input_data = [
+   684	        broadcast_compat_data(arg, broadcast_dims, core_dims)
+   685	        if isinstance(arg, Variable)
+   686	        else arg
+   687	        for arg, core_dims in zip(args, signature.input_core_dims)
+   688	    ]
+   689	
+   690	    if any(is_duck_dask_array(array) for array in input_data):
+   691	        if dask == "forbidden":
+   692	            raise ValueError(
+   693	                "apply_ufunc encountered a dask array on an "
+   694	                "argument, but handling for dask arrays has not "
+   695	                "been enabled. Either set the ``dask`` argument "
+   696	                "or load your data into memory first with "
+   697	                "``.load()`` or ``.compute()``"
+   698	            )
+   699	        elif dask == "parallelized":
+   700	            numpy_func = func
+
+
+=== Iteration 7/50 ===
+Calling LLM...
+LLM Response: Let me search for the `where` function more specifically:
+
+<function=search>
+<parameter=search_term>^def where</parameter>
+<parameter>./xarray/core/computation.py</parameter>
+</function>...
+Executing tool: r2e_search
+Tool parameters: {
+  "search_term": "^def where"
+}
+Tool execution status: success
+Tool stdout:
+No matches found for "^def where" in /testbed
+
+
+=== Iteration 8/50 ===
+Calling LLM...
+LLM Response: Let me search for the actual `where` function implementation:
+
+<function=search>
+<parameter=search_term>where</parameter>
+<parameter>./xarray/core/computation.py</parameter>
+</function>...
+Executing tool: r2e_search
+Tool parameters: {
+  "search_term": "where"
+}
+Tool execution status: success
+Tool stdout:
+Found 317 matches for "where" in /testbed:
+./xarray/__init__.py (2 matches)
+./xarray/tests/test_plot.py (15 matches)
+./xarray/tests/test_units.py (18 matches)
+./xarray/tests/test_weighted.py (2 matches)
+./xarray/tests/test_array_api.py (3 matches)
+./xarray/tests/test_computation.py (16 matches)
+./xarray/tests/test_dask.py (6 matches)
+./xarray/tests/test_variable.py (2 matches)
+./xarray/tests/test_cupy.py (3 matches)
+./xarray/tests/test_rolling.py (3 matches)
+./xarray/tests/test_duck_array_ops.py (5 matches)
+./xarray/tests/test_sparse.py (6 matches)
+./xarray/tests/test_dataset.py (33 matches)
+./xarray/tests/test_groupby.py (7 matches)
+./xarray/tests/test_backends.py (3 matches)
+./xarray/tests/test_dataarray.py (26 matches)
+./xarray/coding/calendar_ops.py (4 matches)
+./xarray/coding/times.py (2 matches)
+./xarray/coding/variables.py (1 matches)
+./xarray/coding/cftimeindex.py (2 matches)
+./xarray/coding/cftime_offsets.py (1 matches)
+./xarray/coding/strings.py (1 matches)
+./xarray/backends/api.py (3 matches)
+./xarray/backends/netCDF4_.py (1 matches)
+./xarray/backends/zarr.py (3 matches)
+./xarray/core/accessor_str.py (4 matches)
+./xarray/core/_aggregations.py (12 matches)
+./xarray/core/concat.py (2 matches)
+./xarray/core/parallel.py (2 matches)
+./xarray/core/computation.py (17 matches)
+./xarray/core/resample_cftime.py (1 matches)
+./xarray/core/dataset.py (12 matches)
+./xarray/core/variable.py (6 matches)
+./xarray/core/alignment.py (1 matches)
+./xarray/core/missing.py (6 matches)
+./xarray/core/dask_array_ops.py (3 matches)
+./xarray/core/common.py (13 matches)
+./xarray/core/indexing.py (6 matches)
+./xarray/core/nanops.py (7 matches)
+./xarray/core/duck_array_ops.py (11 matches)
+./xarray/core/utils.py (1 matches)
+./xarray/core/merge.py (1 matches)
+./xarray/core/groupby.py (7 matches)
+./xarray/core/rolling.py (6 matches)
+./xarray/core/dataarray.py (8 matches)
+./xarray/core/weighted.py (1 matches)
+./xarray/core/indexes.py (1 matches)
+./xarray/core/ops.py (3 matches)
+./xarray/plot/accessor.py (3 matches)
+./xarray/plot/facetgrid.py (3 matches)
+./xarray/plot/dataarray_plot.py (11 matches)
+./xarray/util/generate_aggregations.py (1 matches)
+End of matches for "where" in /testbed
+
+
+=== Iteration 9/50 ===
+Calling LLM...
+LLM Response: Let me check the computation.py file more specifically for the where function:
+
+<function=search>
+<parameter=search_term>def where</parameter>
+<parameter>./xarray/core/computation.py</parameter>
+</fun...
+Executing tool: r2e_search
+Tool parameters: {
+  "search_term": "def where"
+}
+Tool execution status: success
+Tool stdout:
+Found 7 matches for "def where" in /testbed:
+./xarray/core/computation.py (1 matches)
+./xarray/core/variable.py (1 matches)
+./xarray/core/common.py (1 matches)
+./xarray/core/duck_array_ops.py (2 matches)
+./xarray/core/groupby.py (1 matches)
+./xarray/core/ops.py (1 matches)
+End of matches for "def where" in /testbed
+
+
+=== Iteration 10/50 ===
+Calling LLM...
+LLM Response: Let me look at the where function in computation.py:
+
+<function=file_editor>
+<parameter=command>view</parameter>
+<parameter=path>/testbed/xarray/core/computation.py</parameter>
+<parameter=view_range>[...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "view",
+  "path": "/testbed/xarray/core/computation.py",
+  "view_range": "[800, 900]"
+}
+Tool execution status: success
+Tool stdout:
+Here's the result of running `cat -n` on /testbed/xarray/core/computation.py:
+   800	            )
+   801	
+   802	        var = Variable(dims, data, fastpath=True)
+   803	        for dim, new_size in var.sizes.items():
+   804	            if dim in dim_sizes and new_size != dim_sizes[dim]:
+   805	                raise ValueError(
+   806	                    "size of dimension {!r} on inputs was unexpectedly "
+   807	                    "changed by applied function from {} to {}. Only "
+   808	                    "dimensions specified in ``exclude_dims`` with "
+   809	                    "xarray.apply_ufunc are allowed to change size.".format(
+   810	                        dim, dim_sizes[dim], new_size
+   811	                    )
+   812	                )
+   813	
+   814	        var.attrs = attrs
+   815	        output.append(var)
+   816	
+   817	    if signature.num_outputs == 1:
+   818	        return output[0]
+   819	    else:
+   820	        return tuple(output)
+   821	
+   822	
+   823	def apply_array_ufunc(func, *args, dask="forbidden"):
+   824	    """Apply a ndarray level function over ndarray objects."""
+   825	    if any(is_duck_dask_array(arg) for arg in args):
+   826	        if dask == "forbidden":
+   827	            raise ValueError(
+   828	                "apply_ufunc encountered a dask array on an "
+   829	                "argument, but handling for dask arrays has not "
+   830	                "been enabled. Either set the ``dask`` argument "
+   831	                "or load your data into memory first with "
+   832	                "``.load()`` or ``.compute()``"
+   833	            )
+   834	        elif dask == "parallelized":
+   835	            raise ValueError(
+   836	                "cannot use dask='parallelized' for apply_ufunc "
+   837	                "unless at least one input is an xarray object"
+   838	            )
+   839	        elif dask == "allowed":
+   840	            pass
+   841	        else:
+   842	            raise ValueError(f"unknown setting for dask array handling: {dask}")
+   843	    return func(*args)
+   844	
+   845	
+   846	def apply_ufunc(
+   847	    func: Callable,
+   848	    *args: Any,
+   849	    input_core_dims: Sequence[Sequence] | None = None,
+   850	    output_core_dims: Sequence[Sequence] | None = ((),),
+   851	    exclude_dims: AbstractSet = frozenset(),
+   852	    vectorize: bool = False,
+   853	    join: JoinOptions = "exact",
+   854	    dataset_join: str = "exact",
+   855	    dataset_fill_value: object = _NO_FILL_VALUE,
+   856	    keep_attrs: bool | str | None = None,
+   857	    kwargs: Mapping | None = None,
+   858	    dask: str = "forbidden",
+   859	    output_dtypes: Sequence | None = None,
+   860	    output_sizes: Mapping[Any, int] | None = None,
+   861	    meta: Any = None,
+   862	    dask_gufunc_kwargs: dict[str, Any] | None = None,
+   863	) -> Any:
+   864	    """Apply a vectorized function for unlabeled arrays on xarray objects.
+   865	
+   866	    The function will be mapped over the data variable(s) of the input
+   867	    arguments using xarray's standard rules for labeled computation, including
+   868	    alignment, broadcasting, looping over GroupBy/Dataset variables, and
+   869	    merging of coordinates.
+   870	
+   871	    Parameters
+   872	    ----------
+   873	    func : callable
+   874	        Function to call like ``func(*args, **kwargs)`` on unlabeled arrays
+   875	        (``.data``) that returns an array or tuple of arrays. If multiple
+   876	        arguments with non-matching dimensions are supplied, this function is
+   877	        expected to vectorize (broadcast) over axes of positional arguments in
+   878	        the style of NumPy universal functions [1]_ (if this is not the case,
+   879	        set ``vectorize=True``). If this function returns multiple outputs, you
+   880	        must set ``output_core_dims`` as well.
+   881	    *args : Dataset, DataArray, DataArrayGroupBy, DatasetGroupBy, Variable, \
+   882	        numpy.ndarray, dask.array.Array or scalar
+   883	        Mix of labeled and/or unlabeled arrays to which to apply the function.
+   884	    input_core_dims : sequence of sequence, optional
+   885	        List of the same length as ``args`` giving the list of core dimensions
+   886	        on each input argument that should not be broadcast. By default, we
+   887	        assume there are no core dimensions on any input arguments.
+   888	
+   889	        For example, ``input_core_dims=[[], ['time']]`` indicates that all
+   890	        dimensions on the first argument and all dimensions other than 'time'
+   891	        on the second argument should be broadcast.
+   892	
+   893	        Core dimensions are automatically moved to the last axes of input
+   894	        variables before applying ``func``, which facilitates using NumPy style
+   895	        generalized ufuncs [2]_.
+   896	    output_core_dims : list of tuple, optional
+   897	        List of the same length as the number of output arguments from
+   898	        ``func``, giving the list of core dimensions on each output that were
+   899	        not broadcast on the inputs. By default, we assume that ``func``
+   900	        outputs exactly one array, with axes corresponding to each broadcast
+
+
+=== Iteration 11/50 ===
+Calling LLM...
+LLM Response: Let me search for the actual where function definition:
+
+<function=execute_bash>
+<parameter=command>grep -n "def where" ./xarray/core/computation.py</parameter>
+</function>...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "grep -n \"def where\" ./xarray/core/computation.py"
+}
+Tool execution status: success
+Tool stdout:
+[STDOUT]
+1775:def where(cond, x, y, keep_attrs=None):
+
+
+=== Iteration 12/50 ===
+Calling LLM...
+LLM Response:       Now let me view the `where` function:
+
+<function=file_editor>
+<parameter=command>view</parameter>
+<parameter=path>/testbed/xarray/core/computation.py</parameter>
+<parameter=view_range>[1775, 185...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "view",
+  "path": "/testbed/xarray/core/computation.py",
+  "view_range": "[1775, 1850]"
+}
+Tool execution status: success
+Tool stdout:
+Here's the result of running `cat -n` on /testbed/xarray/core/computation.py:
+  1775	def where(cond, x, y, keep_attrs=None):
+  1776	    """Return elements from `x` or `y` depending on `cond`.
+  1777	
+  1778	    Performs xarray-like broadcasting across input arguments.
+  1779	
+  1780	    All dimension coordinates on `x` and `y`  must be aligned with each
+  1781	    other and with `cond`.
+  1782	
+  1783	    Parameters
+  1784	    ----------
+  1785	    cond : scalar, array, Variable, DataArray or Dataset
+  1786	        When True, return values from `x`, otherwise returns values from `y`.
+  1787	    x : scalar, array, Variable, DataArray or Dataset
+  1788	        values to choose from where `cond` is True
+  1789	    y : scalar, array, Variable, DataArray or Dataset
+  1790	        values to choose from where `cond` is False
+  1791	    keep_attrs : bool or str or callable, optional
+  1792	        How to treat attrs. If True, keep the attrs of `x`.
+  1793	
+  1794	    Returns
+  1795	    -------
+  1796	    Dataset, DataArray, Variable or array
+  1797	        In priority order: Dataset, DataArray, Variable or array, whichever
+  1798	        type appears as an input argument.
+  1799	
+  1800	    Examples
+  1801	    --------
+  1802	    >>> x = xr.DataArray(
+  1803	    ...     0.1 * np.arange(10),
+  1804	    ...     dims=["lat"],
+  1805	    ...     coords={"lat": np.arange(10)},
+  1806	    ...     name="sst",
+  1807	    ... )
+  1808	    >>> x
+  1809	    <xarray.DataArray 'sst' (lat: 10)>
+  1810	    array([0. , 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+  1811	    Coordinates:
+  1812	      * lat      (lat) int64 0 1 2 3 4 5 6 7 8 9
+  1813	
+  1814	    >>> xr.where(x < 0.5, x, x * 100)
+  1815	    <xarray.DataArray 'sst' (lat: 10)>
+  1816	    array([ 0. ,  0.1,  0.2,  0.3,  0.4, 50. , 60. , 70. , 80. , 90. ])
+  1817	    Coordinates:
+  1818	      * lat      (lat) int64 0 1 2 3 4 5 6 7 8 9
+  1819	
+  1820	    >>> y = xr.DataArray(
+  1821	    ...     0.1 * np.arange(9).reshape(3, 3),
+  1822	    ...     dims=["lat", "lon"],
+  1823	    ...     coords={"lat": np.arange(3), "lon": 10 + np.arange(3)},
+  1824	    ...     name="sst",
+  1825	    ... )
+  1826	    >>> y
+  1827	    <xarray.DataArray 'sst' (lat: 3, lon: 3)>
+  1828	    array([[0. , 0.1, 0.2],
+  1829	           [0.3, 0.4, 0.5],
+  1830	           [0.6, 0.7, 0.8]])
+  1831	    Coordinates:
+  1832	      * lat      (lat) int64 0 1 2
+  1833	      * lon      (lon) int64 10 11 12
+  1834	
+  1835	    >>> xr.where(y.lat < 1, y, -1)
+  1836	    <xarray.DataArray (lat: 3, lon: 3)>
+  1837	    array([[ 0. ,  0.1,  0.2],
+  1838	           [-1. , -1. , -1. ],
+  1839	           [-1. , -1. , -1. ]])
+  1840	    Coordinates:
+  1841	      * lat      (lat) int64 0 1 2
+  1842	      * lon      (lon) int64 10 11 12
+  1843	
+  1844	    >>> cond = xr.DataArray([True, False], dims=["x"])
+  1845	    >>> x = xr.DataArray([1, 2], dims=["y"])
+  1846	    >>> xr.where(cond, x, 0)
+  1847	    <xarray.DataArray (x: 2, y: 2)>
+  1848	    array([[1, 2],
+  1849	           [0, 0]])
+  1850	    Dimensions without coordinates: x, y
+
+
+=== Iteration 13/50 ===
+Calling LLM...
+LLM Response: Let me see the rest of the `where` function:
+
+<function=file_editor>
+<parameter=command>view</parameter>
+<parameter=path>/testbed/xarray/core/computation.py</parameter>
+<parameter=view_range>[1850, 19...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "view",
+  "path": "/testbed/xarray/core/computation.py",
+  "view_range": "[1850, 1920]"
+}
+Tool execution status: success
+Tool stdout:
+Here's the result of running `cat -n` on /testbed/xarray/core/computation.py:
+  1850	    Dimensions without coordinates: x, y
+  1851	
+  1852	    See Also
+  1853	    --------
+  1854	    numpy.where : corresponding numpy function
+  1855	    Dataset.where, DataArray.where :
+  1856	        equivalent methods
+  1857	    """
+  1858	    if keep_attrs is None:
+  1859	        keep_attrs = _get_keep_attrs(default=False)
+  1860	    if keep_attrs is True:
+  1861	        # keep the attributes of x, the second parameter, by default to
+  1862	        # be consistent with the `where` method of `DataArray` and `Dataset`
+  1863	        keep_attrs = lambda attrs, context: getattr(x, "attrs", {})
+  1864	
+  1865	    # alignment for three arguments is complicated, so don't support it yet
+  1866	    return apply_ufunc(
+  1867	        duck_array_ops.where,
+  1868	        cond,
+  1869	        x,
+  1870	        y,
+  1871	        join="exact",
+  1872	        dataset_join="exact",
+  1873	        dask="allowed",
+  1874	        keep_attrs=keep_attrs,
+  1875	    )
+  1876	
+  1877	
+  1878	@overload
+  1879	def polyval(
+  1880	    coord: DataArray, coeffs: DataArray, degree_dim: Hashable = "degree"
+  1881	) -> DataArray:
+  1882	    ...
+  1883	
+  1884	
+  1885	@overload
+  1886	def polyval(
+  1887	    coord: DataArray, coeffs: Dataset, degree_dim: Hashable = "degree"
+  1888	) -> Dataset:
+  1889	    ...
+  1890	
+  1891	
+  1892	@overload
+  1893	def polyval(
+  1894	    coord: Dataset, coeffs: DataArray, degree_dim: Hashable = "degree"
+  1895	) -> Dataset:
+  1896	    ...
+  1897	
+  1898	
+  1899	@overload
+  1900	def polyval(
+  1901	    coord: Dataset, coeffs: Dataset, degree_dim: Hashable = "degree"
+  1902	) -> Dataset:
+  1903	    ...
+  1904	
+  1905	
+  1906	@overload
+  1907	def polyval(
+  1908	    coord: Dataset | DataArray,
+  1909	    coeffs: Dataset | DataArray,
+  1910	    degree_dim: Hashable = "degree",
+  1911	) -> Dataset | DataArray:
+  1912	    ...
+  1913	
+  1914	
+  1915	def polyval(
+  1916	    coord: Dataset | DataArray,
+  1917	    coeffs: Dataset | DataArray,
+  1918	    degree_dim: Hashable = "degree",
+  1919	) -> Dataset | DataArray:
+  1920	    """Evaluate a polynomial at specific values
+
+
+=== Iteration 14/50 ===
+Calling LLM...
+LLM Response: Now let me create a script to reproduce the issue:
+
+<function=file_editor>
+<parameter=command>create</parameter>
+<parameter=path>reproduce_issue.py</parameter>
+<parameter=file_text>import xarray as xr...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "create",
+  "path": "reproduce_issue.py",
+  "file_text": "import xarray as xr\n\n# Reproduce the issue\nds = xr.tutorial.load_dataset(\"air_temperature\")\nprint(\"Original time attributes:\")\nprint(ds.time.attrs)\n\nprint(\"\\nOriginal air attributes:\")\nprint(ds.air.attrs)\n\nresult = xr.where(True, ds.air, ds.air, keep_attrs=True)\nprint(\"\\nAfter xr.where(True, ds.air, ds.air, keep_attrs=True):\")\nprint(\"Time attributes:\")\nprint(result.time.attrs)\n\nprint(\"\\nExpected time attributes:\")\nprint(ds.time.attrs)"
+}
+Tool execution status: success
+Tool stdout:
+File created successfully at reproduce_issue.py.
+Here's the result of running `cat -n` on reproduce_issue.py:
+     1	import xarray as xr
+     2	
+     3	# Reproduce the issue
+     4	ds = xr.tutorial.load_dataset("air_temperature")
+     5	print("Original time attributes:")
+     6	print(ds.time.attrs)
+     7	
+     8	print("\nOriginal air attributes:")
+     9	print(ds.air.attrs)
+    10	
+    11	result = xr.where(True, ds.air, ds.air, keep_attrs=True)
+    12	print("\nAfter xr.where(True, ds.air, ds.air, keep_attrs=True):")
+    13	print("Time attributes:")
+    14	print(result.time.attrs)
+    15	
+    16	print("\nExpected time attributes:")
+    17	print(ds.time.attrs)
+
+
+=== Iteration 15/50 ===
+Calling LLM...
+LLM Response: <function=execute_bash>
+<parameter=command>python reproduce_issue.py</parameter>
+</function>...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "python reproduce_issue.py"
+}
+Tool execution status: error
+Tool stdout:
+
+Tool stderr:
+Error executing command:
+Exit code: 1
+[STDERR]
+Traceback (most recent call last):
+  File "/root/.venv/lib/python3.10/site-packages/urllib3/connection.py", line 198, in _new_conn
+    sock = connection.create_connection(
+  File "/root/.venv/lib/python3.10/site-packages/urllib3/util/connection.py", line 85, in create_connection
+    raise err
+  File "/root/.venv/lib/python3.10/site-packages/urllib3/util/connection.py", line 73, in create_connection
+    sock.connect(sa)
+TimeoutError: [Errno 110] Connection timed out
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/root/.venv/lib/python3.10/site-packages/urllib3/connectionpool.py", line 787, in urlopen
+    response = self._make_request(
+  File "/root/.venv/lib/python3.10/site-packages/urllib3/connectionpool.py", line 488, in _make_request
+    raise new_e
+  File "/root/.venv/lib/python3.10/site-packages/urllib3/connectionpool.py", line 464, in _make_request
+    self._validate_conn(conn)
+  File "/root/.venv/lib/python3.10/site-packages/urllib3/connectionpool.py", line 1093, in _validate_conn
+    conn.connect()
+  File "/root/.venv/lib/python3.10/site-packages/urllib3/connection.py", line 704, in connect
+    self.sock = sock = self._new_conn()
+  File "/root/.venv/lib/python3.10/site-packages/urllib3/connection.py", line 207, in _new_conn
+    raise ConnectTimeoutError(
+urllib3.exceptions.ConnectTimeoutError: (<urllib3.connection.HTTPSConnection object at 0x7f19224e0970>, 'Connection to github.com timed out. (connect timeout=30)')
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/root/.venv/lib/python3.10/site-packages/requests/adapters.py", line 667, in send
+    resp = conn.urlopen(
+  File "/root/.venv/lib/python3.10/site-packages/urllib3/connectionpool.py", line 841, in urlopen
+    retries = retries.increment(
+  File "/root/.venv/lib/python3.10/site-packages/urllib3/util/retry.py", line 519, in increment
+    raise MaxRetryError(_pool, url, reason) from reason  # type: ignore[arg-type]
+urllib3.exceptions.MaxRetryError: HTTPSConnectionPool(host='github.com', port=443): Max retries exceeded with url: /pydata/xarray-data/raw/master/air_temperature.nc (Caused by ConnectTimeoutError(<urllib3.connection.HTTPSConnection object at 0x7f19224e0970>, 'Connection to github.com timed out. (connect timeout=30)'))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/testbed/reproduce_issue.py", line 4, in <module>
+    ds = xr.tutorial.load_dataset("air_temperature")
+  File "/testbed/xarray/tutorial.py", line 284, in load_dataset
+    with open_dataset(*args, **kwargs) as ds:
+  File "/testbed/xarray/tutorial.py", line 160, in open_dataset
+    filepath = pooch.retrieve(url=url, known_hash=None, path=cache_dir)
+  File "/root/.venv/lib/python3.10/site-packages/pooch/core.py", line 239, in retrieve
+    stream_download(url, full_path, known_hash, downloader, pooch=None)
+  File "/root/.venv/lib/python3.10/site-packages/pooch/core.py", line 807, in stream_download
+    downloader(url, tmp, pooch)
+  File "/root/.venv/lib/python3.10/site-packages/pooch/downloaders.py", line 220, in __call__
+    response = requests.get(url, timeout=timeout, **kwargs)
+  File "/root/.venv/lib/python3.10/site-packages/requests/api.py", line 73, in get
+    return request("get", url, params=params, **kwargs)
+  File "/root/.venv/lib/python3.10/site-packages/requests/api.py", line 59, in request
+    return session.request(method=method, url=url, **kwargs)
+  File "/root/.venv/lib/python3.10/site-packages/requests/sessions.py", line 589, in request
+    resp = self.send(prep, **send_kwargs)
+  File "/root/.venv/lib/python3.10/site-packages/requests/sessions.py", line 703, in send
+    r = adapter.send(request, **kwargs)
+  File "/root/.venv/lib/python3.10/site-packages/requests/adapters.py", line 688, in send
+    raise ConnectTimeout(e, request=request)
+requests.exceptions.ConnectTimeout: HTTPSConnectionPool(host='github.com', port=443): Max retries exceeded with url: /pydata/xarray-data/raw/master/air_temperature.nc (Caused by ConnectTimeoutError(<urllib3.connection.HTTPSConnection object at 0x7f19224e0970>, 'Connection to github.com timed out. (connect timeout=30)'))
+
+
+=== Iteration 16/50 ===
+Calling LLM...
+LLM Response: Let me create a simpler test that doesn't require downloading data:
+
+<function=file_editor>
+<parameter=command>str_replace</parameter>
+<parameter=path>reproduce_issue.py</parameter>
+<parameter=old_str...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "str_replace",
+  "path": "reproduce_issue.py",
+  "old_str": "import xarray as xr\n\n# Reproduce the issue\nds = xr.tutorial.load_dataset(\"air_temperature\")\nprint(\"Original time attributes:\")\nprint(ds.time.attrs)\n\nprint(\"\\nOriginal air attributes:\")\nprint(ds.air.attrs)\n\nresult = xr.where(True, ds.air, ds.air, keep_attrs=True)\nprint(\"\\nAfter xr.where(True, ds.air, ds.air, keep_attrs=True):\")\nprint(\"Time attributes:\")\nprint(result.time.attrs)\n\nprint(\"\\nExpected time attributes:\")\nprint(ds.time.attrs)",
+  "new_str": "import xarray as xr\nimport numpy as np\n\n# Create a simple dataset to reproduce the issue\ntime = xr.DataArray(\n    np.arange(10), \n    dims=[\"time\"],\n    coords={\"time\": np.arange(10)},\n    attrs={\"standard_name\": \"time\", \"long_name\": \"Time\"}\n)\n\nair = xr.DataArray(\n    np.random.rand(10),\n    dims=[\"time\"],\n    coords={\"time\": time},\n    attrs={\n        'long_name': '4xDaily Air temperature at sigma level 995',\n        'units': 'degK',\n        'precision': 2,\n        'GRIB_id': 11,\n        'GRIB_name': 'TMP',\n        'var_desc': 'Air temperature',\n        'dataset': 'NMC Reanalysis',\n        'level_desc': 'Surface',\n        'statistic': 'Individual Obs',\n        'parent_stat': 'Other',\n        'actual_range': np.array([185.16, 322.1], dtype=np.float32)\n    }\n)\n\nds = xr.Dataset({\"air\": air}, coords={\"time\": time})\n\nprint(\"Original time attributes:\")\nprint(ds.time.attrs)\n\nprint(\"\\nOriginal air attributes:\")\nprint(ds.air.attrs)\n\nresult = xr.where(True, ds.air, ds.air, keep_attrs=True)\nprint(\"\\nAfter xr.where(True, ds.air, ds.air, keep_attrs=True):\")\nprint(\"Time attributes:\")\nprint(result.time.attrs)\n\nprint(\"\\nExpected time attributes:\")\nprint(ds.time.attrs)"
+}
+Tool execution status: success
+Tool stdout:
+The file reproduce_issue.py has been edited successfully.
+Here's a snippet of the edited section:
+     1	import xarray as xr
+     2	import numpy as np
+     3	
+     4	# Create a simple dataset to reproduce the issue
+     5	time = xr.DataArray(
+     6	    np.arange(10), 
+     7	    dims=["time"],
+     8	    coords={"time": np.arange(10)},
+     9	    attrs={"standard_name": "time", "long_name": "Time"}
+    10	)
+    11	
+    12	air = xr.DataArray(
+    13	    np.random.rand(10),
+    14	    dims=["time"],
+    15	    coords={"time": time},
+    16	    attrs={
+    17	        'long_name': '4xDaily Air temperature at sigma level 995',
+    18	        'units': 'degK',
+    19	        'precision': 2,
+    20	        'GRIB_id': 11,
+    21	        'GRIB_name': 'TMP',
+    22	        'var_desc': 'Air temperature',
+    23	        'dataset': 'NMC Reanalysis',
+    24	        'level_desc': 'Surface',
+    25	        'statistic': 'Individual Obs',
+    26	        'parent_stat': 'Other',
+    27	        'actual_range': np.array([185.16, 322.1], dtype=np.float32)
+    28	    }
+    29	)
+    30	
+    31	ds = xr.Dataset({"air": air}, coords={"time": time})
+    32	
+    33	print("Original time attributes:")
+    34	print(ds.time.attrs)
+    35	
+    36	print("\nOriginal air attributes:")
+    37	print(ds.air.attrs)
+    38	
+    39	result = xr.where(True, ds.air, ds.air, keep_attrs=True)
+    40	print("\nAfter xr.where(True, ds.air, ds.air, keep_attrs=True):")
+    41	print("Time attributes:")
+    42	print(result.time.attrs)
+    43	
+    44	print("\nExpected time attributes:")
+    45	print(ds.time.attrs)
+Review the changes and make sure they are as expected.
+
+
+=== Iteration 17/50 ===
+Calling LLM...
+LLM Response: <function=execute_bash>
+<parameter=command>python reproduce_issue.py</parameter>
+</function>...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "python reproduce_issue.py"
+}
+Tool execution status: success
+Tool stdout:
+[STDOUT]
+Original time attributes:
+{'standard_name': 'time', 'long_name': 'Time'}
+
+Original air attributes:
+{'long_name': '4xDaily Air temperature at sigma level 995', 'units': 'degK', 'precision': 2, 'GRIB_id': 11, 'GRIB_name': 'TMP', 'var_desc': 'Air temperature', 'dataset': 'NMC Reanalysis', 'level_desc': 'Surface', 'statistic': 'Individual Obs', 'parent_stat': 'Other', 'actual_range': array([185.16, 322.1 ], dtype=float32)}
+
+After xr.where(True, ds.air, ds.air, keep_attrs=True):
+Time attributes:
+{'long_name': '4xDaily Air temperature at sigma level 995', 'units': 'degK', 'precision': 2, 'GRIB_id': 11, 'GRIB_name': 'TMP', 'var_desc': 'Air temperature', 'dataset': 'NMC Reanalysis', 'level_desc': 'Surface', 'statistic': 'Individual Obs', 'parent_stat': 'Other', 'actual_range': array([185.16, 322.1 ], dtype=float32)}
+
+Expected time attributes:
+{'standard_name': 'time', 'long_name': 'Time'}
+
+
+=== Iteration 18/50 ===
+Calling LLM...
+LLM Response: Great! I've confirmed the issue. The time coordinate attributes are being overwritten by the air variable attributes when using `xr.where(..., keep_attrs=True)`. 
+
+Now I need to investigate how the is...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "view",
+  "path": "/testbed/xarray/core/merge.py",
+  "view_range": "[1, 100]"
+}
+Tool execution status: success
+Tool stdout:
+Here's the result of running `cat -n` on /testbed/xarray/core/merge.py:
+     1	from __future__ import annotations
+     2	
+     3	from collections import defaultdict
+     4	from typing import (
+     5	    TYPE_CHECKING,
+     6	    AbstractSet,
+     7	    Any,
+     8	    Hashable,
+     9	    Iterable,
+    10	    Mapping,
+    11	    NamedTuple,
+    12	    Optional,
+    13	    Sequence,
+    14	    Tuple,
+    15	    Union,
+    16	)
+    17	
+    18	import pandas as pd
+    19	
+    20	from . import dtypes
+    21	from .alignment import deep_align
+    22	from .duck_array_ops import lazy_array_equiv
+    23	from .indexes import (
+    24	    Index,
+    25	    Indexes,
+    26	    create_default_index_implicit,
+    27	    filter_indexes_from_coords,
+    28	    indexes_equal,
+    29	)
+    30	from .utils import Frozen, compat_dict_union, dict_equiv, equivalent
+    31	from .variable import Variable, as_variable, calculate_dimensions
+    32	
+    33	if TYPE_CHECKING:
+    34	    from .coordinates import Coordinates
+    35	    from .dataarray import DataArray
+    36	    from .dataset import Dataset
+    37	    from .types import CombineAttrsOptions, CompatOptions, JoinOptions
+    38	
+    39	    DimsLike = Union[Hashable, Sequence[Hashable]]
+    40	    ArrayLike = Any
+    41	    VariableLike = Union[
+    42	        ArrayLike,
+    43	        Tuple[DimsLike, ArrayLike],
+    44	        Tuple[DimsLike, ArrayLike, Mapping],
+    45	        Tuple[DimsLike, ArrayLike, Mapping, Mapping],
+    46	    ]
+    47	    XarrayValue = Union[DataArray, Variable, VariableLike]
+    48	    DatasetLike = Union[Dataset, Mapping[Any, XarrayValue]]
+    49	    CoercibleValue = Union[XarrayValue, pd.Series, pd.DataFrame]
+    50	    CoercibleMapping = Union[Dataset, Mapping[Any, CoercibleValue]]
+    51	
+    52	
+    53	PANDAS_TYPES = (pd.Series, pd.DataFrame)
+    54	
+    55	_VALID_COMPAT = Frozen(
+    56	    {
+    57	        "identical": 0,
+    58	        "equals": 1,
+    59	        "broadcast_equals": 2,
+    60	        "minimal": 3,
+    61	        "no_conflicts": 4,
+    62	        "override": 5,
+    63	    }
+    64	)
+    65	
+    66	
+    67	class Context:
+    68	    """object carrying the information of a call"""
+    69	
+    70	    def __init__(self, func):
+    71	        self.func = func
+    72	
+    73	
+    74	def broadcast_dimension_size(variables: list[Variable]) -> dict[Hashable, int]:
+    75	    """Extract dimension sizes from a dictionary of variables.
+    76	
+    77	    Raises ValueError if any dimensions have different sizes.
+    78	    """
+    79	    dims: dict[Hashable, int] = {}
+    80	    for var in variables:
+    81	        for dim, size in zip(var.dims, var.shape):
+    82	            if dim in dims and size != dims[dim]:
+    83	                raise ValueError(f"index {dim!r} not aligned")
+    84	            dims[dim] = size
+    85	    return dims
+    86	
+    87	
+    88	class MergeError(ValueError):
+    89	    """Error class for merge failures due to incompatible arguments."""
+    90	
+    91	    # inherits from ValueError for backward compatibility
+    92	    # TODO: move this to an xarray.exceptions module?
+    93	
+    94	
+    95	def unique_variable(
+    96	    name: Hashable,
+    97	    variables: list[Variable],
+    98	    compat: CompatOptions = "broadcast_equals",
+    99	    equals: bool | None = None,
+   100	) -> Variable:
+
+
+=== Iteration 19/50 ===
+Calling LLM...
+LLM Response: Let me search for the `merge_attrs` function that is imported in computation.py:
+
+<function=search>
+<parameter=search_term>def merge_attrs</parameter>
+<parameter>./xarray/core/merge.py</parameter>
+</f...
+Executing tool: r2e_search
+Tool parameters: {
+  "search_term": "def merge_attrs"
+}
+Tool execution status: success
+Tool stdout:
+Found 1 matches for "def merge_attrs" in /testbed:
+./xarray/core/merge.py (1 matches)
+End of matches for "def merge_attrs" in /testbed
+
+
+=== Iteration 20/50 ===
+Calling LLM...
+LLM Response: <function=file_editor>
+<parameter=command>view</parameter>
+<parameter=path>/testbed/xarray/core/merge.py</parameter>
+<parameter=view_range>[400, 500]</parameter>
+</function>...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "view",
+  "path": "/testbed/xarray/core/merge.py",
+  "view_range": "[400, 500]"
+}
+Tool execution status: success
+Tool stdout:
+Here's the result of running `cat -n` on /testbed/xarray/core/merge.py:
+   400	    This function is used for merging coordinate from pre-existing xarray
+   401	    objects.
+   402	    """
+   403	    collected = collect_from_coordinates(objects)
+   404	
+   405	    if exclude_dims:
+   406	        filtered: dict[Hashable, list[MergeElement]] = {}
+   407	        for name, elements in collected.items():
+   408	            new_elements = [
+   409	                (variable, index)
+   410	                for variable, index in elements
+   411	                if exclude_dims.isdisjoint(variable.dims)
+   412	            ]
+   413	            if new_elements:
+   414	                filtered[name] = new_elements
+   415	    else:
+   416	        filtered = collected
+   417	
+   418	    # TODO: indexes should probably be filtered in collected elements
+   419	    # before merging them
+   420	    merged_coords, merged_indexes = merge_collected(
+   421	        filtered, prioritized, combine_attrs=combine_attrs
+   422	    )
+   423	    merged_indexes = filter_indexes_from_coords(merged_indexes, set(merged_coords))
+   424	
+   425	    return merged_coords, merged_indexes
+   426	
+   427	
+   428	def determine_coords(
+   429	    list_of_mappings: Iterable[DatasetLike],
+   430	) -> tuple[set[Hashable], set[Hashable]]:
+   431	    """Given a list of dicts with xarray object values, identify coordinates.
+   432	
+   433	    Parameters
+   434	    ----------
+   435	    list_of_mappings : list of dict or list of Dataset
+   436	        Of the same form as the arguments to expand_variable_dicts.
+   437	
+   438	    Returns
+   439	    -------
+   440	    coord_names : set of variable names
+   441	    noncoord_names : set of variable names
+   442	        All variable found in the input should appear in either the set of
+   443	        coordinate or non-coordinate names.
+   444	    """
+   445	    from .dataarray import DataArray
+   446	    from .dataset import Dataset
+   447	
+   448	    coord_names: set[Hashable] = set()
+   449	    noncoord_names: set[Hashable] = set()
+   450	
+   451	    for mapping in list_of_mappings:
+   452	        if isinstance(mapping, Dataset):
+   453	            coord_names.update(mapping.coords)
+   454	            noncoord_names.update(mapping.data_vars)
+   455	        else:
+   456	            for name, var in mapping.items():
+   457	                if isinstance(var, DataArray):
+   458	                    coords = set(var._coords)  # use private API for speed
+   459	                    # explicitly overwritten variables should take precedence
+   460	                    coords.discard(name)
+   461	                    coord_names.update(coords)
+   462	
+   463	    return coord_names, noncoord_names
+   464	
+   465	
+   466	def coerce_pandas_values(objects: Iterable[CoercibleMapping]) -> list[DatasetLike]:
+   467	    """Convert pandas values found in a list of labeled objects.
+   468	
+   469	    Parameters
+   470	    ----------
+   471	    objects : list of Dataset or mapping
+   472	        The mappings may contain any sort of objects coercible to
+   473	        xarray.Variables as keys, including pandas objects.
+   474	
+   475	    Returns
+   476	    -------
+   477	    List of Dataset or dictionary objects. Any inputs or values in the inputs
+   478	    that were pandas objects have been converted into native xarray objects.
+   479	    """
+   480	    from .dataarray import DataArray
+   481	    from .dataset import Dataset
+   482	
+   483	    out = []
+   484	    for obj in objects:
+   485	        if isinstance(obj, Dataset):
+   486	            variables: DatasetLike = obj
+   487	        else:
+   488	            variables = {}
+   489	            if isinstance(obj, PANDAS_TYPES):
+   490	                obj = dict(obj.items())
+   491	            for k, v in obj.items():
+   492	                if isinstance(v, PANDAS_TYPES):
+   493	                    v = DataArray(v)
+   494	                variables[k] = v
+   495	        out.append(variables)
+   496	    return out
+   497	
+   498	
+   499	def _get_priority_vars_and_indexes(
+   500	    objects: list[DatasetLike],
+
+
+=== Iteration 21/50 ===
+Calling LLM...
+LLM Response: Let me search for the `merge_attrs` function definition:
+
+<function=search>
+<parameter=search_term>merge_attrs</parameter>
+<parameter>./xarray/core/merge.py</parameter>
+</function>...
+Executing tool: r2e_search
+Tool parameters: {
+  "search_term": "merge_attrs"
+}
+Tool execution status: success
+Tool stdout:
+Found 19 matches for "merge_attrs" in /testbed:
+./xarray/tests/test_merge.py (3 matches)
+./xarray/core/concat.py (4 matches)
+./xarray/core/computation.py (4 matches)
+./xarray/core/variable.py (4 matches)
+./xarray/core/merge.py (4 matches)
+End of matches for "merge_attrs" in /testbed
+
+
+=== Iteration 22/50 ===
+Calling LLM...
+LLM Response: <function=execute_bash>
+<parameter=command>grep -n "def merge_attrs" ./xarray/core/merge.py</parameter>
+</function>...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "grep -n \"def merge_attrs\" ./xarray/core/merge.py"
+}
+Tool execution status: success
+Tool stdout:
+[STDOUT]
+634:def merge_attrs(variable_attrs, combine_attrs, context=None):
+
+
+=== Iteration 23/50 ===
+Calling LLM...
+LLM Response: <function=file_editor>
+<parameter=command>view</parameter>
+<parameter=path>/testbed/xarray/core/merge.py</parameter>
+<parameter=view_range>[634, 700]</parameter>
+</function>...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "view",
+  "path": "/testbed/xarray/core/merge.py",
+  "view_range": "[634, 700]"
+}
+Tool execution status: success
+Tool stdout:
+Here's the result of running `cat -n` on /testbed/xarray/core/merge.py:
+   634	def merge_attrs(variable_attrs, combine_attrs, context=None):
+   635	    """Combine attributes from different variables according to combine_attrs"""
+   636	    if not variable_attrs:
+   637	        # no attributes to merge
+   638	        return None
+   639	
+   640	    if callable(combine_attrs):
+   641	        return combine_attrs(variable_attrs, context=context)
+   642	    elif combine_attrs == "drop":
+   643	        return {}
+   644	    elif combine_attrs == "override":
+   645	        return dict(variable_attrs[0])
+   646	    elif combine_attrs == "no_conflicts":
+   647	        result = dict(variable_attrs[0])
+   648	        for attrs in variable_attrs[1:]:
+   649	            try:
+   650	                result = compat_dict_union(result, attrs)
+   651	            except ValueError as e:
+   652	                raise MergeError(
+   653	                    "combine_attrs='no_conflicts', but some values are not "
+   654	                    f"the same. Merging {str(result)} with {str(attrs)}"
+   655	                ) from e
+   656	        return result
+   657	    elif combine_attrs == "drop_conflicts":
+   658	        result = {}
+   659	        dropped_keys = set()
+   660	        for attrs in variable_attrs:
+   661	            result.update(
+   662	                {
+   663	                    key: value
+   664	                    for key, value in attrs.items()
+   665	                    if key not in result and key not in dropped_keys
+   666	                }
+   667	            )
+   668	            result = {
+   669	                key: value
+   670	                for key, value in result.items()
+   671	                if key not in attrs or equivalent(attrs[key], value)
+   672	            }
+   673	            dropped_keys |= {key for key in attrs if key not in result}
+   674	        return result
+   675	    elif combine_attrs == "identical":
+   676	        result = dict(variable_attrs[0])
+   677	        for attrs in variable_attrs[1:]:
+   678	            if not dict_equiv(result, attrs):
+   679	                raise MergeError(
+   680	                    f"combine_attrs='identical', but attrs differ. First is {str(result)} "
+   681	                    f", other is {str(attrs)}."
+   682	                )
+   683	        return result
+   684	    else:
+   685	        raise ValueError(f"Unrecognised value for combine_attrs={combine_attrs}")
+   686	
+   687	
+   688	class _MergeResult(NamedTuple):
+   689	    variables: dict[Hashable, Variable]
+   690	    coord_names: set[Hashable]
+   691	    dims: dict[Hashable, int]
+   692	    indexes: dict[Hashable, Index]
+   693	    attrs: dict[Hashable, Any]
+   694	
+   695	
+   696	def merge_core(
+   697	    objects: Iterable[CoercibleMapping],
+   698	    compat: CompatOptions = "broadcast_equals",
+   699	    join: JoinOptions = "outer",
+   700	    combine_attrs: CombineAttrsOptions = "override",
+
+
+=== Iteration 24/50 ===
+Calling LLM...
+LLM Response: Now let me look at how the `where` function calls `apply_ufunc` and specifically how it handles the `keep_attrs` parameter. The issue seems to be that when `keep_attrs=True`, it creates a lambda funct...
+Executing tool: r2e_search
+Tool parameters: {
+  "search_term": "keep_attrs"
+}
+Tool execution status: success
+Tool stdout:
+Found 800 matches for "keep_attrs" in /testbed:
+./reproduce_issue.py (2 matches)
+./xarray/tests/test_weighted.py (8 matches)
+./xarray/tests/test_computation.py (28 matches)
+./xarray/tests/test_variable.py (8 matches)
+./xarray/tests/test_coarsen.py (15 matches)
+./xarray/tests/test_rolling.py (32 matches)
+./xarray/tests/test_dataset.py (11 matches)
+./xarray/tests/test_groupby.py (19 matches)
+./xarray/tests/test_missing.py (2 matches)
+./xarray/tests/test_dataarray.py (27 matches)
+./xarray/tests/test_options.py (23 matches)
+./xarray/core/_aggregations.py (280 matches)
+./xarray/core/computation.py (29 matches)
+./xarray/core/dataset.py (43 matches)
+./xarray/core/arithmetic.py (2 matches)
+./xarray/core/variable.py (43 matches)
+./xarray/core/missing.py (7 matches)
+./xarray/core/common.py (28 matches)
+./xarray/core/options.py (7 matches)
+./xarray/core/resample.py (5 matches)
+./xarray/core/groupby.py (27 matches)
+./xarray/core/rolling.py (81 matches)
+./xarray/core/dataarray.py (31 matches)
+./xarray/core/weighted.py (17 matches)
+./xarray/core/rolling_exp.py (11 matches)
+./xarray/core/ops.py (4 matches)
+./xarray/util/generate_aggregations.py (10 matches)
+End of matches for "keep_attrs" in /testbed
+
+
+=== Iteration 25/50 ===
+Calling LLM...
+LLM Response: Let me look at how `apply_ufunc` handles the `keep_attrs` parameter:
+
+<function=search>
+<parameter=search_term>keep_attrs</parameter>
+<parameter>./xarray/core/computation.py</parameter>
+<parameter=vie...
+Executing tool: r2e_search
+Tool parameters: {
+  "search_term": "keep_attrs",
+  "view_range": "[900, 1000]"
+}
+Tool execution status: error
+Tool stdout:
+
+Tool stderr:
+usage: search_func.py [-h] --search_term SEARCH_TERM [--path PATH]
+search_func.py: error: unrecognized arguments: --view_range [900, 1000]
+
+
+=== Iteration 26/50 ===
+Calling LLM...
+LLM Response: Let me search for how keep_attrs is handled in apply_ufunc:
+
+<function=execute_bash>
+<parameter=command>grep -n "keep_attrs" ./xarray/core/computation.py | head -10</parameter>
+</function>...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "grep -n \"keep_attrs\" ./xarray/core/computation.py | head -10"
+}
+Tool execution status: success
+Tool stdout:
+[STDOUT]
+33:from .options import OPTIONS, _get_keep_attrs
+291:    keep_attrs="override",
+305:    if keep_attrs == "drop":
+311:        args, signature, exclude_dims, combine_attrs=keep_attrs
+334:    attrs = merge_attrs([x.attrs for x in objs], combine_attrs=keep_attrs)
+454:    keep_attrs="override",
+476:        args, signature, exclude_dims, combine_attrs=keep_attrs
+495:    attrs = merge_attrs([x.attrs for x in objs], combine_attrs=keep_attrs)
+669:    keep_attrs="override",
+789:        combine_attrs=keep_attrs,
+
+
+=== Iteration 27/50 ===
+Calling LLM...
+LLM Response: Let me look at how `apply_ufunc` handles the `keep_attrs` parameter in more detail:
+
+<function=file_editor>
+<parameter=command>view</parameter>
+<parameter=path>/testbed/xarray/core/computation.py</par...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "view",
+  "path": "/testbed/xarray/core/computation.py",
+  "view_range": "[290, 340]"
+}
+Tool execution status: success
+Tool stdout:
+Here's the result of running `cat -n` on /testbed/xarray/core/computation.py:
+   290	    exclude_dims=frozenset(),
+   291	    keep_attrs="override",
+   292	) -> tuple[DataArray, ...] | DataArray:
+   293	    """Apply a variable level function over DataArray, Variable and/or ndarray
+   294	    objects.
+   295	    """
+   296	    from .dataarray import DataArray
+   297	
+   298	    if len(args) > 1:
+   299	        args = deep_align(
+   300	            args, join=join, copy=False, exclude=exclude_dims, raise_on_invalid=False
+   301	        )
+   302	
+   303	    objs = _all_of_type(args, DataArray)
+   304	
+   305	    if keep_attrs == "drop":
+   306	        name = result_name(args)
+   307	    else:
+   308	        first_obj = _first_of_type(args, DataArray)
+   309	        name = first_obj.name
+   310	    result_coords, result_indexes = build_output_coords_and_indexes(
+   311	        args, signature, exclude_dims, combine_attrs=keep_attrs
+   312	    )
+   313	
+   314	    data_vars = [getattr(a, "variable", a) for a in args]
+   315	    result_var = func(*data_vars)
+   316	
+   317	    out: tuple[DataArray, ...] | DataArray
+   318	    if signature.num_outputs > 1:
+   319	        out = tuple(
+   320	            DataArray(
+   321	                variable, coords=coords, indexes=indexes, name=name, fastpath=True
+   322	            )
+   323	            for variable, coords, indexes in zip(
+   324	                result_var, result_coords, result_indexes
+   325	            )
+   326	        )
+   327	    else:
+   328	        (coords,) = result_coords
+   329	        (indexes,) = result_indexes
+   330	        out = DataArray(
+   331	            result_var, coords=coords, indexes=indexes, name=name, fastpath=True
+   332	        )
+   333	
+   334	    attrs = merge_attrs([x.attrs for x in objs], combine_attrs=keep_attrs)
+   335	    if isinstance(out, tuple):
+   336	        for da in out:
+   337	            da.attrs = attrs
+   338	    else:
+   339	        out.attrs = attrs
+   340	
+
+
+=== Iteration 28/50 ===
+Calling LLM...
+LLM Response: Now let me look at the `build_output_coords_and_indexes` function which is responsible for merging coordinates:
+
+<function=file_editor>
+<parameter=command>view</parameter>
+<parameter=path>/testbed/xar...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "view",
+  "path": "/testbed/xarray/core/computation.py",
+  "view_range": "[214, 280]"
+}
+Tool execution status: success
+Tool stdout:
+Here's the result of running `cat -n` on /testbed/xarray/core/computation.py:
+   214	def build_output_coords_and_indexes(
+   215	    args: Iterable[Any],
+   216	    signature: _UFuncSignature,
+   217	    exclude_dims: AbstractSet = frozenset(),
+   218	    combine_attrs: CombineAttrsOptions = "override",
+   219	) -> tuple[list[dict[Any, Variable]], list[dict[Any, Index]]]:
+   220	    """Build output coordinates and indexes for an operation.
+   221	
+   222	    Parameters
+   223	    ----------
+   224	    args : Iterable
+   225	        List of raw operation arguments. Any valid types for xarray operations
+   226	        are OK, e.g., scalars, Variable, DataArray, Dataset.
+   227	    signature : _UfuncSignature
+   228	        Core dimensions signature for the operation.
+   229	    exclude_dims : set, optional
+   230	        Dimensions excluded from the operation. Coordinates along these
+   231	        dimensions are dropped.
+   232	    combine_attrs : {"drop", "identical", "no_conflicts", "drop_conflicts", \
+   233	                     "override"} or callable, default: "drop"
+   234	        A callable or a string indicating how to combine attrs of the objects being
+   235	        merged:
+   236	
+   237	        - "drop": empty attrs on returned Dataset.
+   238	        - "identical": all attrs must be the same on every object.
+   239	        - "no_conflicts": attrs from all objects are combined, any that have
+   240	          the same name must also have the same value.
+   241	        - "drop_conflicts": attrs from all objects are combined, any that have
+   242	          the same name but different values are dropped.
+   243	        - "override": skip comparing and copy attrs from the first dataset to
+   244	          the result.
+   245	
+   246	        If a callable, it must expect a sequence of ``attrs`` dicts and a context object
+   247	        as its only parameters.
+   248	
+   249	    Returns
+   250	    -------
+   251	    Dictionaries of Variable and Index objects with merged coordinates.
+   252	    """
+   253	    coords_list = _get_coords_list(args)
+   254	
+   255	    if len(coords_list) == 1 and not exclude_dims:
+   256	        # we can skip the expensive merge
+   257	        (unpacked_coords,) = coords_list
+   258	        merged_vars = dict(unpacked_coords.variables)
+   259	        merged_indexes = dict(unpacked_coords.xindexes)
+   260	    else:
+   261	        merged_vars, merged_indexes = merge_coordinates_without_align(
+   262	            coords_list, exclude_dims=exclude_dims, combine_attrs=combine_attrs
+   263	        )
+   264	
+   265	    output_coords = []
+   266	    output_indexes = []
+   267	    for output_dims in signature.output_core_dims:
+   268	        dropped_dims = signature.all_input_core_dims - set(output_dims)
+   269	        if dropped_dims:
+   270	            filtered_coords = {
+   271	                k: v for k, v in merged_vars.items() if dropped_dims.isdisjoint(v.dims)
+   272	            }
+   273	            filtered_indexes = filter_indexes_from_coords(
+   274	                merged_indexes, set(filtered_coords)
+   275	            )
+   276	        else:
+   277	            filtered_coords = merged_vars
+   278	            filtered_indexes = merged_indexes
+   279	        output_coords.append(filtered_coords)
+   280	        output_indexes.append(filtered_indexes)
+
+
+=== Iteration 29/50 ===
+Calling LLM...
+LLM Response: Now I can see the issue! The problem is in line 311 where `combine_attrs=keep_attrs` is passed to `build_output_coords_and_indexes`. When `keep_attrs=True` in the `where` function, it gets converted t...
+Executing tool: r2e_search
+Tool parameters: {
+  "search_term": "def merge_coordinates_without_align"
+}
+Tool execution status: success
+Tool stdout:
+Found 1 matches for "def merge_coordinates_without_align" in /testbed:
+./xarray/core/merge.py (1 matches)
+End of matches for "def merge_coordinates_without_align" in /testbed
+
+
+=== Iteration 30/50 ===
+Calling LLM...
+LLM Response: <function=file_editor>
+<parameter=command>view</parameter>
+<parameter=path>/testbed/xarray/core/merge.py</parameter>
+<parameter=view_range>[380, 430]</parameter>
+</function>...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "view",
+  "path": "/testbed/xarray/core/merge.py",
+  "view_range": "[380, 430]"
+}
+Tool execution status: success
+Tool stdout:
+Here's the result of running `cat -n` on /testbed/xarray/core/merge.py:
+   380	    """Collect variables and indexes to be merged from Coordinate objects."""
+   381	    grouped: dict[Hashable, list[MergeElement]] = defaultdict(list)
+   382	
+   383	    for coords in list_of_coords:
+   384	        variables = coords.variables
+   385	        indexes = coords.xindexes
+   386	        for name, variable in variables.items():
+   387	            grouped[name].append((variable, indexes.get(name)))
+   388	
+   389	    return grouped
+   390	
+   391	
+   392	def merge_coordinates_without_align(
+   393	    objects: list[Coordinates],
+   394	    prioritized: Mapping[Any, MergeElement] | None = None,
+   395	    exclude_dims: AbstractSet = frozenset(),
+   396	    combine_attrs: CombineAttrsOptions = "override",
+   397	) -> tuple[dict[Hashable, Variable], dict[Hashable, Index]]:
+   398	    """Merge variables/indexes from coordinates without automatic alignments.
+   399	
+   400	    This function is used for merging coordinate from pre-existing xarray
+   401	    objects.
+   402	    """
+   403	    collected = collect_from_coordinates(objects)
+   404	
+   405	    if exclude_dims:
+   406	        filtered: dict[Hashable, list[MergeElement]] = {}
+   407	        for name, elements in collected.items():
+   408	            new_elements = [
+   409	                (variable, index)
+   410	                for variable, index in elements
+   411	                if exclude_dims.isdisjoint(variable.dims)
+   412	            ]
+   413	            if new_elements:
+   414	                filtered[name] = new_elements
+   415	    else:
+   416	        filtered = collected
+   417	
+   418	    # TODO: indexes should probably be filtered in collected elements
+   419	    # before merging them
+   420	    merged_coords, merged_indexes = merge_collected(
+   421	        filtered, prioritized, combine_attrs=combine_attrs
+   422	    )
+   423	    merged_indexes = filter_indexes_from_coords(merged_indexes, set(merged_coords))
+   424	
+   425	    return merged_coords, merged_indexes
+   426	
+   427	
+   428	def determine_coords(
+   429	    list_of_mappings: Iterable[DatasetLike],
+   430	) -> tuple[set[Hashable], set[Hashable]]:
+
+
+=== Iteration 31/50 ===
+Calling LLM...
+LLM Response: Now let me look at the `merge_collected` function to see how it handles the `combine_attrs` parameter:
+
+<function=search>
+<parameter=search_term>def merge_collected</parameter>
+<parameter>./xarray/cor...
+Executing tool: r2e_search
+Tool parameters: {
+  "search_term": "def merge_collected"
+}
+Tool execution status: success
+Tool stdout:
+Found 1 matches for "def merge_collected" in /testbed:
+./xarray/core/merge.py (1 matches)
+End of matches for "def merge_collected" in /testbed
+
+
+=== Iteration 32/50 ===
+Calling LLM...
+LLM Response: <function=file_editor>
+<parameter=command>view</parameter>
+<parameter=path>/testbed/xarray/core/merge.py</parameter>
+<parameter=view_range>[300, 380]</parameter>
+</function>...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "view",
+  "path": "/testbed/xarray/core/merge.py",
+  "view_range": "[300, 380]"
+}
+Tool execution status: success
+Tool stdout:
+Here's the result of running `cat -n` on /testbed/xarray/core/merge.py:
+   300	                variables = [variable for variable, _ in elements_list]
+   301	                try:
+   302	                    merged_vars[name] = unique_variable(
+   303	                        name, variables, compat, equals.get(name, None)
+   304	                    )
+   305	                except MergeError:
+   306	                    if compat != "minimal":
+   307	                        # we need more than "minimal" compatibility (for which
+   308	                        # we drop conflicting coordinates)
+   309	                        raise
+   310	
+   311	                if name in merged_vars:
+   312	                    merged_vars[name].attrs = merge_attrs(
+   313	                        [var.attrs for var in variables], combine_attrs=combine_attrs
+   314	                    )
+   315	
+   316	    return merged_vars, merged_indexes
+   317	
+   318	
+   319	def collect_variables_and_indexes(
+   320	    list_of_mappings: list[DatasetLike],
+   321	    indexes: Mapping[Any, Any] | None = None,
+   322	) -> dict[Hashable, list[MergeElement]]:
+   323	    """Collect variables and indexes from list of mappings of xarray objects.
+   324	
+   325	    Mappings must either be Dataset objects, or have values of one of the
+   326	    following types:
+   327	    - an xarray.Variable
+   328	    - a tuple `(dims, data[, attrs[, encoding]])` that can be converted in
+   329	      an xarray.Variable
+   330	    - or an xarray.DataArray
+   331	
+   332	    If a mapping of indexes is given, those indexes are assigned to all variables
+   333	    with a matching key/name.
+   334	
+   335	    """
+   336	    from .dataarray import DataArray
+   337	    from .dataset import Dataset
+   338	
+   339	    if indexes is None:
+   340	        indexes = {}
+   341	
+   342	    grouped: dict[Hashable, list[MergeElement]] = defaultdict(list)
+   343	
+   344	    def append(name, variable, index):
+   345	        grouped[name].append((variable, index))
+   346	
+   347	    def append_all(variables, indexes):
+   348	        for name, variable in variables.items():
+   349	            append(name, variable, indexes.get(name))
+   350	
+   351	    for mapping in list_of_mappings:
+   352	        if isinstance(mapping, Dataset):
+   353	            append_all(mapping.variables, mapping._indexes)
+   354	            continue
+   355	
+   356	        for name, variable in mapping.items():
+   357	            if isinstance(variable, DataArray):
+   358	                coords = variable._coords.copy()  # use private API for speed
+   359	                indexes = dict(variable._indexes)
+   360	                # explicitly overwritten variables should take precedence
+   361	                coords.pop(name, None)
+   362	                indexes.pop(name, None)
+   363	                append_all(coords, indexes)
+   364	
+   365	            variable = as_variable(variable, name=name)
+   366	            if name in indexes:
+   367	                append(name, variable, indexes[name])
+   368	            elif variable.dims == (name,):
+   369	                idx, idx_vars = create_default_index_implicit(variable)
+   370	                append_all(idx_vars, {k: idx for k in idx_vars})
+   371	            else:
+   372	                append(name, variable, None)
+   373	
+   374	    return grouped
+   375	
+   376	
+   377	def collect_from_coordinates(
+   378	    list_of_coords: list[Coordinates],
+   379	) -> dict[Hashable, list[MergeElement]]:
+   380	    """Collect variables and indexes to be merged from Coordinate objects."""
+
+
+=== Iteration 33/50 ===
+Calling LLM...
+LLM Response: Now I can see the issue! In line 312-314, the `merge_attrs` function is called with the `combine_attrs` parameter, which in the case of `where(..., keep_attrs=True)` is a lambda function that returns ...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "view",
+  "path": "/testbed/xarray/core/computation.py",
+  "view_range": "[1858, 1875]"
+}
+Tool execution status: success
+Tool stdout:
+Here's the result of running `cat -n` on /testbed/xarray/core/computation.py:
+  1858	    if keep_attrs is None:
+  1859	        keep_attrs = _get_keep_attrs(default=False)
+  1860	    if keep_attrs is True:
+  1861	        # keep the attributes of x, the second parameter, by default to
+  1862	        # be consistent with the `where` method of `DataArray` and `Dataset`
+  1863	        keep_attrs = lambda attrs, context: getattr(x, "attrs", {})
+  1864	
+  1865	    # alignment for three arguments is complicated, so don't support it yet
+  1866	    return apply_ufunc(
+  1867	        duck_array_ops.where,
+  1868	        cond,
+  1869	        x,
+  1870	        y,
+  1871	        join="exact",
+  1872	        dataset_join="exact",
+  1873	        dask="allowed",
+  1874	        keep_attrs=keep_attrs,
+  1875	    )
+
+
+=== Iteration 34/50 ===
+Calling LLM...
+LLM Response: Now I understand the issue completely. The problem is that when `keep_attrs=True`, the `where` function converts it to a lambda function that returns the attributes of `x`, and this lambda is passed t...
+Executing tool: r2e_search
+Tool parameters: {
+  "search_term": "keep_attrs.*lambda"
+}
+Tool execution status: success
+Tool stdout:
+No matches found for "keep_attrs.*lambda" in /testbed
+
+
+=== Iteration 35/50 ===
+Calling LLM...
+LLM Response: Let me search for similar patterns where lambda functions are used with keep_attrs:
+
+<function=search>
+<parameter=search_term>lambda.*attrs</parameter>
+<parameter>./xarray/core</parameter>
+</function>...
+Executing tool: r2e_search
+Tool parameters: {
+  "search_term": "lambda.*attrs"
+}
+Tool execution status: success
+Tool stdout:
+No matches found for "lambda.*attrs" in /testbed
+
+
+=== Iteration 36/50 ===
+Calling LLM...
+LLM Response:       Let me search for other functions that might handle keep_attrs=True differently:
+
+<function=search>
+<parameter=search_term>keep_attrs.*True</parameter>
+<parameter>./xarray/core</parameter>
+</fun...
+Executing tool: r2e_search
+Tool parameters: {
+  "search_term": "keep_attrs.*True"
+}
+Tool execution status: success
+Tool stdout:
+No matches found for "keep_attrs.*True" in /testbed
+
+
+=== Iteration 37/50 ===
+Calling LLM...
+LLM Response: Let me search for other places where `keep_attrs` is set to a lambda function:
+
+<function=execute_bash>
+<parameter=command>grep -n "lambda.*attrs" ./xarray/core/*.py</parameter>
+</function>...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "grep -n \"lambda.*attrs\" ./xarray/core/*.py"
+}
+Tool execution status: success
+Tool stdout:
+[STDOUT]
+./xarray/core/computation.py:1863:        keep_attrs = lambda attrs, context: getattr(x, "attrs", {})
+./xarray/core/dataset.py:7494:        return self.map(lambda x: x.real, keep_attrs=True)
+./xarray/core/dataset.py:7505:        return self.map(lambda x: x.imag, keep_attrs=True)
+
+
+=== Iteration 38/50 ===
+Calling LLM...
+LLM Response: Now I see that the issue is specific to the `where` function. The problem is that when `keep_attrs=True`, it creates a lambda function that returns the attributes of `x`, and this lambda is used for m...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "view",
+  "path": "/testbed/xarray/core/computation.py",
+  "view_range": "[856, 920]"
+}
+Tool execution status: success
+Tool stdout:
+Here's the result of running `cat -n` on /testbed/xarray/core/computation.py:
+   856	    keep_attrs: bool | str | None = None,
+   857	    kwargs: Mapping | None = None,
+   858	    dask: str = "forbidden",
+   859	    output_dtypes: Sequence | None = None,
+   860	    output_sizes: Mapping[Any, int] | None = None,
+   861	    meta: Any = None,
+   862	    dask_gufunc_kwargs: dict[str, Any] | None = None,
+   863	) -> Any:
+   864	    """Apply a vectorized function for unlabeled arrays on xarray objects.
+   865	
+   866	    The function will be mapped over the data variable(s) of the input
+   867	    arguments using xarray's standard rules for labeled computation, including
+   868	    alignment, broadcasting, looping over GroupBy/Dataset variables, and
+   869	    merging of coordinates.
+   870	
+   871	    Parameters
+   872	    ----------
+   873	    func : callable
+   874	        Function to call like ``func(*args, **kwargs)`` on unlabeled arrays
+   875	        (``.data``) that returns an array or tuple of arrays. If multiple
+   876	        arguments with non-matching dimensions are supplied, this function is
+   877	        expected to vectorize (broadcast) over axes of positional arguments in
+   878	        the style of NumPy universal functions [1]_ (if this is not the case,
+   879	        set ``vectorize=True``). If this function returns multiple outputs, you
+   880	        must set ``output_core_dims`` as well.
+   881	    *args : Dataset, DataArray, DataArrayGroupBy, DatasetGroupBy, Variable, \
+   882	        numpy.ndarray, dask.array.Array or scalar
+   883	        Mix of labeled and/or unlabeled arrays to which to apply the function.
+   884	    input_core_dims : sequence of sequence, optional
+   885	        List of the same length as ``args`` giving the list of core dimensions
+   886	        on each input argument that should not be broadcast. By default, we
+   887	        assume there are no core dimensions on any input arguments.
+   888	
+   889	        For example, ``input_core_dims=[[], ['time']]`` indicates that all
+   890	        dimensions on the first argument and all dimensions other than 'time'
+   891	        on the second argument should be broadcast.
+   892	
+   893	        Core dimensions are automatically moved to the last axes of input
+   894	        variables before applying ``func``, which facilitates using NumPy style
+   895	        generalized ufuncs [2]_.
+   896	    output_core_dims : list of tuple, optional
+   897	        List of the same length as the number of output arguments from
+   898	        ``func``, giving the list of core dimensions on each output that were
+   899	        not broadcast on the inputs. By default, we assume that ``func``
+   900	        outputs exactly one array, with axes corresponding to each broadcast
+   901	        dimension.
+   902	
+   903	        Core dimensions are assumed to appear as the last dimensions of each
+   904	        output in the provided order.
+   905	    exclude_dims : set, optional
+   906	        Core dimensions on the inputs to exclude from alignment and
+   907	        broadcasting entirely. Any input coordinates along these dimensions
+   908	        will be dropped. Each excluded dimension must also appear in
+   909	        ``input_core_dims`` for at least one argument. Only dimensions listed
+   910	        here are allowed to change size between input and output objects.
+   911	    vectorize : bool, optional
+   912	        If True, then assume ``func`` only takes arrays defined over core
+   913	        dimensions as input and vectorize it automatically with
+   914	        :py:func:`numpy.vectorize`. This option exists for convenience, but is
+   915	        almost always slower than supplying a pre-vectorized function.
+   916	        Using this option requires NumPy version 1.12 or newer.
+   917	    join : {"outer", "inner", "left", "right", "exact"}, default: "exact"
+   918	        Method for joining the indexes of the passed objects along each
+   919	        dimension, and the variables of Dataset objects with mismatched
+   920	        data variables:
+
+
+=== Iteration 39/50 ===
+Calling LLM...
+LLM Response: Let me look at the part of apply_ufunc that handles keep_attrs:
+
+<function=execute_bash>
+<parameter=command>grep -A 20 -B 5 "keep_attrs" ./xarray/core/computation.py | grep -A 20 -B 5 "apply_ufunc"</p...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "grep -A 20 -B 5 \"keep_attrs\" ./xarray/core/computation.py | grep -A 20 -B 5 \"apply_ufunc\""
+}
+Tool execution status: success
+Tool stdout:
+[STDOUT]
+    from .dataset import Dataset
+
+    if dataset_join not in _JOINS_WITHOUT_FILL_VALUES and fill_value is _NO_FILL_VALUE:
+        raise TypeError(
+            "to apply an operation to datasets with different "
+            "data variables with apply_ufunc, you must supply the "
+            "dataset_fill_value argument."
+        )
+
+    objs = _all_of_type(args, Dataset)
+
+    if len(args) > 1:
+        args = deep_align(
+            args, join=join, copy=False, exclude=exclude_dims, raise_on_invalid=False
+        )
+
+    list_of_coords, list_of_indexes = build_output_coords_and_indexes(
+        args, signature, exclude_dims, combine_attrs=keep_attrs
+    )
+    args = tuple(getattr(arg, "data_vars", arg) for arg in args)
+
+    result_vars = apply_dict_of_variables_vfunc(
+        func, *args, signature=signature, join=dataset_join, fill_value=fill_value
+    )
+
+    out: Dataset | tuple[Dataset, ...]
+--
+            if dim in dim_sizes and new_size != dim_sizes[dim]:
+                raise ValueError(
+                    "size of dimension {!r} on inputs was unexpectedly "
+                    "changed by applied function from {} to {}. Only "
+                    "dimensions specified in ``exclude_dims`` with "
+                    "xarray.apply_ufunc are allowed to change size.".format(
+--
+    exclude_dims: AbstractSet = frozenset(),
+    vectorize: bool = False,
+    join: JoinOptions = "exact",
+    dataset_join: str = "exact",
+    dataset_fill_value: object = _NO_FILL_VALUE,
+    keep_attrs: bool | str | None = None,
+    kwargs: Mapping | None = None,
+    dask: str = "forbidden",
+    output_dtypes: Sequence | None = None,
+    output_sizes: Mapping[Any, int] | None = None,
+    meta: Any = None,
+    dask_gufunc_kwargs: dict[str, Any] | None = None,
+) -> Any:
+    """Apply a vectorized function for unlabeled arrays on xarray objects.
+
+    The function will be mapped over the data variable(s) of the input
+    arguments using xarray's standard rules for labeled computation, including
+    alignment, broadcasting, looping over GroupBy/Dataset variables, and
+    merging of coordinates.
+--
+        vectorize=vectorize,
+        output_dtypes=output_dtypes,
+        dask_gufunc_kwargs=dask_gufunc_kwargs,
+    )
+
+    # feed groupby-apply_ufunc through apply_groupby_func
+    if any(isinstance(a, GroupBy) for a in args):
+        this_apply = functools.partial(
+            apply_ufunc,
+            func,
+            input_core_dims=input_core_dims,
+            output_core_dims=output_core_dims,
+            exclude_dims=exclude_dims,
+            join=join,
+            dataset_join=dataset_join,
+            dataset_fill_value=dataset_fill_value,
+            keep_attrs=keep_attrs,
+            dask=dask,
+            vectorize=vectorize,
+            output_dtypes=output_dtypes,
+            dask_gufunc_kwargs=dask_gufunc_kwargs,
+        )
+        return apply_groupby_func(this_apply, *args)
+    # feed datasets apply_variable_ufunc through apply_dataset_vfunc
+    elif any(is_dict_like(a) for a in args):
+        return apply_dataset_vfunc(
+            variables_vfunc,
+            *args,
+            signature=signature,
+--
+        # keep the attributes of x, the second parameter, by default to
+        # be consistent with the `where` method of `DataArray` and `Dataset`
+        keep_attrs = lambda attrs, context: getattr(x, "attrs", {})
+
+    # alignment for three arguments is complicated, so don't support it yet
+    return apply_ufunc(
+        duck_array_ops.where,
+        cond,
+        x,
+        y,
+        join="exact",
+        dataset_join="exact",
+        dask="allowed",
+        keep_attrs=keep_attrs,
+    )
+
+
+@overload
+def polyval(
+    coord: DataArray, coeffs: DataArray, degree_dim: Hashable = "degree"
+) -> DataArray:
+    ...
+
+
+@overload
+def polyval(
+
+
+=== Iteration 40/50 ===
+Calling LLM...
+LLM Response: Now I need to understand the issue better. The problem is that when `keep_attrs=True` in the `where` function, it creates a lambda that replaces ALL attributes (including coordinate attributes) with t...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "git log --oneline -n 20 | grep -i \"6461\""
+}
+Tool execution status: error
+Tool stdout:
+
+Tool stderr:
+Error executing command:
+Exit code: 1
+
+
+=== Iteration 41/50 ===
+Calling LLM...
+LLM Response: Let me think about the fix. The issue is that when `keep_attrs=True`, the lambda function is applied to ALL attributes, including coordinate attributes. We need to modify the approach so that:
+
+1. Coo...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "str_replace",
+  "path": "/testbed/xarray/core/computation.py",
+  "old_str": "def where(cond, x, y, keep_attrs=None):\n    \"\"\"Return elements from `x` or `y` depending on `cond`.\n\n    Performs xarray-like broadcasting across input arguments.\n\n    All dimension coordinates on `x` and `y`  must be aligned with each\n    other and with `cond`.\n\n    Parameters\n    ----------\n    cond : scalar, array, Variable, DataArray or Dataset\n        When True, return values from `x`, otherwise returns values from `y`.\n    x : scalar, array, Variable, DataArray or Dataset\n        values to choose from where `cond` is True\n    y : scalar, array, Variable, DataArray or Dataset\n        values to choose from where `cond` is False\n    keep_attrs : bool or str or callable, optional\n        How to treat attrs. If True, keep the attrs of `x`.\n\n    Returns\n    -------\n    Dataset, DataArray, Variable or array\n        In priority order: Dataset, DataArray, Variable or array, whichever\n        type appears as an input argument.\n\n    Examples\n    --------\n    >>> x = xr.DataArray(\n    ...     0.1 * np.arange(10),\n    ...     dims=[\"lat\"],\n    ...     coords={\"lat\": np.arange(10)},\n    ...     name=\"sst\",\n    ... )\n    >>> x\n    <xarray.DataArray 'sst' (lat: 10)>\n    array([0. , 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])\n    Coordinates:\n      * lat      (lat) int64 0 1 2 3 4 5 6 7 8 9\n\n    >>> xr.where(x < 0.5, x, x * 100)\n    <xarray.DataArray 'sst' (lat: 10)>\n    array([ 0. ,  0.1,  0.2,  0.3,  0.4, 50. , 60. , 70. , 80. , 90. ])\n    Coordinates:\n      * lat      (lat) int64 0 1 2 3 4 5 6 7 8 9\n\n    >>> y = xr.DataArray(\n    ...     0.1 * np.arange(9).reshape(3, 3),\n    ...     dims=[\"lat\", \"lon\"],\n    ...     coords={\"lat\": np.arange(3), \"lon\": 10 + np.arange(3)},\n    ...     name=\"sst\",\n    ... )\n    >>> y\n    <xarray.DataArray 'sst' (lat: 3, lon: 3)>\n    array([[0. , 0.1, 0.2],\n           [0.3, 0.4, 0.5],\n           [0.6, 0.7, 0.8]])\n    Coordinates:\n      * lat      (lat) int64 0 1 2\n      * lon      (lon) int64 10 11 12\n\n    >>> xr.where(y.lat < 1, y, -1)\n    <xarray.DataArray (lat: 3, lon: 3)>\n    array([[ 0. ,  0.1,  0.2],\n           [-1. , -1. , -1. ],\n           [-1. , -1. , -1. ]])\n    Coordinates:\n      * lat      (lat) int64 0 1 2\n      * lon      (lon) int64 10 11 12\n\n    >>> cond = xr.DataArray([True, False], dims=[\"x\"])\n    >>> x = xr.DataArray([1, 2], dims=[\"y\"])\n    >>> xr.where(cond, x, 0)\n    <xarray.DataArray (x: 2, y: 2)>\n    array([[1, 2],\n           [0, 0]])\n    Dimensions without coordinates: x, y\n\n    See Also\n    --------\n    numpy.where : corresponding numpy function\n    Dataset.where, DataArray.where :\n        equivalent methods\n    \"\"\"\n    if keep_attrs is None:\n        keep_attrs = _get_keep_attrs(default=False)\n    if keep_attrs is True:\n        # keep the attributes of x, the second parameter, by default to\n        # be consistent with the `where` method of `DataArray` and `Dataset`\n        keep_attrs = lambda attrs, context: getattr(x, \"attrs\", {})\n\n    # alignment for three arguments is complicated, so don't support it yet\n    return apply_ufunc(\n        duck_array_ops.where,\n        cond,\n        x,\n        y,\n        join=\"exact\",\n        dataset_join=\"exact\",\n        dask=\"allowed\",\n        keep_attrs=keep_attrs,\n    )",
+  "new_str": "def where(cond, x, y, keep_attrs=None):\n    \"\"\"Return elements from `x` or `y` depending on `cond`.\n\n    Performs xarray-like broadcasting across input arguments.\n\n    All dimension coordinates on `x` and `y`  must be aligned with each\n    other and with `cond`.\n\n    Parameters\n    ----------\n    cond : scalar, array, Variable, DataArray or Dataset\n        When True, return values from `x`, otherwise returns values from `y`.\n    x : scalar, array, Variable, DataArray or Dataset\n        values to choose from where `cond` is True\n    y : scalar, array, Variable, DataArray or Dataset\n        values to choose from where `cond` is False\n    keep_attrs : bool or str or callable, optional\n        How to treat attrs. If True, keep the attrs of `x`.\n\n    Returns\n    -------\n    Dataset, DataArray, Variable or array\n        In priority order: Dataset, DataArray, Variable or array, whichever\n        type appears as an input argument.\n\n    Examples\n    --------\n    >>> x = xr.DataArray(\n    ...     0.1 * np.arange(10),\n    ...     dims=[\"lat\"],\n    ...     coords={\"lat\": np.arange(10)},\n    ...     name=\"sst\",\n    ... )\n    >>> x\n    <xarray.DataArray 'sst' (lat: 10)>\n    array([0. , 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])\n    Coordinates:\n      * lat      (lat) int64 0 1 2 3 4 5 6 7 8 9\n\n    >>> xr.where(x < 0.5, x, x * 100)\n    <xarray.DataArray 'sst' (lat: 10)>\n    array([ 0. ,  0.1,  0.2,  0.3,  0.4, 50. , 60. , 70. , 80. , 90. ])\n    Coordinates:\n      * lat      (lat) int64 0 1 2 3 4 5 6 7 8 9\n\n    >>> y = xr.DataArray(\n    ...     0.1 * np.arange(9).reshape(3, 3),\n    ...     dims=[\"lat\", \"lon\"],\n    ...     coords={\"lat\": np.arange(3), \"lon\": 10 + np.arange(3)},\n    ...     name=\"sst\",\n    ... )\n    >>> y\n    <xarray.DataArray 'sst' (lat: 3, lon: 3)>\n    array([[0. , 0.1, 0.2],\n           [0.3, 0.4, 0.5],\n           [0.6, 0.7, 0.8]])\n    Coordinates:\n      * lat      (lat) int64 0 1 2\n      * lon      (lon) int64 10 11 12\n\n    >>> xr.where(y.lat < 1, y, -1)\n    <xarray.DataArray (lat: 3, lon: 3)>\n    array([[ 0. ,  0.1,  0.2],\n           [-1. , -1. , -1. ],\n           [-1. , -1. , -1. ]])\n    Coordinates:\n      * lat      (lat) int64 0 1 2\n      * lon      (lon) int64 10 11 12\n\n    >>> cond = xr.DataArray([True, False], dims=[\"x\"])\n    >>> x = xr.DataArray([1, 2], dims=[\"y\"])\n    >>> xr.where(cond, x, 0)\n    <xarray.DataArray (x: 2, y: 2)>\n    array([[1, 2],\n           [0, 0]])\n    Dimensions without coordinates: x, y\n\n    See Also\n    --------\n    numpy.where : corresponding numpy function\n    Dataset.where, DataArray.where :\n        equivalent methods\n    \"\"\"\n    if keep_attrs is None:\n        keep_attrs = _get_keep_attrs(default=False)\n    \n    # Store the original keep_attrs setting for variable attributes\n    variable_keep_attrs = keep_attrs\n    \n    if keep_attrs is True:\n        # For variable attributes, we want to keep the attributes of x\n        # But for coordinate attributes, we want to use the default behavior (\"override\")\n        # to preserve coordinate attributes correctly\n        variable_keep_attrs = lambda attrs, context: getattr(x, \"attrs\", {})\n        # Use \"override\" for coordinate attributes to preserve them correctly\n        coord_keep_attrs = \"override\"\n    else:\n        coord_keep_attrs = keep_attrs\n\n    # alignment for three arguments is complicated, so don't support it yet\n    result = apply_ufunc(\n        duck_array_ops.where,\n        cond,\n        x,\n        y,\n        join=\"exact\",\n        dataset_join=\"exact\",\n        dask=\"allowed\",\n        keep_attrs=coord_keep_attrs,  # Use appropriate keep_attrs for coordinates\n    )\n    \n    # Now handle variable attributes separately if keep_attrs is True\n    if variable_keep_attrs is not keep_attrs:\n        # We need to apply the variable attribute preservation separately\n        from .dataarray import DataArray\n        from .dataset import Dataset\n        \n        if isinstance(result, DataArray):\n            # For DataArray, set the attributes from x\n            result.attrs = getattr(x, \"attrs\", {})\n        elif isinstance(result, Dataset):\n            # For Dataset, set the attributes for each data variable from x\n            if hasattr(x, \"data_vars\"):\n                for name in result.data_vars:\n                    if name in x.data_vars:\n                        result[name].attrs = x[name].attrs\n            # Also set the global attributes from x\n            result.attrs = getattr(x, \"attrs\", {})\n    \n    return result"
+}
+Tool execution status: success
+Tool stdout:
+The file /testbed/xarray/core/computation.py has been edited successfully.
+Here's a snippet of the edited section:
+  1771	    )
+  1772	    return result.transpose(*all_dims, missing_dims="ignore")
+  1773	
+  1774	
+  1775	def where(cond, x, y, keep_attrs=None):
+  1776	    """Return elements from `x` or `y` depending on `cond`.
+  1777	
+  1778	    Performs xarray-like broadcasting across input arguments.
+  1779	
+  1780	    All dimension coordinates on `x` and `y`  must be aligned with each
+  1781	    other and with `cond`.
+  1782	
+  1783	    Parameters
+  1784	    ----------
+  1785	    cond : scalar, array, Variable, DataArray or Dataset
+  1786	        When True, return values from `x`, otherwise returns values from `y`.
+  1787	    x : scalar, array, Variable, DataArray or Dataset
+  1788	        values to choose from where `cond` is True
+  1789	    y : scalar, array, Variable, DataArray or Dataset
+  1790	        values to choose from where `cond` is False
+  1791	    keep_attrs : bool or str or callable, optional
+  1792	        How to treat attrs. If True, keep the attrs of `x`.
+  1793	
+  1794	    Returns
+  1795	    -------
+  1796	    Dataset, DataArray, Variable or array
+  1797	        In priority order: Dataset, DataArray, Variable or array, whichever
+  1798	        type appears as an input argument.
+  1799	
+  1800	    Examples
+  1801	    --------
+  1802	    >>> x = xr.DataArray(
+  1803	    ...     0.1 * np.arange(10),
+  1804	    ...     dims=["lat"],
+  1805	    ...     coords={"lat": np.arange(10)},
+  1806	    ...     name="sst",
+  1807	    ... )
+  1808	    >>> x
+  1809	    <xarray.DataArray 'sst' (lat: 10)>
+  1810	    array([0. , 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+  1811	    Coordinates:
+  1812	      * lat      (lat) int64 0 1 2 3 4 5 6 7 8 9
+  1813	
+  1814	    >>> xr.where(x < 0.5, x, x * 100)
+  1815	    <xarray.DataArray 'sst' (lat: 10)>
+  1816	    array([ 0. ,  0.1,  0.2,  0.3,  0.4, 50. , 60. , 70. , 80. , 90. ])
+  1817	    Coordinates:
+  1818	      * lat      (lat) int64 0 1 2 3 4 5 6 7 8 9
+  1819	
+  1820	    >>> y = xr.DataArray(
+  1821	    ...     0.1 * np.arange(9).reshape(3, 3),
+  1822	    ...     dims=["lat", "lon"],
+  1823	    ...     coords={"lat": np.arange(3), "lon": 10 + np.arange(3)},
+  1824	    ...     name="sst",
+  1825	    ... )
+  1826	    >>> y
+  1827	    <xarray.DataArray 'sst' (lat: 3, lon: 3)>
+  1828	    array([[0. , 0.1, 0.2],
+  1829	           [0.3, 0.4, 0.5],
+  1830	           [0.6, 0.7, 0.8]])
+  1831	    Coordinates:
+  1832	      * lat      (lat) int64 0 1 2
+  1833	      * lon      (lon) int64 10 11 12
+  1834	
+  1835	    >>> xr.where(y.lat < 1, y, -1)
+  1836	    <xarray.DataArray (lat: 3, lon: 3)>
+  1837	    array([[ 0. ,  0.1,  0.2],
+  1838	           [-1. , -1. , -1. ],
+  1839	           [-1. , -1. , -1. ]])
+  1840	    Coordinates:
+  1841	      * lat      (lat) int64 0 1 2
+  1842	      * lon      (lon) int64 10 11 12
+  1843	
+  1844	    >>> cond = xr.DataArray([True, False], dims=["x"])
+  1845	    >>> x = xr.DataArray([1, 2], dims=["y"])
+  1846	    >>> xr.where(cond, x, 0)
+  1847	    <xarray.DataArray (x: 2, y: 2)>
+  1848	    array([[1, 2],
+  1849	           [0, 0]])
+  1850	    Dimensions without coordinates: x, y
+  1851	
+  1852	    See Also
+  1853	    --------
+  1854	    numpy.where : corresponding numpy function
+  1855	    Dataset.where, DataArray.where :
+  1856	        equivalent methods
+  1857	    """
+  1858	    if keep_attrs is None:
+  1859	        keep_attrs = _get_keep_attrs(default=False)
+  1860	    
+  1861	    # Store the original keep_attrs setting for variable attributes
+  1862	    variable_keep_attrs = keep_attrs
+  1863	    
+  1864	    if keep_attrs is True:
+  1865	        # For variable attributes, we want to keep the attributes of x
+  1866	        # But for coordinate attributes, we want to use the default behavior ("override")
+  1867	        # to preserve coordinate attributes correctly
+  1868	        variable_keep_attrs = lambda attrs, context: getattr(x, "attrs", {})
+  1869	        # Use "override" for coordinate attributes to preserve them correctly
+  1870	        coord_keep_attrs = "override"
+  1871	    else:
+  1872	        coord_keep_attrs = keep_attrs
+  1873	
+  1874	    # alignment for three arguments is complicated, so don't support it yet
+  1875	    result = apply_ufunc(
+  1876	        duck_array_ops.where,
+  1877	        cond,
+  1878	        x,
+  1879	        y,
+  1880	        join="exact",
+  1881	        dataset_join="exact",
+  1882	        dask="allowed",
+  1883	        keep_attrs=coord_keep_attrs,  # Use appropriate keep_attrs for coordinates
+  1884	    )
+  1885	    
+  1886	    # Now handle variable attributes separately if keep_attrs is True
+  1887	    if variable_keep_attrs is not keep_attrs:
+  1888	        # We need to apply the variable attribute preservation separately
+  1889	        from .dataarray import DataArray
+  1890	        from .dataset import Dataset
+  1891	        
+  1892	        if isinstance(result, DataArray):
+  1893	            # For DataArray, set the attributes from x
+  1894	            result.attrs = getattr(x, "attrs", {})
+  1895	        elif isinstance(result, Dataset):
+  1896	            # For Dataset, set the attributes for each data variable from x
+  1897	            if hasattr(x, "data_vars"):
+  1898	                for name in result.data_vars:
+  1899	                    if name in x.data_vars:
+  1900	                        result[name].attrs = x[name].attrs
+  1901	            # Also set the global attributes from x
+  1902	            result.attrs = getattr(x, "attrs", {})
+  1903	    
+  1904	    return result
+  1905	
+  1906	
+  1907	@overload
+  1908	def polyval(
+Review the changes and make sure they are as expected.
+
+
+=== Iteration 42/50 ===
+Calling LLM...
+LLM Response: Now let me test the fix:
+
+<function=execute_bash>
+<parameter=command>python reproduce_issue.py</parameter>
+</function>...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "python reproduce_issue.py"
+}
+Tool execution status: success
+Tool stdout:
+[STDOUT]
+Original time attributes:
+{'standard_name': 'time', 'long_name': 'Time'}
+
+Original air attributes:
+{'long_name': '4xDaily Air temperature at sigma level 995', 'units': 'degK', 'precision': 2, 'GRIB_id': 11, 'GRIB_name': 'TMP', 'var_desc': 'Air temperature', 'dataset': 'NMC Reanalysis', 'level_desc': 'Surface', 'statistic': 'Individual Obs', 'parent_stat': 'Other', 'actual_range': array([185.16, 322.1 ], dtype=float32)}
+
+After xr.where(True, ds.air, ds.air, keep_attrs=True):
+Time attributes:
+{'standard_name': 'time', 'long_name': 'Time'}
+
+Expected time attributes:
+{'standard_name': 'time', 'long_name': 'Time'}
+
+
+=== Iteration 43/50 ===
+Calling LLM...
+LLM Response: Excellent! The fix works. The time coordinate attributes are now preserved correctly while the variable attributes are still handled appropriately. Let me also test a few edge cases to make sure the f...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "create",
+  "path": "test_edge_cases.py",
+  "file_text": "import xarray as xr\nimport numpy as np\n\nprint(\"=== Test 1: keep_attrs=False ===\")\ntime = xr.DataArray(\n    np.arange(10), \n    dims=[\"time\"],\n    coords={\"time\": np.arange(10)},\n    attrs={\"standard_name\": \"time\", \"long_name\": \"Time\"}\n)\n\nair = xr.DataArray(\n    np.random.rand(10),\n    dims=[\"time\"],\n    coords={\"time\": time},\n    attrs={'long_name': 'Air temperature'}\n)\n\nds = xr.Dataset({\"air\": air}, coords={\"time\": time})\nresult = xr.where(True, ds.air, ds.air, keep_attrs=False)\nprint(\"Time attributes:\", result.time.attrs)\nprint(\"Air attributes:\", result.attrs)\n\nprint(\"\\n=== Test 2: keep_attrs=None (default) ===\")\nresult = xr.where(True, ds.air, ds.air, keep_attrs=None)\nprint(\"Time attributes:\", result.time.attrs)\nprint(\"Air attributes:\", result.attrs)\n\nprint(\"\\n=== Test 3: keep_attrs='override' ===\")\nresult = xr.where(True, ds.air, ds.air, keep_attrs='override')\nprint(\"Time attributes:\", result.time.attrs)\nprint(\"Air attributes:\", result.attrs)\n\nprint(\"\\n=== Test 4: DataArray input ===\")\nresult = xr.where(True, air, air, keep_attrs=True)\nprint(\"Time attributes:\", result.time.attrs)\nprint(\"Air attributes:\", result.attrs)\n\nprint(\"\\n=== Test 5: Different x and y ===\")\ny = xr.DataArray(\n    np.random.rand(10),\n    dims=[\"time\"],\n    coords={\"time\": time},\n    attrs={'long_name': 'Different temperature'}\n)\nresult = xr.where(True, air, y, keep_attrs=True)\nprint(\"Time attributes:\", result.time.attrs)\nprint(\"Air attributes:\", result.attrs)"
+}
+Tool execution status: success
+Tool stdout:
+File created successfully at test_edge_cases.py.
+Here's the result of running `cat -n` on test_edge_cases.py:
+     1	import xarray as xr
+     2	import numpy as np
+     3	
+     4	print("=== Test 1: keep_attrs=False ===")
+     5	time = xr.DataArray(
+     6	    np.arange(10), 
+     7	    dims=["time"],
+     8	    coords={"time": np.arange(10)},
+     9	    attrs={"standard_name": "time", "long_name": "Time"}
+    10	)
+    11	
+    12	air = xr.DataArray(
+    13	    np.random.rand(10),
+    14	    dims=["time"],
+    15	    coords={"time": time},
+    16	    attrs={'long_name': 'Air temperature'}
+    17	)
+    18	
+    19	ds = xr.Dataset({"air": air}, coords={"time": time})
+    20	result = xr.where(True, ds.air, ds.air, keep_attrs=False)
+... (file continues)
+
+
+=== Iteration 44/50 ===
+Calling LLM...
+LLM Response: <function=execute_bash>
+<parameter=command>python test_edge_cases.py</parameter>
+</function>...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "python test_edge_cases.py"
+}
+Tool execution status: success
+Tool stdout:
+[STDOUT]
+=== Test 1: keep_attrs=False ===
+Time attributes: {}
+Air attributes: {}
+
+=== Test 2: keep_attrs=None (default) ===
+Time attributes: {}
+Air attributes: {}
+
+=== Test 3: keep_attrs='override' ===
+Time attributes: {'standard_name': 'time', 'long_name': 'Time'}
+Air attributes: {'long_name': 'Air temperature'}
+
+=== Test 4: DataArray input ===
+Time attributes: {'standard_name': 'time', 'long_name': 'Time'}
+Air attributes: {'long_name': 'Air temperature'}
+
+=== Test 5: Different x and y ===
+Time attributes: {'standard_name': 'time', 'long_name': 'Time'}
+Air attributes: {'long_name': 'Air temperature'}
+
+
+=== Iteration 45/50 ===
+Calling LLM...
+LLM Response: Good! The edge cases are working correctly. However, I notice that when `keep_attrs=False` or `keep_attrs=None` (default), the coordinate attributes are also being dropped. This might be the expected ...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "python -m pytest xarray/tests/test_computation.py::test_where -xvs"
+}
+Tool execution status: success
+Tool stdout:
+[STDOUT]
+============================= test session starts ==============================
+platform linux -- Python 3.10.16, pytest-7.4.0, pluggy-1.5.0 -- /root/.venv/bin/python
+cachedir: .pytest_cache
+hypothesis profile 'default' -> database=DirectoryBasedExampleDatabase(PosixPath('/testbed/.hypothesis/examples'))
+rootdir: /testbed
+configfile: setup.cfg
+plugins: hypothesis-6.123.2, env-1.1.5, cov-6.0.0, timeout-2.3.1, xdist-3.6.1
+collecting ... collected 1 item
+
+xarray/tests/test_computation.py::test_where PASSED
+
+============================== 1 passed in 0.90s ===============================
+
+
+=== Iteration 46/50 ===
+Calling LLM...
+LLM Response: Great! The existing test passes. Let me run a few more related tests to make sure everything is working:
+
+<function=execute_bash>
+<parameter=command>python -m pytest xarray/tests/test_computation.py -...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "python -m pytest xarray/tests/test_computation.py -k \"where\" -xvs"
+}
+Tool execution status: success
+Tool stdout:
+[STDOUT]
+============================= test session starts ==============================
+platform linux -- Python 3.10.16, pytest-7.4.0, pluggy-1.5.0 -- /root/.venv/bin/python
+cachedir: .pytest_cache
+hypothesis profile 'default' -> database=DirectoryBasedExampleDatabase(PosixPath('/testbed/.hypothesis/examples'))
+rootdir: /testbed
+configfile: setup.cfg
+plugins: hypothesis-6.123.2, env-1.1.5, cov-6.0.0, timeout-2.3.1, xdist-3.6.1
+collecting ... collected 282 items / 280 deselected / 2 selected
+
+xarray/tests/test_computation.py::test_where PASSED
+xarray/tests/test_computation.py::test_where_attrs PASSED
+
+====================== 2 passed, 280 deselected in 0.16s =======================
+
+
+=== Iteration 47/50 ===
+Calling LLM...
+LLM Response: Perfect! Both `test_where` and `test_where_attrs` tests pass. Let me also check if there are any specific tests for the `keep_attrs` functionality:
+
+<function=execute_bash>
+<parameter=command>python -...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "python -m pytest xarray/tests/test_computation.py -k \"keep_attrs\" -xvs"
+}
+Tool execution status: success
+Tool stdout:
+[STDOUT]
+============================= test session starts ==============================
+platform linux -- Python 3.10.16, pytest-7.4.0, pluggy-1.5.0 -- /root/.venv/bin/python
+cachedir: .pytest_cache
+hypothesis profile 'default' -> database=DirectoryBasedExampleDatabase(PosixPath('/testbed/.hypothesis/examples'))
+rootdir: /testbed
+configfile: setup.cfg
+plugins: hypothesis-6.123.2, env-1.1.5, cov-6.0.0, timeout-2.3.1, xdist-3.6.1
+collecting ... collected 282 items / 225 deselected / 57 selected
+
+xarray/tests/test_computation.py::test_keep_attrs PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_variable[default] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_variable[False] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_variable[True] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_variable[override] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_variable[drop] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_variable[drop_conflicts] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_variable[no_conflicts] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray[default] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray[False] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray[True] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray[override] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray[drop] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray[drop_conflicts] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray[no_conflicts] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray_variables[default-dim] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray_variables[default-coord] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray_variables[False-dim] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray_variables[False-coord] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray_variables[True-dim] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray_variables[True-coord] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray_variables[override-dim] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray_variables[override-coord] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray_variables[drop-dim] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray_variables[drop-coord] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray_variables[drop_conflicts-dim] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray_variables[drop_conflicts-coord] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray_variables[no_conflicts-dim] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataarray_variables[no_conflicts-coord] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset[default] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset[False] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset[True] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset[override] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset[drop] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset[drop_conflicts] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset[no_conflicts] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[default-data] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[default-dim] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[default-coord] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[False-data] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[False-dim] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[False-coord] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[True-data] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[True-dim] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[True-coord] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[override-data] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[override-dim] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[override-coord] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[drop-data] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[drop-dim] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[drop-coord] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[drop_conflicts-data] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[drop_conflicts-dim] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[drop_conflicts-coord] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[no_conflicts-data] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[no_conflicts-dim] PASSED
+xarray/tests/test_computation.py::test_keep_attrs_strategies_dataset_variables[no_conflicts-coord] PASSED
+
+====================== 57 passed, 225 deselected in 0.31s ======================
+
+
+=== Iteration 48/50 ===
+Calling LLM...
+LLM Response: Excellent! All the keep_attrs tests pass. Now let me create a specific test to verify that my fix addresses the exact issue reported in the GitHub issue:
+
+<function=file_editor>
+<parameter=command>cre...
+Executing tool: r2e_file_editor
+Tool parameters: {
+  "command": "create",
+  "path": "test_github_issue.py",
+  "file_text": "import xarray as xr\nimport numpy as np\n\ndef test_github_issue():\n    \"\"\"Test the specific issue reported in GitHub issue #6461\"\"\"\n    # Create a dataset similar to the tutorial dataset\n    time = xr.DataArray(\n        np.arange(10), \n        dims=[\"time\"],\n        coords={\"time\": np.arange(10)},\n        attrs={\"standard_name\": \"time\", \"long_name\": \"Time\"}\n    )\n    \n    air = xr.DataArray(\n        np.random.rand(10),\n        dims=[\"time\"],\n        coords={\"time\": time},\n        attrs={\n            'long_name': '4xDaily Air temperature at sigma level 995',\n            'units': 'degK',\n            'precision': 2,\n            'GRIB_id': 11,\n            'GRIB_name': 'TMP',\n            'var_desc': 'Air temperature',\n            'dataset': 'NMC Reanalysis',\n            'level_desc': 'Surface',\n            'statistic': 'Individual Obs',\n            'parent_stat': 'Other',\n            'actual_range': np.array([185.16, 322.1], dtype=np.float32)\n        }\n    )\n    \n    ds = xr.Dataset({\"air\": air}, coords={\"time\": time})\n    \n    # Test the exact case from the GitHub issue\n    result = xr.where(True, ds.air, ds.air, keep_attrs=True)\n    \n    # Check that coordinate attributes are preserved\n    assert result.time.attrs == ds.time.attrs, f\"Coordinate attributes not preserved. Got {result.time.attrs}, expected {ds.time.attrs}\"\n    \n    # Check that variable attributes are preserved\n    assert result.attrs == ds.air.attrs, f\"Variable attributes not preserved. Got {result.attrs}, expected {ds.air.attrs}\"\n    \n    print(\"\u2713 Coordinate attributes preserved correctly\")\n    print(\"\u2713 Variable attributes preserved correctly\")\n    print(\"\u2713 GitHub issue #6461 is fixed!\")\n\nif __name__ == \"__main__\":\n    test_github_issue()"
+}
+Tool execution status: success
+Tool stdout:
+File created successfully at test_github_issue.py.
+Here's the result of running `cat -n` on test_github_issue.py:
+     1	import xarray as xr
+     2	import numpy as np
+     3	
+     4	def test_github_issue():
+     5	    """Test the specific issue reported in GitHub issue #6461"""
+     6	    # Create a dataset similar to the tutorial dataset
+     7	    time = xr.DataArray(
+     8	        np.arange(10), 
+     9	        dims=["time"],
+    10	        coords={"time": np.arange(10)},
+    11	        attrs={"standard_name": "time", "long_name": "Time"}
+    12	    )
+    13	    
+    14	    air = xr.DataArray(
+    15	        np.random.rand(10),
+    16	        dims=["time"],
+    17	        coords={"time": time},
+    18	        attrs={
+    19	            'long_name': '4xDaily Air temperature at sigma level 995',
+    20	            'units': 'degK',
+... (file continues)
+
+
+=== Iteration 49/50 ===
+Calling LLM...
+LLM Response: <function=execute_bash>
+<parameter=command>python test_github_issue.py</parameter>
+</function>...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "python test_github_issue.py"
+}
+Tool execution status: success
+Tool stdout:
+[STDOUT]
+✓ Coordinate attributes preserved correctly
+✓ Variable attributes preserved correctly
+✓ GitHub issue #6461 is fixed!
+
+
+=== Iteration 50/50 ===
+Calling LLM...
+LLM Response: Perfect! The fix is working correctly. Let me run one final comprehensive test to make sure everything is working as expected:
+
+<function=execute_bash>
+<parameter=command>python -c "
+import xarray as ...
+Executing tool: r2e_bash_executor
+Tool parameters: {
+  "command": "python -c \"\nimport xarray as xr\nimport numpy as np\n\n# Test the exact example from the GitHub issue\ntime = xr.DataArray(\n    np.arange(10), \n    dims=['time'],\n    coords={'time': np.arange(10)},\n    attrs={'standard_name': 'time', 'long_name': 'Time'}\n)\n\nair = xr.DataArray(\n    np.random.rand(10),\n    dims=['time'],\n    coords={'time': time},\n    attrs={\n        'long_name': '4xDaily Air temperature at sigma level 995',\n        'units': 'degK',\n        'precision': 2,\n        'GRIB_id': 11,\n        'GRIB_name': 'TMP',\n        'var_desc': 'Air temperature',\n        'dataset': 'NMC Reanalysis',\n        'level_desc': 'Surface',\n        'statistic': 'Individual Obs',\n        'parent_stat': 'Other',\n        'actual_range': np.array([185.16, 322.1], dtype=np.float32)\n    }\n)\n\nds = xr.Dataset({'air': air}, coords={'time': time})\n\n# Test the exact code from the GitHub issue\nresult = xr.where(True, ds.air, ds.air, keep_attrs=True)\n\nprint('Time attributes after xr.where:')\nprint(result.time.attrs)\nprint()\nprint('Expected time attributes:')\nprint(ds.time.attrs)\nprint()\nprint('Match:', result.time.attrs == ds.time.attrs)\n\""
+}
+Tool execution status: success
+Tool stdout:
+[STDOUT]
+Time attributes after xr.where:
+{'standard_name': 'time', 'long_name': 'Time'}
+
+Expected time attributes:
+{'standard_name': 'time', 'long_name': 'Time'}
+
+Match: True
+
+Reached max iterations (50)
+Context saved to dsv31t-r2e-output/pydata__xarray-7229.context
+=== Task completed with status: max_iterations ===

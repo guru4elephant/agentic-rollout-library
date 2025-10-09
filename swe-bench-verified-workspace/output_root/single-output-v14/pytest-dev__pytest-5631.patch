@@ -1,0 +1,516 @@
+diff --git a/debug_compat.py b/debug_compat.py
+new file mode 100644
+index 000000000..6f6d3381d
+--- /dev/null
++++ b/debug_compat.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python3
++"""Debug the num_mock_patch_args function behavior."""
++
++import sys
++from unittest.mock import patch
++
++# Create a function with a patch that has an array as new value
++@patch(target='os.path.exists', new=[-5.5, 3.0])
++def test_func():
++    pass
++
++# Examine what patchings contains
++patchings = getattr(test_func, "patchings", None)
++print(f"patchings: {patchings}")
++print(f"patchings type: {type(patchings)}")
++
++if patchings:
++    for i, p in enumerate(patchings):
++        print(f"patching {i}: {p}")
++        print(f"p.new: {p.new}")
++        print(f"p.new type: {type(p.new)}")
++        print(f"p.attribute_name: {p.attribute_name}")
++        
++        # Check mock modules
++        mock_modules = [sys.modules.get("mock"), sys.modules.get("unittest.mock")]
++        print(f"mock_modules: {mock_modules}")
++        
++        if any(mock_modules):
++            sentinels = [m.DEFAULT for m in mock_modules if m is not None]
++            print(f"sentinels: {sentinels}")
++            
++            # This is the problematic line
++            try:
++                result = p.new in sentinels
++                print(f"p.new in sentinels: {result}")
++            except Exception as e:
++                print(f"ERROR in p.new in sentinels: {type(e).__name__}: {e}")
++                import traceback
++                traceback.print_exc()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..59fd25bc3
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,16 @@
++#!/usr/bin/env python3
++"""Script to reproduce the ValueError when patching with an array."""
++
++from unittest.mock import patch
++
++# Create a simple module that exists
++import os
++
++# This should cause the ValueError during pytest collection
++# Using a list instead of numpy array to demonstrate the same issue
++@patch(target='os.path.exists', new=[-5.5, 3.0])
++def test_function():
++    pass
++
++if __name__ == "__main__":
++    print("Script created successfully")
+\ No newline at end of file
+diff --git a/src/_pytest/compat.py b/src/_pytest/compat.py
+index d238061b4..f7d56d724 100644
+--- a/src/_pytest/compat.py
++++ b/src/_pytest/compat.py
+@@ -67,9 +67,21 @@ def num_mock_patch_args(function):
+     mock_modules = [sys.modules.get("mock"), sys.modules.get("unittest.mock")]
+     if any(mock_modules):
+         sentinels = [m.DEFAULT for m in mock_modules if m is not None]
+-        return len(
+-            [p for p in patchings if not p.attribute_name and p.new in sentinels]
+-        )
++        # Handle the case where p.new might be an array-like object
++        # that returns an array from the 'in' operation instead of a boolean
++        count = 0
++        for p in patchings:
++            if not p.attribute_name:
++                try:
++                    # Use bool() to ensure we get a proper boolean value
++                    # This handles the case where p.new in sentinels returns an array
++                    if bool(p.new in sentinels):
++                        count += 1
++                except ValueError:
++                    # If we get a ValueError (e.g., from numpy array truth evaluation),
++                    # assume the comparison is False
++                    pass
++        return count
+     return len(patchings)
+ 
+ 
+diff --git a/test_actual_issue.py b/test_actual_issue.py
+new file mode 100644
+index 000000000..de35d872a
+--- /dev/null
++++ b/test_actual_issue.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""Test to reproduce the actual ValueError from the issue."""
++
++import sys
++from unittest.mock import patch
++
++# Create a class that mimics the problematic numpy array behavior
++class ProblematicArray:
++    def __init__(self, data):
++        self.data = data
++    
++    def __contains__(self, item):
++        # This mimics numpy's behavior where array comparison returns
++        # an array of booleans instead of a single boolean
++        return [False, True]  # This causes the ValueError
++    
++    def __bool__(self):
++        # This is what raises the ValueError
++        raise ValueError("The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()")
++    
++    def __repr__(self):
++        return f"ProblematicArray({self.data})"
++
++# Create a function with a patch that uses our problematic array
++@patch(target='os.path.exists', new=ProblematicArray([-5.5, 3.0]))
++def test_func():
++    pass
++
++# Now let's simulate the exact code from num_mock_patch_args
++patchings = getattr(test_func, "patchings", None)
++print(f"patchings: {patchings}")
++
++if patchings:
++    mock_modules = [sys.modules.get("mock"), sys.modules.get("unittest.mock")]
++    print(f"mock_modules: {mock_modules}")
++    
++    if any(mock_modules):
++        sentinels = [m.DEFAULT for m in mock_modules if m is not None]
++        print(f"sentinels: {sentinels}")
++        
++        # This is the exact problematic line from the issue
++        try:
++            # Simulate: [p for p in patchings if not p.attribute_name and p.new in sentinels]
++            result = []
++            for p in patchings:
++                print(f"Checking patching: {p}")
++                print(f"p.attribute_name: {p.attribute_name}")
++                print(f"p.new: {p.new}")
++                
++                # This is where the error occurs
++                comparison_result = p.new in sentinels
++                print(f"p.new in sentinels: {comparison_result}")
++                print(f"Type of comparison_result: {type(comparison_result)}")
++                
++                # This will trigger the ValueError
++                if not p.attribute_name and comparison_result:
++                    result.append(p)
++            
++            print(f"Result length: {len(result)}")
++            
++        except Exception as e:
++            print(f"ERROR: {type(e).__name__}: {e}")
++            import traceback
++            traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_compat_issue.py b/test_compat_issue.py
+new file mode 100644
+index 000000000..7e6c2d535
+--- /dev/null
++++ b/test_compat_issue.py
+@@ -0,0 +1,19 @@
++#!/usr/bin/env python3
++"""Test to reproduce the specific ValueError in num_mock_patch_args function."""
++
++from _pytest.compat import num_mock_patch_args
++from unittest.mock import patch
++
++# Create a function with a patch that has an array as new value
++@patch(target='os.path.exists', new=[-5.5, 3.0])
++def test_func():
++    pass
++
++# Directly call the problematic function
++try:
++    result = num_mock_patch_args(test_func)
++    print(f"num_mock_patch_args returned: {result}")
++except Exception as e:
++    print(f"Error occurred: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 000000000..316ec98da
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,45 @@
++#!/usr/bin/env python3
++"""Test to verify the fix for the ValueError issue."""
++
++from _pytest.compat import num_mock_patch_args
++from unittest.mock import patch
++
++# Create a class that mimics numpy array behavior
++class NumpyLikeArray:
++    def __init__(self, data):
++        self.data = data
++    
++    def __contains__(self, item):
++        # For numpy arrays, the 'in' operator doesn't work like this
++        # Instead, let's simulate what happens when numpy arrays are compared
++        pass
++    
++    def __eq__(self, other):
++        # This is what causes the issue - numpy array comparisons return arrays
++        # When comparing a numpy array with a scalar, it returns a boolean array
++        return NumpyLikeArray([False, True])  # Returns an array, not a boolean
++    
++    def __bool__(self):
++        # This is what raises the ValueError when an array with multiple elements
++        # is used in a boolean context
++        if len(self.data) > 1:
++            raise ValueError("The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()")
++        return bool(self.data[0])
++    
++    def __repr__(self):
++        return f"NumpyLikeArray({self.data})"
++
++# Create a function with a patch that uses our numpy-like array
++@patch(target='os.path.exists', new=NumpyLikeArray([-5.5, 3.0]))
++def test_func():
++    pass
++
++# Test the fixed num_mock_patch_args function
++try:
++    result = num_mock_patch_args(test_func)
++    print(f"num_mock_patch_args returned: {result}")
++    print("SUCCESS: No ValueError raised!")
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 000000000..56d982ec7
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,41 @@
++#!/usr/bin/env python3
++"""Test to reproduce the exact GitHub issue scenario."""
++
++from _pytest.compat import num_mock_patch_args
++from unittest.mock import patch
++
++# Create a class that exactly mimics numpy array behavior causing the issue
++class NumpyArray:
++    def __init__(self, data):
++        self.data = data
++    
++    def __contains__(self, item):
++        # For numpy arrays, the 'in' operator returns an array of booleans
++        # when comparing with a scalar, not a single boolean
++        return [False, True]  # This causes the ValueError
++    
++    def __bool__(self):
++        # This is what raises the ValueError when an array with multiple elements
++        # is used in a boolean context (exactly as described in the issue)
++        raise ValueError("The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()")
++    
++    def __repr__(self):
++        return f"np.array({self.data})"
++
++# Reproduce the exact scenario from the GitHub issue
++@patch(target='XXXXXX', new=NumpyArray([-5.5, 3.0]))
++def test_function():
++    pass
++
++# Test that the fix handles this case without raising ValueError
++try:
++    result = num_mock_patch_args(test_function)
++    print(f"SUCCESS: num_mock_patch_args returned {result}")
++    print("No ValueError raised when patching with array-like object")
++except ValueError as e:
++    if "The truth value of an array with more than one element is ambiguous" in str(e):
++        print(f"FAILED: Original issue still exists - {e}")
++    else:
++        print(f"FAILED: Different ValueError - {e}")
++except Exception as e:
++    print(f"FAILED: Unexpected error - {type(e).__name__}: {e}")
+\ No newline at end of file
+diff --git a/test_normal_case.py b/test_normal_case.py
+new file mode 100644
+index 000000000..4760bd0bd
+--- /dev/null
++++ b/test_normal_case.py
+@@ -0,0 +1,34 @@
++#!/usr/bin/env python3
++"""Test to verify normal cases still work with the fix."""
++
++from _pytest.compat import num_mock_patch_args
++from unittest.mock import patch, DEFAULT
++
++# Test case 1: Regular patch without array
++@patch(target='os.path.exists')
++def test_func1(mock_exists):
++    pass
++
++# Test case 2: Patch with DEFAULT (should count as a mock argument)
++@patch(target='os.path.exists', new=DEFAULT)
++def test_func2():
++    pass
++
++# Test case 3: Patch with a regular value (should not count as a mock argument)
++@patch(target='os.path.exists', new="some_value")
++def test_func3():
++    pass
++
++# Test all cases
++test_cases = [
++    (test_func1, "Regular patch without array"),
++    (test_func2, "Patch with DEFAULT"), 
++    (test_func3, "Patch with regular value")
++]
++
++for func, description in test_cases:
++    try:
++        result = num_mock_patch_args(func)
++        print(f"{description}: num_mock_patch_args returned {result}")
++    except Exception as e:
++        print(f"{description}: ERROR - {type(e).__name__}: {e}")
+\ No newline at end of file
+diff --git a/test_numpy_behavior.py b/test_numpy_behavior.py
+new file mode 100644
+index 000000000..00ff935df
+--- /dev/null
++++ b/test_numpy_behavior.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++"""Test to reproduce the actual numpy behavior that causes the ValueError."""
++
++import sys
++from unittest.mock import patch
++
++# Create a class that truly mimics numpy array behavior
++class NumpyLikeArray:
++    def __init__(self, data):
++        self.data = data
++    
++    def __contains__(self, item):
++        # For numpy arrays, the 'in' operator doesn't work like this
++        # Instead, let's simulate what happens when numpy arrays are compared
++        # The issue is that numpy array comparisons return arrays, not booleans
++        pass
++    
++    def __eq__(self, other):
++        # This is what causes the issue - numpy array comparisons return arrays
++        # When comparing a numpy array with a scalar, it returns a boolean array
++        return NumpyLikeArray([False, True])  # Returns an array, not a boolean
++    
++    def __bool__(self):
++        # This is what raises the ValueError when an array with multiple elements
++        # is used in a boolean context
++        if len(self.data) > 1:
++            raise ValueError("The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()")
++        return bool(self.data[0])
++    
++    def __repr__(self):
++        return f"NumpyLikeArray({self.data})"
++
++# Create a function with a patch that uses our numpy-like array
++@patch(target='os.path.exists', new=NumpyLikeArray([-5.5, 3.0]))
++def test_func():
++    pass
++
++# Now let's simulate the exact code from num_mock_patch_args
++patchings = getattr(test_func, "patchings", None)
++print(f"patchings: {patchings}")
++
++if patchings:
++    mock_modules = [sys.modules.get("mock"), sys.modules.get("unittest.mock")]
++    print(f"mock_modules: {mock_modules}")
++    
++    if any(mock_modules):
++        sentinels = [m.DEFAULT for m in mock_modules if m is not None]
++        print(f"sentinels: {sentinels}")
++        
++        # This is the exact problematic line from the issue
++        try:
++            # Simulate: [p for p in patchings if not p.attribute_name and p.new in sentinels]
++            result = []
++            for p in patchings:
++                print(f"Checking patching: {p}")
++                print(f"p.attribute_name: {p.attribute_name}")
++                print(f"p.new: {p.new}")
++                
++                # The issue is that p.new (a numpy array) compared with sentinels
++                # returns an array, not a boolean
++                comparison_result = p.new == sentinels[0]  # This would return an array
++                print(f"p.new == sentinels[0]: {comparison_result}")
++                print(f"Type of comparison_result: {type(comparison_result)}")
++                
++                # This will trigger the ValueError when the array is used in boolean context
++                if not p.attribute_name and comparison_result:
++                    result.append(p)
++            
++            print(f"Result length: {len(result)}")
++            
++        except Exception as e:
++            print(f"ERROR: {type(e).__name__}: {e}")
++            import traceback
++            traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_numpy_issue.py b/test_numpy_issue.py
+new file mode 100644
+index 000000000..99959c2ac
+--- /dev/null
++++ b/test_numpy_issue.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++"""Test to reproduce the specific ValueError with numpy-like arrays."""
++
++import sys
++from unittest.mock import patch
++
++# Create a mock numpy array class that mimics the problematic behavior
++class MockArray:
++    def __init__(self, data):
++        self.data = data
++    
++    def __contains__(self, item):
++        # This mimics numpy's behavior where comparing an array with 'in'
++        # returns an array of booleans instead of a single boolean
++        # This causes ValueError when used in a boolean context
++        return [False, True]  # This should be a single boolean, but returns array
++    
++    def __repr__(self):
++        return f"MockArray({self.data})"
++
++# Create a function with a patch that uses our mock array
++@patch(target='os.path.exists', new=MockArray([-5.5, 3.0]))
++def test_func():
++    pass
++
++# Examine what patchings contains
++patchings = getattr(test_func, "patchings", None)
++print(f"patchings: {patchings}")
++
++if patchings:
++    for i, p in enumerate(patchings):
++        print(f"patching {i}: {p}")
++        print(f"p.new: {p.new}")
++        print(f"p.new type: {type(p.new)}")
++        
++        # Check mock modules
++        mock_modules = [sys.modules.get("mock"), sys.modules.get("unittest.mock")]
++        print(f"mock_modules: {mock_modules}")
++        
++        if any(mock_modules):
++            sentinels = [m.DEFAULT for m in mock_modules if m is not None]
++            print(f"sentinels: {sentinels}")
++            
++            # This is the problematic line
++            try:
++                result = p.new in sentinels
++                print(f"p.new in sentinels: {result}")
++            except Exception as e:
++                print(f"ERROR in p.new in sentinels: {type(e).__name__}: {e}")
++                import traceback
++                traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_truth_value_issue.py b/test_truth_value_issue.py
+new file mode 100644
+index 000000000..c31f922fc
+--- /dev/null
++++ b/test_truth_value_issue.py
+@@ -0,0 +1,34 @@
++#!/usr/bin/env python3
++"""Test to reproduce the ValueError with truth value of arrays."""
++
++# Create a class that mimics numpy array behavior
++class MockArray:
++    def __init__(self, data):
++        self.data = data
++    
++    def __contains__(self, item):
++        # This should return a single boolean, but mimics numpy's behavior
++        # where it might return an array-like object
++        return [False, True]  # This causes the ValueError
++    
++    def __bool__(self):
++        # This is what causes the ValueError - trying to evaluate
++        # an array with multiple elements in a boolean context
++        raise ValueError("The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()")
++
++# Test the problematic behavior
++sentinels = ["DEFAULT"]
++
++try:
++    mock_array = MockArray([-5.5, 3.0])
++    result = mock_array in sentinels
++    print(f"Result: {result}")
++    # This should trigger the ValueError when used in a boolean context
++    if result:
++        print("True")
++    else:
++        print("False")
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file

@@ -1,0 +1,225 @@
+diff --git a/pylint/lint/run.py b/pylint/lint/run.py
+index a7e5d5574..d47407136 100644
+--- a/pylint/lint/run.py
++++ b/pylint/lint/run.py
+@@ -76,7 +76,7 @@ def _cpu_count() -> int:
+     else:
+         cpu_count = 1
+     if cpu_share is not None:
+-        return min(cpu_share, cpu_count)
++        return max(1, min(cpu_share, cpu_count))
+     return cpu_count
+ 
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..31d2664dd
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++"""Reproduce the issue with pylint --jobs=0 in Kubernetes environment."""
++
++import os
++import tempfile
++import subprocess
++from pathlib import Path
++
++def test_cpu_query():
++    """Test the _query_cpu function behavior."""
++    # Import the function directly
++    from pylint.lint.run import _query_cpu
++    
++    # Create a mock environment similar to Kubernetes
++    with tempfile.TemporaryDirectory() as temp_dir:
++        # Create mock cgroup files
++        cgroup_dir = Path(temp_dir) / "sys" / "fs" / "cgroup" / "cpu"
++        cgroup_dir.mkdir(parents=True, exist_ok=True)
++        
++        # Create mock files with values from the issue
++        (cgroup_dir / "cpu.cfs_quota_us").write_text("-1")
++        (cgroup_dir / "cpu.cfs_period_us").write_text("100000")
++        (cgroup_dir / "cpu.shares").write_text("2")
++        
++        # Temporarily override the paths
++        original_paths = [
++            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
++            "/sys/fs/cgroup/cpu/cpu.cfs_period_us", 
++            "/sys/fs/cgroup/cpu/cpu.shares"
++        ]
++        
++        mock_paths = [
++            str(cgroup_dir / "cpu.cfs_quota_us"),
++            str(cgroup_dir / "cpu.cfs_period_us"),
++            str(cgroup_dir / "cpu.shares")
++        ]
++        
++        # Monkey patch the Path checks
++        original_is_file = Path.is_file
++        
++        def mock_is_file(self):
++            if str(self) in original_paths:
++                return Path(mock_paths[original_paths.index(str(self))]).exists()
++            return original_is_file(self)
++        
++        Path.is_file = mock_is_file
++        
++        # Monkey patch the open calls
++        import builtins
++        original_open = builtins.open
++        
++        def mock_open(file_path, *args, **kwargs):
++            if file_path in original_paths:
++                mock_file = mock_paths[original_paths.index(file_path)]
++                return original_open(mock_file, *args, **kwargs)
++            return original_open(file_path, *args, **kwargs)
++        
++        builtins.open = mock_open
++        
++        try:
++            result = _query_cpu()
++            print(f"_query_cpu() returned: {result}")
++            
++            from pylint.lint.run import _cpu_count
++            cpu_count = _cpu_count()
++            print(f"_cpu_count() returned: {cpu_count}")
++            
++            # Test multiprocessing.Pool with 0 processes
++            import multiprocessing
++            try:
++                pool = multiprocessing.Pool(processes=0)
++                print("Multiprocessing.Pool with 0 processes succeeded")
++                pool.close()
++            except ValueError as e:
++                print(f"Multiprocessing.Pool with 0 processes failed: {e}")
++                
++        finally:
++            # Restore original functions
++            Path.is_file = original_is_file
++            import builtins
++            builtins.open = original_open
++
++if __name__ == "__main__":
++    test_cpu_query()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..dbfdc408a
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++"""Test edge cases for the _cpu_count fix."""
++
++import os
++import tempfile
++from pathlib import Path
++
++def test_edge_cases():
++    """Test various edge cases for _cpu_count function."""
++    from pylint.lint.run import _cpu_count
++    
++    # Test case 1: cpu_share = 0 (the original issue)
++    print("Test case 1: cpu_share = 0")
++    result = mock_cpu_query_with_values(cpu_shares=2)  # 2/1024 = 0.00195 -> int() = 0
++    print(f"_cpu_count() returned: {result}")
++    
++    # Test case 2: cpu_share = 1 (normal case)
++    print("Test case 2: cpu_share = 1")
++    result = mock_cpu_query_with_values(cpu_shares=1024)  # 1024/1024 = 1 -> int() = 1
++    print(f"_cpu_count() returned: {result}")
++    
++    # Test case 3: cpu_share > cpu_count
++    print("Test case 3: cpu_share > cpu_count")
++    result = mock_cpu_query_with_values(cpu_shares=2048)  # 2048/1024 = 2 -> int() = 2
++    print(f"_cpu_count() returned: {result}")
++    
++    # Test case 4: cpu_share = None (no cgroup files)
++    print("Test case 4: cpu_share = None")
++    result = mock_cpu_query_with_values(no_cgroup_files=True)
++    print(f"_cpu_count() returned: {result}")
++
++def mock_cpu_query_with_values(cpu_shares=None, no_cgroup_files=False):
++    """Mock the cgroup environment with specific values."""
++    from pylint.lint.run import _cpu_count
++    import builtins
++    
++    with tempfile.TemporaryDirectory() as temp_dir:
++        # Create mock cgroup files
++        cgroup_dir = Path(temp_dir) / "sys" / "fs" / "cgroup" / "cpu"
++        cgroup_dir.mkdir(parents=True, exist_ok=True)
++        
++        if no_cgroup_files:
++            # Don't create any files to simulate no cgroup environment
++            pass
++        else:
++            # Create mock files with specific values
++            (cgroup_dir / "cpu.cfs_quota_us").write_text("-1")
++            (cgroup_dir / "cpu.cfs_period_us").write_text("100000")
++            (cgroup_dir / "cpu.shares").write_text(str(cpu_shares))
++        
++        # Temporarily override the paths
++        original_paths = [
++            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
++            "/sys/fs/cgroup/cpu/cpu.cfs_period_us", 
++            "/sys/fs/cgroup/cpu/cpu.shares"
++        ]
++        
++        mock_paths = [
++            str(cgroup_dir / "cpu.cfs_quota_us"),
++            str(cgroup_dir / "cpu.cfs_period_us"),
++            str(cgroup_dir / "cpu.shares")
++        ]
++        
++        # Monkey patch the Path checks
++        original_is_file = Path.is_file
++        
++        def mock_is_file(self):
++            if str(self) in original_paths:
++                if no_cgroup_files:
++                    return False
++                return Path(mock_paths[original_paths.index(str(self))]).exists()
++            return original_is_file(self)
++        
++        Path.is_file = mock_is_file
++        
++        # Monkey patch the open calls
++        original_open = builtins.open
++        
++        def mock_open(file_path, *args, **kwargs):
++            if file_path in original_paths:
++                if no_cgroup_files:
++                    raise FileNotFoundError(f"No such file: {file_path}")
++                mock_file = mock_paths[original_paths.index(file_path)]
++                return original_open(mock_file, *args, **kwargs)
++            return original_open(file_path, *args, **kwargs)
++        
++        builtins.open = mock_open
++        
++        try:
++            result = _cpu_count()
++            return result
++        finally:
++            # Restore original functions
++            Path.is_file = original_is_file
++            builtins.open = original_open
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_file.py b/test_file.py
+new file mode 100644
+index 000000000..9008bffaf
+--- /dev/null
++++ b/test_file.py
+@@ -0,0 +1,9 @@
++#!/usr/bin/env python3
++"""Test file for pylint."""
++
++def hello_world():
++    """A simple function."""
++    print("Hello, World!")
++
++if __name__ == "__main__":
++    hello_world()
+\ No newline at end of file

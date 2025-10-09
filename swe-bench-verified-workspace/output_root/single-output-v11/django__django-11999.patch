@@ -1,0 +1,217 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index ee45bb941e..36ad0b2190 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -763,8 +763,10 @@ class Field(RegisterLookupMixin):
+             if not getattr(cls, self.attname, None):
+                 setattr(cls, self.attname, self.descriptor_class(self))
+         if self.choices is not None:
+-            setattr(cls, 'get_%s_display' % self.name,
+-                    partialmethod(cls._get_FIELD_display, field=self))
++            method_name = 'get_%s_display' % self.name
++            if not hasattr(cls, method_name):
++                setattr(cls, method_name,
++                        partialmethod(cls._get_FIELD_display, field=self))
+ 
+     def get_filter_kwargs_for_object(self, obj):
+         """
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..1ae2e3b796
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the get_FOO_display() override issue in Django 2.2+
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a test model
++class FooBar(models.Model):
++    foo_bar = models.CharField("foo", choices=[(1, 'foo'), (2, 'bar')])
++    
++    class Meta:
++        app_label = 'test'
++    
++    def __str__(self):
++        return self.get_foo_bar_display()  # Should return 'something' if overridden
++    
++    def get_foo_bar_display(self):
++        return "something"
++
++# Test the behavior
++if __name__ == "__main__":
++    # Create an instance
++    foo = FooBar(foo_bar=1)
++    
++    print("Testing get_foo_bar_display() override:")
++    print(f"Expected: 'something'")
++    print(f"Actual: '{foo.get_foo_bar_display()}'")
++    
++    if foo.get_foo_bar_display() == "something":
++        print("✅ Override works correctly!")
++    else:
++        print("❌ Override does NOT work!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..7bb7bfdc83
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,128 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the get_FOO_display() override fix
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Test Case 1: Basic override
++class TestModel1(models.Model):
++    status = models.CharField("status", choices=[('a', 'Active'), ('i', 'Inactive')])
++    
++    class Meta:
++        app_label = 'test'
++    
++    def get_status_display(self):
++        return "CUSTOM_DISPLAY"
++
++# Test Case 2: Multiple fields with choices, some overridden, some not
++class TestModel2(models.Model):
++    status = models.CharField("status", choices=[('a', 'Active'), ('i', 'Inactive')])
++    type = models.CharField("type", choices=[('t1', 'Type 1'), ('t2', 'Type 2')])
++    
++    class Meta:
++        app_label = 'test'
++    
++    def get_status_display(self):
++        return "CUSTOM_STATUS_DISPLAY"
++
++# Test Case 3: Field without choices should not interfere
++class TestModel3(models.Model):
++    status = models.CharField("status", choices=[('a', 'Active'), ('i', 'Inactive')])
++    name = models.CharField("name", max_length=100)  # No choices
++    
++    class Meta:
++        app_label = 'test'
++    
++    def get_status_display(self):
++        return "CUSTOM_DISPLAY"
++
++# Test Case 4: Inheritance test
++class BaseModel(models.Model):
++    status = models.CharField("status", choices=[('a', 'Active'), ('i', 'Inactive')])
++    
++    class Meta:
++        app_label = 'test'
++
++class DerivedModel(BaseModel):
++    type = models.CharField("type", choices=[('t1', 'Type 1'), ('t2', 'Type 2')])
++    
++    class Meta:
++        app_label = 'test'
++    
++    def get_status_display(self):
++        return "DERIVED_CUSTOM_DISPLAY"
++
++def test_case(model_class, field_name, expected_value, test_name):
++    """Test a specific case"""
++    instance = model_class()
++    # Get the first choice value (not the display text)
++    choice_value = model_class._meta.get_field(field_name).choices[0][0]
++    setattr(instance, field_name, choice_value)
++    
++    actual_value = getattr(instance, f'get_{field_name}_display')()
++    print(f"{test_name}:")
++    print(f"  Expected: '{expected_value}'")
++    print(f"  Actual: '{actual_value}'")
++    
++    if actual_value == expected_value:
++        print("  ✅ PASS")
++        return True
++    else:
++        print("  ❌ FAIL")
++        return False
++
++if __name__ == "__main__":
++    print("Testing edge cases for get_FOO_display() override fix...")
++    
++    results = []
++    
++    # Test Case 1
++    results.append(test_case(TestModel1, 'status', 'CUSTOM_DISPLAY', 'Test Case 1: Basic override'))
++    
++    # Test Case 2
++    results.append(test_case(TestModel2, 'status', 'CUSTOM_STATUS_DISPLAY', 'Test Case 2: Overridden field'))
++    results.append(test_case(TestModel2, 'type', 'Type 1', 'Test Case 2: Non-overridden field (should use default)'))
++    
++    # Test Case 3
++    results.append(test_case(TestModel3, 'status', 'CUSTOM_DISPLAY', 'Test Case 3: Field with choices alongside field without choices'))
++    
++    # Test Case 4
++    results.append(test_case(DerivedModel, 'status', 'DERIVED_CUSTOM_DISPLAY', 'Test Case 4: Inheritance - overridden in derived class'))
++    results.append(test_case(DerivedModel, 'type', 'Type 1', 'Test Case 4: Inheritance - non-overridden field'))
++    
++    # Summary
++    passed = sum(results)
++    total = len(results)
++    print(f"\nSummary: {passed}/{total} tests passed")
++    
++    if passed == total:
++        print("🎉 All tests passed!")
++        sys.exit(0)
++    else:
++        print("❌ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file

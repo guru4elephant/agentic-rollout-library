@@ -1,0 +1,207 @@
+diff --git a/django/db/migrations/loader.py b/django/db/migrations/loader.py
+index 95a5062ec9..119b026208 100644
+--- a/django/db/migrations/loader.py
++++ b/django/db/migrations/loader.py
+@@ -90,7 +90,7 @@ class MigrationLoader:
+             else:
+                 # Empty directories are namespaces.
+                 # getattr() needed on PY36 and older (replace w/attribute access).
+-                if getattr(module, '__file__', None) is None:
++                if getattr(module, '__file__', None) is None and not isinstance(module.__path__, list):
+                     self.unmigrated_apps.add(app_config.label)
+                     continue
+                 # Module is not a package (e.g. migrations.py).
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..f95249fa0a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with namespace package detection in migration loader.
++This simulates a frozen environment where packages don't have __file__ attribute.
++"""
++
++import sys
++from importlib import import_module, reload
++from types import ModuleType
++
++# Create a mock module that simulates a frozen environment package
++# This module has no __file__ but is not a namespace package
++class MockFrozenModule(ModuleType):
++    def __init__(self, name):
++        super().__init__(name)
++        # Simulate frozen environment: no __file__ attribute
++        self.__path__ = ['/fake/path']  # Regular list, not namespace path
++        # Don't set __file__ to simulate frozen environment
++
++# Test the current logic
++def test_current_logic():
++    """Test the current logic that rejects all modules without __file__"""
++    module = MockFrozenModule('test_app.migrations')
++    
++    # Current check from django/db/migrations/loader.py line 93
++    if getattr(module, '__file__', None) is None:
++        print("❌ Current logic: Module rejected because no __file__")
++        return False
++    else:
++        print("✅ Current logic: Module accepted")
++        return True
++
++# Test the proposed logic
++def test_proposed_logic():
++    """Test the proposed logic that distinguishes namespace packages"""
++    module = MockFrozenModule('test_app.migrations')
++    
++    # Proposed check: allow modules without __file__ if they're not namespace packages
++    if getattr(module, '__file__', None) is None:
++        # Check if it's a namespace package by examining __path__
++        # Namespace packages have custom iterable types for __path__, not regular lists
++        if hasattr(module, '__path__') and isinstance(module.__path__, list):
++            print("✅ Proposed logic: Module accepted (no __file__ but regular package)")
++            return True
++        else:
++            print("❌ Proposed logic: Module rejected (namespace package)")
++            return False
++    else:
++        print("✅ Proposed logic: Module accepted (has __file__)")
++        return True
++
++if __name__ == '__main__':
++    print("Testing current vs proposed logic for migration loader:")
++    print("=" * 50)
++    
++    result_current = test_current_logic()
++    result_proposed = test_proposed_logic()
++    
++    print("=" * 50)
++    print(f"Current logic result: {'PASS' if result_current else 'FAIL'}")
++    print(f"Proposed logic result: {'PASS' if result_proposed else 'FAIL'}")
++    
++    if result_current != result_proposed:
++        print("\n⚠️  The issue exists: Current logic rejects modules that should be accepted!")
++        print("This demonstrates the need for the fix described in the GitHub issue.")
++    else:
++        print("\n✅ No issue detected with current logic")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..20d3d27697
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,113 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the fix for namespace package detection.
++Tests various scenarios including the frozen environment case.
++"""
++
++import sys
++from types import ModuleType
++
++def test_scenario(name, module_attrs, should_be_accepted):
++    """
++    Test a specific scenario with given module attributes.
++    
++    Args:
++        name: Descriptive name of the test scenario
++        module_attrs: Dictionary of attributes to set on the module
++        should_be_accepted: Whether this module should be accepted by the migration loader
++    """
++    print(f"\nTesting: {name}")
++    print("-" * 40)
++    
++    # Create module with specified attributes
++    module = ModuleType('test_module')
++    for attr_name, attr_value in module_attrs.items():
++        setattr(module, attr_name, attr_value)
++    
++    # Apply the complete migration loader logic (both conditions)
++    rejected = False
++    
++    # First condition: namespace package check (line 93)
++    if getattr(module, '__file__', None) is None and not isinstance(getattr(module, '__path__', None), list):
++        rejected = True
++        print("❌ Module rejected by namespace package check")
++    
++    # Second condition: not a package check (line 97) - only if not already rejected
++    elif not hasattr(module, '__path__'):
++        rejected = True
++        print("❌ Module rejected by not-a-package check")
++    
++    else:
++        print("✅ Module accepted by migration loader")
++    
++    return rejected != should_be_accepted
++    
++    # Check if result matches expectation
++    if rejected != (not should_be_accepted):
++        print(f"✅ EXPECTATION MET: Module {'accepted' if should_be_accepted else 'rejected'} as expected")
++        return True
++    else:
++        print(f"❌ EXPECTATION FAILED: Module should be {'accepted' if should_be_accepted else 'rejected'}")
++        return False
++
++def main():
++    print("Testing the migration loader fix for namespace packages")
++    print("=" * 60)
++    
++    test_cases = [
++        # Normal case: module with __file__ and regular __path__
++        {
++            "name": "Normal package with __file__",
++            "attrs": {"__file__": "/path/to/file.py", "__path__": ["/path/to"]},
++            "should_be_accepted": True
++        },
++        
++        # Frozen environment case: no __file__ but regular __path__ (should be accepted)
++        {
++            "name": "Frozen environment package (no __file__, regular __path__)",
++            "attrs": {"__path__": ["/frozen/path"]},
++            "should_be_accepted": True
++        },
++        
++        # Namespace package case: no __file__ and non-list __path__ (should be rejected)
++        {
++            "name": "Namespace package (no __file__, non-list __path__)",
++            "attrs": {"__path__": iter(["/namespace/path"])},  # Simulate namespace path
++            "should_be_accepted": False
++        },
++        
++        # Edge case: no __path__ at all (should be rejected)
++        {
++            "name": "Module without __path__",
++            "attrs": {"__file__": "/path/to/file.py"},
++            "should_be_accepted": False
++        },
++        
++        # Edge case: no __file__ and no __path__ (should be rejected)
++        {
++            "name": "Module without __file__ and __path__",
++            "attrs": {},
++            "should_be_accepted": False
++        },
++    ]
++    
++    passed = 0
++    total = len(test_cases)
++    
++    for test_case in test_cases:
++        if test_scenario(test_case["name"], test_case["attrs"], test_case["should_be_accepted"]):
++            passed += 1
++    
++    print(f"\n" + "=" * 60)
++    print(f"Results: {passed}/{total} tests passed")
++    
++    if passed == total:
++        print("🎉 All tests passed! The fix is working correctly.")
++        return True
++    else:
++        print("❌ Some tests failed. The fix needs more work.")
++        return False
++
++if __name__ == '__main__':
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

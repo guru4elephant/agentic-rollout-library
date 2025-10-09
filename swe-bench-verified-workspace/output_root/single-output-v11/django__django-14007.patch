@@ -1,0 +1,176 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 55b1691166..6dffba4dde 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -872,6 +872,10 @@ class Model(metaclass=ModelBase):
+             results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
+             if results:
+                 for value, field in zip(results[0], returning_fields):
++                    # Apply field converters (including from_db_value) to the value
++                    converters = field.get_db_converters(using)
++                    for converter in converters:
++                        value = converter(value, field, using)
+                     setattr(self, field.attname, value)
+         return updated
+ 
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 387deca527..cb91851b66 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -505,6 +505,10 @@ class QuerySet:
+                 for obj_with_pk, results in zip(objs_with_pk, returned_columns):
+                     for result, field in zip(results, opts.db_returning_fields):
+                         if field != opts.pk:
++                            # Apply field converters (including from_db_value) to the result
++                            converters = field.get_db_converters(self.connection)
++                            for converter in converters:
++                                result = converter(result, field, self.connection)
+                             setattr(obj_with_pk, field.attname, result)
+                 for obj_with_pk in objs_with_pk:
+                     obj_with_pk._state.adding = False
+@@ -516,12 +520,25 @@ class QuerySet:
+                 )
+                 if connection.features.can_return_rows_from_bulk_insert and not ignore_conflicts:
+                     assert len(returned_columns) == len(objs_without_pk)
+-                for obj_without_pk, results in zip(objs_without_pk, returned_columns):
++                for obj_without_pk, results in zip(objs_without_pk,  returned_columns):
+                     for result, field in zip(results, opts.db_returning_fields):
++                        # Apply field converters (including from_db_value) to the result
++                        converters = field.get_db_converters(self.connection)
++                        for converter in converters:
++                            result = converter(result, field, self.connection)
+                         setattr(obj_without_pk, field.attname, result)
+                     obj_without_pk._state.adding = False
+                     obj_without_pk._state.db = self.db
+ 
++        # Apply field converters to primary key values for all objects
++        # This is needed for databases that don't support returning rows from bulk insert
++        for obj in objs:
++            if obj.pk is not None:
++                # Apply field converters (including from_db_value) to the PK value
++                converters = obj._meta.pk.get_db_converters(self.connection)
++                for converter in converters:
++                    obj.pk = converter(obj.pk, obj._meta.pk, self.connection)
++
+         return objs
+ 
+     def bulk_update(self, objs, fields, batch_size=None):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..418fdfce39
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a custom field wrapper as described in the issue
++class MyIntWrapper:
++    def __init__(self, value):
++        self.value = value
++    
++    def __repr__(self):
++        return f"<MyIntWrapper: {self.value}>"
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return False
++
++# Create a custom auto field
++class MyAutoField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        return int(value)
++
++# Create a model using the custom field
++class AutoModel(models.Model):
++    id = MyAutoField(primary_key=True)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_issue():
++    print("Testing the issue with database converters not being called on insert...")
++    
++    # Create the table
++    from django.db import connection
++    with connection.cursor() as cursor:
++        cursor.execute("CREATE TABLE test_automodel (id INTEGER PRIMARY KEY AUTOINCREMENT)")
++    
++    # Test 1: Query existing instance (should work correctly)
++    print("\n1. Testing query of existing instance:")
++    try:
++        # Insert a record directly
++        with connection.cursor() as cursor:
++            cursor.execute("INSERT INTO test_automodel (id) VALUES (1)")
++        
++        am = AutoModel.objects.first()
++        print(f"Queried instance id: {am.id} (type: {type(am.id)})")
++        print("✓ from_db_value was called for query")
++    except Exception as e:
++        print(f"Error in query test: {e}")
++    
++    # Test 2: Create new instance (the bug - from_db_value not called)
++    print("\n2. Testing creation of new instance:")
++    try:
++        am2 = AutoModel.objects.create()
++        print(f"Created instance id: {am2.id} (type: {type(am2.id)})")
++        if isinstance(am2.id, MyIntWrapper):
++            print("✓ from_db_value was called for create")
++        else:
++            print("✗ from_db_value was NOT called for create - BUG CONFIRMED")
++    except Exception as e:
++        print(f"Error in create test: {e}")
++    
++    # Test 3: Bulk create (should also have the bug)
++    print("\n3. Testing bulk create:")
++    try:
++        ams = [AutoModel()]
++        print(f"Before bulk_create - id: {ams[0].id} (type: {type(ams[0].id)})")
++        # Let's check what get_pk_value_on_save returns
++        pk_value = ams[0]._meta.pk.get_pk_value_on_save(ams[0])
++        print(f"get_pk_value_on_save returns: {pk_value} (type: {type(pk_value)})")
++        created = AutoModel.objects.bulk_create(ams)
++        print(f"After bulk_create - id: {ams[0].id} (type: {type(ams[0].id)})")
++        if isinstance(ams[0].id, MyIntWrapper):
++            print("✓ from_db_value was called for bulk_create")
++        else:
++            print("✗ from_db_value was NOT called for bulk_create - BUG CONFIRMED")
++    except Exception as e:
++        print(f"Error in bulk_create test: {e}")
++
++if __name__ == "__main__":
++    test_issue()
+\ No newline at end of file

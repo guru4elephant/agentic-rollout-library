@@ -1,0 +1,390 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index b99f03cd88..d69c24419b 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1338,7 +1338,7 @@ class Query(BaseExpression):
+             if isinstance(child, Node):
+                 child_clause, needed_inner = self._add_q(
+                     child, used_aliases, branch_negated,
+-                    current_negated, allow_joins, split_subq)
++                    current_negated, allow_joins, split_subq, simple_col)
+                 joinpromoter.add_votes(needed_inner)
+             else:
+                 child_clause, needed_inner = self.build_filter(
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..f230507ed8
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q
++
++# Create the test model
++class TestConstraint(models.Model):
++    field_1 = models.IntegerField(blank=True, null=True)
++    flag = models.BooleanField(blank=False, null=False)
++    
++    class Meta:
++        app_label = 'test'
++        constraints = [
++            models.CheckConstraint(
++                check=models.Q(flag__exact=True, field_1__isnull=False) | models.Q(flag__exact=False),
++                name='field_1_has_value_if_flag_set'
++            ),
++        ]
++
++# Test the constraint SQL generation
++from django.db import connection
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++
++# Create a schema editor
++with connection.schema_editor() as schema_editor:
++    # Get the constraint SQL
++    constraint = TestConstraint._meta.constraints[0]
++    constraint_sql = constraint.constraint_sql(TestConstraint, schema_editor)
++    print("CONSTRAINT SQL:")
++    print(constraint_sql)
++    print()
++    
++    # Get the full create SQL with constraint
++    create_sql = constraint.create_sql(TestConstraint, schema_editor)
++    print("CREATE SQL WITH CONSTRAINT:")
++    print(create_sql)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..e031f301c2
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q
++
++# Test case 1: Original issue - OR with AND clauses
++class TestConstraint1(models.Model):
++    field_1 = models.IntegerField(blank=True, null=True)
++    flag = models.BooleanField(blank=False, null=False)
++    
++    class Meta:
++        app_label = 'test1'
++        constraints = [
++            models.CheckConstraint(
++                check=models.Q(flag__exact=True, field_1__isnull=False) | models.Q(flag__exact=False),
++                name='field_1_has_value_if_flag_set'
++            ),
++        ]
++
++# Test case 2: Multiple OR clauses
++class TestConstraint2(models.Model):
++    field_1 = models.IntegerField(blank=True, null=True)
++    field_2 = models.IntegerField(blank=True, null=True)
++    flag = models.BooleanField(blank=False, null=False)
++    
++    class Meta:
++        app_label = 'test2'
++        constraints = [
++            models.CheckConstraint(
++                check=models.Q(flag__exact=True, field_1__isnull=False) | 
++                       models.Q(flag__exact=False, field_2__isnull=False) |
++                       models.Q(field_1__gt=10),
++                name='complex_constraint'
++            ),
++        ]
++
++# Test case 3: Nested OR clauses
++class TestConstraint3(models.Model):
++    field_1 = models.IntegerField(blank=True, null=True)
++    field_2 = models.IntegerField(blank=True, null=True)
++    flag = models.BooleanField(blank=False, null=False)
++    
++    class Meta:
++        app_label = 'test3'
++        constraints = [
++            models.CheckConstraint(
++                check=(models.Q(flag__exact=True) & models.Q(field_1__isnull=False)) | 
++                       (models.Q(flag__exact=False) & models.Q(field_2__isnull=False)),
++                name='nested_constraint'
++            ),
++        ]
++
++# Test the constraint SQL generation
++from django.db import connection
++
++def test_constraint(model_class):
++    print(f"Testing {model_class.__name__}:")
++    with connection.schema_editor() as schema_editor:
++        constraint = model_class._meta.constraints[0]
++        constraint_sql = constraint.constraint_sql(model_class, schema_editor)
++        print("CONSTRAINT SQL:")
++        print(constraint_sql)
++        print()
++        
++        create_sql = constraint.create_sql(model_class, schema_editor)
++        print("CREATE SQL WITH CONSTRAINT:")
++        print(create_sql)
++        print("\n" + "="*50 + "\n")
++
++# Run all tests
++test_constraint(TestConstraint1)
++test_constraint(TestConstraint2)
++test_constraint(TestConstraint3)
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..9eae8e902d
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++"""
++Test to verify the exact issue from GitHub is fixed.
++The issue was that CheckConstraint with OR operator generated incorrect SQL
++on SQLite and Oracle, using fully qualified field names in some parts but not others.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q
++
++# Reproduce the exact model from the GitHub issue
++class TestConstraint(models.Model):
++    field_1 = models.IntegerField(blank=True, null=True)
++    flag = models.BooleanField(blank=False, null=False)
++    
++    class Meta:
++        app_label = 'test'
++        constraints = [
++            models.CheckConstraint(
++                check=models.Q(flag__exact=True, field_1__isnull=False) | models.Q(flag__exact=False),
++                name='field_1_has_value_if_flag_set'
++            ),
++        ]
++
++def test_original_issue():
++    """Test that the original issue is fixed"""
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        constraint = TestConstraint._meta.constraints[0]
++        constraint_sql = constraint.constraint_sql(TestConstraint, schema_editor)
++        
++        print("Generated constraint SQL:")
++        print(constraint_sql)
++        print()
++        
++        # The issue was that some parts used fully qualified names and others didn't
++        # Now all parts should use simple column names
++        assert '"test_testconstraint"."field_1"' not in constraint_sql, "Should not use fully qualified field_1"
++        assert '"test_testconstraint"."flag"' not in constraint_sql, "Should not use fully qualified flag"
++        assert '"field_1"' in constraint_sql, "Should use simple field_1"
++        assert '"flag"' in constraint_sql, "Should use simple flag"
++        
++        # Verify the exact expected format from the GitHub issue
++        expected_patterns = [
++            '"field_1" IS NOT NULL',
++            '"flag" = 1',
++            '"flag" = 0'
++        ]
++        
++        for pattern in expected_patterns:
++            assert pattern in constraint_sql, f"Expected pattern '{pattern}' not found in SQL"
++        
++        print("✓ All checks passed! The issue has been fixed.")
++        print("✓ Constraint SQL uses consistent simple column names throughout.")
++
++if __name__ == '__main__':
++    test_original_issue()
+\ No newline at end of file
+diff --git a/test_regular_queries.py b/test_regular_queries.py
+new file mode 100644
+index 0000000000..f80c442417
+--- /dev/null
++++ b/test_regular_queries.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++"""
++Test to ensure that regular queries (not constraints) still work correctly
++and use fully qualified column names when appropriate.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q
++
++class TestModel(models.Model):
++    field_1 = models.IntegerField(blank=True, null=True)
++    flag = models.BooleanField(blank=False, null=False)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_regular_queries():
++    """Test that regular queries still use fully qualified column names"""
++    from django.db import connection
++    from django.db.models.sql.query import Query
++    
++    # Create a regular query using add_q (not build_where)
++    query = Query(model=TestModel)
++    query.add_q(Q(flag__exact=True, field_1__isnull=False) | Q(flag__exact=False))
++    compiler = query.get_compiler(connection=connection)
++    sql, params = query.where.as_sql(compiler, connection)
++    
++    print("Regular query SQL pattern:")
++    print(sql)
++    print()
++    
++    # For regular queries, we should see fully qualified column names
++    assert '"test_testmodel"."field_1"' in sql, "Regular queries should use fully qualified field_1"
++    assert '"test_testmodel"."flag"' in sql, "Regular queries should use fully qualified flag"
++    
++    print("✓ Regular queries still use fully qualified column names as expected.")
++
++def test_constraint_queries():
++    """Test that constraint queries use simple column names"""
++    from django.db import connection
++    from django.db.models.constraints import CheckConstraint
++    
++    constraint = CheckConstraint(
++        check=Q(flag__exact=True, field_1__isnull=False) | Q(flag__exact=False),
++        name='test_constraint'
++    )
++    
++    with connection.schema_editor() as schema_editor:
++        constraint_sql = constraint.constraint_sql(TestModel, schema_editor)
++        
++        print("Constraint SQL:")
++        print(constraint_sql)
++        print()
++        
++        # For constraints, we should see simple column names
++        assert '"test_testmodel"."field_1"' not in constraint_sql, "Constraints should not use fully qualified field_1"
++        assert '"test_testmodel"."flag"' not in constraint_sql, "Constraints should not use fully qualified flag"
++        assert '"field_1"' in constraint_sql, "Constraints should use simple field_1"
++        assert '"flag"' in constraint_sql, "Constraints should use simple flag"
++    
++    print("✓ Constraint queries use simple column names as expected.")
++
++if __name__ == '__main__':
++    test_regular_queries()
++    test_constraint_queries()
++    print("✓ All tests passed! Regular queries and constraints work correctly.")
+\ No newline at end of file
+diff --git a/test_settings.py b/test_settings.py
+new file mode 100644
+index 0000000000..26a7c9b9cc
+--- /dev/null
++++ b/test_settings.py
+@@ -0,0 +1,13 @@
++SECRET_KEY = 'test-key'
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++INSTALLED_APPS = [
++    'django.contrib.contenttypes',
++    'django.contrib.auth',
++    'constraints',
++]
++USE_TZ = True
+\ No newline at end of file

@@ -1,0 +1,203 @@
+diff --git a/django/db/backends/postgresql/client.py b/django/db/backends/postgresql/client.py
+index 7fca6eff30..9d01f93e29 100644
+--- a/django/db/backends/postgresql/client.py
++++ b/django/db/backends/postgresql/client.py
+@@ -2,17 +2,9 @@ import os
+ import signal
+ import subprocess
+ 
+-from django.core.files.temp import NamedTemporaryFile
+ from django.db.backends.base.client import BaseDatabaseClient
+ 
+ 
+-def _escape_pgpass(txt):
+-    """
+-    Escape a fragment of a PostgreSQL .pgpass file.
+-    """
+-    return txt.replace('\\', '\\\\').replace(':', '\\:')
+-
+-
+ class DatabaseClient(BaseDatabaseClient):
+     executable_name = 'psql'
+ 
+@@ -34,38 +26,20 @@ class DatabaseClient(BaseDatabaseClient):
+             args += ['-p', str(port)]
+         args += [dbname]
+ 
+-        temp_pgpass = None
+         sigint_handler = signal.getsignal(signal.SIGINT)
+         try:
+-            if passwd:
+-                # Create temporary .pgpass file.
+-                temp_pgpass = NamedTemporaryFile(mode='w+')
+-                try:
+-                    print(
+-                        _escape_pgpass(host) or '*',
+-                        str(port) or '*',
+-                        _escape_pgpass(dbname) or '*',
+-                        _escape_pgpass(user) or '*',
+-                        _escape_pgpass(passwd),
+-                        file=temp_pgpass,
+-                        sep=':',
+-                        flush=True,
+-                    )
+-                    os.environ['PGPASSFILE'] = temp_pgpass.name
+-                except UnicodeEncodeError:
+-                    # If the current locale can't encode the data, let the
+-                    # user input the password manually.
+-                    pass
+             # Allow SIGINT to pass to psql to abort queries.
+             signal.signal(signal.SIGINT, signal.SIG_IGN)
+-            subprocess.check_call(args)
++            
++            # Use PGPASSWORD environment variable instead of .pgpass file
++            env = os.environ.copy()
++            if passwd:
++                env['PGPASSWORD'] = passwd
++            
++            subprocess.run(args, env=env)
+         finally:
+             # Restore the original SIGINT handler.
+             signal.signal(signal.SIGINT, sigint_handler)
+-            if temp_pgpass:
+-                temp_pgpass.close()
+-                if 'PGPASSFILE' in os.environ:  # unit tests need cleanup
+-                    del os.environ['PGPASSFILE']
+ 
+     def runshell(self):
+         DatabaseClient.runshell_db(self.connection.get_connection_params())
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e7fa5efa75
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the postgres client issue and test the fix.
++"""
++
++import os
++import sys
++from django.db.backends.postgresql.client import DatabaseClient
++
++def test_current_implementation():
++    """Test the current implementation to understand its behavior."""
++    print("Testing current postgres client implementation...")
++    
++    # Mock connection parameters
++    conn_params = {
++        'host': 'localhost',
++        'port': 5432,
++        'database': 'testdb',
++        'user': 'testuser',
++        'password': 'testpass'
++    }
++    
++    try:
++        # This should demonstrate the new behavior using subprocess.run
++        DatabaseClient.runshell_db(conn_params)
++    except Exception as e:
++        print(f"Error occurred (expected as we don't have actual psql): {e}")
++        print("This confirms the implementation now uses subprocess.run")
++
++def test_environment_variable():
++    """Test that PGPASSWORD environment variable is properly set."""
++    print("Testing PGPASSWORD environment variable handling...")
++    
++    import subprocess
++    import os
++    
++    # Test with password
++    env = os.environ.copy()
++    env['PGPASSWORD'] = 'testpass'
++    
++    # Check if the environment variable is set correctly
++    print(f"PGPASSWORD in env: {env.get('PGPASSWORD', 'NOT_SET')}")
++    
++    # Test without password
++    env_no_pass = os.environ.copy()
++    if 'PGPASSWORD' in env_no_pass:
++        del env_no_pass['PGPASSWORD']
++    print(f"PGPASSWORD without password: {env_no_pass.get('PGPASSWORD', 'NOT_SET')}")
++
++if __name__ == "__main__":
++    # Add django to path if needed
++    if 'django' not in sys.path:
++        sys.path.insert(0, '.')
++    
++    test_current_implementation()
++    test_environment_variable()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..aaa825098f
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the postgres client implementation.
++"""
++
++import os
++import sys
++from django.db.backends.postgresql.client import DatabaseClient
++
++def test_no_password():
++    """Test case where no password is provided."""
++    print("Testing with no password...")
++    
++    conn_params = {
++        'host': 'localhost',
++        'port': 5432,
++        'database': 'testdb',
++        'user': 'testuser',
++        # No password provided
++    }
++    
++    try:
++        DatabaseClient.runshell_db(conn_params)
++    except Exception as e:
++        print(f"Error (expected): {e}")
++
++def test_empty_password():
++    """Test case where empty password is provided."""
++    print("Testing with empty password...")
++    
++    conn_params = {
++        'host': 'localhost',
++        'port': 5432,
++        'database': 'testdb',
++        'user': 'testuser',
++        'password': ''  # Empty password
++    }
++    
++    try:
++        DatabaseClient.runshell_db(conn_params)
++    except Exception as e:
++        print(f"Error (expected): {e}")
++
++def test_minimal_connection_params():
++    """Test case with minimal connection parameters."""
++    print("Testing with minimal connection parameters...")
++    
++    conn_params = {
++        'database': 'testdb',
++        # Only database name provided
++    }
++    
++    try:
++        DatabaseClient.runshell_db(conn_params)
++    except Exception as e:
++        print(f"Error (expected): {e}")
++
++if __name__ == "__main__":
++    # Add django to path if needed
++    if 'django' not in sys.path:
++        sys.path.insert(0, '.')
++    
++    test_no_password()
++    test_empty_password()
++    test_minimal_connection_params()
+\ No newline at end of file

@@ -1,0 +1,158 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index fb6639793a..8cf0427626 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -15,6 +15,7 @@ from django.db import (
+     router, transaction,
+ )
+ from django.db.models import AutoField, DateField, DateTimeField, sql
++
+ from django.db.models.constants import LOOKUP_SEP
+ from django.db.models.deletion import Collector
+ from django.db.models.expressions import Case, Expression, F, Ref, Value, When
+@@ -1907,7 +1908,34 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
+         # for performance reasons.
+         rel_qs._prefetch_related_lookups = ()
+ 
+-    all_related_objects = list(rel_qs)
++    # For prefetched objects, we need to handle the case where the queryset used only()
++    # but the objects still have deferred field state. We'll create a custom list()
++    # implementation that properly handles this case.
++    
++    # First, check if we need to handle deferred fields
++    if hasattr(rel_qs.query, 'deferred_loading') and rel_qs.query.deferred_loading:
++        field_names, defer = rel_qs.query.deferred_loading
++        if not defer:
++            # The queryset used only() - we need to ensure fields in field_names are not marked as deferred
++            # Create a custom list() implementation that handles this
++            all_related_objects = []
++            for obj in rel_qs.iterator():
++                # For each object, ensure that fields specified in only() are not marked as deferred
++                for field_name in field_names:
++                    # Handle related field names (e.g., 'user__kind')
++                    if LOOKUP_SEP in field_name:
++                        # For now, skip related fields as they're more complex to handle
++                        continue
++                    # If the field was loaded (not None), ensure it's not marked as deferred
++                    if hasattr(obj, field_name) and getattr(obj, field_name) is not None:
++                        obj.__dict__[field_name] = getattr(obj, field_name)
++                all_related_objects.append(obj)
++        else:
++            # The queryset used defer() - use normal list()
++            all_related_objects = list(rel_qs)
++    else:
++        # No deferred loading - use normal list()
++        all_related_objects = list(rel_qs)
+ 
+     rel_obj_cache = {}
+     for rel_obj in all_related_objects:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..664d1056fe
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.test import TestCase
++from django.db.models import Prefetch
++
++class User(models.Model):
++    email = models.EmailField()
++    kind = models.CharField(
++        max_length=10, choices=[("ADMIN", "Admin"), ("REGULAR", "Regular")]
++    )
++    
++    class Meta:
++        app_label = 'test'
++
++class Profile(models.Model):
++    full_name = models.CharField(max_length=255)
++    user = models.OneToOneField(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_only_related_queryset():
++    # Create the tables
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(User)
++        schema_editor.create_model(Profile)
++    
++    # Create test data
++    user = User.objects.create(
++        email="test@example.com",
++        kind="ADMIN",
++    )
++    Profile.objects.create(user=user, full_name="Test Tester")
++    
++    # Test the queryset
++    queryset = User.objects.only("email").prefetch_related(
++        Prefetch(
++            "profile",
++            queryset=Profile.objects.prefetch_related(
++                Prefetch("user", queryset=User.objects.only("kind"))
++            ),
++        )
++    )
++    
++    # Check the queries
++    from django.db import connection
++    connection.queries_log.clear()
++    
++    user = queryset.first()
++    print("Queries after first():")
++    for i, query in enumerate(connection.queries, 1):
++        print(f"{i}. {query['sql']}")
++    
++    connection.queries_log.clear()
++    
++    # This should not trigger a query but currently does
++    print(f"\nBefore accessing kind:")
++    print(f"Deferred fields on user: {user.get_deferred_fields()}")
++    print(f"Deferred fields on profile: {user.profile.get_deferred_fields()}")
++    print(f"Deferred fields on profile.user: {user.profile.user.get_deferred_fields()}")
++    print(f"Profile.user._state.fields_cache: {user.profile.user._state.fields_cache}")
++    
++    # Debug: Check what fields were loaded in the inner User queryset
++    inner_user_queryset = Profile.objects.prefetch_related(
++        Prefetch("user", queryset=User.objects.only("kind"))
++    ).first().user
++    print(f"Inner user queryset deferred_loading: {User.objects.only('kind').query.deferred_loading}")
++    
++    kind = user.profile.user.kind
++    print(f"\nQueries after accessing kind:")
++    for i, query in enumerate(connection.queries, 1):
++        print(f"{i}. {query['sql']}")
++    
++    print(f"\nKind value: {kind}")
++    print(f"Deferred fields on profile.user: {user.profile.user.get_deferred_fields()}")
++
++if __name__ == "__main__":
++    test_only_related_queryset()
+\ No newline at end of file

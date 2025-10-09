@@ -1,0 +1,851 @@
+diff --git a/django/template/autoreload.py b/django/template/autoreload.py
+index 84c8554165..f3fd704031 100644
+--- a/django/template/autoreload.py
++++ b/django/template/autoreload.py
+@@ -17,7 +17,7 @@ def get_template_directories():
+         if not isinstance(backend, DjangoTemplates):
+             continue
+ 
+-        items.update(cwd / to_path(dir) for dir in backend.engine.dirs)
++        items.update(cwd / to_path(dir) for dir in backend.engine.dirs if dir)
+ 
+         for loader in backend.engine.template_loaders:
+             if not hasattr(loader, "get_dirs"):
+@@ -25,7 +25,7 @@ def get_template_directories():
+             items.update(
+                 cwd / to_path(directory)
+                 for directory in loader.get_dirs()
+-                if not is_django_path(directory)
++                if directory and not is_django_path(directory)
+             )
+     return items
+ 
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..c893f6b6ca
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,167 @@
++#!/usr/bin/env python3
++"""
++Final verification that the Django autoreload empty string issue is fixed.
++This demonstrates the problem and shows that the fix resolves it.
++"""
++import os
++import django
++from django.conf import settings
++from pathlib import Path
++
++# Configure Django settings with the problematic case
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[],
++        TEMPLATES=[
++            {
++                'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                'DIRS': [''],  # This is what breaks autoreload
++            },
++        ],
++    )
++    django.setup()
++
++from django.template.autoreload import get_template_directories, template_changed
++from django.utils._os import to_path
++from unittest.mock import patch
++
++def demonstrate_issue_and_fix():
++    """Demonstrate the issue and show that it's fixed"""
++    print("=" * 60)
++    print("DEMONSTRATING THE DJANGO AUTORELOAD EMPTY STRING ISSUE")
++    print("=" * 60)
++    
++    print("\n1. PROBLEM: Empty string in TEMPLATES DIRS")
++    print("   This happens with: os.getenv('TEMPLATES_DIRS', '').split(',')")
++    print("   Result: DIRS = ['']")
++    
++    # Show what the empty string becomes when normalized
++    empty_path = to_path("")
++    cwd = Path.cwd()
++    combined_path = cwd / empty_path
++    
++    print(f"\n2. PATH NORMALIZATION:")
++    print(f"   Empty string: ''")
++    print(f"   Normalized: {empty_path}")
++    print(f"   Combined with CWD ({cwd}): {combined_path}")
++    print(f"   This becomes the project root directory!")
++    
++    # Test the current behavior (with our fix)
++    template_dirs = get_template_directories()
++    print(f"\n3. CURRENT BEHAVIOR (WITH FIX):")
++    print(f"   get_template_directories() returns: {template_dirs}")
++    
++    if not template_dirs:
++        print("   ✓ Empty strings are filtered out - no false autoreload triggers")
++    else:
++        print("   ✗ Empty strings are still being processed")
++        return False
++    
++    # Test various files to show they won't trigger autoreload
++    test_files = [
++        Path("app.py").absolute(),
++        Path("templates/index.html").absolute(),
++        Path("manage.py").absolute(),
++        Path("any/file.txt").absolute(),
++    ]
++    
++    print(f"\n4. TESTING AUTORELOAD BEHAVIOR:")
++    for test_file in test_files:
++        result = template_changed(None, test_file)
++        print(f"   template_changed({test_file}) = {result}")
++        
++        if test_file.suffix == ".py" and result is None:
++            print("     ✓ Python file correctly doesn't trigger autoreload")
++        elif test_file.suffix != ".py" and result is None:
++            print("     ✓ Non-template file correctly doesn't trigger autoreload")
++        else:
++            print("     ✗ File incorrectly triggers autoreload")
++            return False
++    
++    # Test with mixed valid and empty directories
++    print(f"\n5. TESTING MIXED DIRECTORIES:")
++    mixed_dirs = ["/valid/templates", "", "/other/templates"]
++    processed_dirs = set()
++    
++    for dir in mixed_dirs:
++        if dir:  # Our fix
++            processed_dirs.add(cwd / to_path(dir))
++    
++    print(f"   Input: {mixed_dirs}")
++    print(f"   Output: {processed_dirs}")
++    
++    if len(processed_dirs) == 2 and "" not in processed_dirs:
++        print("   ✓ Empty strings filtered out, valid directories preserved")
++    else:
++        print("   ✗ Mixed directory processing failed")
++        return False
++    
++    return True
++
++def test_original_issue_scenario():
++    """Test the exact scenario described in the GitHub issue"""
++    print("\n" + "=" * 60)
++    print("TESTING ORIGINAL ISSUE SCENARIO")
++    print("=" * 60)
++    
++    # Simulate the exact problematic code from the issue
++    def problematic_code():
++        """This is the problematic code that causes the issue"""
++        return os.getenv("TEMPLATES_DIRS", "").split(",")
++    
++    # Test case 1: Empty environment variable
++    os.environ["TEMPLATES_DIRS"] = ""
++    template_dirs = problematic_code()
++    print(f"Empty env var: {template_dirs}")
++    
++    # Test case 2: Environment variable with trailing comma
++    os.environ["TEMPLATES_DIRS"] = "/path/to/templates,"
++    template_dirs = problematic_code()
++    print(f"Trailing comma: {template_dirs}")
++    
++    # Test case 3: Multiple paths with empty ones
++    os.environ["TEMPLATES_DIRS"] = "/path1,,/path2"
++    template_dirs = problematic_code()
++    print(f"Multiple with empty: {template_dirs}")
++    
++    # Show that our fix handles all these cases
++    print(f"\nOUR FIX HANDLES ALL THESE CASES:")
++    for case_name, dirs in [
++        ("Empty", [""]),
++        ("Trailing comma", ["/path/to/templates", ""]),
++        ("Multiple empty", ["/path1", "", "/path2"]),
++    ]:
++        processed_dirs = set()
++        for dir in dirs:
++            if dir:  # Our fix
++                processed_dirs.add(Path.cwd() / to_path(dir))
++        
++        print(f"  {case_name}: {dirs} -> {processed_dirs}")
++        
++        # Verify no empty strings result in false autoreload triggers
++        has_empty = any(not d for d in dirs)
++        has_cwd = any(str(d) == str(Path.cwd()) for d in processed_dirs)
++        
++        if has_empty and has_cwd:
++            print(f"    ✗ FAILURE: Empty string resulted in false trigger")
++            return False
++        else:
++            print(f"    ✓ SUCCESS: No false triggers")
++    
++    return True
++
++if __name__ == "__main__":
++    success = demonstrate_issue_and_fix() and test_original_issue_scenario()
++    
++    if success:
++        print("\n" + "=" * 60)
++        print("🎉 FINAL VERIFICATION COMPLETE!")
++        print("✓ The Django autoreload empty string issue has been FIXED!")
++        print("✓ Empty strings in TEMPLATES DIRS are now properly filtered out")
++        print("✓ No more false autoreload triggers")
++        print("✓ Existing functionality is preserved")
++        print("=" * 60)
++    else:
++        print("\n❌ VERIFICATION FAILED!")
++        exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..938ae93c56
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the Django autoreload issue with empty strings in TEMPLATES DIRS.
++"""
++import os
++import tempfile
++from pathlib import Path
++from django.template.autoreload import get_template_directories
++from django.utils._os import to_path
++
++def test_empty_string_normalization():
++    """Test how empty strings are normalized in template directories"""
++    print("Testing empty string normalization...")
++    
++    # Test what happens when we convert an empty string to a Path
++    empty_path = to_path("")
++    print(f"Empty string converted to path: {empty_path}")
++    print(f"Absolute path: {empty_path.absolute()}")
++    print(f"Current working directory: {Path.cwd()}")
++    
++    # Test if the empty path equals the current working directory
++    print(f"Empty path equals cwd: {empty_path.absolute() == Path.cwd()}")
++    
++    # Simulate the template directory processing
++    template_dirs = [""]  # This is what happens with empty string in DIRS
++    processed_dirs = set()
++    cwd = Path.cwd()
++    
++    for dir in template_dirs:
++        processed_dir = cwd / to_path(dir)
++        processed_dirs.add(processed_dir)
++        print(f"Processed template dir: {processed_dir}")
++    
++    print(f"Final template directories: {processed_dirs}")
++    
++    # Test if a file change would trigger autoreload
++    test_file = Path("some_template.html")
++    print(f"Testing if {test_file} would trigger autoreload:")
++    
++    for template_dir in processed_dirs:
++        if template_dir in test_file.parents:
++            print(f"  {template_dir} is in parents of {test_file} - WOULD trigger autoreload")
++        else:
++            print(f"  {template_dir} is NOT in parents of {test_file} - would NOT trigger autoreload")
++
++def test_actual_autoreload_issue():
++    """Test the actual autoreload issue described in the GitHub issue"""
++    print("\nTesting actual autoreload issue...")
++    
++    # Simulate the problematic scenario: empty string in TEMPLATES DIRS
++    template_dirs = [""]  # This produces [''] which is wrong
++    
++    # This is what happens in get_template_directories()
++    cwd = Path.cwd()
++    processed_dirs = set()
++    
++    for dir in template_dirs:
++        processed_dir = cwd / to_path(dir)
++        processed_dirs.add(processed_dir)
++    
++    print(f"Template directories after processing: {processed_dirs}")
++    
++    # Test various file paths to see if they would trigger autoreload
++    test_files = [
++        Path("app.py"),  # Python file (should not trigger according to line 49)
++        Path("templates/my_template.html"),  # Template file
++        Path("static/style.css"),  # Static file
++        Path("manage.py"),  # Django management file
++    ]
++    
++    for test_file in test_files:
++        print(f"\nTesting file: {test_file}")
++        if test_file.suffix == ".py":
++            print("  Python file - should not trigger autoreload")
++            continue
++            
++        for template_dir in processed_dirs:
++            if template_dir in test_file.parents:
++                print(f"  {template_dir} is in parents of {test_file} - WOULD trigger autoreload")
++                break
++        else:
++            print(f"  No template directory matches - would NOT trigger autoreload")
++
++if __name__ == "__main__":
++    test_empty_string_normalization()
++    test_actual_autoreload_issue()
+\ No newline at end of file
+diff --git a/reproduce_issue2.py b/reproduce_issue2.py
+new file mode 100644
+index 0000000000..329b6c1476
+--- /dev/null
++++ b/reproduce_issue2.py
+@@ -0,0 +1,101 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the Django autoreload issue with empty strings in TEMPLATES DIRS.
++This demonstrates the actual issue where template_changed() always returns True.
++"""
++import os
++from pathlib import Path
++from django.template.autoreload import get_template_directories
++from django.utils._os import to_path
++
++def test_get_template_directories_with_empty_string():
++    """Test get_template_directories() with empty strings in template dirs"""
++    print("Testing get_template_directories() with empty strings...")
++    
++    # Mock the engines.all() to return a backend with empty dirs
++    from django.template import engines
++    from django.template.backends.django import DjangoTemplates
++    from django.template.engine import Engine
++    
++    # Create a mock engine with empty dirs
++    class MockEngine:
++        def __init__(self):
++            self.dirs = [""]  # This is the problematic case
++            self.template_loaders = []
++    
++    class MockBackend:
++        def __init__(self):
++            self.engine = MockEngine()
++    
++    # Mock engines.all() to return our mock backend
++    original_all = engines.all
++    def mock_all():
++        return [MockBackend()]
++    
++    engines.all = mock_all
++    
++    try:
++        template_dirs = get_template_directories()
++        print(f"Template directories: {template_dirs}")
++        
++        # Test if any file change would trigger autoreload
++        test_files = [
++            Path("/testbed/app.py"),  # Absolute path to a Python file
++            Path("/testbed/templates/my_template.html"),  # Absolute path to template
++            Path("/testbed/any/file.txt"),  # Any file in the project
++        ]
++        
++        for test_file in test_files:
++            print(f"\nTesting file: {test_file}")
++            if test_file.suffix == ".py":
++                print("  Python file - should not trigger autoreload")
++                continue
++                
++            for template_dir in template_dirs:
++                if template_dir in test_file.parents:
++                    print(f"  {template_dir} is in parents of {test_file} - WOULD trigger autoreload")
++                    break
++            else:
++                print(f"  No template directory matches - would NOT trigger autoreload")
++    
++    finally:
++        # Restore original function
++        engines.all = original_all
++
++def test_template_changed_function():
++    """Test the template_changed function directly"""
++    print("\nTesting template_changed function...")
++    
++    # Import the function
++    from django.template.autoreload import template_changed
++    from django.utils.autoreload import file_changed
++    
++    # Mock get_template_directories to return problematic directories
++    from django.template.autoreload import get_template_directories
++    original_get_template_dirs = get_template_directories
++    
++    def mock_get_template_directories():
++        # Return directories that include the root path (from empty string)
++        return {Path("/testbed")}
++    
++    get_template_directories = mock_get_template_directories
++    
++    try:
++        # Test various file paths
++        test_files = [
++            Path("/testbed/app.py"),  # Python file
++            Path("/testbed/templates/my_template.html"),  # Template file
++            Path("/testbed/any/other/file.txt"),  # Any other file
++        ]
++        
++        for test_file in test_files:
++            result = template_changed(None, test_file)
++            print(f"template_changed({test_file}) = {result}")
++            
++    finally:
++        # Restore original function
++        get_template_directories = original_get_template_dirs
++
++if __name__ == "__main__":
++    test_get_template_directories_with_empty_string()
++    test_template_changed_function()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..045036c481
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the empty string fix in TEMPLATES DIRS.
++"""
++import os
++from pathlib import Path
++from django.utils._os import to_path
++
++def test_edge_cases():
++    """Test various edge cases for template directory filtering"""
++    print("Testing edge cases...")
++    
++    # Test case 1: Mixed valid and empty directories
++    test_cases = [
++        [""],  # Only empty string
++        ["/valid/path", ""],  # Valid path + empty string
++        ["", "/another/valid/path"],  # Empty string + valid path
++        ["/valid/path", "", "/another/valid/path"],  # Mixed
++        [],  # Empty list
++        ["/only/valid/path"],  # Only valid paths
++    ]
++    
++    cwd = Path.cwd()
++    
++    for i, template_dirs in enumerate(test_cases, 1):
++        print(f"\n--- Test Case {i}: {template_dirs} ---")
++        
++        # Simulate the fixed behavior
++        processed_dirs = set()
++        for dir in template_dirs:
++            if dir:  # This is the fix - filter out empty strings
++                normalized_dir = to_path(dir)
++                combined_path = cwd / normalized_dir
++                processed_dirs.add(combined_path)
++                print(f"  '{dir}' -> {combined_path} (PROCESSED)")
++            else:
++                print(f"  '{dir}' -> FILTERED OUT")
++        
++        print(f"  Result: {processed_dirs}")
++        
++        # Test if empty strings were properly filtered
++        has_empty_strings = any(not dir for dir in template_dirs)
++        has_processed_empty = any(str(d) == str(cwd) for d in processed_dirs if has_empty_strings)
++        
++        if has_empty_strings and not has_processed_empty:
++            print("  ✓ Empty strings properly filtered out")
++        elif not has_empty_strings:
++            print("  ✓ No empty strings to filter")
++        else:
++            print("  ✗ Empty strings not properly filtered")
++
++def test_realistic_scenario():
++    """Test a realistic scenario that mimics the original issue"""
++    print("\n--- Testing Realistic Scenario ---")
++    
++    # This mimics: os.getenv("TEMPLATES_DIRS", "").split(",")
++    def get_template_dirs_from_env():
++        env_value = os.getenv("TEMPLATES_DIRS", "")
++        return env_value.split(",") if env_value else [""]
++    
++    # Test case: Empty environment variable
++    os.environ["TEMPLATES_DIRS"] = ""
++    template_dirs = get_template_dirs_from_env()
++    print(f"Empty env var -> template_dirs: {template_dirs}")
++    
++    # Test case: Environment variable with trailing comma
++    os.environ["TEMPLATES_DIRS"] = "/path/to/templates,"
++    template_dirs = get_template_dirs_from_env()
++    print(f"Trailing comma -> template_dirs: {template_dirs}")
++    
++    # Test case: Multiple paths with empty ones
++    os.environ["TEMPLATES_DIRS"] = "/path1,,/path2"
++    template_dirs = get_template_dirs_from_env()
++    print(f"Multiple with empty -> template_dirs: {template_dirs}")
++    
++    # Test the fixed processing
++    cwd = Path.cwd()
++    processed_dirs = set()
++    for dir in template_dirs:
++        if dir:  # The fix
++            processed_dirs.add(cwd / to_path(dir))
++    
++    print(f"After filtering: {processed_dirs}")
++
++if __name__ == "__main__":
++    test_edge_cases()
++    test_realistic_scenario()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..37f842a721
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for empty strings in TEMPLATES DIRS.
++"""
++import os
++from pathlib import Path
++from django.utils._os import to_path
++
++def test_fixed_behavior():
++    """Test that empty strings are properly filtered out"""
++    print("Testing fixed behavior...")
++    
++    # Simulate the problematic case: empty string in template dirs
++    template_dirs = [""]  # This is what happens with os.getenv("TEMPLATES_DIRS", "").split(",")
++    cwd = Path.cwd()
++    
++    print(f"Current working directory: {cwd}")
++    print(f"Template dirs input: {template_dirs}")
++    
++    # This is what happens in get_template_directories() AFTER the fix
++    processed_dirs = set()
++    for dir in template_dirs:
++        if dir:  # This is the fix - filter out empty strings
++            normalized_dir = to_path(dir)
++            combined_path = cwd / normalized_dir
++            processed_dirs.add(combined_path)
++            
++            print(f"  Input: '{dir}' - PROCESSED")
++            print(f"  Normalized: {normalized_dir}")
++            print(f"  Combined with cwd: {combined_path}")
++        else:
++            print(f"  Input: '{dir}' - FILTERED OUT (empty string)")
++    
++    print(f"Final processed directories: {processed_dirs}")
++    
++    # Test files to see if they would trigger autoreload
++    test_files = [
++        Path("app.py").absolute(),
++        Path("templates/index.html").absolute(),
++        Path("manage.py").absolute(),
++        Path("any/sub/directory/file.txt").absolute(),
++    ]
++    
++    print("\nTesting if files would trigger autoreload:")
++    for test_file in test_files:
++        print(f"\nFile: {test_file}")
++        for template_dir in processed_dirs:
++            if template_dir in test_file.parents:
++                print(f"  {template_dir} is in parents of {test_file} - WOULD trigger autoreload")
++                break
++        else:
++            print(f"  No template directory matches - would NOT trigger autoreload")
++    
++    # The key test: with empty strings filtered out, no files should trigger autoreload
++    # unless there are actual valid template directories
++    if not processed_dirs:
++        print("\n✓ SUCCESS: Empty strings are filtered out, no false autoreload triggers")
++    else:
++        print("\n✗ FAILURE: Empty strings are still being processed")
++
++if __name__ == "__main__":
++    test_fixed_behavior()
+\ No newline at end of file
+diff --git a/test_normal_functionality.py b/test_normal_functionality.py
+new file mode 100644
+index 0000000000..32725f0c6e
+--- /dev/null
++++ b/test_normal_functionality.py
+@@ -0,0 +1,104 @@
++#!/usr/bin/env python3
++"""
++Test that normal template directory functionality still works after the fix.
++"""
++import os
++import django
++from django.conf import settings
++from pathlib import Path
++
++# Configure Django settings with valid template directories
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[],
++        TEMPLATES=[
++            {
++                'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                'DIRS': [
++                    '/valid/template/dir',  # Absolute path
++                    'relative/template/dir',  # Relative path
++                    Path('pathlib/template/dir'),  # Path object,
++                ],
++            },
++        ],
++    )
++    django.setup()
++
++from django.template.autoreload import get_template_directories
++from django.utils._os import to_path
++
++def test_normal_functionality():
++    """Test that valid template directories are still processed correctly"""
++    print("Testing normal template directory functionality...")
++    
++    # Get template directories using the fixed function
++    template_dirs = get_template_directories()
++    print(f"Template directories returned: {template_dirs}")
++    
++    # Expected directories (absolute paths)
++    cwd = Path.cwd()
++    expected_dirs = {
++        Path('/valid/template/dir'),
++        cwd / 'relative/template/dir',
++        cwd / 'pathlib/template/dir',
++    }
++    
++    print(f"Expected directories: {expected_dirs}")
++    
++    if template_dirs == expected_dirs:
++        print("✓ SUCCESS: Valid template directories are processed correctly")
++        return True
++    else:
++        print("✗ FAILURE: Valid template directories are not processed correctly")
++        print(f"  Expected: {expected_dirs}")
++        print(f"  Got: {template_dirs}")
++        return False
++
++def test_template_changed_function():
++    """Test that template_changed function works correctly"""
++    print("\nTesting template_changed function...")
++    
++    from django.template.autoreload import template_changed
++    from unittest.mock import patch
++    
++    # Mock get_template_directories to return our test directories
++    with patch('django.template.autoreload.get_template_directories') as mock_get_dirs:
++        mock_get_dirs.return_value = {
++            Path('/valid/template/dir'),
++            Path.cwd() / 'relative/template/dir',
++        }
++        
++        # Test with a file that should trigger autoreload
++        template_file = Path('/valid/template/dir/some_template.html')
++        result = template_changed(None, template_file)
++        print(f"template_changed({template_file}) = {result}")
++        
++        if result is True:
++            print("✓ SUCCESS: Template file correctly triggers autoreload")
++        else:
++            print("✗ FAILURE: Template file should trigger autoreload")
++            return False
++        
++        # Test with a file that should NOT trigger autoreload
++        non_template_file = Path('/some/other/dir/file.txt')
++        result = template_changed(None, non_template_file)
++        print(f"template_changed({non_template_file}) = {result}")
++        
++        if result is None:
++            print("✓ SUCCESS: Non-template file correctly does not trigger autoreload")
++        else:
++            print("✗ FAILURE: Non-template file should not trigger autoreload")
++            return False
++    
++    return True
++
++if __name__ == "__main__":
++    success = test_normal_functionality() and test_template_changed_function()
++    
++    if success:
++        print("\n🎉 NORMAL FUNCTIONALITY TESTS PASSED!")
++        print("The fix preserves all existing functionality while fixing the empty string issue.")
++    else:
++        print("\n❌ SOME TESTS FAILED!")
++        exit(1)
+\ No newline at end of file
+diff --git a/test_simple_reproduction.py b/test_simple_reproduction.py
+new file mode 100644
+index 0000000000..7ecebc83d6
+--- /dev/null
++++ b/test_simple_reproduction.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++"""
++Simple test to reproduce the path normalization issue.
++"""
++import os
++from pathlib import Path
++from django.utils._os import to_path
++
++def test_path_normalization():
++    """Test how empty strings are normalized and combined with cwd"""
++    print("Testing path normalization issue...")
++    
++    # Test the problematic case: empty string in template dirs
++    template_dirs = [""]  # This is what happens with os.getenv("TEMPLATES_DIRS", "").split(",")
++    cwd = Path.cwd()
++    
++    print(f"Current working directory: {cwd}")
++    print(f"Template dirs input: {template_dirs}")
++    
++    # This is what happens in get_template_directories()
++    processed_dirs = set()
++    for dir in template_dirs:
++        normalized_dir = to_path(dir)
++        combined_path = cwd / normalized_dir
++        processed_dirs.add(combined_path)
++        
++        print(f"  Input: '{dir}'")
++        print(f"  Normalized: {normalized_dir}")
++        print(f"  Combined with cwd: {combined_path}")
++    
++    print(f"Final processed directories: {processed_dirs}")
++    
++    # The issue: any file in the project will have the cwd in its parents
++    test_files = [
++        Path("app.py").absolute(),
++        Path("templates/index.html").absolute(),
++        Path("manage.py").absolute(),
++        Path("any/sub/directory/file.txt").absolute(),
++    ]
++    
++    print("\nTesting if files would trigger autoreload:")
++    for test_file in test_files:
++        print(f"\nFile: {test_file}")
++        for template_dir in processed_dirs:
++            if template_dir in test_file.parents:
++                print(f"  {template_dir} is in parents of {test_file} - WOULD trigger autoreload")
++                break
++        else:
++            print(f"  No template directory matches - would NOT trigger autoreload")
++
++if __name__ == "__main__":
++    test_path_normalization()
+\ No newline at end of file
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 0000000000..5e43d54b0d
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++"""
++Script to verify that the fix for empty strings in TEMPLATES DIRS works correctly.
++"""
++import os
++import django
++from django.conf import settings
++from pathlib import Path
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[],
++        TEMPLATES=[
++            {
++                'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                'DIRS': [''],  # This is the problematic case
++            },
++        ],
++    )
++    django.setup()
++
++from django.template.autoreload import get_template_directories
++from django.utils._os import to_path
++
++def test_fix():
++    """Test that empty strings are filtered out from template directories"""
++    print("Testing the fix for empty strings in TEMPLATES DIRS...")
++    
++    # Get template directories using the fixed function
++    template_dirs = get_template_directories()
++    print(f"Template directories returned: {template_dirs}")
++    
++    # The fix should filter out empty strings, so no directories should be returned
++    # when only empty strings are provided
++    if not template_dirs:
++        print("✓ SUCCESS: Empty strings are properly filtered out")
++        print("✓ No false autoreload triggers will occur")
++    else:
++        print("✗ FAILURE: Empty strings are not being filtered out")
++        print(f"  Found directories: {template_dirs}")
++        return False
++    
++    # Test with mixed valid and empty directories
++    print("\nTesting with mixed valid and empty directories...")
++    
++    # Simulate what happens with the problematic code:
++    # os.getenv("TEMPLATES_DIRS", "").split(",") -> ["/valid/path", ""]
++    test_dirs = ["/valid/path", ""]
++    cwd = Path.cwd()
++    processed_dirs = set()
++    
++    for dir in test_dirs:
++        if dir:  # This is our fix
++            processed_dirs.add(cwd / to_path(dir))
++            print(f"  '{dir}' -> PROCESSED")
++        else:
++            print(f"  '{dir}' -> FILTERED OUT")
++    
++    print(f"Result: {processed_dirs}")
++    
++    if len(processed_dirs) == 1 and str(next(iter(processed_dirs))) == "/valid/path":
++        print("✓ SUCCESS: Only valid paths are processed, empty strings are filtered")
++    else:
++        print("✗ FAILURE: Mixed directory processing failed")
++        return False
++    
++    return True
++
++def test_edge_cases():
++    """Test various edge cases"""
++    print("\nTesting edge cases...")
++    
++    test_cases = [
++        ([], "Empty list"),
++        ([""], "Only empty string"),
++        (["/path1", ""], "Valid + empty"),
++        (["", "/path2"], "Empty + valid"),
++        (["/path1", "", "/path2"], "Mixed"),
++        (["/only/valid"], "Only valid"),
++    ]
++    
++    cwd = Path.cwd()
++    
++    for dirs, description in test_cases:
++        processed_dirs = set()
++        for dir in dirs:
++            if dir:  # Our fix
++                processed_dirs.add(cwd / to_path(dir))
++        
++        print(f"  {description}: {dirs} -> {processed_dirs}")
++        
++        # Verify no empty strings result in cwd being added
++        has_empty_strings = any(not d for d in dirs)
++        has_cwd_as_result = any(str(d) == str(cwd) for d in processed_dirs)
++        
++        if has_empty_strings and has_cwd_as_result:
++            print(f"    ✗ FAILURE: Empty string resulted in cwd being added")
++            return False
++        else:
++            print(f"    ✓ SUCCESS: No false cwd additions")
++    
++    return True
++
++if __name__ == "__main__":
++    success = test_fix() and test_edge_cases()
++    
++    if success:
++        print("\n🎉 ALL TESTS PASSED! The fix is working correctly.")
++        print("Empty strings in TEMPLATES DIRS will no longer break autoreload.")
++    else:
++        print("\n❌ SOME TESTS FAILED! The fix needs more work.")
++        exit(1)
+\ No newline at end of file

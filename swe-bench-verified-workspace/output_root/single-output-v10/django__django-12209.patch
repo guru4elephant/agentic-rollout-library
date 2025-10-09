@@ -1,0 +1,488 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..23261ec90a
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,138 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from uuid import uuid4
++from django.db import models
++
++# Test 1: Model with UUID default (the original issue)
++class SampleWithDefault(models.Model):
++    id = models.UUIDField(primary_key=True, default=uuid4)
++    name = models.CharField(blank=True, max_length=100)
++    
++    class Meta:
++        app_label = 'test1'
++
++# Test 2: Model without default
++class SampleWithoutDefault(models.Model):
++    id = models.UUIDField(primary_key=True)
++    name = models.CharField(blank=True, max_length=100)
++    
++    class Meta:
++        app_label = 'test2'
++
++# Test 3: Model with non-callable default
++class SampleWithNonCallableDefault(models.Model):
++    id = models.UUIDField(primary_key=True, default='12345678-1234-5678-1234-567812345678')
++    name = models.CharField(blank=True, max_length=100)
++    
++    class Meta:
++        app_label = 'test3'
++
++def test_all_scenarios():
++    print("=== Comprehensive Test of PK Default Behavior ===")
++    
++    from django.db import connection
++    
++    # Test 1: UUID default (callable)
++    print("\n1. Testing UUID default (callable)...")
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SampleWithDefault)
++    
++    try:
++        # Create first instance
++        s0 = SampleWithDefault.objects.create(name='First')
++        print(f"   Created s0: {s0.pk}")
++        
++        # Create second instance with explicit PK (should UPDATE)
++        s1 = SampleWithDefault(pk=s0.pk, name='Second')
++        s1.save()
++        print(f"   Created s1 with explicit PK: {s1.pk}")
++        
++        # Verify only one object exists
++        count = SampleWithDefault.objects.count()
++        print(f"   Total objects: {count} (expected: 1)")
++        assert count == 1, f"Expected 1 object, got {count}"
++        
++    except Exception as e:
++        print(f"   Error: {e}")
++        return False
++    
++    # Test 2: No default
++    print("\n2. Testing no default...")
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SampleWithoutDefault)
++    
++    try:
++        # Create first instance with explicit PK
++        s0 = SampleWithoutDefault(id=uuid4(), name='First')
++        s0.save()
++        print(f"   Created s0: {s0.pk}")
++        
++        # Create second instance with same PK (should UPDATE)
++        s1 = SampleWithoutDefault(id=s0.id, name='Second')
++        s1.save()
++        print(f"   Created s1 with explicit PK: {s1.pk}")
++        
++        # Verify only one object exists
++        count = SampleWithoutDefault.objects.count()
++        print(f"   Total objects: {count} (expected: 1)")
++        assert count == 1, f"Expected 1 object, got {count}"
++        
++    except Exception as e:
++        print(f"   Error: {e}")
++        return False
++    
++    # Test 3: Non-callable default
++    print("\n3. Testing non-callable default...")
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SampleWithNonCallableDefault)
++    
++    try:
++        # Create instance without explicit PK (should use default)
++        s0 = SampleWithNonCallableDefault(name='First')
++        s0.save()
++        print(f"   Created s0 with default PK: {s0.pk}")
++        
++        # Create instance with explicit PK different from default (should INSERT)
++        custom_pk = '11111111-1111-1111-1111-111111111111'
++        s1 = SampleWithNonCallableDefault(id=custom_pk, name='Second')
++        s1.save()
++        print(f"   Created s1 with explicit PK: {s1.pk}")
++        
++        # Verify both objects exist
++        count = SampleWithNonCallableDefault.objects.count()
++        print(f"   Total objects: {count} (expected: 2)")
++        assert count == 2, f"Expected 2 objects, got {count}"
++        
++    except Exception as e:
++        print(f"   Error: {e}")
++        return False
++    
++    print("\n=== All tests passed! ===")
++    return True
++
++if __name__ == "__main__":
++    success = test_all_scenarios()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index e3b14a41a0..006d66d331 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -847,14 +847,34 @@ class Model(metaclass=ModelBase):
+         if not pk_set and (force_update or update_fields):
+             raise ValueError("Cannot force an update in save() with no primary key.")
+         updated = False
+-        # Skip an UPDATE when adding an instance and primary key has a default.
++        # Skip an UPDATE when adding an instance and primary key has a default,
++        # but only if the primary key value is not explicitly set.
+         if (
+             not force_insert and
+             self._state.adding and
+             self._meta.pk.default and
+             self._meta.pk.default is not NOT_PROVIDED
+         ):
+-            force_insert = True
++            # Check if the primary key value was explicitly set (not from default)
++            default_value = self._meta.pk.get_default()
++            current_value = self._get_pk_val(meta)
++            
++            # Handle callable defaults (like uuid4)
++            if callable(default_value):
++                # For callable defaults, we can't compare the values directly
++                # Instead, we need to check if the current value was explicitly set
++                # by comparing it to what the default would generate
++                try:
++                    generated_default = default_value()
++                    if current_value == generated_default:
++                        force_insert = True
++                except Exception:
++                    # If we can't generate the default, assume explicit value was provided
++                    pass
++            else:
++                # For non-callable defaults, compare directly
++                if current_value == default_value:
++                    force_insert = True
+         # If possible, try an UPDATE. If that doesn't update anything, do an INSERT.
+         if pk_set and not force_insert:
+             base_qs = cls._base_manager.using(using)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..95c63469fc
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from uuid import uuid4
++from django.db import models
++
++# Define the model from the issue
++class Sample(models.Model):
++    id = models.UUIDField(primary_key=True, default=uuid4)
++    name = models.CharField(blank=True, max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_issue():
++    print("Testing the issue described in the GitHub issue...")
++    
++    # Create the database tables using Django's schema editor
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Sample)
++    
++    try:
++        # Step 1: Create first instance
++        print("Creating first instance...")
++        s0 = Sample.objects.create()
++        print(f"s0 created with pk: {s0.pk}")
++        
++        # Step 2: Create second instance with explicit pk
++        print("Creating second instance with explicit pk...")
++        s1 = Sample(pk=s0.pk, name='Test 1')
++        
++        # Step 3: Save the second instance - this should do UPDATE in Django 2.2, but INSERT in 3.0+
++        print("Saving second instance...")
++        s1.save()
++        print(f"s1 saved successfully with pk: {s1.pk}")
++        
++        # Verify the behavior
++        print("Verifying the behavior...")
++        all_samples = Sample.objects.all()
++        print(f"Total objects in database: {all_samples.count()}")
++        for sample in all_samples:
++            print(f"  - {sample.pk}: {sample.name}")
++            
++    except Exception as e:
++        print(f"Error occurred: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_issue()
+\ No newline at end of file
+diff --git a/test_default_behavior.py b/test_default_behavior.py
+new file mode 100644
+index 0000000000..271b5b0c59
+--- /dev/null
++++ b/test_default_behavior.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from uuid import uuid4
++from django.db import models
++
++# Define the model from the issue
++class Sample(models.Model):
++    id = models.UUIDField(primary_key=True, default=uuid4)
++    name = models.CharField(blank=True, max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_default_behavior():
++    print("Testing default behavior (no explicit PK)...")
++    
++    # Create the database tables using Django's schema editor
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Sample)
++    
++    try:
++        # Create instance without explicit PK - should use default
++        print("Creating instance without explicit PK...")
++        s0 = Sample(name='Test Default')
++        s0.save()
++        print(f"s0 created with pk: {s0.pk}")
++        
++        # Verify the behavior
++        print("Verifying the behavior...")
++        all_samples = Sample.objects.all()
++        print(f"Total objects in database: {all_samples.count()}")
++        for sample in all_samples:
++            print(f"  - {sample.pk}: {sample.name}")
++            
++    except Exception as e:
++        print(f"Error occurred: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_default_behavior()
+\ No newline at end of file
+diff --git a/test_edge_case.py b/test_edge_case.py
+new file mode 100644
+index 0000000000..1c22d09f86
+--- /dev/null
++++ b/test_edge_case.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from uuid import uuid4
++from django.db import models
++
++# Test edge case: Simulate a scenario where default generation might fail during comparison
++class SampleWithFailingDefault(models.Model):
++    id = models.UUIDField(primary_key=True, default=uuid4)
++    name = models.CharField(blank=True, max_length=100)
++    
++    class Meta:
++        app_label = 'test_edge'
++
++def test_edge_case():
++    print("=== Testing Edge Case: Failing Default ===")
++    
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SampleWithFailingDefault)
++    
++    try:
++        # Create instance with explicit PK (should work despite failing default)
++        explicit_pk = uuid4()
++        s0 = SampleWithFailingDefault(id=explicit_pk, name='Test')
++        s0.save()
++        print(f"Created instance with explicit PK: {s0.pk}")
++        
++        # Verify the object exists
++        count = SampleWithFailingDefault.objects.count()
++        print(f"Total objects: {count} (expected: 1)")
++        assert count == 1, f"Expected 1 object, got {count}"
++        
++        print("Edge case test passed!")
++        return True
++        
++    except Exception as e:
++        print(f"Error: {e}")
++        return False
++
++if __name__ == "__main__":
++    success = test_edge_case()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_no_default.py b/test_no_default.py
+new file mode 100644
+index 0000000000..e0fa6e05a2
+--- /dev/null
++++ b/test_no_default.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from uuid import uuid4
++from django.db import models
++
++# Define a model without default PK
++class SampleNoDefault(models.Model):
++    id = models.UUIDField(primary_key=True)  # No default
++    name = models.CharField(blank=True, max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_no_default():
++    print("Testing behavior with no default PK...")
++    
++    # Create the database tables using Django's schema editor
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SampleNoDefault)
++    
++    try:
++        # Create first instance with explicit PK
++        print("Creating first instance with explicit PK...")
++        s0 = SampleNoDefault(id=uuid4(), name='First')
++        s0.save()
++        print(f"s0 created with pk: {s0.pk}")
++        
++        # Create second instance with same explicit PK - should do UPDATE
++        print("Creating second instance with same explicit PK...")
++        s1 = SampleNoDefault(id=s0.id, name='Second')
++        s1.save()
++        print(f"s1 saved with pk: {s1.pk}")
++        
++        # Verify the behavior
++        print("Verifying the behavior...")
++        all_samples = SampleNoDefault.objects.all()
++        print(f"Total objects in database: {all_samples.count()}")
++        for sample in all_samples:
++            print(f"  - {sample.pk}: {sample.name}")
++            
++    except Exception as e:
++        print(f"Error occurred: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_no_default()
+\ No newline at end of file

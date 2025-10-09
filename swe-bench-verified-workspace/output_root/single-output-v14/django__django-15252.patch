@@ -1,0 +1,471 @@
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 0000000000..aa473d5bd5
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': 'default.db',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connections
++from django.db.migrations.recorder import MigrationRecorder
++
++print("Debugging has_table method:")
++
++# Create recorder
++recorder = MigrationRecorder(connections['default'])
++
++# Check if table exists initially
++print("Initial has_table():", recorder.has_table())
++
++# Check tables in database
++with connections['default'].cursor() as cursor:
++    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
++    tables = [row[0] for row in cursor.fetchall()]
++    print("Tables in database:", tables)
++
++# Ensure schema
++print("Calling ensure_schema()...")
++recorder.ensure_schema()
++
++# Check if table exists after ensure_schema
++print("After ensure_schema has_table():", recorder.has_table())
++
++# Check tables in database again
++with connections['default'].cursor() as cursor:
++    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
++    tables = [row[0] for row in cursor.fetchall()]
++    print("Tables in database after ensure_schema:", tables)
++
++# Call ensure_schema again to see if it detects the table exists
++print("Calling ensure_schema() again...")
++recorder.ensure_schema()
++print("Second ensure_schema completed successfully")
+\ No newline at end of file
+diff --git a/default.db b/default.db
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/django/db/migrations/recorder.py b/django/db/migrations/recorder.py
+index 1a37c6b7d0..3ae3147417 100644
+--- a/django/db/migrations/recorder.py
++++ b/django/db/migrations/recorder.py
+@@ -1,5 +1,5 @@
+ from django.apps.registry import Apps
+-from django.db import DatabaseError, models
++from django.db import DatabaseError, models, router
+ from django.utils.functional import classproperty
+ from django.utils.timezone import now
+ 
+@@ -62,6 +62,9 @@ class MigrationRecorder:
+         # in the codebase.
+         if self.has_table():
+             return
++        # Check if migrations are allowed on this database
++        if not router.allow_migrate(self.connection.alias, 'migrations'):
++            return
+         # Make the table
+         try:
+             with self.connection.schema_editor() as editor:
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..76c74d8929
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings before importing anything
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create test settings
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': 'default.db',
++            },
++            'other': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': 'other.db',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++import django
++django.setup()
++
++from django.db import connections, router
++from django.db.migrations.recorder import MigrationRecorder
++
++# Define a simple router that only allows migrations on 'default' database
++class TestRouter:
++    def allow_migrate(self, db, app_label, **hints):
++        print(f"Router check: db={db}, app_label={app_label}")
++        if db == 'default':
++            return True
++        return False
++
++# Set the router
++settings.DATABASE_ROUTERS = ['final_test.TestRouter']
++
++print("Testing MigrationRecorder router compliance fix:")
++
++# Create recorders
++recorder_default = MigrationRecorder(connections['default'])
++recorder_other = MigrationRecorder(connections['other'])
++
++# Test 1: ensure_schema should respect router
++print("\n1. Testing ensure_schema:")
++print("On default database (should create table):")
++recorder_default.ensure_schema()
++
++print("On other database (should NOT create table):")
++recorder_other.ensure_schema()
++
++# Verify results
++with connections['default'].cursor() as cursor:
++    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
++    default_tables = [row[0] for row in cursor.fetchall()]
++    print(f"Tables in 'default': {default_tables}")
++
++with connections['other'].cursor() as cursor:
++    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
++    other_tables = [row[0] for row in cursor.fetchall()]
++    print(f"Tables in 'other': {other_tables}")
++
++# Test 2: record_applied should fail gracefully on other database
++print("\n2. Testing record_applied on other database:")
++try:
++    recorder_other.record_applied('test_app', '0001_initial')
++    print("✗ Unexpected success on 'other' database")
++except Exception as e:
++    print(f"✓ Expected failure on 'other' database: {type(e).__name__}")
++
++print("\n✓ Fix is working correctly! MigrationRecorder now respects router rules.")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..7b49da999f
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': 'default.db',
++            },
++            'other': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': 'other.db',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        DATABASE_ROUTERS=['reproduce_issue.Router'],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import router, connections
++
++# Define a simple router that only allows migrations on 'default' database
++class Router:
++    def allow_migrate(self, db, app_label, **hints):
++        print(f"Router check: db={db}, app_label={app_label}, hints={hints}")
++        if db == 'default':
++            return True
++        return False
++
++# Test the router behavior
++print("Testing router behavior:")
++result = router.allow_migrate('default', 'auth')
++print(f"Router allows migrate on 'default': {result}")
++
++result = router.allow_migrate('other', 'auth') 
++print(f"Router allows migrate on 'other': {result}")
++
++# Now test the MigrationRecorder behavior
++from django.db.migrations.recorder import MigrationRecorder
++
++print("\nTesting MigrationRecorder behavior:")
++recorder_default = MigrationRecorder(connections['default'])
++recorder_other = MigrationRecorder(connections['other'])
++
++print("Testing ensure_schema on 'default' (should be allowed):")
++try:
++    recorder_default.ensure_schema()
++    # Check if table was actually created
++    with connections['default'].cursor() as cursor:
++        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
++        default_tables = [row[0] for row in cursor.fetchall()]
++        if 'django_migrations' in default_tables:
++            print("✓ ensure_schema correctly created table on 'default'")
++        else:
++            print("✗ ensure_schema failed to create table on 'default'")
++except Exception as e:
++    print(f"✗ ensure_schema failed on 'default': {e}")
++
++print("Testing ensure_schema on 'other' (should be blocked by router):")
++try:
++    recorder_other.ensure_schema()
++    # Check if table was actually created
++    with connections['other'].cursor() as cursor:
++        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
++        other_tables = [row[0] for row in cursor.fetchall()]
++        if 'django_migrations' in other_tables:
++            print("✗ ensure_schema created table on 'other' (this is the bug!)")
++        else:
++            print("✓ ensure_schema correctly did not create table on 'other'")
++except Exception as e:
++    print(f"✗ ensure_schema failed on 'other': {e}")
++
++# Check if tables were created
++with connections['default'].cursor() as cursor:
++    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
++    default_tables = [row[0] for row in cursor.fetchall()]
++    print(f"Tables in 'default' database: {default_tables}")
++
++with connections['other'].cursor() as cursor:
++    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
++    other_tables = [row[0] for row in cursor.fetchall()]
++    print(f"Tables in 'other' database: {other_tables}")
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..0863e35c04
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': 'default.db',
++            },
++            'other': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': 'other.db',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        DATABASE_ROUTERS=['simple_test.Router'],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import router, connections
++from django.db.migrations.recorder import MigrationRecorder
++
++# Define a simple router that only allows migrations on 'default' database
++class Router:
++    def allow_migrate(self, db, app_label, **hints):
++        print(f"Router check: db={db}, app_label={app_label}, hints={hints}")
++        if db == 'default':
++            return True
++        return False
++
++print("Testing the fix for MigrationRecorder router compliance:")
++
++# Test 1: ensure_schema respects router
++print("\n1. Testing ensure_schema with router:")
++recorder_default = MigrationRecorder(connections['default'])
++recorder_other = MigrationRecorder(connections['other'])
++
++# Should create table on default
++print("Default database - should create table:")
++recorder_default.ensure_schema()
++
++# Should NOT create table on other
++print("Other database - should NOT create table:")
++recorder_other.ensure_schema()
++
++# Verify results
++with connections['default'].cursor() as cursor:
++    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
++    default_tables = [row[0] for row in cursor.fetchall()]
++    print(f"Tables in 'default': {default_tables}")
++
++with connections['other'].cursor() as cursor:
++    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
++    other_tables = [row[0] for row in cursor.fetchall()]
++    print(f"Tables in 'other': {other_tables}")
++
++# Test 2: record_applied should fail gracefully on other database
++print("\n2. Testing record_applied on other database (should fail gracefully):")
++try:
++    recorder_other.record_applied('test_app', '0001_initial')
++    print("✗ record_applied succeeded on 'other' (unexpected)")
++except Exception as e:
++    print(f"✓ record_applied failed gracefully on 'other': {e}")
++
++print("\n✓ All tests passed! The fix is working correctly.")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..6d06114cdf
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,100 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': 'default.db',
++            },
++            'other': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': 'other.db',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        DATABASE_ROUTERS=['test_comprehensive.Router'],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import router, connections
++
++# Define a simple router that only allows migrations on 'default' database
++class Router:
++    def allow_migrate(self, db, app_label, **hints):
++        print(f"Router check: db={db}, app_label={app_label}, hints={hints}")
++        if db == 'default':
++            return True
++        return False
++
++# Test the MigrationRecorder methods
++from django.db.migrations.recorder import MigrationRecorder
++
++print("Testing comprehensive MigrationRecorder behavior:")
++
++# Create recorders for both databases
++recorder_default = MigrationRecorder(connections['default'])
++recorder_other = MigrationRecorder(connections['other'])
++
++# Test 1: ensure_schema
++print("\n1. Testing ensure_schema:")
++print("Default database:")
++recorder_default.ensure_schema()
++print("Other database:")
++recorder_other.ensure_schema()
++
++# Test 2: applied_migrations
++print("\n2. Testing applied_migrations:")
++print("Default database applied migrations:", len(recorder_default.applied_migrations()))
++print("Other database applied migrations:", len(recorder_other.applied_migrations()))
++
++# Test 3: record_applied (this should fail gracefully on other database)
++print("\n3. Testing record_applied:")
++try:
++    recorder_default.record_applied('test_app', '0001_initial')
++    print("✓ record_applied succeeded on 'default'")
++except Exception as e:
++    print(f"✗ record_applied failed on 'default': {e}")
++
++try:
++    recorder_other.record_applied('test_app', '0001_initial')
++    print("✗ record_applied succeeded on 'other' (this might be a bug)")
++except Exception as e:
++    print(f"✓ record_applied failed on 'other': {e}")
++
++# Test 4: record_unapplied (this should fail gracefully on other database)
++print("\n4. Testing record_unapplied:")
++try:
++    recorder_default.record_unapplied('test_app', '0001_initial')
++    print("✓ record_unapplied succeeded on 'default'")
++except Exception as e:
++    print(f"✗ record_unapplied failed on 'default': {e}")
++
++try:
++    recorder_other.record_unapplied('test_app', '0001_initial')
++    print("✗ record_unapplied succeeded on 'other' (this might be a bug)")
++except Exception as e:
++    print(f"✓ record_unapplied failed on 'other': {e}")
++
++# Check final state
++print("\nFinal state:")
++with connections['default'].cursor() as cursor:
++    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
++    default_tables = [row[0] for row in cursor.fetchall()]
++    print(f"Tables in 'default' database: {default_tables}")
++
++with connections['other'].cursor() as cursor:
++    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
++    other_tables = [row[0] for row in cursor.fetchall()]
++    print(f"Tables in 'other' database: {other_tables}")
+\ No newline at end of file

@@ -1,0 +1,508 @@
+diff --git a/django/db/migrations/serializer.py b/django/db/migrations/serializer.py
+index 27b5cbd379..4994fbb8b1 100644
+--- a/django/db/migrations/serializer.py
++++ b/django/db/migrations/serializer.py
+@@ -120,9 +120,10 @@ class EnumSerializer(BaseSerializer):
+     def serialize(self):
+         enum_class = self.value.__class__
+         module = enum_class.__module__
+-        v_string, v_imports = serializer_factory(self.value.value).serialize()
+-        imports = {'import %s' % module, *v_imports}
+-        return "%s.%s(%s)" % (module, enum_class.__name__, v_string), imports
++        # Use the enum name instead of value to avoid translation issues
++        name_string, name_imports = serializer_factory(self.value.name).serialize()
++        imports = {'import %s' % module, *name_imports}
++        return "%s.%s[%s]" % (module, enum_class.__name__, name_string), imports
+ 
+ 
+ class FloatSerializer(BaseSimpleSerializer):
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..865cd0eb93
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++import sys
++sys.path.insert(0, '.')
++
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++import django
++django.setup()
++
++from django.db.migrations.serializer import serializer_factory
++from django.db import models
++from enum import Enum
++from django.utils.translation import gettext_lazy as _
++
++def test_original_issue():
++    """Test the exact scenario from the GitHub issue"""
++    print("Testing the original GitHub issue scenario...")
++    
++    class Status(Enum):
++        GOOD = _('Good')  # 'Good' will be translated
++        BAD = _('Bad')    # 'Bad' will be translated
++        
++        def __str__(self):
++            return self.name
++    
++    # Test the serializer directly with the enum value
++    result, imports = serializer_factory(Status.GOOD).serialize()
++    print(f"Serialized Status.GOOD: {result}")
++    
++    # The fix should use Status['GOOD'] instead of Status('Good')
++    assert "['GOOD']" in result, f"Expected ['GOOD'] in result, got: {result}"
++    assert "'Good'" not in result, f"Should not contain translated value 'Good', got: {result}"
++    assert "Status(" not in result, f"Should not use parentheses notation, got: {result}"
++    
++    # Test with BAD enum value
++    result, imports = serializer_factory(Status.BAD).serialize()
++    print(f"Serialized Status.BAD: {result}")
++    
++    assert "['BAD']" in result, f"Expected ['BAD'] in result, got: {result}"
++    assert "'Bad'" not in result, f"Should not contain translated value 'Bad', got: {result}"
++    
++    print("✅ Original issue test passed! The fix correctly uses enum names.")
++    return True
++
++def test_edge_cases():
++    """Test edge cases to ensure the fix is robust"""
++    print("Testing edge cases...")
++    
++    # Test with different enum value types
++    class Numbers(Enum):
++        ONE = 1
++        TWO = "two"
++        THREE = 3.14
++        
++    result, imports = serializer_factory(Numbers.ONE).serialize()
++    print(f"Serialized Numbers.ONE: {result}")
++    assert "['ONE']" in result, f"Expected ['ONE'] in result, got: {result}"
++    assert "1" not in result, f"Should not contain value 1, got: {result}"
++    
++    result, imports = serializer_factory(Numbers.TWO).serialize()
++    print(f"Serialized Numbers.TWO: {result}")
++    assert "['TWO']" in result, f"Expected ['TWO'] in result, got: {result}"
++    assert "'two'" not in result, f"Should not contain value 'two', got: {result}"
++    
++    result, imports = serializer_factory(Numbers.THREE).serialize()
++    print(f"Serialized Numbers.THREE: {result}")
++    assert "['THREE']" in result, f"Expected ['THREE'] in result, got: {result}"
++    assert "3.14" not in result, f"Should not contain value 3.14, got: {result}"
++    
++    print("✅ Edge cases test passed!")
++    return True
++
++if __name__ == "__main__":
++    try:
++        success1 = test_original_issue()
++        success2 = test_edge_cases()
++        if success1 and success2:
++            print("🎉 All tests passed! The fix is working correctly.")
++            sys.exit(0)
++        else:
++            print("❌ Some tests failed.")
++            sys.exit(1)
++    except Exception as e:
++        print(f"❌ Test failed: {e}")
++        import traceback
++        traceback1 = traceback.format_exc()
++        print(traceback1)
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..6f48ff37cf
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++import os
++import sys
++import tempfile
++import shutil
++from pathlib import Path
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++from django.conf import settings
++from django.db import models
++from django.utils.translation import gettext_lazy as _
++from enum import Enum
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++import django
++django.setup()
++
++from django.db.migrations.serializer import serializer_factory
++
++class Status(Enum):
++    GOOD = _('Good')  # 'Good' will be translated
++    BAD = _('Bad')    # 'Bad' will be translated
++    
++    def __str__(self):
++        return self.name
++
++def test_enum_serialization():
++    """Test that enum serialization uses the name instead of value"""
++    print("Testing enum serialization...")
++    
++    # Test the current behavior
++    serializer = serializer_factory(Status.GOOD)
++    result, imports = serializer.serialize()
++    
++    print(f"Current serialization result: {result}")
++    print(f"Current imports: {imports}")
++    
++    # The issue: it should use Status['GOOD'] instead of Status('Good')
++    expected_good = "Status['GOOD']"
++    expected_bad = "Status['BAD']"
++    
++    print(f"Expected GOOD: {expected_good}")
++    print(f"Expected BAD: {expected_bad}")
++    
++    # Check if the current implementation is wrong
++    if "'Good'" in result:
++        print("❌ ISSUE CONFIRMED: Serializer uses enum value instead of name")
++        return False
++    elif "['GOOD']" in result:
++        print("✅ FIXED: Serializer uses enum name instead of value")
++        return True
++    else:
++        print("❓ UNEXPECTED: Unknown serialization format")
++        return False
++
++if __name__ == "__main__":
++    success = test_enum_serialization()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..789dfeae57
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++import os
++import sys
++import tempfile
++import shutil
++from pathlib import Path
++
++# Add the current directory to Python path
++sys.path.insert(0, '.')
++
++from django.conf import settings
++from django.db import models
++from django.utils.translation import gettext_lazy as _
++from enum import Enum
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++import django
++django.setup()
++
++from django.db.migrations.serializer import serializer_factory
++
++class Status(Enum):
++    GOOD = _('Good')  # 'Good' will be translated
++    BAD = _('Bad')    # 'Bad' will be translated
++    UNKNOWN = _('Unknown')
++    
++    def __str__(self):
++        return self.name
++
++class Numbers(Enum):
++    ONE = 1
++    TWO = 2
++    THREE = 3
++
++def test_enum_serialization_comprehensive():
++    """Test comprehensive enum serialization scenarios"""
++    print("Testing comprehensive enum serialization...")
++    
++    # Test 1: Translated enum values
++    serializer = serializer_factory(Status.GOOD)
++    result, imports = serializer.serialize()
++    print(f"Status.GOOD: {result}")
++    assert "['GOOD']" in result, f"Expected ['GOOD'], got {result}"
++    
++    serializer = serializer_factory(Status.BAD)
++    result, imports = serializer.serialize()
++    print(f"Status.BAD: {result}")
++    assert "['BAD']" in result, f"Expected ['BAD'], got {result}"
++    
++    serializer = serializer_factory(Status.UNKNOWN)
++    result, imports = serializer.serialize()
++    print(f"Status.UNKNOWN: {result}")
++    assert "['UNKNOWN']" in result, f"Expected ['UNKNOWN'], got {result}"
++    
++    # Test 2: Numeric enum values
++    serializer = serializer_factory(Numbers.ONE)
++    result, imports = serializer.serialize()
++    print(f"Numbers.ONE: {result}")
++    assert "['ONE']" in result, f"Expected ['ONE'], got {result}"
++    
++    serializer = serializer_factory(Numbers.TWO)
++    result, imports = serializer.serialize()
++    print(f"Numbers.TWO: {result}")
++    assert "['TWO']" in result, f"Expected ['TWO'], got {result}"
++    
++    # Test 3: Verify it uses bracket notation instead of parentheses
++    assert "Status[" in result or "Numbers[" in result, "Should use bracket notation"
++    assert "Status(" not in result and "Numbers(" not in result, "Should not use parentheses notation"
++    
++    print("✅ All tests passed! The fix handles various enum scenarios correctly.")
++    return True
++
++if __name__ == "__main__":
++    try:
++        success = test_enum_serialization_comprehensive()
++        sys.exit(0 if success else 1)
++    except Exception as e:
++        print(f"❌ Test failed: {e}")
++        import traceback
++        traceback.print_exc()
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_migration_generation.py b/test_migration_generation.py
+new file mode 100644
+index 0000000000..723709d0f4
+--- /dev/null
++++ b/test_migration_generation.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++import sys
++sys.path.insert(0, '.')
++
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++import django
++django.setup()
++
++from django.db import models
++from django.db.migrations import Migration
++from django.db.migrations.state import ProjectState
++from django.db.migrations.autodetector import MigrationAutodetector
++from django.db.migrations.state import ModelState
++from enum import Enum
++from django.utils.translation import gettext_lazy as _
++
++class Status(Enum):
++    GOOD = _('Good')  # This will be translated
++    BAD = _('Bad')    # This will be translated
++    
++    def __str__(self):
++        return self.name
++
++class TestModel(models.Model):
++    status = models.CharField(default=Status.GOOD, max_length=128)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_migration_generation():
++    """Test that migration generation uses the correct enum syntax"""
++    print("Testing migration generation with enum defaults...")
++    
++    # Create initial state
++    initial_state = ProjectState()
++    initial_state.add_model(ModelState.from_model(TestModel))
++    
++    # Create a new model with the same field but different default (simulating a change)
++    class TestModel2(models.Model):
++        status = models.CharField(default=Status.BAD, max_length=128)
++        
++        class Meta:
++            app_label = 'test_app'
++    
++    new_state = ProjectState()
++    new_state.add_model(ModelState.from_model(TestModel2))
++    
++    # Detect changes
++    detector = MigrationAutodetector(initial_state, new_state)
++    changes = detector.changes(graph=None)
++    
++    print(f"Detected changes: {changes}")
++    
++    # Check if the operations contain the correct enum syntax
++    if changes:
++        for app_label, app_changes in changes.items():
++            for migration in app_changes:
++                for operation in migration.operations:
++                    print(f"Operation: {operation}")
++                    # The operation should use Status['BAD'] instead of Status('Bad')
++                    if hasattr(operation, 'field'):
++                        field_repr = repr(operation.field)
++                        print(f"Field representation: {field_repr}")
++                        if "Status" in field_repr:
++                            assert "['BAD']" in field_repr, f"Expected ['BAD'] in field representation, got: {field_repr}"
++                            assert "'Bad'" not in field_repr, f"Should not contain translated value 'Bad', got: {field_repr}"
++    
++    print("✅ Migration generation test passed!")
++    return True
++
++if __name__ == "__main__":
++    try:
++        success = test_migration_generation()
++        sys.exit(0 if success else 1)
++    except Exception as e:
++        print(f"❌ Test failed: {e}")
++        import traceback
++        traceback.print_exc()
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 0000000000..b055e3d382
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++import sys
++sys.path.insert(0, '.')
++
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++import django
++django.setup()
++
++from django.db.migrations.serializer import serializer_factory
++from enum import Enum
++from django.utils.translation import gettext_lazy as _
++
++class Status(Enum):
++    GOOD = _('Good')  # This will be translated
++    BAD = _('Bad')    # This will be translated
++    
++    def __str__(self):
++        return self.name
++
++def test_enum_serialization_fix():
++    """Test that the fix correctly uses enum names instead of values"""
++    print("Testing enum serialization fix...")
++    
++    # Test with translated enum values
++    result, imports = serializer_factory(Status.GOOD).serialize()
++    print(f"Status.GOOD serialized as: {result}")
++    
++    # The fix should use the enum name 'GOOD' instead of the translated value 'Good'
++    assert "['GOOD']" in result, f"Expected ['GOOD'] in result, got: {result}"
++    assert "'Good'" not in result, f"Should not contain translated value 'Good', got: {result}"
++    
++    result, imports = serializer_factory(Status.BAD).serialize()
++    print(f"Status.BAD serialized as: {result}")
++    
++    assert "['BAD']" in result, f"Expected ['BAD'] in result, got: {result}"
++    assert "'Bad'" not in result, f"Should not contain translated value 'Bad', got: {result}"
++    
++    # Test with regular enum values
++    class Numbers(Enum):
++        ONE = 1
++        TWO = 2
++        
++    result, imports = serializer_factory(Numbers.ONE).serialize()
++    print(f"Numbers.ONE serialized as: {result}")
++    
++    assert "['ONE']" in result, f"Expected ['ONE'] in result, got: {result}"
++    assert "1" not in result, f"Should not contain value 1, got: {result}"
++    
++    print("✅ All tests passed! The fix correctly uses enum names instead of values.")
++    return True
++
++if __name__ == "__main__":
++    try:
++        success = test_enum_serialization_fix()
++        sys.exit(0 if success else 1)
++    except Exception as e:
++        print(f"❌ Test failed: {e}")
++        import traceback
++        traceback.print_exc()
++        sys.exit(1)
+\ No newline at end of file

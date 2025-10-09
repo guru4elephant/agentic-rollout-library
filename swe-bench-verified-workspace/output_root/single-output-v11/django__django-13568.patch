@@ -1,0 +1,625 @@
+diff --git a/django/contrib/auth/checks.py b/django/contrib/auth/checks.py
+index 65fc266f7e..f398b6fddb 100644
+--- a/django/contrib/auth/checks.py
++++ b/django/contrib/auth/checks.py
+@@ -52,7 +52,16 @@ def check_user_model(app_configs=None, **kwargs):
+         )
+ 
+     # Check that the username field is unique
+-    if not cls._meta.get_field(cls.USERNAME_FIELD).unique:
++    username_field_unique = cls._meta.get_field(cls.USERNAME_FIELD).unique
++    
++    # Check if username field is unique through UniqueConstraint
++    username_constraint_exists = any(
++        constraint.fields == (cls.USERNAME_FIELD,) 
++        for constraint in cls._meta.constraints
++        if hasattr(constraint, 'fields')
++    )
++    
++    if not username_field_unique and not username_constraint_exists:
+         if (settings.AUTHENTICATION_BACKENDS ==
+                 ['django.contrib.auth.backends.ModelBackend']):
+             errors.append(
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..b9e4b5c485
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'testapp',
++        ],
++        AUTH_USER_MODEL='testapp.User',
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Import the User model from testapp
++from testapp.models import User
++
++if __name__ == "__main__":
++    from django.core.checks import run_checks
++    
++    print("Running Django system checks...")
++    errors = run_checks()
++    
++    print(f"Total errors found: {len(errors)}")
++    
++    # Filter for auth.E003 errors
++    e003_errors = [error for error in errors if error.id == 'auth.E003']
++    
++    if e003_errors:
++        print("✓ Reproduced the issue - auth.E003 found:")
++        for error in e003_errors:
++            print(f"  - {error}")
++    else:
++        print("✗ Issue not reproduced - no auth.E003 found")
++    
++    # Also check for warnings
++    warnings = [error for error in errors if error.id == 'auth.W004']
++    if warnings:
++        print("auth.W004 warnings found:")
++        for warning in warnings:
++            print(f"  - {warning}")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..4fb11a9744
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'testapp',
++        ],
++        AUTH_USER_MODEL='testapp.User',
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.auth.models import AbstractBaseUser
++from django.core.checks import run_checks
++
++# Test case 1: Field with unique=True (should not trigger E003)
++class UserWithUniqueField(AbstractBaseUser):
++    username = models.CharField(max_length=30, unique=True)
++    USERNAME_FIELD = "username"
++
++# Test case 2: Field with no uniqueness constraints (should trigger E003)  
++class UserNoConstraints(AbstractBaseUser):
++    username = models.CharField(max_length=30)
++    USERNAME_FIELD = "username"
++
++# Test case 3: Field with UniqueConstraint that includes multiple fields (should not trigger E003)
++class UserWithMultiFieldConstraint(AbstractBaseUser):
++    username = models.CharField(max_length=30)
++    email = models.EmailField()
++    USERNAME_FIELD = "username"
++    
++    class Meta:
++        constraints = [
++            models.UniqueConstraint(fields=["username", "email"], name="user_username_email_unq")
++        ]
++
++# Test case 4: Field with UniqueConstraint on just username (should not trigger E003)
++class UserWithUsernameConstraint(AbstractBaseUser):
++    username = models.CharField(max_length=30)
++    USERNAME_FIELD = "username"
++    
++    class Meta:
++        constraints = [
++            models.UniqueConstraint(fields=["username"], name="user_username_unq")
++        ]
++
++def test_model(model_class, expected_e003):
++    print(f"\nTesting {model_class.__name__}:")
++    
++    # Temporarily change AUTH_USER_MODEL
++    original_auth_user_model = settings.AUTH_USER_MODEL
++    settings.AUTH_USER_MODEL = f'testapp.{model_class.__name__}'
++    
++    # Clear app registry and re-run checks
++    from django.apps import apps
++    apps.clear_cache()
++    
++    errors = run_checks()
++    e003_errors = [error for error in errors if error.id == 'auth.E003']
++    
++    if e003_errors:
++        print(f"  ✓ E003 found (expected: {expected_e003})")
++        for error in e003_errors:
++            print(f"    - {error}")
++    else:
++        print(f"  ✓ No E003 found (expected: {not expected_e003})")
++    
++    # Restore original AUTH_USER_MODEL
++    settings.AUTH_USER_MODEL = original_auth_user_model
++    apps.clear_cache()
++
++if __name__ == "__main__":
++    print("Testing edge cases for E003 fix...")
++    
++    # Test all cases
++    test_model(UserWithUniqueField, False)
++    test_model(UserNoConstraints, True)
++    test_model(UserWithMultiFieldConstraint, False)
++    test_model(UserWithUsernameConstraint, False)
++    
++    print("\nAll tests completed!")
+\ No newline at end of file
+diff --git a/test_final.py b/test_final.py
+new file mode 100644
+index 0000000000..42dc1ffbab
+--- /dev/null
++++ b/test_final.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Test the main case - should NOT trigger E003 anymore
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'testapp',  # Uses the model with UniqueConstraint
++        ],
++        AUTH_USER_MODEL='testapp.User',
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.core.checks import run_checks
++
++print("Testing User model with UniqueConstraint on username (should NOT trigger E003)")
++errors = run_checks()
++e003_errors = [error for error in errors if error.id == 'auth.E003']
++
++if e003_errors:
++    print("  ✗ FAILED: E003 found when it shouldn't be:")
++    for error in e003_errors:
++        print(f"    - {error}")
++else:
++    print("  ✓ PASSED: No E003 found")
++
++# Test the constraint checking logic directly
++from testapp.models import User
++
++print("\nTesting constraint checking logic directly:")
++username_field_unique = User._meta.get_field(User.USERNAME_FIELD).unique
++username_constraint_exists = any(
++    constraint.fields == (User.USERNAME_FIELD,) 
++    for constraint in User._meta.constraints
++    if hasattr(constraint, 'fields')
++)
++
++print(f"username_field_unique: {username_field_unique}")
++print(f"username_constraint_exists: {username_constraint_exists}")
++print(f"Should trigger E003: {not username_field_unique and not username_constraint_exists}")
++
++if not username_field_unique and not username_constraint_exists:
++    print("  ✗ Logic error: E003 should be triggered but our fix should prevent it")
++else:
++    print("  ✓ Logic correct: E003 should not be triggered")
++
++print("\nTest completed!")
+\ No newline at end of file
+diff --git a/test_multi_constraint.py b/test_multi_constraint.py
+new file mode 100644
+index 0000000000..1f4e2994af
+--- /dev/null
++++ b/test_multi_constraint.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Test case with multiple fields in UniqueConstraint including username
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'testapp',
++        ],
++        AUTH_USER_MODEL='testapp.UserMultiConstraint',
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from testapp.models import UserMultiConstraint
++
++print("Testing multi-field constraint case:")
++print(f"USERNAME_FIELD: {UserMultiConstraint.USERNAME_FIELD}")
++print(f"Field unique: {UserMultiConstraint._meta.get_field(UserMultiConstraint.USERNAME_FIELD).unique}")
++print("Constraints:")
++for constraint in UserMultiConstraint._meta.constraints:
++    print(f"  {constraint}: fields={constraint.fields}")
++    print(f"    Contains username: {UserMultiConstraint.USERNAME_FIELD in constraint.fields}")
++
++# Test our logic
++username_field_unique = UserMultiConstraint._meta.get_field(UserMultiConstraint.USERNAME_FIELD).unique
++username_constraint_exists = any(
++    constraint.fields == (UserMultiConstraint.USERNAME_FIELD,) 
++    for constraint in UserMultiConstraint._meta.constraints
++    if hasattr(constraint, 'fields')
++)
++
++print(f"\nusername_field_unique: {username_field_unique}")
++print(f"username_constraint_exists (exact match): {username_constraint_exists}")
++
++from django.core.checks import run_checks
++errors = run_checks()
++e003_errors = [error for error in errors if error.id == 'auth.E003']
++
++print(f"\nActual E003 errors: {len(e003_errors)}")
++if e003_errors:
++    print("  E003 should be triggered because username is not uniquely constrained")
++    for error in e003_errors:
++        print(f"  - {error}")
++else:
++    print("  No E003 - this is correct because username is not uniquely constrained by itself")
+\ No newline at end of file
+diff --git a/test_multiple_fields.py b/test_multiple_fields.py
+new file mode 100644
+index 0000000000..9e3099399e
+--- /dev/null
++++ b/test_multiple_fields.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Test case with multiple fields in UniqueConstraint including username
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'testapp',
++        ],
++        AUTH_USER_MODEL='testapp.User',
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from testapp.models import User
++
++print("Testing constraint checking for multiple field constraints:")
++print(f"USERNAME_FIELD: {User.USERNAME_FIELD}")
++print(f"Field unique: {User._meta.get_field(User.USERNAME_FIELD).unique}")
++print("Constraints:")
++for constraint in User._meta.constraints:
++    print(f"  {constraint}: fields={constraint.fields}")
++    print(f"    Contains username: {User.USERNAME_FIELD in constraint.fields}")
++
++# Test our logic
++username_field_unique = User._meta.get_field(User.USERNAME_FIELD).unique
++username_constraint_exists = any(
++    constraint.fields == (User.USERNAME_FIELD,) 
++    for constraint in User._meta.constraints
++    if hasattr(constraint, 'fields')
++)
++
++print(f"\nusername_field_unique: {username_field_unique}")
++print(f"username_constraint_exists (exact match): {username_constraint_exists}")
++
++# Test if username is in any constraint fields
++username_in_any_constraint = any(
++    User.USERNAME_FIELD in constraint.fields
++    for constraint in User._meta.constraints
++    if hasattr(constraint, 'fields')
++)
++
++print(f"username_in_any_constraint: {username_in_any_constraint}")
++print(f"Should E003 trigger: {not username_field_unique and not username_in_any_constraint}")
++
++from django.core.checks import run_checks
++errors = run_checks()
++e003_errors = [error for error in errors if error.id == 'auth.E003']
++
++print(f"\nActual E003 errors: {len(e003_errors)}")
++if e003_errors:
++    for error in e003_errors:
++        print(f"  - {error}")
+\ No newline at end of file
+diff --git a/test_simple_cases.py b/test_simple_cases.py
+new file mode 100644
+index 0000000000..5f483df087
+--- /dev/null
++++ b/test_simple_cases.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Test 1: Original issue case - should NOT trigger E003
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'testapp',  # Uses the model with UniqueConstraint
++        ],
++        AUTH_USER_MODEL='testapp.User',
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.core.checks import run_checks
++
++print("Test 1: User model with UniqueConstraint on username (should NOT trigger E003)")
++errors = run_checks()
++e003_errors = [error for error in errors if error.id == 'auth.E003']
++
++if e003_errors:
++    print("  ✗ FAILED: E003 found when it shouldn't be:")
++    for error in e003_errors:
++        print(f"    - {error}")
++else:
++    print("  ✓ PASSED: No E003 found")
++
++# Test 2: Create a new app with a model that should trigger E003
++import tempfile
++import shutil
++
++# Create a temporary directory for our test app
++test_app_dir = tempfile.mkdtemp()
++test_app_init = os.path.join(test_app_dir, '__init__.py')
++test_app_models = os.path.join(test_app_dir, 'models.py')
++
++# Create __init__.py
++with open(test_app_init, 'w') as f:
++    f.write('# Test app package')
++
++# Create models.py with a model that should trigger E003
++with open(test_app_models, 'w') as f:
++    f.write('''
++from django.db import models
++from django.contrib.auth.models import AbstractBaseUser
++
++class UserNoConstraints(AbstractBaseUser):
++    username = models.CharField(max_length=30)
++    USERNAME_FIELD = "username"
++''')
++
++# Add the test app to Python path and reconfigure Django
++sys.path.insert(0, os.path.dirname(test_app_dir))
++
++# Reconfigure with the new app
++from django import conf
++conf.settings._wrapped = None
++
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.auth',
++        'django.contrib.contenttypes',
++        os.path.basename(test_app_dir),  # Our test app
++    ],
++    AUTH_USER_MODEL=f'{os.path.basename(test_app_dir)}.UserNoConstraints',
++    SECRET_KEY='test-secret-key',
++)
++
++# Clear app registry and re-setup
++from django.apps import apps
++apps.clear_cache()
++django.setup()
++
++print("\nTest 2: User model with NO constraints on username (should trigger E003)")
++errors = run_checks()
++e003_errors = [error for error in errors if error.id == 'auth.E003']
++
++if e003_errors:
++    print("  ✓ PASSED: E003 found as expected:")
++    for error in e003_errors:
++        print(f"    - {error}")
++else:
++    print("  ✗ FAILED: No E003 found when it should be")
++
++# Clean up
++shutil.rmtree(test_app_dir)
++sys.path.pop(0)
++
++print("\nTesting completed!")
+\ No newline at end of file
+diff --git a/test_unique_true.py b/test_unique_true.py
+new file mode 100644
+index 0000000000..936e71c05e
+--- /dev/null
++++ b/test_unique_true.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Test case with unique=True field
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'testapp',
++        ],
++        AUTH_USER_MODEL='testapp.UserUniqueTrue',
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.auth.models import AbstractBaseUser
++
++# Create a model with unique=True
++class UserUniqueTrue(AbstractBaseUser):
++    username = models.CharField(max_length=30, unique=True)
++    USERNAME_FIELD = "username"
++
++from django.core.checks import run_checks
++
++print("Testing User model with unique=True (should NOT trigger E003)")
++errors = run_checks()
++e003_errors = [error for error in errors if error.id == 'auth.E003']
++
++if e003_errors:
++    print("  ✗ FAILED: E003 found when it shouldn't be:")
++    for error in e003_errors:
++        print(f"    - {error}")
++else:
++    print("  ✓ PASSED: No E003 found")
++
++print("\nTest completed!")
+\ No newline at end of file
+diff --git a/testapp/__init__.py b/testapp/__init__.py
+new file mode 100644
+index 0000000000..f62aa30c4e
+--- /dev/null
++++ b/testapp/__init__.py
+@@ -0,0 +1 @@
++# This file makes testapp a Python package
+\ No newline at end of file
+diff --git a/testapp/models.py b/testapp/models.py
+new file mode 100644
+index 0000000000..242ef9d628
+--- /dev/null
++++ b/testapp/models.py
+@@ -0,0 +1,25 @@
++from django.db import models
++from django.contrib.auth.models import AbstractBaseUser
++
++class User(AbstractBaseUser):
++    username = models.CharField(max_length=30)
++    USERNAME_FIELD = "username"
++    
++    class Meta:
++        constraints = [
++            models.UniqueConstraint(fields=["username"], name="user_username_unq")
++        ]
++
++class UserMultiConstraint(AbstractBaseUser):
++    username = models.CharField(max_length=30)
++    email = models.EmailField()
++    USERNAME_FIELD = "username"
++    
++    class Meta:
++        constraints = [
++            models.UniqueConstraint(fields=["username", "email"], name="user_username_email_unq")
++        ]
++
++class UserUniqueTrue(AbstractBaseUser):
++    username = models.CharField(max_length=30, unique=True)
++    USERNAME_FIELD = "username"
+\ No newline at end of file
+diff --git a/testapp/models_multi.py b/testapp/models_multi.py
+new file mode 100644
+index 0000000000..5d117cf5ae
+--- /dev/null
++++ b/testapp/models_multi.py
+@@ -0,0 +1,12 @@
++from django.db import models
++from django.contrib.auth.models import AbstractBaseUser
++
++class UserMultiConstraint(AbstractBaseUser):
++    username = models.CharField(max_length=30)
++    email = models.EmailField()
++    USERNAME_FIELD = "username"
++    
++    class Meta:
++        constraints = [
++            models.UniqueConstraint(fields=["username", "email"], name="user_username_email_unq")
++        ]
+\ No newline at end of file

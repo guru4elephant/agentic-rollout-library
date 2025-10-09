@@ -1,0 +1,265 @@
+diff --git a/django/utils/autoreload.py b/django/utils/autoreload.py
+index b8efb9f881..92210bed5f 100644
+--- a/django/utils/autoreload.py
++++ b/django/utils/autoreload.py
+@@ -219,13 +219,26 @@ def get_child_arguments():
+     import django.__main__
+     django_main_path = Path(django.__main__.__file__)
+     py_script = Path(sys.argv[0])
+-
+     args = [sys.executable] + ['-W%s' % o for o in sys.warnoptions]
++
++    # Check if Python was started with -m (module execution)
++    main_module = sys.modules['__main__']
++    if hasattr(main_module, '__spec__') and main_module.__spec__ is not None:
++        # Python was launched with -m or the name of a directory/zipfile
++        if main_module.__spec__.parent:
++            # Python was started with -m pkg (not a directory/zipfile)
++            args += ['-m', main_module.__spec__.parent]
++            args += sys.argv[1:]
++            return args
++
++    # Fallback for detecting -m django when __main__.__spec__ is not available
+     if py_script == django_main_path:
+         # The server was started with `python -m django runserver`.
+         args += ['-m', 'django']
+         args += sys.argv[1:]
+-    elif not py_script.exists():
++        return args
++
++    if not py_script.exists():
+         # sys.argv[0] may not exist for several reasons on Windows.
+         # It may exist with a .exe extension or have a -script.py suffix.
+         exe_entrypoint = py_script.with_suffix('.exe')
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..6e3d7d41a5
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with get_child_arguments not detecting -m packages other than django.
++"""
++import sys
++import os
++import tempfile
++import subprocess
++from pathlib import Path
++
++# Create a temporary package structure
++with tempfile.TemporaryDirectory() as tmpdir:
++    # Create a package structure
++    pkg_dir = Path(tmpdir) / "my_package"
++    pkg_dir.mkdir()
++    
++    # Create __main__.py file
++    main_file = pkg_dir / "__main__.py"
++    main_file.write_text("""
++import sys
++print("Running my_package __main__")
++print(f"sys.argv: {sys.argv}")
++""")
++    
++    # Create __init__.py file
++    init_file = pkg_dir / "__init__.py"
++    init_file.write_text("# Package init")
++    
++    # Add the package directory to Python path
++    sys.path.insert(0, str(tmpdir))
++    
++    # Test the current behavior
++    from django.utils.autoreload import get_child_arguments
++    
++    # Simulate running as python -m my_package runserver by setting up __main__ module correctly
++    original_argv = sys.argv.copy()
++    original_main_module = sys.modules['__main__']
++    
++    # Create a mock __main__ module that simulates -m execution
++    mock_main = type('MockModule', (), {
++        '__spec__': type('MockSpec', (), {
++            'parent': 'my_package',
++            'name': '__main__'
++        })()
++    })()
++    sys.modules['__main__'] = mock_main
++    
++    # Set argv to simulate -m execution (argv[0] would be the path to __main__.py)
++    sys.argv = [str(main_file), 'runserver']
++    
++    try:
++        args = get_child_arguments()
++        print("Current get_child_arguments() result:")
++        print(args)
++        
++        # The expected behavior should be:
++        # [sys.executable, '-m', 'my_package', 'runserver']
++        expected_args = [sys.executable, '-m', 'my_package', 'runserver']
++        if args == expected_args:
++            print("✓ Issue is FIXED: get_child_arguments correctly detects -m my_package")
++        else:
++            print("✗ Issue is NOT FIXED: get_child_arguments does not detect -m my_package")
++            print(f"Expected: {expected_args}")
++            print(f"Got: {args}")
++            
++    finally:
++        sys.argv = original_argv
++        sys.modules['__main__'] = original_main_module
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..b2e7870420
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for the get_child_arguments fix
++"""
++import sys
++import types
++from django.utils.autoreload import get_child_arguments
++
++def test_case(name, setup_func, expected_args):
++    """Test a specific case"""
++    print(f"\nTesting: {name}")
++    
++    # Save original state
++    original_argv = sys.argv.copy()
++    original_main = sys.modules['__main__']
++    
++    try:
++        # Set up the test case
++        setup_func()
++        
++        # Run the function
++        args = get_child_arguments()
++        
++        # Check result
++        if args == expected_args:
++            print("✓ PASS")
++        else:
++            print("✗ FAIL")
++            print(f"Expected: {expected_args}")
++            print(f"Got:      {args}")
++            
++    finally:
++        # Restore original state
++        sys.argv = original_argv
++        sys.modules['__main__'] = original_main
++
++# Test 1: Regular script execution
++def setup_regular_script():
++    sys.argv = [__file__, 'runserver']  # Use current file which exists
++
++test_case("Regular script execution", setup_regular_script, 
++          [sys.executable, __file__, 'runserver'])
++
++# Test 2: -m django execution (original functionality)
++def setup_django_m():
++    sys.argv = ['/testbed/django/__main__.py', 'runserver']
++
++test_case("-m django execution", setup_django_m,
++          [sys.executable, '-m', 'django', 'runserver'])
++
++# Test 3: -m other_package execution (new functionality)
++def setup_other_package_m():
++    # Create mock __main__ module with __spec__
++    mock_spec = types.SimpleNamespace()
++    mock_spec.parent = 'my_package'
++    mock_spec.name = '__main__'
++    mock_main = types.SimpleNamespace()
++    mock_main.__spec__ = mock_spec
++    sys.modules['__main__'] = mock_main
++    
++    sys.argv = ['/some/path/my_package/__main__.py', 'runserver']
++
++test_case("-m other package execution", setup_other_package_m,
++          [sys.executable, '-m', 'my_package', 'runserver'])
++
++# Test 4: Directory execution (__main__.__spec__.parent is empty string)
++def setup_directory_execution():
++    # Create mock __main__ module with empty parent (directory execution)
++    mock_spec = types.SimpleNamespace()
++    mock_spec.parent = ''  # Empty string indicates directory/zipfile execution
++    mock_spec.name = '__main__'
++    mock_main = types.SimpleNamespace()
++    mock_main.__spec__ = mock_spec
++    sys.modules['__main__'] = mock_main
++    
++    # Use current directory which exists
++    sys.argv = ['.', 'runserver']
++
++test_case("Directory execution (should not use -m)",  setup_directory_execution,
++          [sys.executable, '.', 'runserver'])
++
++# Test 5: No __spec__ (fallback to original behavior)
++def setup_no_spec():
++    # Create mock __main__ module without __spec__
++    mock_main = types.SimpleNamespace()
++    sys.modules['__main__'] = mock_main
++    
++    sys.argv = ['/testbed/django/__main__.py', 'runserver']
++
++test_case("No __spec__ (fallback to path comparison)", setup_no_spec,
++          [sys.executable, '-m', 'django', 'runserver'])
++
++print("\n" + "="*50)
++print("All tests completed!")
+\ No newline at end of file
+diff --git a/test_m_execution.py b/test_m_execution.py
+new file mode 100644
+index 0000000000..adfea68387
+--- /dev/null
++++ b/test_m_execution.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""
++Test script to properly simulate -m execution environment
++"""
++import sys
++import types
++from django.utils.autoreload import get_child_arguments
++
++# Save original state
++original_argv = sys.argv.copy()
++original_main_module = sys.modules['__main__']
++
++# Simulate what happens when Python runs with -m my_package runserver
++# When Python runs with -m, sys.argv[0] is set to the full path of the __main__.py file
++# and __main__.__spec__ is set appropriately
++
++# Create a mock __main__ module that simulates -m execution
++mock_spec = types.SimpleNamespace()
++mock_spec.parent = 'my_package'  # This is the package name used with -m
++mock_spec.name = '__main__'
++
++mock_main = types.SimpleNamespace()
++mock_main.__spec__ = mock_spec
++
++sys.modules['__main__'] = mock_main
++
++# Simulate argv as it would be when running: python -m my_package runserver
++# sys.argv[0] would be the path to my_package/__main__.py
++# sys.argv[1:] would be the arguments ['runserver']
++sys.argv = ['/some/path/my_package/__main__.py', 'runserver']
++
++try:
++    args = get_child_arguments()
++    print("get_child_arguments() result:")
++    print(args)
++    
++    # Expected: [sys.executable, '-m', 'my_package', 'runserver']
++    expected_args = [sys.executable, '-m', 'my_package', 'runserver']
++    if args == expected_args:
++        print("✓ SUCCESS: get_child_arguments correctly detects -m my_package")
++    else:
++        print("✗ FAILURE: get_child_arguments does not work correctly")
++        print(f"Expected: {expected_args}")
++        print(f"Got: {args}")
++        
++finally:
++    # Restore original state
++    sys.argv = original_argv
++    sys.modules['__main__'] = original_main_module
+\ No newline at end of file

@@ -1,0 +1,587 @@
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 0000000000..a4c666508b
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++"""
++Debug script to understand what's happening with the field processing.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField(default=42)
++    
++    class Meta:
++        app_label = 'test'
++
++class TestForm(forms.ModelForm):
++    class Meta:
++        model = TestModel
++        fields = ['name', 'value']
++    
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.fields['value'].required = False
++
++def debug_form_processing():
++    """Debug what's happening during form processing"""
++    print("Debugging form processing...")
++    
++    # Create form with data that doesn't include the 'value' field
++    form_data = {'name': 'Test Object'}
++    form = TestForm(data=form_data)
++    
++    if form.is_valid():
++        print(f"cleaned_data: {form.cleaned_data}")
++        print(f"'value' in cleaned_data: {'value' in form.cleaned_data}")
++        
++        # Check field properties
++        instance = TestModel()
++        field = instance._meta.get_field('value')
++        print(f"field.has_default(): {field.has_default()}")
++        if field.has_default():
++            print(f"field.get_default(): {field.get_default()}")
++        
++        # Check if widget thinks value was omitted
++        widget = form.fields['value'].widget
++        print(f"value_omitted_from_data: {widget.value_omitted_from_data(form.data, form.files, form.add_prefix('value'))}")
++        
++        # Create instance from form
++        instance = form.save(commit=False)
++        print(f"Instance value: {instance.value}")
++        
++    else:
++        print(f"Form invalid: {form.errors}")
++
++if __name__ == '__main__':
++    debug_form_processing()
+\ No newline at end of file
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 5edbbd376f..9abb8a656c 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -39,8 +39,10 @@ def construct_instance(form, instance, fields=None, exclude=None):
+     cleaned_data = form.cleaned_data
+     file_field_list = []
+     for f in opts.fields:
+-        if not f.editable or isinstance(f, models.AutoField) \
+-                or f.name not in cleaned_data:
++        if not f.editable or isinstance(f, models.AutoField):
++            continue
++        # Allow fields with defaults to be processed even if not in cleaned_data
++        if f.name not in cleaned_data and not f.has_default():
+             continue
+         if fields is not None and f.name not in fields:
+             continue
+@@ -48,18 +50,29 @@ def construct_instance(form, instance, fields=None, exclude=None):
+             continue
+         # Leave defaults for fields that aren't in POST data, except for
+         # checkbox inputs because they don't appear in POST data if not checked.
++        # Also skip if the field is not in cleaned_data (e.g., validation removed it)
+         if (f.has_default() and
+-                form[f.name].field.widget.value_omitted_from_data(form.data, form.files, form.add_prefix(f.name))):
++                form[f.name].field.widget.value_omitted_from_data(form.data, form.files, form.add_prefix(f.name)) and
++                f.name not in cleaned_data):
+             continue
+         # Defer saving file-type fields until after the other fields, so a
+         # callable upload_to can use the values from other fields.
+         if isinstance(f, models.FileField):
+             file_field_list.append(f)
+         else:
+-            f.save_form_data(instance, cleaned_data[f.name])
++            # Use cleaned_data value if available and not None, otherwise use default value
++            if f.name in cleaned_data and cleaned_data[f.name] is not None:
++                f.save_form_data(instance, cleaned_data[f.name])
++            elif f.has_default():
++                # Apply default value if field is not in cleaned_data or value is None but has a default
++                f.save_form_data(instance, f.get_default())
+ 
+     for f in file_field_list:
+-        f.save_form_data(instance, cleaned_data[f.name])
++        if f.name in cleaned_data and cleaned_data[f.name] is not None:
++            f.save_form_data(instance, cleaned_data[f.name])
++        elif f.has_default():
++            # Apply default value if file field is not in cleaned_data or value is None but has a default
++            f.save_form_data(instance, f.get_default())
+ 
+     return instance
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..39f43ecc34
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the issue where cleaned_data cannot overwrite
++fields' default values.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++# Create a test model with a field that has a default value
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField(default=42)  # Field with default value
++    
++    class Meta:
++        app_label = 'test'
++
++# Create a model form
++class TestForm(forms.ModelForm):
++    class Meta:
++        model = TestModel
++        fields = ['name', 'value']
++    
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.fields['value'].required = False  # Make value field optional
++    
++    def clean(self):
++        cleaned_data = super().clean()
++        # Try to modify the value in cleaned_data
++        cleaned_data['value'] = 100  # Try to overwrite the default
++        return cleaned_data
++
++def test_current_behavior():
++    """Test the current behavior where cleaned_data cannot overwrite defaults"""
++    print("Testing current behavior...")
++    
++    # Create form with data that doesn't include the 'value' field
++    form_data = {'name': 'Test Object'}
++    form = TestForm(data=form_data)
++    
++    if form.is_valid():
++        print("Form is valid")
++        print(f"cleaned_data: {form.cleaned_data}")
++        
++        # Create instance from form
++        instance = form.save(commit=False)
++        print(f"Instance value: {instance.value} (should be 100 if fixed)")
++        print(f"Instance name: {instance.name}")
++        
++        if instance.value == 42:
++            print("❌ BUG: Default value was used instead of cleaned_data value")
++            return False
++        elif instance.value == 100:
++            print("✅ FIXED: cleaned_data value was used")
++            return True
++    else:
++        print("Form is invalid")
++        print(f"Errors: {form.errors}")
++        return False
++
++if __name__ == '__main__':
++    success = test_current_behavior()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_backward_compatibility.py b/test_backward_compatibility.py
+new file mode 100644
+index 0000000000..e953b67c31
+--- /dev/null
++++ b/test_backward_compatibility.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++"""
++Test that the fix doesn't break backward compatibility.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField(default=42)
++    
++    class Meta:
++        app_label = 'test'
++
++class TestForm(forms.ModelForm):
++    class Meta:
++        model = TestModel
++        fields = ['name', 'value']
++    
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.fields['value'].required = False
++
++def test_backward_compatibility():
++    """Test that the original behavior is preserved when appropriate"""
++    print("Testing backward compatibility...")
++    
++    # Test 1: Normal case - field not in form data, not modified in clean()
++    print("\n1. Testing normal case (field not in form data, not modified in clean):")
++    form_data = {'name': 'Test Object'}
++    form = TestForm(data=form_data)
++    
++    if form.is_valid():
++        instance = form.save(commit=False)
++        print(f"  name: {instance.name} (expected: 'Test Object')")
++        print(f"  value: {instance.value} (expected: 42 - default value)")
++        
++        success = (instance.name == 'Test Object' and instance.value == 42)
++        print(f"  Result: {'✅ PASS' if success else '❌ FAIL'}")
++    else:
++        print(f"  Form invalid: {form.errors}")
++        return False
++    
++    # Test 2: Field in form data - should use form data value
++    print("\n2. Testing field in form data:")
++    form_data = {'name': 'Test Object', 'value': '25'}
++    form = TestForm(data=form_data)
++    
++    if form.is_valid():
++        instance = form.save(commit=False)
++        print(f"  name: {instance.name} (expected: 'Test Object')")
++        print(f"  value: {instance.value} (expected: 25 - form data value)")
++        
++        success = (instance.name == 'Test Object' and instance.value == 25)
++        print(f"  Result: {'✅ PASS' if success else '❌ FAIL'}")
++    else:
++        print(f"  Form invalid: {form.errors}")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    success = test_backward_compatibility()
++    print(f"\nOverall result: {'✅ BACKWARD COMPATIBILITY MAINTAINED' if success else '❌ BACKWARD COMPATIBILITY BROKEN'}")
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..4f341bb28c
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,134 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the cleaned_data default value fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++# Test model with various field types and defaults
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField(default=42)
++    active = models.BooleanField(default=True)
++    description = models.TextField(default="Default description")
++    
++    class Meta:
++        app_label = 'test'
++
++class TestForm(forms.ModelForm):
++    class Meta:
++        model = TestModel
++        fields = ['name', 'value', 'active', 'description']
++    
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # Make all fields optional for testing
++        for field_name in self.fields:
++            self.fields[field_name].required = False
++    
++    def clean(self):
++        cleaned_data = super().clean()
++        # Modify multiple fields in cleaned_data
++        cleaned_data['value'] = 100
++        cleaned_data['active'] = False
++        cleaned_data['description'] = "Modified in clean()"
++        return cleaned_data
++
++def test_edge_cases():
++    """Test various edge cases"""
++    print("Testing edge cases...")
++    
++    # Test 1: Form with no data for fields with defaults
++    print("\n1. Testing form with no data for default fields:")
++    form_data = {'name': 'Test Object'}
++    form = TestForm(data=form_data)
++    
++    if form.is_valid():
++        instance = form.save(commit=False)
++        print(f"  name: {instance.name} (expected: 'Test Object')")
++        print(f"  value: {instance.value} (expected: 100)")
++        print(f"  active: {instance.active} (expected: False)")
++        print(f"  description: {instance.description} (expected: 'Modified in clean()')")
++        
++        success = (instance.name == 'Test Object' and 
++                  instance.value == 100 and 
++                  instance.active == False and 
++                  instance.description == "Modified in clean()")
++        print(f"  Result: {'✅ PASS' if success else '❌ FAIL'}")
++    else:
++        print(f"  Form invalid: {form.errors}")
++        return False
++    
++    # Test 2: Form with some data, some defaults modified in clean()
++    print("\n2. Testing form with partial data:")
++    form_data = {'name': 'Test 2', 'value': '50'}  # User provides value
++    form = TestForm(data=form_data)
++    
++    if form.is_valid():
++        instance = form.save(commit=False)
++        print(f"  name: {instance.name} (expected: 'Test 2')")
++        print(f"  value: {instance.value} (expected: 100)")  # Should be overridden by clean()
++        print(f"  active: {instance.active} (expected: False)")
++        print(f"  description: {instance.description} (expected: 'Modified in clean()')")
++        
++        success = (instance.name == 'Test 2' and 
++                  instance.value == 100 and 
++                  instance.active == False and 
++                  instance.description == "Modified in clean()")
++        print(f"  Result: {'✅ PASS' if success else '❌ FAIL'}")
++    else:
++        print(f"  Form invalid: {form.errors}")
++        return False
++    
++    # Test 3: Empty form (all defaults)
++    print("\n3. Testing empty form:")
++    form_data = {}
++    form = TestForm(data=form_data)
++    
++    if form.is_valid():
++        instance = form.save(commit=False)
++        print(f"  name: {instance.name} (expected: '')")
++        print(f"  value: {instance.value} (expected: 100)")  # Should be overridden by clean()
++        print(f"  active: {instance.active} (expected: False)")
++        print(f"  description: {instance.description} (expected: 'Modified in clean()')")
++        
++        success = (instance.name == '' and 
++                  instance.value == 100 and 
++                  instance.active == False and 
++                  instance.description == "Modified in clean()")
++        print(f"  Result: {'✅ PASS' if success else '❌ FAIL'}")
++    else:
++        print(f"  Form invalid: {form.errors}")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    success = test_edge_cases()
++    print(f"\nOverall result: {'✅ ALL TESTS PASSED' if success else '❌ SOME TESTS FAILED'}")
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_integration.py b/test_integration.py
+new file mode 100644
+index 0000000000..55b6c781de
+--- /dev/null
++++ b/test_integration.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python3
++"""
++Integration test to verify our changes work with Django's test infrastructure.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.test import TestCase
++from django.db import models
++from django import forms
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField(default=42)
++    active = models.BooleanField(default=True)
++    
++    class Meta:
++        app_label = 'test'
++
++class TestForm(forms.ModelForm):
++    class Meta:
++        model = TestModel
++        fields = ['name', 'value', 'active']
++    
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # Make fields optional for testing
++        for field_name in self.fields:
++            self.fields[field_name].required = False
++    
++    def clean(self):
++        cleaned_data = super().clean()
++        # Modify fields in cleaned_data
++        cleaned_data['value'] = 100
++        cleaned_data['active'] = False
++        return cleaned_data
++
++class CleanedDataDefaultTest(TestCase):
++    def test_cleaned_data_overrides_defaults(self):
++        """Test that cleaned_data can override field defaults"""
++        form_data = {'name': 'Test Object'}  # value and active not provided
++        form = TestForm(data=form_data)
++        
++        self.assertTrue(form.is_valid())
++        self.assertEqual(form.cleaned_data['value'], 100)
++        self.assertEqual(form.cleaned_data['active'], False)
++        
++        instance = form.save(commit=False)
++        self.assertEqual(instance.value, 100)  # Should use cleaned_data, not default
++        self.assertEqual(instance.active, False)  # Should use cleaned_data, not default
++        self.assertEqual(instance.name, 'Test Object')
++    
++    def test_backward_compatibility(self):
++        """Test that normal default behavior still works"""
++        # Create a form without the clean method override
++        class TestFormNoClean(forms.ModelForm):
++            class Meta:
++                model = TestModel
++                fields = ['name', 'value', 'active']
++            
++            def __init__(self, *args, **kwargs):
++                super().__init__(*args, **kwargs)
++                # Make fields optional for testing
++                for field_name in self.fields:
++                    self.fields[field_name].required = False
++        
++        form_data = {'name': 'Test Object'}  # value and active not provided
++        form = TestFormNoClean(data=form_data)
++        
++        self.assertTrue(form.is_valid())
++        instance = form.save(commit=False)
++        self.assertEqual(instance.value, 42)  # Should use default
++        self.assertEqual(instance.active, True)  # Should use default
++    
++    def test_form_data_overrides_defaults(self):
++        """Test that form data still overrides defaults"""
++        form_data = {'name': 'Test Object', 'value': '25', 'active': 'false'}
++        form = TestForm(data=form_data)
++        
++        self.assertTrue(form.is_valid())
++        instance = form.save(commit=False)
++        self.assertEqual(instance.value, 25)  # Should use form data
++        self.assertEqual(instance.active, False)  # Should use form data
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file

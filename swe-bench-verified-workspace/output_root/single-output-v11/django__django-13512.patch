@@ -1,0 +1,422 @@
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index a249f4cdbf..66c039c6e4 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -81,7 +81,7 @@ class JSONField(CheckFieldDefaultMixin, Field):
+     def get_prep_value(self, value):
+         if value is None:
+             return value
+-        return json.dumps(value, cls=self.encoder)
++        return json.dumps(value, cls=self.encoder, ensure_ascii=False)
+ 
+     def get_transform(self, name):
+         transform = super().get_transform(name)
+diff --git a/django/forms/fields.py b/django/forms/fields.py
+index 9de2c60b35..8235aaac01 100644
+--- a/django/forms/fields.py
++++ b/django/forms/fields.py
+@@ -1258,7 +1258,7 @@ class JSONField(CharField):
+     def prepare_value(self, value):
+         if isinstance(value, InvalidJSONInput):
+             return value
+-        return json.dumps(value, cls=self.encoder)
++        return json.dumps(value, cls=self.encoder, ensure_ascii=False)
+ 
+     def has_changed(self, initial, data):
+         if super().has_changed(initial, data):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..cda9b0274c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the Unicode display issue in JSONFields in Django admin.
++The issue is that json.dumps() uses ASCII encoding by default, which converts
++Unicode characters to escape sequences like \u4e2d\u56fd instead of displaying
++the actual characters.
++"""
++
++import json
++from django.forms import JSONField
++
++def test_json_dumps_unicode():
++    """Test the current behavior of json.dumps with Unicode characters"""
++    chinese_text = '中国'
++    print("Original Chinese text:", chinese_text)
++    
++    # Current behavior (default ensure_ascii=True)
++    result_default = json.dumps(chinese_text)
++    print("json.dumps() default (ensure_ascii=True):", result_default)
++    
++    # Desired behavior (ensure_ascii=False)
++    result_unicode = json.dumps(chinese_text, ensure_ascii=False)
++    print("json.dumps() with ensure_ascii=False:", result_unicode)
++
++def test_jsonfield_prepare_value():
++    """Test the JSONField.prepare_value method behavior"""
++    field = JSONField()
++    chinese_data = {'text': '中国'}
++    
++    print("Original Chinese data:", chinese_data)
++    
++    # Test current behavior
++    result_current = field.prepare_value(chinese_data)
++    print("JSONField.prepare_value() current:", result_current)
++    
++    # Test what it should be with ensure_ascii=False
++    result_desired = json.dumps(chinese_data, ensure_ascii=False)
++    print("JSONField.prepare_value() desired:", result_desired)
++
++if __name__ == "__main__":
++    print("=== Testing json.dumps behavior ===")
++    test_json_dumps_unicode()
++    print("\n=== Testing JSONField.prepare_value behavior ===")
++    test_jsonfield_prepare_value()
+\ No newline at end of file
+diff --git a/test_admin_simulation.py b/test_admin_simulation.py
+new file mode 100644
+index 0000000000..2c6abe8bdd
+--- /dev/null
++++ b/test_admin_simulation.py
+@@ -0,0 +1,41 @@
++#!/usr/bin/env python3
++"""
++Test to simulate Django admin behavior with JSONField Unicode display.
++"""
++
++import json
++from django.db import models
++from django.forms import JSONField
++from django.contrib.admin.utils import display_for_field
++
++class TestModel(models.Model):
++    json_data = models.JSONField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_admin_display():
++    """Test how JSONField data would be displayed in Django admin"""
++    
++    # Create a test instance with Unicode data
++    test_data = {'chinese': '中国', 'japanese': '日本語', 'korean': '한국'}
++    
++    # Test 1: Model field get_prep_value (used by admin display)
++    field = TestModel._meta.get_field('json_data')
++    prep_value = field.get_prep_value(test_data)
++    print("Model field get_prep_value:", prep_value)
++    
++    # Test 2: Form field prepare_value (used by admin form rendering)
++    form_field = JSONField()
++    form_value = form_field.prepare_value(test_data)
++    print("Form field prepare_value:", form_value)
++    
++    # Test 3: Simulate admin display_for_field behavior
++    display_value = display_for_field(test_data, field, '')
++    print("Admin display_for_field:", display_value)
++    
++    # Test 4: Verify both methods produce the same result
++    print("Values match:", prep_value == form_value)
++
++if __name__ == "__main__":
++    test_admin_display()
+\ No newline at end of file
+diff --git a/test_custom_encoder.py b/test_custom_encoder.py
+new file mode 100644
+index 0000000000..8020036e1f
+--- /dev/null
++++ b/test_custom_encoder.py
+@@ -0,0 +1,38 @@
++#!/usr/bin/env python3
++"""
++Test that our fix works with custom encoders.
++"""
++
++import json
++from django.db.models.fields.json import JSONField as ModelJSONField
++from django.forms.fields import JSONField as FormJSONField
++
++class CustomEncoder(json.JSONEncoder):
++    def default(self, obj):
++        if isinstance(obj, str):
++            return f"CUSTOM_{obj}"
++        return super().default(obj)
++
++def test_custom_encoder():
++    """Test that custom encoders still work with our fix"""
++    
++    # Test model field with custom encoder
++    model_field = ModelJSONField(encoder=CustomEncoder)
++    model_result = model_field.get_prep_value({'text': '中国'})
++    print(f"Model with custom encoder: {model_result}")
++    
++    # Test form field with custom encoder
++    form_field = FormJSONField(encoder=CustomEncoder)
++    form_result = form_field.prepare_value({'text': '中国'})
++    print(f"Form with custom encoder: {form_result}")
++    
++    # Verify custom encoding still works
++    print(f"Custom encoding works: {'CUSTOM_中国' in model_result}")
++    
++    # Verify Unicode is still preserved (not escaped)
++    print(f"Unicode preserved: {'中国' in model_result}")
++    escape_seq = '\\u4e2d'
++    print(f"No escape sequences: {escape_seq not in model_result}")
++
++if __name__ == "__main__":
++    test_custom_encoder()
+\ No newline at end of file
+diff --git a/test_custom_encoder_proper.py b/test_custom_encoder_proper.py
+new file mode 100644
+index 0000000000..40c6a475fc
+--- /dev/null
++++ b/test_custom_encoder_proper.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++"""
++Test that our fix works with custom encoders for actual custom objects.
++"""
++
++import json
++from django.db.models.fields.json import JSONField as ModelJSONField
++from django.forms.fields import JSONField as FormJSONField
++
++class CustomObject:
++    def __init__(self, value):
++        self.value = value
++    
++    def __str__(self):
++        return f"CustomObject({self.value})"
++
++class CustomEncoder(json.JSONEncoder):
++    def default(self, obj):
++        if isinstance(obj, CustomObject):
++            return f"CUSTOM_{obj.value}"
++        return super().default(obj)
++
++def test_custom_encoder():
++    """Test that custom encoders work correctly with our fix"""
++    
++    # Test with a custom object that requires the custom encoder
++    custom_obj = CustomObject('中国')
++    
++    # Test model field with custom encoder
++    model_field = ModelJSONField(encoder=CustomEncoder)
++    model_result = model_field.get_prep_value({'obj': custom_obj})
++    print(f"Model with custom encoder: {model_result}")
++    
++    # Test form field with custom encoder
++    form_field = FormJSONField(encoder=CustomEncoder)
++    form_result = form_field.prepare_value({'obj': custom_obj})
++    print(f"Form with custom encoder: {form_result}")
++    
++    # Verify custom encoding works
++    print(f"Custom encoding works: {'CUSTOM_中国' in model_result}")
++    
++    # Verify Unicode is preserved (not escaped)
++    print(f"Unicode preserved: {'中国' in model_result}")
++    escape_seq = '\\u4e2d'
++    print(f"No escape sequences: {escape_seq not in model_result}")
++
++if __name__ == "__main__":
++    test_custom_encoder()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..de892215ca
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the JSONField Unicode fix.
++"""
++
++import json
++from django.forms import JSONField
++
++def test_edge_cases():
++    """Test various edge cases for the JSONField.prepare_value method"""
++    field = JSONField()
++    
++    # Test 1: Empty values
++    print("Test 1: Empty values")
++    print("None:", field.prepare_value(None))
++    print("Empty string:", field.prepare_value(""))
++    print("Empty dict:", field.prepare_value({}))
++    print("Empty list:", field.prepare_value([]))
++    
++    # Test 2: ASCII characters (should work as before)
++    print("\nTest 2: ASCII characters")
++    ascii_data = {'text': 'hello world'}
++    print("ASCII data:", field.prepare_value(ascii_data))
++    
++    # Test 3: Mixed Unicode and ASCII
++    print("\nTest 3: Mixed Unicode and ASCII")
++    mixed_data = {'english': 'hello', 'chinese': '中国', 'japanese': '日本語'}
++    print("Mixed data:", field.prepare_value(mixed_data))
++    
++    # Test 4: Special characters
++    print("\nTest 4: Special characters")
++    special_data = {'quotes': '"hello"', 'backslash': '\\', 'unicode': 'ñáéíóú'}
++    print("Special chars:", field.prepare_value(special_data))
++    
++    # Test 5: Complex nested structure
++    print("\nTest 5: Complex nested structure")
++    complex_data = {
++        'languages': ['English', '中文', '日本語', 'Español'],
++        'metadata': {
++            'author': '张三',
++            'title': '多语言支持'
++        }
++    }
++    print("Complex data:", field.prepare_value(complex_data))
++    
++    # Test 6: With custom encoder
++    print("\nTest 6: With custom encoder")
++    class CustomEncoder(json.JSONEncoder):
++        def default(self, obj):
++            return str(obj)
++    
++    custom_field = JSONField(encoder=CustomEncoder)
++    custom_data = {'custom': '中国'}
++    print("Custom encoder:", custom_field.prepare_value(custom_data))
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_existing_behavior.py b/test_existing_behavior.py
+new file mode 100644
+index 0000000000..1874b5b428
+--- /dev/null
++++ b/test_existing_behavior.py
+@@ -0,0 +1,34 @@
++#!/usr/bin/env python3
++"""
++Test to ensure our changes don't break existing expected behavior.
++"""
++
++from django.forms.fields import JSONField
++
++def test_existing_behavior():
++    """Test that our changes don't break existing expected behavior"""
++    field = JSONField()
++    
++    # Test the exact cases from the existing tests
++    result1 = field.prepare_value({'a': 'b'})
++    expected1 = '{"a": "b"}'
++    print(f"Test 1: {result1} == {expected1}: {result1 == expected1}")
++    
++    result2 = field.prepare_value(None)
++    expected2 = 'null'
++    print(f"Test 2: {result2} == {expected2}: {result2 == expected2}")
++    
++    result3 = field.prepare_value('foo')
++    expected3 = '"foo"'
++    print(f"Test 3: {result3} == {expected3}: {result3 == expected3}")
++    
++    # Test with Unicode characters (our fix)
++    result4 = field.prepare_value({'chinese': '中国'})
++    expected4 = '{"chinese": "中国"}'  # Should contain actual characters, not escape sequences
++    print(f"Test 4: {result4} == {expected4}: {result4 == expected4}")
++    print(f"Test 4 contains actual characters: {'中国' in result4}")
++    escape_seq = '\\u4e2d'
++    print(f"Test 4 no escape sequences: {escape_seq not in result4}")
++
++if __name__ == "__main__":
++    test_existing_behavior()
+\ No newline at end of file
+diff --git a/test_final_verification.py b/test_final_verification.py
+new file mode 100644
+index 0000000000..8b4539f9d4
+--- /dev/null
++++ b/test_final_verification.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++"""
++Final verification test for the JSONField Unicode fix.
++Tests both the model field and form field fixes.
++"""
++
++import json
++from django.db.models.fields.json import JSONField as ModelJSONField
++from django.forms.fields import JSONField as FormJSONField
++
++def test_both_fixes():
++    """Test both the model field and form field fixes"""
++    
++    # Test data with Unicode characters
++    test_data = {'chinese': '中国', 'japanese': '日本語', 'korean': '한국'}
++    
++    # Test model field
++    model_field = ModelJSONField()
++    model_result = model_field.get_prep_value(test_data)
++    print("Model JSONField.get_prep_value():")
++    print(model_result)
++    print()
++    
++    # Test form field
++    form_field = FormJSONField()
++    form_result = form_field.prepare_value(test_data)
++    print("Form JSONField.prepare_value():")
++    print(form_result)
++    print()
++    
++    # Verify they produce the same result
++    print("Results match:", model_result == form_result)
++    print()
++    
++    # Verify Unicode characters are preserved
++    print("Contains actual Chinese characters:", '中国' in model_result)
++    print("Contains actual Japanese characters:", '日本語' in model_result)
++    print("Contains actual Korean characters:", '한국' in model_result)
++    print()
++    
++    # Verify no escape sequences
++    print("No Unicode escape sequences:", '\\u4e2d' not in model_result)
++    print("No Unicode escape sequences:", '\\u56fd' not in model_result)
++
++if __name__ == "__main__":
++    test_both_fixes()
+\ No newline at end of file
+diff --git a/test_model_field.py b/test_model_field.py
+new file mode 100644
+index 0000000000..b3d8fb1c2a
+--- /dev/null
++++ b/test_model_field.py
+@@ -0,0 +1,32 @@
++#!/usr/bin/env python3
++"""
++Test the model field get_prep_value method.
++"""
++
++from django.db.models.fields.json import JSONField
++
++def test_model_field():
++    """Test the model field get_prep_value method"""
++    field = JSONField()
++    
++    # Test basic functionality
++    result1 = field.get_prep_value({'a': 'b'})
++    expected1 = '{"a": "b"}'
++    print(f"Test 1: {result1} == {expected1}: {result1 == expected1}")
++    
++    # Test None
++    result2 = field.get_prep_value(None)
++    expected2 = None
++    print(f"Test 2: {result2} == {expected2}: {result2 == expected2}")
++    
++    # Test Unicode characters
++    result3 = field.get_prep_value({'chinese': '中国'})
++    expected3 = '{"chinese": "中国"}'
++    print(f"Test 3: {result3} == {expected3}: {result3 == expected3}")
++    print(f"Test 3 contains actual characters: {'中国' in result3}")
++    
++    escape_seq = '\\u4e2d'
++    print(f"Test 3 no escape sequences: {escape_seq not in result3}")
++
++if __name__ == "__main__":
++    test_model_field()
+\ No newline at end of file

@@ -1,0 +1,158 @@
+diff --git a/debug_construct.py b/debug_construct.py
+new file mode 100644
+index 00000000..d7a231bd
+--- /dev/null
++++ b/debug_construct.py
+@@ -0,0 +1,17 @@
++import xarray as xr
++import numpy as np
++
++# Create test data
++my_data = xr.DataArray(np.arange(1, 10), dims="x")
++
++# Check how construct works with center=True
++rolling_center = my_data.rolling(x=3, center=True)
++constructed_center = rolling_center.construct("window")
++print("Constructed with center=True:")
++print(constructed_center.values)
++
++# Check how construct works with center=False  
++rolling_no_center = my_data.rolling(x=3, center=False)
++constructed_no_center = rolling_no_center.construct("window")
++print("\nConstructed with center=False:")
++print(constructed_no_center.values)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..78a23976
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,17 @@
++import xarray as xr
++import numpy as np
++
++# Create test data
++my_data = xr.DataArray(np.arange(1, 10), dims="x")
++
++# Option 1: take a center-justified rolling average
++result1 = my_data.rolling(x=3, center=True).mean().values
++print("Result 1 (built-in mean):", result1)
++
++# Option 2: try to manually iterate, but the result is not centered
++my_data_rolling = my_data.rolling(x=3, center=True)
++result2 = [window.mean().values.item() for label, window in my_data_rolling]
++print("Result 2 (manual iteration):", result2)
++
++# Expected result should match result1
++print("Expected result:", [np.nan, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, np.nan])
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 00000000..4916e716
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,42 @@
++import xarray as xr
++import numpy as np
++
++print("Testing edge cases for centered rolling windows:")
++
++# Test 1: Even window size
++print("\n1. Testing even window size (window=4):")
++data = xr.DataArray(np.arange(1, 11), dims="x")
++result_builtin = data.rolling(x=4, center=True).mean().values
++print("Built-in mean:", result_builtin)
++
++rolling_obj = data.rolling(x=4, center=True)
++result_manual = [window.mean().values.item() for label, window in rolling_obj]
++print("Manual iteration:", result_manual)
++
++# Test 2: Different min_periods
++print("\n2. Testing min_periods=1:")
++result_builtin = data.rolling(x=3, center=True, min_periods=1).mean().values
++print("Built-in mean:", result_builtin)
++
++rolling_obj = data.rolling(x=3, center=True, min_periods=1)
++result_manual = [window.mean().values.item() for label, window in rolling_obj]
++print("Manual iteration:", result_manual)
++
++# Test 3: center=False (should still work as before)
++print("\n3. Testing center=False:")
++result_builtin = data.rolling(x=3, center=False).mean().values
++print("Built-in mean:", result_builtin)
++
++rolling_obj = data.rolling(x=3, center=False)
++result_manual = [window.mean().values.item() for label, window in rolling_obj]
++print("Manual iteration:", result_manual)
++
++# Test 4: Small array
++print("\n4. Testing small array:")
++small_data = xr.DataArray([1, 2, 3], dims="x")
++result_builtin = small_data.rolling(x=3, center=True).mean().values
++print("Built-in mean:", result_builtin)
++
++rolling_obj = small_data.rolling(x=3, center=True)
++result_manual = [window.mean().values.item() for label, window in rolling_obj]
++print("Manual iteration:", result_manual)
+\ No newline at end of file
+diff --git a/test_multi_dim.py b/test_multi_dim.py
+new file mode 100644
+index 00000000..d5c4b0fa
+--- /dev/null
++++ b/test_multi_dim.py
+@@ -0,0 +1,21 @@
++import xarray as xr
++import numpy as np
++
++print("Testing multi-dimensional case (should raise ValueError):")
++
++# Create 2D data
++data_2d = xr.DataArray(np.arange(12).reshape(3, 4), dims=["x", "y"])
++
++try:
++    rolling_obj = data_2d.rolling(x=2, y=2, center=True)
++    result_manual = [window.mean().values.item() for label, window in rolling_obj]
++    print("Manual iteration worked (unexpected):", result_manual)
++except ValueError as e:
++    print("Manual iteration correctly raised ValueError:", str(e))
++
++# Test 1D case with multiple dimensions specified (should work)
++print("\nTesting 1D case with multiple dimensions specified:")
++data_1d = xr.DataArray(np.arange(6), dims=["x"])
++rolling_obj = data_1d.rolling(x=3, center=True)
++result_manual = [window.mean().values.item() for label, window in rolling_obj]
++print("Manual iteration:", result_manual)
+\ No newline at end of file
+diff --git a/xarray/core/rolling.py b/xarray/core/rolling.py
+index aef290f6..807fdee5 100644
+--- a/xarray/core/rolling.py
++++ b/xarray/core/rolling.py
+@@ -270,9 +270,26 @@ class DataArrayRolling(Rolling["DataArray"]):
+     def __iter__(self) -> Iterator[tuple[RollingKey, DataArray]]:
+         if self.ndim > 1:
+             raise ValueError("__iter__ is only supported for 1d-rolling")
+-        stops = np.arange(1, len(self.window_labels) + 1)
+-        starts = stops - int(self.window[0])
+-        starts[: int(self.window[0])] = 0
++        
++        window_size = int(self.window[0])
++        n = len(self.window_labels)
++        
++        if self.center[0]:
++            # For centered windows, we need to adjust the start and stop positions
++            # to center the window around each label
++            half_window = window_size // 2
++            starts = np.arange(n) - half_window
++            stops = starts + window_size
++            
++            # Handle boundaries by clipping to valid ranges
++            starts = np.clip(starts, 0, n)
++            stops = np.clip(stops, 0, n)
++        else:
++            # For left-aligned windows (original behavior)
++            stops = np.arange(1, n + 1)
++            starts = stops - window_size
++            starts[:window_size] = 0
++        
+         for (label, start, stop) in zip(self.window_labels, starts, stops):
+             window = self.obj.isel({self.dim[0]: slice(start, stop)})

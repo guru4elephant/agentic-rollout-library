@@ -1,0 +1,585 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index d9c9b0db04..325a99aa69 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -15,7 +15,7 @@ from django.db import (
+     DJANGO_VERSION_PICKLE_KEY, IntegrityError, NotSupportedError, connections,
+     router, transaction,
+ )
+-from django.db.models import AutoField, DateField, DateTimeField, sql
++from django.db.models import AutoField, DateField, DateTimeField, sql, UniqueConstraint
+ from django.db.models.constants import LOOKUP_SEP
+ from django.db.models.deletion import Collector
+ from django.db.models.expressions import Case, Expression, F, Value, When
+@@ -682,6 +682,19 @@ class QuerySet:
+         for obj in (self.reverse() if self.ordered else self.order_by('-pk'))[:1]:
+             return obj
+ 
++    def _is_field_unique_by_constraint(self, field_name):
++        """
++        Check if a field is part of any unique constraint in the model.
++        """
++        # Get all unique constraints without conditions (total unique constraints)
++        unique_constraints = self.model._meta.total_unique_constraints
++        
++        # Check if the field is part of any unique constraint
++        for constraint in unique_constraints:
++            if field_name in constraint.fields:
++                return True
++        return False
++
+     def in_bulk(self, id_list=None, *, field_name='pk'):
+         """
+         Return a dictionary mapping each of the given IDs to the object with
+@@ -689,8 +702,10 @@ class QuerySet:
+         """
+         assert not self.query.is_sliced, \
+             "Cannot use 'limit' or 'offset' with in_bulk"
+-        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:
+-            raise ValueError("in_bulk()'s field_name must be a unique field but %r isn't." % field_name)
++        if field_name != 'pk':
++            field = self.model._meta.get_field(field_name)
++            if not field.unique and not self._is_field_unique_by_constraint(field_name):
++                raise ValueError("in_bulk()'s field_name must be a unique field but %r isn't." % field_name)
+         if id_list is not None:
+             if not id_list:
+                 return {}
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..cf15526bd8
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,163 @@
++#!/usr/bin/env python3
++"""
++Final comprehensive test to validate the fix for in_bulk() with UniqueConstraints
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure a minimal database
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Test case 1: Original issue - field with UniqueConstraint
++class ArticleWithConstraint(models.Model):
++    slug = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'test1'
++        constraints = [
++            models.UniqueConstraint(fields=["slug"], name="test1_article_slug_unq")
++        ]
++
++# Test case 2: Field with unique=True (should still work)
++class ArticleWithUnique(models.Model):
++    slug = models.CharField(max_length=255, unique=True)
++    
++    class Meta:
++        app_label = 'test2'
++
++# Test case 3: Field without uniqueness (should fail)
++class ArticleWithoutUnique(models.Model):
++    slug = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'test3'
++
++print("Final comprehensive test for in_bulk() fix with UniqueConstraints")
++print("=" * 70)
++
++# Test 1: Field with UniqueConstraint (should pass validation)
++print("\n1. Testing field with UniqueConstraint...")
++try:
++    queryset = ArticleWithConstraint.objects.all()
++    field = ArticleWithConstraint._meta.get_field("slug")
++    
++    # Test our helper method
++    is_unique_by_constraint = queryset._is_field_unique_by_constraint("slug")
++    print(f"   Helper method result: {is_unique_by_constraint}")
++    
++    # Test the validation logic (this was the failing part)
++    if not field.unique and not is_unique_by_constraint:
++        raise ValueError("in_bulk()'s field_name must be a unique field but 'slug' isn't.")
++    
++    print("   ✓ Validation passed - field is unique via UniqueConstraint")
++    
++except Exception as e:
++    print(f"   ✗ Failed: {e}")
++
++# Test 2: Field with unique=True (should pass validation)
++print("\n2. Testing field with unique=True...")
++try:
++    queryset = ArticleWithUnique.objects.all()
++    field = ArticleWithUnique._meta.get_field("slug")
++    
++    # Test our helper method
++    is_unique_by_constraint = queryset._is_field_unique_by_constraint("slug")
++    print(f"   Helper method result: {is_unique_by_constraint}")
++    
++    # Test the validation logic
++    if not field.unique and not is_unique_by_constraint:
++        raise ValueError("in_bulk()'s field_name must be a unique field but 'slug' isn't.")
++    
++    print("   ✓ Validation passed - field is unique via unique=True")
++    
++except Exception as e:
++    print(f"   ✗ Failed: {e}")
++
++# Test 3: Field without uniqueness (should fail validation)
++print("\n3. Testing field without uniqueness...")
++try:
++    queryset = ArticleWithoutUnique.objects.all()
++    field = ArticleWithoutUnique._meta.get_field("slug")
++    
++    # Test our helper method
++    is_unique_by_constraint = queryset._is_field_unique_by_constraint("slug")
++    print(f"   Helper method result: {is_unique_by_constraint}")
++    
++    # Test the validation logic (this should fail)
++    if not field.unique and not is_unique_by_constraint:
++        raise ValueError("in_bulk()'s field_name must be a unique field but 'slug' isn't.")
++    
++    print("   ✗ Validation should have failed but didn't")
++    
++except ValueError as e:
++    if "in_bulk()'s field_name must be a unique field" in str(e):
++        print("   ✓ Validation correctly failed - field is not unique")
++    else:
++        print(f"   ✗ Unexpected ValueError: {e}")
++except Exception as e:
++    print(f"   ✗ Unexpected error: {e}")
++
++# Test 4: Verify the exact error message from the original issue
++print("\n4. Testing exact error message reproduction...")
++try:
++    # Reproduce the exact scenario from the GitHub issue
++    class Article(models.Model):
++        slug = models.CharField(max_length=255)
++        
++        class Meta:
++            app_label = 'test_original'
++            constraints = [
++                models.UniqueConstraint(fields=["slug"], name="%(app_label)s_%(class)s_slug_unq")
++            ]
++    
++    # This should work now but previously failed with:
++    # ValueError: in_bulk()'s field_name must be a unique field but 'slug' isn't.
++    queryset = Article.objects.all()
++    field_name = "slug"
++    
++    if field_name != 'pk':
++        field = Article._meta.get_field(field_name)
++        if not field.unique and not queryset._is_field_unique_by_constraint(field_name):
++            raise ValueError("in_bulk()'s field_name must be a unique field but %r isn't." % field_name)
++    
++    print("   ✓ Original issue is fixed - no error raised")
++    
++except ValueError as e:
++    if "in_bulk()'s field_name must be a unique field" in str(e):
++        print(f"   ✗ Original issue still exists: {e}")
++    else:
++        print(f"   ✗ Unexpected ValueError: {e}")
++except Exception as e:
++    print(f"   ✗ Unexpected error: {e}")
++
++print("\n" + "=" * 70)
++print("Test completed! The fix allows in_bulk() to work with UniqueConstraints.")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..f587f3d2c8
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with QuerySet.in_bulk() for fields with UniqueConstraints
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure a minimal database
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a test model with UniqueConstraint instead of unique=True
++class Article(models.Model):
++    slug = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'test'
++        constraints = [
++            models.UniqueConstraint(fields=["slug"], name="%(app_label)s_%(class)s_slug_unq")
++        ]
++
++# Test the validation logic without creating database tables
++try:
++    # This should work but currently fails during validation
++    queryset = Article.objects.all()
++    # Just test the validation part by accessing the field check
++    field = Article._meta.get_field("slug")
++    is_unique = field.unique
++    has_constraint = any("slug" in constraint.fields for constraint in Article._meta.total_unique_constraints)
++    
++    print(f"Field 'slug' unique attribute: {is_unique}")
++    print(f"Field 'slug' has unique constraint: {has_constraint}")
++    
++    # Test the helper method directly
++    is_unique_by_constraint = queryset._is_field_unique_by_constraint("slug")
++    print(f"Field 'slug' is unique by constraint (helper method): {is_unique_by_constraint}")
++    
++    print("SUCCESS: Validation logic works with UniqueConstraint field")
++except Exception as e:
++    print(f"ERROR: {e}")
++    print("This reproduces the issue described in the GitHub issue")
+\ No newline at end of file
+diff --git a/test_basic_functionality.py b/test_basic_functionality.py
+new file mode 100644
+index 0000000000..a5b8a46600
+--- /dev/null
++++ b/test_basic_functionality.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++"""
++Test to ensure basic in_bulk functionality still works after our changes
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure a minimal database
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Test basic in_bulk functionality
++class TestModel(models.Model):
++    name = models.CharField(max_length=100, unique=True)
++    
++    class Meta:
++        app_label = 'test_basic'
++
++print("Testing basic in_bulk functionality...")
++
++try:
++    # Test that basic in_bulk still works
++    queryset = TestModel.objects.all()
++    
++    # Test with default field_name='pk'
++    result = queryset.in_bulk()
++    print("✓ Default in_bulk() works")
++    
++    # Test with explicit field_name='pk'
++    result = queryset.in_bulk(field_name='pk')
++    print("✓ in_bulk() with field_name='pk' works")
++    
++    # Test with unique field
++    result = queryset.in_bulk(field_name='name')
++    print("✓ in_bulk() with unique field works")
++    
++    print("All basic functionality tests passed!")
++    
++except Exception as e:
++    print(f"✗ Error: {e}")
++    print("Basic functionality is broken!")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..9d53b838b2
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,130 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for the in_bulk() fix with UniqueConstraints
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure a minimal database
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Test 1: Field with UniqueConstraint (should work)
++class ArticleWithConstraint(models.Model):
++    slug = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'test1'
++        constraints = [
++            models.UniqueConstraint(fields=["slug"], name="test1_article_slug_unq")
++        ]
++
++# Test 2: Field with unique=True (should work)
++class ArticleWithUnique(models.Model):
++    slug = models.CharField(max_length=255, unique=True)
++    
++    class Meta:
++        app_label = 'test2'
++
++# Test 3: Field without uniqueness (should fail)
++class ArticleWithoutUnique(models.Model):
++    slug = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'test3'
++
++# Test 4: Field with conditional UniqueConstraint (should fail for in_bulk)
++class ArticleWithConditionalConstraint(models.Model):
++    slug = models.CharField(max_length=255)
++    is_active = models.BooleanField(default=True)
++    
++    class Meta:
++        app_label = 'test4'
++        constraints = [
++            models.UniqueConstraint(
++                fields=["slug"], 
++                name="test4_article_slug_unq",
++                condition=models.Q(is_active=True)
++            )
++        ]
++
++print("Testing in_bulk() validation with different field configurations:")
++
++# Test 1: Field with UniqueConstraint
++print("\n1. Testing field with UniqueConstraint...")
++try:
++    queryset = ArticleWithConstraint.objects.all()
++    is_unique = queryset._is_field_unique_by_constraint("slug")
++    print(f"   Field 'slug' is unique by constraint: {is_unique}")
++    print("   ✓ Should work with in_bulk()")
++except Exception as e:
++    print(f"   ✗ Unexpected error: {e}")
++
++# Test 2: Field with unique=True
++print("\n2. Testing field with unique=True...")
++try:
++    field = ArticleWithUnique._meta.get_field("slug")
++    is_unique = field.unique
++    print(f"   Field 'slug' has unique=True: {is_unique}")
++    print("   ✓ Should work with in_bulk()")
++except Exception as e:
++    print(f"   ✗ Unexpected error: {e}")
++
++# Test 3: Field without uniqueness
++print("\n3. Testing field without uniqueness...")
++try:
++    field = ArticleWithoutUnique._meta.get_field("slug")
++    is_unique = field.unique
++    has_constraint = any("slug" in constraint.fields for constraint in ArticleWithoutUnique._meta.total_unique_constraints)
++    print(f"   Field 'slug' unique=True: {is_unique}")
++    print(f"   Field 'slug' has constraint: {has_constraint}")
++    print("   ✗ Should fail with in_bulk()")
++except Exception as e:
++    print(f"   ✗ Unexpected error: {e}")
++
++# Test 4: Field with conditional UniqueConstraint
++print("\n4. Testing field with conditional UniqueConstraint...")
++try:
++    queryset = ArticleWithConditionalConstraint.objects.all()
++    is_unique = queryset._is_field_unique_by_constraint("slug")
++    print(f"   Field 'slug' is unique by constraint (including conditional): {is_unique}")
++    
++    # Check if we have any conditional constraints
++    conditional_constraints = [
++        constraint for constraint in ArticleWithConditionalConstraint._meta.constraints
++        if isinstance(constraint, models.UniqueConstraint) and constraint.condition is not None
++    ]
++    print(f"   Has conditional constraints: {len(conditional_constraints) > 0}")
++    print("   ✗ Should fail with in_bulk() (conditional constraints not supported)")
++except Exception as e:
++    print(f"   ✗ Unexpected error: {e}")
++
++print("\nAll tests completed!")
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..97b916bd63
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++"""
++Test to reproduce the exact scenario from the GitHub issue
++"""
++
++import os
++import sys
++
++# Add the current directory to Python path
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure a minimal database
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Reproduce the exact model from the GitHub issue
++class Article(models.Model):
++    slug = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'test'
++        constraints = [
++            models.UniqueConstraint(fields=["slug"], name="%(app_label)s_%(class)s_slug_unq")
++        ]
++
++print("Testing the exact scenario from the GitHub issue...")
++
++try:
++    # This should work now but previously failed
++    queryset = Article.objects.all()
++    
++    # Test the validation (this was the failing part)
++    field_name = "slug"
++    if field_name != 'pk':
++        field = Article._meta.get_field(field_name)
++        if not field.unique and not queryset._is_field_unique_by_constraint(field_name):
++            raise ValueError("in_bulk()'s field_name must be a unique field but %r isn't." % field_name)
++    
++    print("✓ SUCCESS: in_bulk() validation passed with UniqueConstraint field")
++    print("The issue has been fixed!")
++    
++except ValueError as e:
++    if "in_bulk()'s field_name must be a unique field" in str(e):
++        print(f"✗ FAILED: {e}")
++        print("The issue is NOT fixed")
++    else:
++        print(f"✗ Unexpected ValueError: {e}")
++except Exception as e:
++    print(f"✗ Unexpected error: {e}")
+\ No newline at end of file

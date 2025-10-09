@@ -1,0 +1,296 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 33cc636b22..5036335bec 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -748,7 +748,7 @@ class Query(BaseExpression):
+                     cur_model = source.related_model
+                 else:
+                     cur_model = source.remote_field.model
+-                opts = cur_model._meta
++                opts = cur_model._meta.concrete_model._meta
+                 # Even if we're "just passing through" this model, we must add
+                 # both the current model's pk and the related reference field
+                 # (if it's not a reverse relation) to the things we select.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..3213671f04
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create the models as described in the issue
++class CustomModel(models.Model):
++    name = models.CharField(max_length=16)
++    
++    class Meta:
++        app_label = 'test'
++
++class ProxyCustomModel(CustomModel):
++    class Meta:
++        proxy = True
++        app_label = 'test'
++
++class AnotherModel(models.Model):
++    custom = models.ForeignKey(
++        ProxyCustomModel,
++        on_delete=models.SET_NULL,
++        null=True,
++        blank=True,
++    )
++    
++    class Meta:
++        app_label = 'test'
++
++# Create database tables
++from django.db import connection
++
++# Create tables using schema_editor
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(CustomModel)
++    schema_editor.create_model(AnotherModel)
++
++# Insert some test data
++custom_obj = CustomModel.objects.create(name="Test Name")
++another_obj = AnotherModel.objects.create(custom=custom_obj)
++
++print("Test data created successfully!")
++
++# Try to reproduce the issue
++try:
++    print("Attempting to reproduce the issue...")
++    objs = list(AnotherModel.objects.select_related("custom").only("custom__name").all())
++    print("SUCCESS: No error occurred!")
++    print(f"Retrieved {len(objs)} objects")
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..b7b50e5189
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Test edge cases with multiple levels of proxy models
++class BaseModel(models.Model):
++    name = models.CharField(max_length=16)
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++class ProxyModel1(BaseModel):
++    class Meta:
++        proxy = True
++        app_label = 'test'
++
++class ProxyModel2(ProxyModel1):
++    class Meta:
++        proxy = True
++        app_label = 'test'
++
++# Model with foreign key to deepest proxy model
++class DeepProxyFKModel(models.Model):
++    deep_proxy = models.ForeignKey(ProxyModel2, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create database tables
++from django.db import connection
++
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(BaseModel)
++    schema_editor.create_model(DeepProxyFKModel)
++
++# Insert test data
++base_obj = BaseModel.objects.create(name="Base", value=1)
++proxy1_obj = ProxyModel1.objects.create(name="Proxy1", value=2) 
++proxy2_obj = ProxyModel2.objects.create(name="Proxy2", value=3)
++deep_fk_obj = DeepProxyFKModel.objects.create(deep_proxy=proxy2_obj)
++
++print("Test data created successfully!")
++
++# Test edge cases
++test_cases = [
++    # Multiple levels of proxy models
++    ("Deep proxy with only()", lambda: list(DeepProxyFKModel.objects.select_related("deep_proxy").only("deep_proxy__name").all())),
++    ("Deep proxy with defer()", lambda: list(DeepProxyFKModel.objects.select_related("deep_proxy").defer("deep_proxy__value").all())),
++    
++    # Multiple field selections
++    ("Multiple only() fields", lambda: list(DeepProxyFKModel.objects.select_related("deep_proxy").only("deep_proxy__name", "deep_proxy__value").all())),
++    
++    # Chained relationships
++    ("Chained only()", lambda: list(DeepProxyFKModel.objects.select_related("deep_proxy").only("deep_proxy__name").only("deep_proxy__value").all())),
++]
++
++for test_name, test_func in test_cases:
++    try:
++        result = test_func()
++        print(f"✓ {test_name}: SUCCESS ({len(result)} objects)")
++    except Exception as e:
++        print(f"✗ {test_name}: ERROR - {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++print("\nAll edge case tests completed!")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..59d426dd0a
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Test 1: Basic model without proxy
++class RegularModel(models.Model):
++    name = models.CharField(max_length=16)
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Test 2: Proxy model
++class ProxyModel(RegularModel):
++    class Meta:
++        proxy = True
++        app_label = 'test'
++
++# Test 3: Model with foreign key to regular model
++class ModelWithRegularFK(models.Model):
++    regular = models.ForeignKey(RegularModel, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test 4: Model with foreign key to proxy model (the original issue)
++class ModelWithProxyFK(models.Model):
++    proxy = models.ForeignKey(ProxyModel, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create database tables
++from django.db import connection
++
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(RegularModel)
++    schema_editor.create_model(ModelWithRegularFK)
++    schema_editor.create_model(ModelWithProxyFK)
++
++# Insert test data
++regular_obj = RegularModel.objects.create(name="Regular", value=42)
++proxy_obj = ProxyModel.objects.create(name="Proxy", value=24)
++model_with_regular = ModelWithRegularFK.objects.create(regular=regular_obj)
++model_with_proxy = ModelWithProxyFK.objects.create(proxy=proxy_obj)
++
++print("Test data created successfully!")
++
++# Test various scenarios
++test_cases = [
++    # Regular model tests
++    ("Regular model with only()", lambda: list(ModelWithRegularFK.objects.select_related("regular").only("regular__name").all())),
++    ("Regular model with defer()", lambda: list(ModelWithRegularFK.objects.select_related("regular").defer("regular__value").all())),
++    
++    # Proxy model tests (the original issue)
++    ("Proxy model with only()", lambda: list(ModelWithProxyFK.objects.select_related("proxy").only("proxy__name").all())),
++    ("Proxy model with defer()", lambda: list(ModelWithProxyFK.objects.select_related("proxy").defer("proxy__value").all())),
++    
++    # Mixed tests
++    ("Mixed: regular with only on proxy field", lambda: list(ModelWithRegularFK.objects.select_related("regular").only("regular__name").all())),
++]
++
++for test_name, test_func in test_cases:
++    try:
++        result = test_func()
++        print(f"✓ {test_name}: SUCCESS ({len(result)} objects)")
++    except Exception as e:
++        print(f"✗ {test_name}: ERROR - {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++print("\nAll tests completed!")
+\ No newline at end of file

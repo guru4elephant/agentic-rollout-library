@@ -1,0 +1,335 @@
+diff --git a/django/db/models/constraints.py b/django/db/models/constraints.py
+index 075ecee1be..a171591245 100644
+--- a/django/db/models/constraints.py
++++ b/django/db/models/constraints.py
+@@ -19,10 +19,11 @@ __all__ = ["BaseConstraint", "CheckConstraint", "Deferrable", "UniqueConstraint"
+ class BaseConstraint:
+     default_violation_error_message = _("Constraint “%(name)s” is violated.")
+     violation_error_message = None
++    violation_error_code = None
+ 
+     # RemovedInDjango60Warning: When the deprecation ends, replace with:
+-    # def __init__(self, *, name, violation_error_message=None):
+-    def __init__(self, *args, name=None, violation_error_message=None):
++    # def __init__(self, *, name, violation_error_message=None, violation_error_code=None):
++    def __init__(self, *args, name=None, violation_error_message=None, violation_error_code=None):
+         # RemovedInDjango60Warning.
+         if name is None and not args:
+             raise TypeError(
+@@ -34,6 +35,7 @@ class BaseConstraint:
+             self.violation_error_message = violation_error_message
+         else:
+             self.violation_error_message = self.default_violation_error_message
++        self.violation_error_code = violation_error_code
+         # RemovedInDjango60Warning.
+         if args:
+             warnings.warn(
+@@ -42,7 +44,7 @@ class BaseConstraint:
+                 RemovedInDjango60Warning,
+                 stacklevel=2,
+             )
+-            for arg, attr in zip(args, ["name", "violation_error_message"]):
++            for arg, attr in zip(args, ["name", "violation_error_message", "violation_error_code"]):
+                 if arg:
+                     setattr(self, attr, arg)
+ 
+@@ -65,6 +67,9 @@ class BaseConstraint:
+     def get_violation_error_message(self):
+         return self.violation_error_message % {"name": self.name}
+ 
++    def get_violation_error(self):
++        return (self.violation_error_message % {"name": self.name}, self.violation_error_code)
++
+     def deconstruct(self):
+         path = "%s.%s" % (self.__class__.__module__, self.__class__.__name__)
+         path = path.replace("django.db.models.constraints", "django.db.models")
+@@ -74,6 +79,8 @@ class BaseConstraint:
+             and self.violation_error_message != self.default_violation_error_message
+         ):
+             kwargs["violation_error_message"] = self.violation_error_message
++        if self.violation_error_code is not None:
++            kwargs["violation_error_code"] = self.violation_error_code
+         return (path, (), kwargs)
+ 
+     def clone(self):
+@@ -82,13 +89,13 @@ class BaseConstraint:
+ 
+ 
+ class CheckConstraint(BaseConstraint):
+-    def __init__(self, *, check, name, violation_error_message=None):
++    def __init__(self, *, check, name, violation_error_message=None, violation_error_code=None):
+         self.check = check
+         if not getattr(check, "conditional", False):
+             raise TypeError(
+                 "CheckConstraint.check must be a Q instance or boolean expression."
+             )
+-        super().__init__(name=name, violation_error_message=violation_error_message)
++        super().__init__(name=name, violation_error_message=violation_error_message, violation_error_code=violation_error_code)
+ 
+     def _get_check_sql(self, model, schema_editor):
+         query = Query(model=model, alias_cols=False)
+@@ -112,7 +119,8 @@ class CheckConstraint(BaseConstraint):
+         against = instance._get_field_value_map(meta=model._meta, exclude=exclude)
+         try:
+             if not Q(self.check).check(against, using=using):
+-                raise ValidationError(self.get_violation_error_message())
++                message, code = self.get_violation_error()
++                raise ValidationError(message, code=code)
+         except FieldError:
+             pass
+ 
+@@ -164,6 +172,7 @@ class UniqueConstraint(BaseConstraint):
+         include=None,
+         opclasses=(),
+         violation_error_message=None,
++        violation_error_code=None,
+     ):
+         if not name:
+             raise ValueError("A unique constraint must be named.")
+@@ -213,7 +222,7 @@ class UniqueConstraint(BaseConstraint):
+             F(expression) if isinstance(expression, str) else expression
+             for expression in expressions
+         )
+-        super().__init__(name=name, violation_error_message=violation_error_message)
++        super().__init__(name=name, violation_error_message=violation_error_message, violation_error_code=violation_error_code)
+ 
+     @property
+     def contains_expressions(self):
+@@ -385,7 +394,8 @@ class UniqueConstraint(BaseConstraint):
+         if not self.condition:
+             if queryset.exists():
+                 if self.expressions:
+-                    raise ValidationError(self.get_violation_error_message())
++                    message, code = self.get_violation_error()
++                    raise ValidationError(message, code=code)
+                 # When fields are defined, use the unique_error_message() for
+                 # backward compatibility.
+                 for model, constraints in instance.get_constraints():
+@@ -400,6 +410,7 @@ class UniqueConstraint(BaseConstraint):
+                 if (self.condition & Exists(queryset.filter(self.condition))).check(
+                     against, using=using
+                 ):
+-                    raise ValidationError(self.get_violation_error_message())
++                    message, code = self.get_violation_error()
++                    raise ValidationError(message, code=code)
+             except FieldError:
+                 pass
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..ac1ce89699
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue: Allow to customize the code attribute of ValidationError 
++raised by BaseConstraint.validate
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++    django.setup()
++
++from django.db import models
++from django.core.exceptions import ValidationError
++from django.db.models import CheckConstraint, Q, UniqueConstraint
++from django.db.models.constraints import BaseConstraint
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Test current behavior
++def test_current_behavior():
++    print("=== Testing Current Behavior ===")
++    
++    # Create a constraint with custom violation error message
++    constraint = CheckConstraint(
++        check=Q(value__gt=0),
++        name="value_positive",
++        violation_error_message="Value must be positive",
++        violation_error_code="value_positive_constraint"
++    )
++    
++    # Create an instance that violates the constraint
++    instance = TestModel(name="test", value=-1)
++    
++    try:
++        constraint.validate(TestModel, instance)
++        print("No validation error raised")
++    except ValidationError as e:
++        print(f"ValidationError raised:")
++        print(f"  Message: {e.message}")
++        print(f"  Code: {e.code}")
++        print(f"  Params: {e.params}")
++        print(f"  Error list: {[err.code for err in e.error_list]}")
++
++def test_unique_constraint_behavior():
++    print("\n=== Testing UniqueConstraint Behavior ===")
++    
++    # Create a unique constraint with custom violation error message and code
++    constraint = UniqueConstraint(
++        fields=['name'],
++        name="unique_name",
++        violation_error_message="Name must be unique",
++        violation_error_code="unique_name_constraint"
++    )
++    
++    # Just test that the constraint can be created with the new parameter
++    print(f"Constraint created successfully with error code: {constraint.violation_error_code}")
++    
++    # Test the get_violation_error method
++    message, code = constraint.get_violation_error()
++    print(f"Violation error message: {message}")
++    print(f"Violation error code: {code}")
++
++if __name__ == "__main__":
++    test_current_behavior()
++    test_unique_constraint_behavior()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..a20f65c0c8
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the violation_error_code implementation
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++    django.setup()
++
++from django.db import models
++from django.core.exceptions import ValidationError
++from django.db.models import CheckConstraint, Q, UniqueConstraint
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_no_error_code():
++    """Test constraint without error code (should default to None)"""
++    print("=== Testing No Error Code ===")
++    
++    constraint = CheckConstraint(
++        check=Q(value__gt=0),
++        name="value_positive",
++        violation_error_message="Value must be positive"
++    )
++    
++    instance = TestModel(name="test", value=-1)
++    
++    try:
++        constraint.validate(TestModel, instance)
++    except ValidationError as e:
++        print(f"Error code: {e.code}")
++        assert e.code is None, "Error code should be None when not specified"
++
++def test_none_error_code():
++    """Test constraint with explicit None error code"""
++    print("=== Testing Explicit None Error Code ===")
++    
++    constraint = CheckConstraint(
++        check=Q(value__gt=0),
++        name="value_positive",
++        violation_error_message="Value must be positive",
++        violation_error_code=None
++    )
++    
++    instance = TestModel(name="test", value=-1)
++    
++    try:
++        constraint.validate(TestModel, instance)
++    except ValidationError as e:
++        print(f"Error code: {e.code}")
++        assert e.code is None, "Error code should be None when explicitly set to None"
++
++def test_empty_error_code():
++    """Test constraint with empty string error code"""
++    print("=== Testing Empty String Error Code ===")
++    
++    constraint = CheckConstraint(
++        check=Q(value__gt=0),
++        name="value_positive",
++        violation_error_message="Value must be positive",
++        violation_error_code=""
++    )
++    
++    instance = TestModel(name="test", value=-1)
++    
++    try:
++        constraint.validate(TestModel, instance)
++    except ValidationError as e:
++        print(f"Error code: {e.code}")
++        assert e.code == "", "Error code should be empty string"
++
++def test_deconstruct_method():
++    """Test that deconstruct method includes error code"""
++    print("=== Testing Deconstruct Method ===")
++    
++    constraint = CheckConstraint(
++        check=Q(value__gt=0),
++        name="value_positive",
++        violation_error_message="Value must be positive",
++        violation_error_code="custom_code"
++    )
++    
++    path, args, kwargs = constraint.deconstruct()
++    print(f"Deconstructed kwargs: {kwargs}")
++    assert "violation_error_code" in kwargs, "violation_error_code should be in deconstructed kwargs"
++    assert kwargs["violation_error_code"] == "custom_code", "Error code should be preserved in deconstruction"
++
++if __name__ == "__main__":
++    test_no_error_code()
++    test_none_error_code()
++    test_empty_error_code()
++    test_deconstruct_method()
++    print("\nAll edge case tests passed!")
+\ No newline at end of file

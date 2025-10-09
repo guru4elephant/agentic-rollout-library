@@ -1,0 +1,369 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..56c3398a4
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the decorated __init__ issue.
++This script demonstrates that decorated methods don't show up in Sphinx docs
++when napoleon_include_init_with_doc = True.
++"""
++
++import functools
++import sys
++from pathlib import Path
++
++# Create a simple test module with a decorated __init__ method
++test_module_content = '''
++import functools
++import types
++
++def my_decorator(func):
++    """A simple decorator that preserves docstring but changes __globals__."""
++    @functools.wraps(func)
++    def wrapper(*args, **kwargs):
++        return func(*args, **kwargs)
++    # Simulate a decorator that creates a new function with different __globals__
++    # This can happen with some complex decorators
++    new_wrapper = types.FunctionType(
++        wrapper.__code__,
++        {},  # Empty globals dict - this simulates the problem
++        name=wrapper.__name__,
++        argdefs=wrapper.__defaults__,
++        closure=wrapper.__closure__
++    )
++    new_wrapper.__doc__ = wrapper.__doc__
++    new_wrapper.__qualname__ = wrapper.__qualname__
++    new_wrapper.__module__ = wrapper.__module__
++    return new_wrapper
++
++class TestClass:
++    """A test class with decorated __init__."""
++    
++    @my_decorator
++    def __init__(self):
++        """This __init__ should be documented but won't be due to the bug."""
++        self.value = 42
++'''
++
++# Write the test module
++with open('test_module.py', 'w') as f:
++    f.write(test_module_content)
++
++# Now let's test the issue by importing the module and checking the behavior
++import test_module
++
++# Check if the decorated __init__ has the right attributes
++print("Testing decorated __init__ method:")
++print(f"Qualname: {test_module.TestClass.__init__.__qualname__}")
++print(f"Has __doc__: {bool(test_module.TestClass.__init__.__doc__)}")
++print(f"Module: {test_module.TestClass.__init__.__module__}")
++
++# Try to access __globals__ (this should fail for decorated methods)
++try:
++    globals_dict = test_module.TestClass.__init__.__globals__
++    print(f"Has __globals__: {bool(globals_dict)}")
++    if globals_dict:
++        print(f"Keys in __globals__: {list(globals_dict.keys())}")
++except AttributeError as e:
++    print(f"__globals__ access failed: {e}")
++
++# Now let's try to reproduce the exact issue from the Napoleon code
++def test_napoleon_behavior():
++    """Simulate the problematic part of Napoleon's _skip_member function."""
++    obj = test_module.TestClass.__init__
++    name = '__init__'
++    what = 'class'
++    
++    has_doc = getattr(obj, '__doc__', False)
++    print(f"Has docstring: {has_doc}")
++    
++    if name != '__weakref__' and has_doc and (what == 'class' or what == 'exception'):
++        qualname = getattr(obj, '__qualname__', '')
++        print(f"Qualname: {qualname}")
++        
++        cls_path, _, _ = qualname.rpartition('.')
++        print(f"Class path: {cls_path}")
++        
++        if cls_path:
++            try:
++                if '.' in cls_path:
++                    import importlib
++                    import functools
++                    
++                    mod = importlib.import_module(obj.__module__)
++                    mod_path = cls_path.split('.')
++                    cls = functools.reduce(getattr, mod_path, mod)
++                    print(f"Method 1 - Class found: {cls}")
++                else:
++                    # This is the problematic line that fails for decorated methods
++                    cls = obj.__globals__[cls_path]
++                    print(f"Method 2 - Class found: {cls}")
++            except Exception as e:
++                print(f"Error accessing class: {e}")
++                cls_is_owner = False
++            else:
++                cls_is_owner = (cls and hasattr(cls, name) and name in cls.__dict__)
++                print(f"Class is owner: {cls_is_owner}")
++        else:
++            cls_is_owner = False
++            print(f"No class path, cls_is_owner: {cls_is_owner}")
++
++if __name__ == '__main__':
++    test_napoleon_behavior()
+\ No newline at end of file
+diff --git a/setup.py b/setup.py
+index a404f1fa5..2c6848797 100644
+--- a/setup.py
++++ b/setup.py
+@@ -15,22 +15,22 @@ if sys.version_info < (3, 5):
+     sys.exit(1)
+ 
+ install_requires = [
+-    'sphinxcontrib-applehelp',
+-    'sphinxcontrib-devhelp',
++    'sphinxcontrib-applehelp<=1.0.7',
++    'sphinxcontrib-devhelp<=1.0.5',
+     'sphinxcontrib-jsmath',
+-    'sphinxcontrib-htmlhelp',
+-    'sphinxcontrib-serializinghtml',
+-    'sphinxcontrib-qthelp',
+-    'Jinja2>=2.3',
++    'sphinxcontrib-htmlhelp<=2.0.4',
++    'sphinxcontrib-serializinghtml<=1.1.9',
++    'sphinxcontrib-qthelp<=1.0.6',
++    'Jinja2<3.0',
+     'Pygments>=2.0',
+     'docutils>=0.12',
+     'snowballstemmer>=1.1',
+     'babel>=1.3',
+-    'alabaster>=0.7,<0.8',
++    'alabaster>=0.7,<0.7.12',
+     'imagesize',
+     'requests>=2.5.0',
+     'setuptools',
+-    'packaging',
++    'packaging', 'markupsafe<=2.0.1',
+ ]
+ 
+ extras_require = {
+diff --git a/sphinx/ext/napoleon/__init__.py b/sphinx/ext/napoleon/__init__.py
+index 10b1ff3a3..07aefaab5 100644
+--- a/sphinx/ext/napoleon/__init__.py
++++ b/sphinx/ext/napoleon/__init__.py
+@@ -438,7 +438,18 @@ def _skip_member(app: Sphinx, what: str, name: str, obj: Any,
+                         mod_path = cls_path.split('.')
+                         cls = functools.reduce(getattr, mod_path, mod)
+                     else:
+-                        cls = obj.__globals__[cls_path]
++                        # Try to get the class from obj.__globals__ first
++                        try:
++                            cls = obj.__globals__[cls_path]
++                        except (KeyError, AttributeError):
++                            # If obj.__globals__ doesn't contain the class (e.g., decorated methods),
++                            # try to import it from the module directly
++                            try:
++                                mod = importlib.import_module(obj.__module__)
++                                cls = getattr(mod, cls_path)
++                            except (ImportError, AttributeError):
++                                # If both methods fail, set cls to None
++                                cls = None
+                 except Exception:
+                     cls_is_owner = False
+                 else:
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 000000000..2bebecdcd
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for decorated __init__ methods.
++This script tests the actual _skip_member function from Napoleon.
++"""
++
++import sys
++import os
++
++# Add the testbed to Python path so we can import sphinx modules
++sys.path.insert(0, '/testbed')
++
++from sphinx.ext.napoleon import _skip_member
++from sphinx.application import Sphinx
++
++# Create a mock app object with the required config
++class MockApp:
++    def __init__(self):
++        self.config = MockConfig()
++
++class MockConfig:
++    def __init__(self):
++        self.napoleon_include_init_with_doc = True
++        self.napoleon_include_private_with_doc = False
++        self.napoleon_include_special_with_doc = False
++
++# Create a simple test module with a decorated __init__ method
++test_module_content = '''
++import functools
++import types
++
++def my_decorator(func):
++    """A simple decorator that preserves docstring but changes __globals__."""
++    @functools.wraps(func)
++    def wrapper(*args, **kwargs):
++        return func(*args, **kwargs)
++    # Simulate a decorator that creates a new function with different __globals__
++    # This can happen with some complex decorators
++    new_wrapper = types.FunctionType(
++        wrapper.__code__,
++        {},  # Empty globals dict - this simulates the problem
++        name=wrapper.__name__,
++        argdefs=wrapper.__defaults__,
++        closure=wrapper.__closure__
++    )
++    new_wrapper.__doc__ = wrapper.__doc__
++    new_wrapper.__qualname__ = wrapper.__qualname__
++    new_wrapper.__module__ = wrapper.__module__
++    return new_wrapper
++
++class TestClass:
++    """A test class with decorated __init__."""
++    
++    @my_decorator
++    def __init__(self):
++        """This __init__ should be documented but won't be due to the bug."""
++        self.value = 42
++'''
++
++# Write the test module
++with open('test_module_fix.py', 'w') as f:
++    f.write(test_module_content)
++
++# Import the test module
++import test_module_fix
++
++def test_skip_member():
++    """Test the _skip_member function with decorated methods."""
++    app = MockApp()
++    obj = test_module_fix.TestClass.__init__
++    name = '__init__'
++    what = 'class'
++    skip = False
++    options = None
++    
++    print("Testing _skip_member with decorated __init__:")
++    print(f"Object: {obj}")
++    print(f"Name: {name}")
++    print(f"Type: {what}")
++    print(f"Has __doc__: {bool(getattr(obj, '__doc__', False))}")
++    print(f"Qualname: {getattr(obj, '__qualname__', '')}")
++    
++    # Test the fixed _skip_member function
++    result = _skip_member(app, what, name, obj, skip, options)
++    
++    print(f"Result: {result}")
++    print(f"Expected result: False (should include in docs)")
++    
++    # The method should NOT be skipped (result should be False) because:
++    # 1. It has a docstring
++    # 2. napoleon_include_init_with_doc = True
++    # 3. It's a method of a class
++    
++    # None means "use default behavior", False means "don't skip", True means "skip"
++    return result == False
++
++if __name__ == '__main__':
++    success = test_skip_member()
++    if success:
++        print("✓ Fix is working correctly! Decorated __init__ will be included in docs.")
++    else:
++        print("✗ Fix is not working. Decorated __init__ will be skipped.")
+\ No newline at end of file
+diff --git a/test_module.py b/test_module.py
+new file mode 100644
+index 000000000..59f79379f
+--- /dev/null
++++ b/test_module.py
+@@ -0,0 +1,30 @@
++
++import functools
++import types
++
++def my_decorator(func):
++    """A simple decorator that preserves docstring but changes __globals__."""
++    @functools.wraps(func)
++    def wrapper(*args, **kwargs):
++        return func(*args, **kwargs)
++    # Simulate a decorator that creates a new function with different __globals__
++    # This can happen with some complex decorators
++    new_wrapper = types.FunctionType(
++        wrapper.__code__,
++        {},  # Empty globals dict - this simulates the problem
++        name=wrapper.__name__,
++        argdefs=wrapper.__defaults__,
++        closure=wrapper.__closure__
++    )
++    new_wrapper.__doc__ = wrapper.__doc__
++    new_wrapper.__qualname__ = wrapper.__qualname__
++    new_wrapper.__module__ = wrapper.__module__
++    return new_wrapper
++
++class TestClass:
++    """A test class with decorated __init__."""
++    
++    @my_decorator
++    def __init__(self):
++        """This __init__ should be documented but won't be due to the bug."""
++        self.value = 42
+diff --git a/test_module_fix.py b/test_module_fix.py
+new file mode 100644
+index 000000000..59f79379f
+--- /dev/null
++++ b/test_module_fix.py
+@@ -0,0 +1,30 @@
++
++import functools
++import types
++
++def my_decorator(func):
++    """A simple decorator that preserves docstring but changes __globals__."""
++    @functools.wraps(func)
++    def wrapper(*args, **kwargs):
++        return func(*args, **kwargs)
++    # Simulate a decorator that creates a new function with different __globals__
++    # This can happen with some complex decorators
++    new_wrapper = types.FunctionType(
++        wrapper.__code__,
++        {},  # Empty globals dict - this simulates the problem
++        name=wrapper.__name__,
++        argdefs=wrapper.__defaults__,
++        closure=wrapper.__closure__
++    )
++    new_wrapper.__doc__ = wrapper.__doc__
++    new_wrapper.__qualname__ = wrapper.__qualname__
++    new_wrapper.__module__ = wrapper.__module__
++    return new_wrapper
++
++class TestClass:
++    """A test class with decorated __init__."""
++    
++    @my_decorator
++    def __init__(self):
++        """This __init__ should be documented but won't be due to the bug."""
++        self.value = 42
+diff --git a/tox.ini b/tox.ini
+index ccfd60f84..c5ac3713f 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -28,7 +28,7 @@ extras =
+ setenv =
+     PYTHONWARNINGS = all,ignore::ImportWarning:importlib._bootstrap_external,ignore::DeprecationWarning:site,ignore::DeprecationWarning:distutils
+ commands=
+-    pytest --durations 25 {posargs}
++    pytest -rA --durations 25 {posargs}
+ 
+ [testenv:flake8]
+ basepython = python3

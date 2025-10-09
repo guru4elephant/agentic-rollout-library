@@ -1,0 +1,293 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index d69c24419b..aff50d4bb2 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1666,6 +1666,11 @@ class Query(BaseExpression):
+             filter_expr = (filter_lhs, OuterRef(filter_rhs.name))
+         # Generate the inner query.
+         query = Query(self.model)
++        # Copy annotations and filtered relations that might be needed for the filter,
++        # especially FilteredRelation annotations which are required to resolve field names
++        # in the exclude condition
++        query.annotations = self.annotations.copy()
++        query._filtered_relations = self._filtered_relations.copy()
+         query.add_filter(filter_expr)
+         query.clear_ordering(True)
+         # Try to have as simple as possible subquery -> trim leading joins from
+diff --git a/reproduce_exclude_issue.py b/reproduce_exclude_issue.py
+new file mode 100644
+index 0000000000..e20e844ea7
+--- /dev/null
++++ b/reproduce_exclude_issue.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Set up Django environment using the same approach as runtests.py
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++# Create a minimal settings configuration
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.filtered_relation',
++        ],
++        USE_TZ=True,
++    )
++
++import django
++django.setup()
++
++from django.db import models
++from django.db.models import Q, FilteredRelation
++from django.core.management import execute_from_command_line
++from tests.filtered_relation.models import Author, Book
++
++# Create database tables
++from django.core.management.color import no_style
++from django.db import connection
++
++style = no_style()
++sql = connection.ops.sql_table_creation_suffix()
++tables = connection.introspection.table_names()
++cursor = connection.cursor()
++
++# Create tables for filtered_relation models
++for model in [Author, Book]:
++    sql = connection.ops.sql_create_table(model._meta, style)
++    cursor.execute(sql)
++
++def test_exclude_issue():
++    # Create test data
++    author1 = Author.objects.create(name='Alice')
++    author2 = Author.objects.create(name='Bob')
++    
++    Book.objects.create(title='Poem by Alice', author=author1)
++    Book.objects.create(title='Story by Bob', author=author2)
++    
++    print("Testing FILTER (should work):")
++    try:
++        result1 = Author.objects.annotate(
++            book_alice=FilteredRelation('book', condition=Q(book__title__iexact='poem by alice')),
++        ).filter(book_alice__isnull=False)
++        print("SUCCESS:", list(result1))
++    except Exception as e:
++        print("ERROR:", e)
++    
++    print("\nTesting EXCLUDE (should fail):")
++    try:
++        result2 = Author.objects.annotate(
++            book_alice=FilteredRelation('book', condition=Q(book__title__iexact='poem by alice')),
++        ).exclude(book_alice__isnull=False)
++        print("SUCCESS:", list(result2))
++    except Exception as e:
++        print("ERROR:", e)
++        print("This reproduces the issue!")
++
++if __name__ == '__main__':
++    test_exclude_issue()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..c83de9c784
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import Q, FilteredRelation
++from django.test.utils import get_runner
++
++# Initialize Django
++django.setup()
++
++# Create a simple test case to reproduce the issue
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_filtered_relation_exclude():
++    # Create test data
++    author1 = Author.objects.create(name='Alice')
++    author2 = Author.objects.create(name='Bob')
++    
++    Book.objects.create(title='Poem by Alice', author=author1)
++    Book.objects.create(title='Story by Bob', author=author2)
++    
++    # This should work (filter)
++    try:
++        result1 = Author.objects.annotate(
++            book_alice=FilteredRelation('book', condition=Q(book__title__iexact='poem by alice')),
++        ).filter(book_alice__isnull=False)
++        print("FILTER works:", list(result1))
++    except Exception as e:
++        print("FILTER error:", e)
++    
++    # This should fail (exclude) - reproduces the issue
++    try:
++        result2 = Author.objects.annotate(
++            book_alice=FilteredRelation('book', condition=Q(book__title__iexact='poem by alice')),
++        ).exclude(book_alice__isnull=False)
++        print("EXCLUDE works:", list(result2))
++    except Exception as e:
++        print("EXCLUDE error:", e)
++
++if __name__ == '__main__':
++    test_filtered_relation_exclude()
+\ No newline at end of file
+diff --git a/tests/filtered_relation/tests.py b/tests/filtered_relation/tests.py
+index 5e85dff16c..fcf138f83f 100644
+--- a/tests/filtered_relation/tests.py
++++ b/tests/filtered_relation/tests.py
+@@ -98,6 +98,8 @@ class FilteredRelationTests(TestCase):
+             [self.author1]
+         )
+ 
++    
++
+     def test_with_join_and_complex_condition(self):
+         self.assertSequenceEqual(
+             Author.objects.annotate(
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 0000000000..5e3de40c55
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the testbed directory to Python path
++sys.path.insert(0, '/testbed')
++
++# Set up Django environment using the same approach as runtests.py
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.filtered_relation',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q, FilteredRelation
++from tests.filtered_relation.models import Author, Book
++
++def test_github_issue_fix():
++    """Test the exact scenario described in the GitHub issue"""
++    
++    # Create test data
++    author1 = Author.objects.create(name='Alice')
++    author2 = Author.objects.create(name='Bob')
++    
++    Book.objects.create(title='Poem by Alice', author=author1)
++    Book.objects.create(title='Story by Bob', author=author2)
++    
++    print("Testing the original GitHub issue scenario...")
++    
++    # This is the exact code from the GitHub issue that should now work
++    try:
++        result = Author.objects.annotate(
++            book_alice=FilteredRelation('book', condition=Q(book__title__iexact='poem by alice')),
++        ).exclude(book_alice__isnull=False)
++        
++        authors = list(result)
++        print(f"SUCCESS: exclude() worked! Found {len(authors)} authors")
++        print(f"Authors: {[a.name for a in authors]}")
++        
++        # The expected result should be an empty queryset since we're excluding
++        # authors who have the filtered relation (book_alice)
++        assert len(authors) == 0, f"Expected empty result, got {len(authors)} authors"
++        print("✓ Test passed: exclude() with FilteredRelation works correctly!")
++        
++    except Exception as e:
++        print(f"ERROR: {e}")
++        print("✗ Test failed: The fix did not work")
++        return False
++    
++    # Also test that filter still works (should not be affected by our changes)
++    try:
++        result = Author.objects.annotate(
++            book_alice=FilteredRelation('book', condition=Q(book__title__iexact='poem by alice')),
++        ).filter(book_alice__isnull=False)
++        
++        authors = list(result)
++        print(f"SUCCESS: filter() also works! Found {len(authors)} authors")
++        print(f"Authors: {[a.name for a in authors]}")
++        
++        # Should find author1 who has the filtered relation
++        assert len(authors) == 1, f"Expected 1 author, got {len(authors)}"
++        assert authors[0].name == 'Alice', f"Expected Alice, got {authors[0].name}"
++        print("✓ Test passed: filter() with FilteredRelation still works correctly!")
++        
++    except Exception as e:
++        print(f"ERROR: {e}")
++        print("✗ Test failed: filter() broke after our changes")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    success = test_github_issue_fix()
++    if success:
++        print("\n🎉 All tests passed! The GitHub issue has been fixed.")
++        sys.exit(0)
++    else:
++        print("\n❌ Tests failed. The fix needs more work.")
++        sys.exit(1)
+\ No newline at end of file

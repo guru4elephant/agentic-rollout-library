@@ -1,0 +1,342 @@
+diff --git a/django/contrib/contenttypes/fields.py b/django/contrib/contenttypes/fields.py
+index ed98ecb48c..6098b71a39 100644
+--- a/django/contrib/contenttypes/fields.py
++++ b/django/contrib/contenttypes/fields.py
+@@ -202,7 +202,7 @@ class GenericForeignKey(FieldCacheMixin):
+             else:
+                 model = self.get_content_type(id=ct_id,
+                                               using=obj._state.db).model_class()
+-                return (model._meta.pk.get_prep_value(getattr(obj, self.fk_field)),
++                return (model._meta.pk.to_python(getattr(obj, self.fk_field)),
+                         model)
+ 
+         return (
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..abb3eeea6d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import uuid
++
++# Add the current directory to Python path to import Django
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++from django.db import models
++from django.contrib.contenttypes.fields import GenericForeignKey
++from django.contrib.contenttypes.models import ContentType
++
++# Configure database
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    USE_TZ=True,
++)
++
++django.setup()
++
++# Create models as described in the issue
++class Foo(models.Model):
++    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++    name = models.CharField(max_length=100)
++
++class Bar(models.Model):
++    foo_content_type = models.ForeignKey(
++        ContentType, related_name='actor',
++        on_delete=models.CASCADE, db_index=True
++    )
++    foo_object_id = models.CharField(max_length=255, db_index=True)
++    foo = GenericForeignKey('foo_content_type', 'foo_object_id')
++    name = models.CharField(max_length=100)
++
++# Create database tables
++from django.db import connection
++from django.core.management.color import no_style
++
++style = no_style()
++sql = connection.ops.sql_table_creation_suffix()
++tables = connection.introspection.table_names()
++
++# Create tables
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Foo)
++    schema_editor.create_model(Bar)
++
++# Create test data
++foo = Foo.objects.create(name="Test Foo")
++bar = Bar.objects.create(
++    foo_content_type=ContentType.objects.get_for_model(Foo),
++    foo_object_id=str(foo.id),
++    name="Test Bar"
++)
++
++# Test prefetch_related
++bars = Bar.objects.all().prefetch_related('foo')
++for bar_instance in bars:
++    print(f"Bar: {bar_instance.name}, Foo: {bar_instance.foo}")
++
++# Check if foo is None (the bug)
++if bar_instance.foo is None:
++    print("BUG REPRODUCED: foo is None when it should be the Foo object")
++else:
++    print("SUCCESS: foo is correctly prefetched")
+\ No newline at end of file
+diff --git a/test_uuid_gfk.py b/test_uuid_gfk.py
+new file mode 100644
+index 0000000000..8c9c166fa3
+--- /dev/null
++++ b/test_uuid_gfk.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import uuid
++
++# Add the current directory to Python path to import Django
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++from django.db import models
++from django.contrib.contenttypes.fields import GenericForeignKey
++from django.contrib.contenttypes.models import ContentType
++
++# Configure database
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    USE_TZ=True,
++)
++
++django.setup()
++
++# Create models as described in the issue
++class Foo(models.Model):
++    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++    name = models.CharField(max_length=100)
++
++class Bar(models.Model):
++    foo_content_type = models.ForeignKey(
++        ContentType, related_name='actor',
++        on_delete=models.CASCADE, db_index=True
++    )
++    foo_object_id = models.CharField(max_length=255, db_index=True)
++    foo = GenericForeignKey('foo_content_type', 'foo_object_id')
++    name = models.CharField(max_length=100)
++
++# Create database tables
++from django.db import connection
++from django.core.management.color import no_style
++
++style = no_style()
++sql = connection.ops.sql_table_creation_suffix()
++
++# Create tables
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Foo)
++    schema_editor.create_model(Bar)
++
++# Create test data
++foo = Foo.objects.create(name="Test Foo")
++bar = Bar.objects.create(
++    foo_content_type=ContentType.objects.get_for_model(Foo),
++    foo_object_id=str(foo.id),
++    name="Test Bar"
++)
++
++# Test prefetch_related
++print("Testing prefetch_related with UUID primary key...")
++bars = Bar.objects.all().prefetch_related('foo')
++for bar_instance in bars:
++    print(f"Bar: {bar_instance.name}, Foo: {bar_instance.foo}")
++
++# Check if foo is None (the bug)
++if bar_instance.foo is None:
++    print("BUG REPRODUCED: foo is None when it should be the Foo object")
++else:
++    print("SUCCESS: foo is correctly prefetched")
+\ No newline at end of file
+diff --git a/test_uuid_gfk_reproduction.py b/test_uuid_gfk_reproduction.py
+new file mode 100644
+index 0000000000..90b49c7306
+--- /dev/null
++++ b/test_uuid_gfk_reproduction.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import uuid
++
++# Add the current directory to Python path to import Django
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings')
++
++import django
++from django.conf import settings
++
++# Configure database
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.contenttypes.fields import GenericForeignKey
++from django.contrib.contenttypes.models import ContentType
++from django.test import TestCase
++
++class UUIDGFKTest(TestCase):
++    
++    def test_prefetch_related_with_uuid_primary_key(self):
++        """Test that prefetch_related works with UUID primary keys"""
++        
++        # Create models as described in the issue
++        class Foo(models.Model):
++            id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++            name = models.CharField(max_length=100)
++            
++            class Meta:
++                app_label = 'test_uuid_gfk'
++
++        class Bar(models.Model):
++            foo_content_type = models.ForeignKey(
++                ContentType, related_name='actor',
++                on_delete=models.CASCADE, db_index=True
++            )
++            foo_object_id = models.CharField(max_length=255, db_index=True)
++            foo = GenericForeignKey('foo_content_type', 'foo_object_id')
++            name = models.CharField(max_length=100)
++            
++            class Meta:
++                app_label = 'test_uuid_gfk'
++
++        # Create database tables
++        with self.captureOnCommitCallbacks(True):
++            with connection.schema_editor() as schema_editor:
++                schema_editor.create_model(Foo)
++                schema_editor.create_model(Bar)
++
++        # Create test data
++        foo = Foo.objects.create(name="Test Foo")
++        bar = Bar.objects.create(
++            foo_content_type=ContentType.objects.get_for_model(Foo),
++            foo_object_id=str(foo.id),
++            name="Test Bar"
++        )
++
++        # Test prefetch_related
++        bars = Bar.objects.all().prefetch_related('foo')
++        for bar_instance in bars:
++            print(f"Bar: {bar_instance.name}, Foo: {bar_instance.foo}")
++            
++            # Check if foo is None (the bug)
++            if bar_instance.foo is None:
++                self.fail("BUG REPRODUCED: foo is None when it should be the Foo object")
++            else:
++                self.assertEqual(bar_instance.foo.name, "Test Foo")
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/tests/contenttypes_tests/test_uuid_gfk.py b/tests/contenttypes_tests/test_uuid_gfk.py
+new file mode 100644
+index 0000000000..ec6f6acf89
+--- /dev/null
++++ b/tests/contenttypes_tests/test_uuid_gfk.py
+@@ -0,0 +1,47 @@
++import uuid
++
++from django.contrib.contenttypes.fields import GenericForeignKey
++from django.contrib.contenttypes.models import ContentType
++from django.db import models
++from django.test import TestCase
++
++
++class UUIDGFKTest(TestCase):
++    
++    def test_prefetch_related_with_uuid_primary_key(self):
++        """Test that prefetch_related works with UUID primary keys"""
++        
++        # Create models as described in the issue
++        class Foo(models.Model):
++            id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++            name = models.CharField(max_length=100)
++            
++            class Meta:
++                app_label = 'contenttypes_tests'
++
++        class Bar(models.Model):
++            foo_content_type = models.ForeignKey(
++                ContentType, related_name='actor',
++                on_delete=models.CASCADE, db_index=True
++            )
++            foo_object_id = models.CharField(max_length=255, db_index=True)
++            foo = GenericForeignKey('foo_content_type', 'foo_object_id')
++            name = models.CharField(max_length=100)
++            
++            class Meta:
++                app_label = 'contenttypes_tests'
++
++        # Create test data
++        foo = Foo.objects.create(name="Test Foo")
++        bar = Bar.objects.create(
++            foo_content_type=ContentType.objects.get_for_model(Foo),
++            foo_object_id=str(foo.id),
++            name="Test Bar"
++        )
++
++        # Test prefetch_related
++        bars = Bar.objects.all().prefetch_related('foo')
++        for bar_instance in bars:
++            # Check if foo is None (the bug should be fixed)
++            self.assertIsNotNone(bar_instance.foo, "foo should not be None when prefetch_related is used")
++            self.assertEqual(bar_instance.foo.name, "Test Foo")
+\ No newline at end of file

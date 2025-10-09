@@ -1,0 +1,273 @@
+diff --git a/debug_issue.py b/debug_issue.py
+new file mode 100644
+index 0000000000..a921205b3f
+--- /dev/null
++++ b/debug_issue.py
+@@ -0,0 +1,13 @@
++from sympy import *
++A = MatrixSymbol('A', 2, 2)
++B = MatrixSymbol('B', 2, 2)
++expr = A - A*B - B
++
++print("Expression:", expr)
++print("Type:", type(expr))
++print("Args:", expr.args)
++print("Args types:", [type(arg) for arg in expr.args])
++
++# Check if any args are negative
++for i, arg in enumerate(expr.args):
++    print(f"Arg {i}: {arg}, type: {type(arg)}, is negative: {hasattr(arg, 'is_Mul') and arg.args[0] == -1 if hasattr(arg, 'args') else False}")
+\ No newline at end of file
+diff --git a/debug_str.py b/debug_str.py
+new file mode 100644
+index 0000000000..660a6c4b10
+--- /dev/null
++++ b/debug_str.py
+@@ -0,0 +1,14 @@
++from sympy import *
++from sympy.printing.str import StrPrinter
++
++A = MatrixSymbol('A', 2, 2)
++B = MatrixSymbol('B', 2, 2)
++expr = A - A*B - B
++
++printer = StrPrinter()
++print("Expression:", expr)
++print("Args:", expr.args)
++
++for i, term in enumerate(expr.args):
++    t = printer._print(term)
++    print(f"Term {i}: {term}, printed as: '{t}', starts with '-': {t.startswith('-')}")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..1c729f88e0
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,9 @@
++from sympy import *
++A = MatrixSymbol('A', 2, 2)
++B = MatrixSymbol('B', 2, 2)
++print("Str printer:")
++print(A - A*B - B)
++print("\nPretty printer:")
++pprint(A - A*B - B)
++print("\nLatex printer:")
++print(latex(A - A*B - B))
+\ No newline at end of file
+diff --git a/sympy/printing/latex.py b/sympy/printing/latex.py
+index 8253b2f682..caad3995f8 100644
+--- a/sympy/printing/latex.py
++++ b/sympy/printing/latex.py
+@@ -1478,12 +1478,35 @@ def _print_Adjoint(self, expr):
+ 
+     def _print_MatAdd(self, expr):
+         terms = list(expr.args)
+-        tex = " + ".join(map(self._print, terms))
+-        return tex
++        s = []
++        for term in terms:
++            t = self._print(term)
++            if t.startswith('-'):
++                sign = "-"
++                t = t[1:]
++            else:
++                sign = "+"
++            s.extend([sign, t])
++        sign = s.pop(0)
++        if sign == '+':
++            sign = ""
++        return sign + ' '.join(s)
+ 
+     def _print_MatMul(self, expr):
+         from sympy import Add, MatAdd, HadamardProduct
+ 
++        # Handle negative coefficients like -1*A should print as -A
++        if len(expr.args) >= 2 and expr.args[0] == -1:
++            # If first argument is -1, print as negative of the rest
++            if len(expr.args) == 2:
++                # Single term like -1*A -> -A
++                return "-" + self._print(expr.args[1])
++            else:
++                # Multiple terms like -1*A*B -> -(A*B)
++                from sympy.matrices.expressions.matmul import MatMul
++                rest = MatMul(*expr.args[1:])
++                return "-" + self._print(rest)
++
+         def parens(x):
+             if isinstance(x, (Add, MatAdd, HadamardProduct)):
+                 return r"\left(%s\right)" % self._print(x)
+diff --git a/sympy/printing/pretty/pretty.py b/sympy/printing/pretty/pretty.py
+index db24f4c612..eda19a0a62 100644
+--- a/sympy/printing/pretty/pretty.py
++++ b/sympy/printing/pretty/pretty.py
+@@ -819,7 +819,48 @@ def _print_BlockMatrix(self, B):
+         return self._print(B.blocks)
+ 
+     def _print_MatAdd(self, expr):
+-        return self._print_seq(expr.args, None, None, ' + ')
++        terms = list(expr.args)
++        pforms = []
++
++        def pretty_negative(pform, index):
++            """Prepend a minus sign to a pretty form. """
++            #TODO: Move this code to prettyForm
++            if index == 0:
++                if pform.height() > 1:
++                    pform_neg = '- '
++                else:
++                    pform_neg = '-'
++            else:
++                pform_neg = ' - '
++
++            if (pform.binding > prettyForm.NEG
++                or pform.binding == prettyForm.ADD):
++                p = stringPict(*pform.parens())
++            else:
++                p = pform
++            p = stringPict.next(pform_neg, p)
++            # Lower the binding to NEG, even if it was higher. Otherwise, it
++            # will print as a + ( - (b)), instead of a - (b).
++            return prettyForm(binding=prettyForm.NEG, *p)
++
++        for i, term in enumerate(terms):
++            # Check if term is a MatMul with negative coefficient
++            if hasattr(term, 'is_MatMul') and term.is_MatMul:
++                # Check if first argument is -1 (negative coefficient)
++                if term.args[0] == -1:
++                    # Print the term without the negative coefficient
++                    if len(term.args) == 2:
++                        # Single matrix term like (-1)*A
++                        pform = self._print(term.args[1])
++                    else:
++                        # Multiple terms like (-1)*A*B
++                        from sympy.matrices.expressions.matmul import MatMul
++                        pform = self._print(MatMul(*term.args[1:]))
++                    pforms.append(pretty_negative(pform, i))
++                    continue
++            pforms.append(self._print(term))
++
++        return prettyForm.__add__(*pforms)
+ 
+     def _print_MatMul(self, expr):
+         args = list(expr.args)
+diff --git a/sympy/printing/str.py b/sympy/printing/str.py
+index 0baefe0f7f..c828bae64a 100644
+--- a/sympy/printing/str.py
++++ b/sympy/printing/str.py
+@@ -304,6 +304,17 @@ def _print_Mul(self, expr):
+             return sign + '*'.join(a_str) + "/(%s)" % '*'.join(b_str)
+ 
+     def _print_MatMul(self, expr):
++        # Handle negative coefficients like -1*A should print as -A
++        if len(expr.args) >= 2 and expr.args[0] == -1:
++            # If first argument is -1, print as negative of the rest
++            if len(expr.args) == 2:
++                # Single term like -1*A -> -A
++                return "-" + self._print(expr.args[1])
++            else:
++                # Multiple terms like -1*A*B -> -(A*B)
++                from sympy.matrices.expressions.matmul import MatMul
++                rest = MatMul(*expr.args[1:])
++                return "-" + self._print(rest)
+         return '*'.join([self.parenthesize(arg, precedence(expr))
+             for arg in expr.args])
+ 
+@@ -312,8 +323,23 @@ def _print_HadamardProduct(self, expr):
+             for arg in expr.args])
+ 
+     def _print_MatAdd(self, expr):
+-        return ' + '.join([self.parenthesize(arg, precedence(expr))
+-            for arg in expr.args])
++        PREC = precedence(expr)
++        l = []
++        for term in expr.args:
++            t = self._print(term)
++            if t.startswith('-'):
++                sign = "-"
++                t = t[1:]
++            else:
++                sign = "+"
++            if precedence(term) < PREC:
++                l.extend([sign, "(%s)" % t])
++            else:
++                l.extend([sign, t])
++        sign = l.pop(0)
++        if sign == '+':
++            sign = ""
++        return sign + ' '.join(l)
+ 
+     def _print_NaN(self, expr):
+         return 'nan'
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..fc75c8f3b6
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,35 @@
++from sympy import *
++A = MatrixSymbol('A', 2, 2)
++B = MatrixSymbol('B', 2, 2)
++C = MatrixSymbol('C', 2, 2)
++
++# Test various edge cases
++print("=== Test Case 1: Simple subtraction ===")
++expr1 = A - B
++print("str:", str(expr1))
++print("pretty:"); pprint(expr1)
++print("latex:", latex(expr1))
++
++print("\n=== Test Case 2: Multiple subtractions ===")
++expr2 = A - B - C
++print("str:", str(expr2))
++print("pretty:"); pprint(expr2)
++print("latex:", latex(expr2))
++
++print("\n=== Test Case 3: Mixed operations ===")
++expr3 = A - A*B + C
++print("str:", str(expr3))
++print("pretty:"); pprint(expr3)
++print("latex:", latex(expr3))
++
++print("\n=== Test Case 4: Complex expression ===")
++expr4 = A - B - A*B + C
++print("str:", str(expr4))
++print("pretty:"); pprint(expr4)
++print("latex:", latex(expr4))
++
++print("\n=== Test Case 5: Positive only ===")
++expr5 = A + B + C
++print("str:", str(expr5))
++print("pretty:"); pprint(expr5)
++print("latex:", latex(expr5))
+\ No newline at end of file
+diff --git a/test_regular_symbols.py b/test_regular_symbols.py
+new file mode 100644
+index 0000000000..93a38259c3
+--- /dev/null
++++ b/test_regular_symbols.py
+@@ -0,0 +1,23 @@
++from sympy import *
++a = Symbol('a')
++b = Symbol('b')
++c = Symbol('c')
++
++# Test regular symbols for comparison
++print("=== Regular Symbols: Simple subtraction ===")
++expr1 = a - b
++print("str:", str(expr1))
++print("pretty:"); pprint(expr1)
++print("latex:", latex(expr1))
++
++print("\n=== Regular Symbols: Multiple subtractions ===")
++expr2 = a - b - c
++print("str:", str(expr2))
++print("pretty:"); pprint(expr2)
++print("latex:", latex(expr2))
++
++print("\n=== Regular Symbols: Mixed operations ===")
++expr3 = a - a*b + c
++print("str:", str(expr3))
++print("pretty:"); pprint(expr3)
++print("latex:", latex(expr3))
+\ No newline at end of file

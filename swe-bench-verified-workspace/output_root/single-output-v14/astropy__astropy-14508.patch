@@ -1,0 +1,309 @@
+diff --git a/astropy/io/fits/card.py b/astropy/io/fits/card.py
+index 118bfced89..5b81d86d29 100644
+--- a/astropy/io/fits/card.py
++++ b/astropy/io/fits/card.py
+@@ -1299,6 +1299,28 @@ def _format_value(value):
+ 
+ def _format_float(value):
+     """Format a floating number to make sure it gets the decimal point."""
++    # First try Python's string representation, which is often more compact
++    value_str = str(value)
++    
++    # Check if the string representation is valid for FITS (has decimal point or E notation)
++    # and doesn't exceed the 20-character limit
++    if ("." in value_str or "E" in value_str or "e" in value_str) and len(value_str) <= 20:
++        # For scientific notation, ensure it uses uppercase E and proper formatting
++        if "e" in value_str:
++            value_str = value_str.replace("e", "E")
++        elif "E" in value_str:
++            # Normalize exponent formatting to use two digits
++            significand, exponent = value_str.split("E")
++            if exponent[0] in ("+", "-"):
++                sign = exponent[0]
++                exponent = exponent[1:]
++            else:
++                sign = "+"
++            value_str = f"{significand}E{sign}{int(exponent):02d}"
++        
++        return value_str
++    
++    # If Python's string representation is not suitable or too long, fall back to the original method
+     value_str = f"{value:.16G}"
+     if "." not in value_str and "E" not in value_str:
+         value_str += ".0"
+@@ -1311,7 +1333,7 @@ def _format_float(value):
+             sign = exponent[0]
+             exponent = exponent[1:]
+         else:
+-            sign = ""
++            sign = "+"
+         value_str = f"{significand}E{sign}{int(exponent):02d}"
+ 
+     # Limit the value string to at most 20 characters.
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..16403acc0b
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,131 @@
++#!/usr/bin/env python3
++"""Final comprehensive test for the _format_float fix"""
++
++from astropy.io import fits
++from astropy.io.fits.card import _format_float
++
++def test_original_issue():
++    """Test the exact case from the GitHub issue"""
++    print("Testing original issue case...")
++    
++    # This is the exact case from the GitHub issue
++    keyword = "ESO IFM CL RADIUS"
++    value = 0.009125
++    comment = "[m] radius around actuator to avoid"
++    
++    # Create the card - this should NOT produce a warning
++    card = fits.Card(f'HIERARCH {keyword}', value, comment)
++    
++    print(f"Card created: {card}")
++    print(f"Card string: {str(card)}")
++    print(f"Card string length: {len(str(card))}")
++    
++    # Verify the card has the expected properties
++    assert card.keyword == keyword
++    assert card.value == value
++    assert card.comment == comment
++    assert "0.009125" in str(card)  # Should use compact representation
++    assert "0.009124999999999999" not in str(card)  # Should NOT use expanded representation
++    
++    print("✓ Original issue fixed successfully!")
++
++def test_format_float_edge_cases():
++    """Test various edge cases for _format_float"""
++    print("\nTesting _format_float edge cases...")
++    
++    test_cases = [
++        # Values that should use Python's compact str() representation
++        (0.009125, "0.009125"),
++        (1.0, "1.0"),
++        (123.456, "123.456"),
++        (-0.001, "-0.001"),
++        
++        # Scientific notation cases
++        (1.234e-10, "1.234E-10"),
++        
++        # Edge cases that should fall back to original formatting
++        (0.12345678901234567890,),  # Too long for Python str()
++        (1.2345678901234567e-100,),  # Very small number
++        
++        # Integer-like floats
++        (2.0, "2.0"),
++        (100.0, "100.0"),
++    ]
++    
++    for i, case in enumerate(test_cases):
++        value = case[0]
++        result = _format_float(value)
++        
++        print(f"Case {i+1}: {value} -> {result} (length: {len(result)})")
++        
++        # Verify the result is valid
++        assert len(result) <= 20, f"Result too long: {result}"
++        
++        # If we expected a specific result, verify it
++        if len(case) > 1:
++            expected = case[1]
++            assert result == expected, f"Expected {expected}, got {result}"
++        
++        # Verify the result contains a decimal point or E notation
++        assert "." in result or "E" in result, f"Result missing decimal point: {result}"
++    
++    print("✓ All edge cases handled correctly!")
++
++def test_card_creation_with_various_floats():
++    """Test creating cards with various float values"""
++    print("\nTesting card creation with various float values...")
++    
++    test_values = [
++        0.009125,
++        1.0,
++        123.456,
++        1.234e-10,
++        1.234e+10,
++        0.1234567890123456,  # Exactly 18 chars
++    ]
++    
++    for value in test_values:
++        card = fits.Card("TEST", value, "test comment")
++        card_str = str(card)
++        
++        print(f"Value {value}: {card_str} (length: {len(card_str)})")
++        
++        # Verify the card is valid and within limits
++        assert len(card_str) <= 80, f"Card too long: {card_str}"
++        assert card.value == value, f"Value mismatch: {card.value} != {value}"
++    
++    print("✓ All card creations successful!")
++
++def test_no_regression():
++    """Test that we haven't broken any existing functionality"""
++    print("\nTesting for regression...")
++    
++    # Test various existing functionality
++    from astropy.io.fits import Header
++    
++    # Create a header with various float values
++    hdr = Header()
++    hdr['FLOAT1'] = 1.0
++    hdr['FLOAT2'] = 123.456
++    hdr['FLOAT3'] = 1.234e-10
++    hdr['FLOAT4'] = 0.009125  # The problematic case
++    
++    # Verify all values are stored correctly
++    assert hdr['FLOAT1'] == 1.0
++    assert hdr['FLOAT2'] == 123.456
++    assert hdr['FLOAT3'] == 1.234e-10
++    assert hdr['FLOAT4'] == 0.009125
++    
++    # Verify the string representations are compact where possible
++    cards = hdr.cards
++    assert "0.009125" in str(cards['FLOAT4'])
++    assert "0.009124999999999999" not in str(cards['FLOAT4'])
++    
++    print("✓ No regression detected!")
++
++if __name__ == "__main__":
++    test_original_issue()
++    test_format_float_edge_cases()
++    test_card_creation_with_various_floats()
++    test_no_regression()
++    print("\n🎉 All tests passed! The fix is working correctly.")
+\ No newline at end of file
+diff --git a/pyproject.toml b/pyproject.toml
+index 65df5b1b77..d02c4f9eda 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,5 +1,5 @@
+ [build-system]
+-requires = ["setuptools",
++requires = ["setuptools==68.0.0",
+             "setuptools_scm>=6.2",
+             "wheel",
+             "cython==0.29.30",
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..0e7df3a75e
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++"""Script to reproduce the float formatting issue in io.fits.Card"""
++
++from astropy.io import fits
++
++# Test the issue described in the GitHub issue
++print("Testing float formatting issue in io.fits.Card...")
++
++# Create a test value that should demonstrate the issue
++test_value = 0.009125
++
++print(f"Original value: {test_value}")
++print(f"str(value): {str(test_value)}")
++print(f"repr(value): {repr(test_value)}")
++
++# Test the current _format_float implementation
++from astropy.io.fits.card import _format_float
++current_format = _format_float(test_value)
++print(f"Current _format_float result: {current_format}")
++print(f"Length of current format: {len(current_format)}")
++
++# Try to create a card with this value and a comment
++try:
++    # Create a card similar to the one in the issue
++    keyword = "ESO IFM CL RADIUS"
++    comment = "[m] radius around actuator to avoid"
++    
++    print(f"\nCreating card with:")
++    print(f"  Keyword: {keyword}")
++    print(f"  Value: {test_value}")
++    print(f"  Comment: {comment}")
++    
++    # Try to create the card (this should trigger the warning)
++    card = fits.Card(f'HIERARCH {keyword}', test_value, comment)
++    print(f"Card created successfully: {card}")
++    print(f"Card string representation: {str(card)}")
++    print(f"Card string length: {len(str(card))}")
++    
++except Exception as e:
++    print(f"Error creating card: {e}")
++
++# Test with a few more values that might have similar issues
++test_values = [0.009125, 0.1234567890123456, 1.2345678901234567e-10]
++print(f"\nTesting with additional values:")
++for val in test_values:
++    current_format = _format_float(val)
++    python_str = str(val)
++    print(f"Value: {val}")
++    print(f"  Python str(): {python_str} (length: {len(python_str)})")
++    print(f"  Current _format_float(): {current_format} (length: {len(current_format)})")
++    print(f"  Difference: {len(current_format) - len(python_str)} characters")
++    print()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..030e73d123
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++"""Test edge cases for the _format_float fix"""
++
++from astropy.io.fits.card import _format_float
++
++def test_format_float():
++    """Test various edge cases for _format_float"""
++    
++    test_cases = [
++        # Basic cases that should use Python's str()
++        (0.009125, "0.009125"),
++        (1.0, "1.0"),  # Should get .0 added
++        (123.456, "123.456"),
++        
++        # Scientific notation cases
++        (1.234e-10, "1.234E-10"),
++        (1.234e+10, "1.234E+10"),
++        (1.234e10, "1.234E+10"),  # No explicit + sign
++        
++        # Edge cases that should fall back to original formatting
++        (0.12345678901234567890, "0.12345678901234568"),  # Too long for Python str()
++        (1.2345678901234567e-100, "1.23456789012345E-100"),  # Very small number
++        
++        # Integer-like floats that need .0
++        (1.0, "1.0"),
++        (2.0, "2.0"),
++        
++        # Boundary cases around 20 characters
++        (0.1234567890123456, "0.1234567890123456"),  # Exactly 18 chars
++        (0.12345678901234567, "0.12345678901234567"),  # 19 chars
++        (0.123456789012345678, "0.12345678901234568"),  # 20 chars (truncated)
++    ]
++    
++    print("Testing _format_float edge cases...")
++    for value, expected in test_cases:
++        result = _format_float(value)
++        print(f"Value: {value}")
++        print(f"  Expected: {expected} (len: {len(expected)})")
++        print(f"  Actual:   {result} (len: {len(result)})")
++        print(f"  Match:    {result == expected}")
++        print(f"  Length OK: {len(result) <= 20}")
++        print()
++    
++    # Test that all results are <= 20 characters
++    all_values = [case[0] for case in test_cases]
++    results = [_format_float(val) for val in all_values]
++    max_length = max(len(r) for r in results)
++    print(f"Maximum result length: {max_length} characters")
++    print(f"All results <= 20 chars: {max_length <= 20}")
++
++if __name__ == "__main__":
++    test_format_float()
+\ No newline at end of file

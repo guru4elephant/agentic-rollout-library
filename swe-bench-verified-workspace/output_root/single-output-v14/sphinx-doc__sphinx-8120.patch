@@ -1,0 +1,578 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..68346ef20
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the locale translation issue.
++This script simulates the scenario described in the GitHub issue.
++"""
++
++import os
++import tempfile
++import shutil
++from pathlib import Path
++from sphinx.util.i18n import CatalogRepository
++
++def test_locale_dir_issue():
++    """Test that demonstrates the issue with locale directory detection."""
++    
++    # Create a temporary directory structure
++    with tempfile.TemporaryDirectory() as temp_dir:
++        temp_path = Path(temp_dir)
++        
++        # Create a locale directory structure like the user would
++        locale_dir = temp_path / "locale" / "da" / "LC_MESSAGES"
++        locale_dir.mkdir(parents=True, exist_ok=True)
++        
++        # Create a test sphinx.po file
++        po_file = locale_dir / "sphinx.po"
++        po_content = '''# Danish translations for Sphinx.
++# Copyright (C) 2020 Sphinx Team
++# This file is distributed under the same license as the Sphinx package.
++# FIRST AUTHOR <EMAIL@ADDRESS>, 2020.
++#
++#, fuzzy
++msgid ""
++msgstr ""
++"Project-Id-Version: Sphinx 1.0\\n"
++"Report-Msgid-Bugs-To: \\n"
++"POT-Creation-Date: 2020-01-01 00:00+0000\\n"
++"PO-Revision-Date: 2020-01-01 00:00+0000\\n"
++"Last-Translator: FULL NAME <EMAIL@ADDRESS>\\n"
++"Language-Team: da <LL@li.org>\\n"
++"Language: da\\n"
++"MIME-Version: 1.0\\n"
++"Content-Type: text/plain; charset=UTF-8\\n"
++"Content-Transfer-Encoding: 8bit\\n"
++"Plural-Forms: nplurals=2; plural=(n != 1);\\n"
++
++msgid "Fig. %s"
++msgstr "Foobar %s"
++
++msgid "Listing %s"
++msgstr "Whatever %s"
++'''
++        po_file.write_text(po_content, encoding='utf-8')
++        
++        # Test the current CatalogRepository behavior
++        repo = CatalogRepository(str(temp_path), ["locale"], "da", "utf-8")
++        
++        print("Locale directories found:")
++        locale_dirs = list(repo.locale_dirs)
++        print(f"  {locale_dirs}")
++        
++        print("PO files found:")
++        pofiles = list(repo.pofiles)
++        print(f"  {pofiles}")
++        
++        print("Catalogs found:")
++        catalogs = list(repo.catalogs)
++        print(f"  {catalogs}")
++        
++        # The issue: if LC_MESSAGES doesn't exist yet, the directory won't be found
++        # Let's simulate this by removing the LC_MESSAGES directory and testing again
++        shutil.rmtree(locale_dir)
++        
++        print("\nAfter removing LC_MESSAGES directory:")
++        repo2 = CatalogRepository(str(temp_path), ["locale"], "da", "utf-8")
++        locale_dirs2 = list(repo2.locale_dirs)
++        print(f"Locale directories found: {locale_dirs2}")
++        
++        # Now create just the locale directory without LC_MESSAGES
++        (temp_path / "locale" / "da").mkdir(parents=True, exist_ok=True)
++        
++        print("\nAfter creating locale/da directory (without LC_MESSAGES):")
++        repo3 = CatalogRepository(str(temp_path), ["locale"], "da", "utf-8")
++        locale_dirs3 = list(repo3.locale_dirs)
++        print(f"Locale directories found: {locale_dirs3}")
++
++if __name__ == "__main__":
++    test_locale_dir_issue()
+\ No newline at end of file
+diff --git a/setup.py b/setup.py
+index a404f1fa5..2c6848797 100644
+--- a/setup.py
++++ b/setup.py
+@@ -15,22 +15,22 @@ if sys.version_info < (3, 5):
+     sys.exit(1)
+ 
+ install_requires = [
+-    'sphinxcontrib-applehelp',
+-    'sphinxcontrib-devhelp',
++    'sphinxcontrib-applehelp<=1.0.7',
++    'sphinxcontrib-devhelp<=1.0.5',
+     'sphinxcontrib-jsmath',
+-    'sphinxcontrib-htmlhelp',
+-    'sphinxcontrib-serializinghtml',
+-    'sphinxcontrib-qthelp',
+-    'Jinja2>=2.3',
++    'sphinxcontrib-htmlhelp<=2.0.4',
++    'sphinxcontrib-serializinghtml<=1.1.9',
++    'sphinxcontrib-qthelp<=1.0.6',
++    'Jinja2<3.0',
+     'Pygments>=2.0',
+     'docutils>=0.12',
+     'snowballstemmer>=1.1',
+     'babel>=1.3',
+-    'alabaster>=0.7,<0.8',
++    'alabaster>=0.7,<0.7.12',
+     'imagesize',
+     'requests>=2.5.0',
+     'setuptools',
+-    'packaging',
++    'packaging', 'markupsafe<=2.0.1',
+ ]
+ 
+ extras_require = {
+diff --git a/sphinx/util/i18n.py b/sphinx/util/i18n.py
+index 41407f4e1..12577841b 100644
+--- a/sphinx/util/i18n.py
++++ b/sphinx/util/i18n.py
+@@ -92,23 +92,47 @@ class CatalogRepository:
+ 
+         for locale_dir in self._locale_dirs:
+             locale_dir = path.join(self.basedir, locale_dir)
+-            if path.exists(path.join(locale_dir, self.language, 'LC_MESSAGES')):
++            # Yield locale directory if LC_MESSAGES exists OR if the language directory exists
++            # This allows for locale directories that might have LC_MESSAGES created later
++            if (path.exists(path.join(locale_dir, self.language, 'LC_MESSAGES')) or
++                path.exists(path.join(locale_dir, self.language))):
+                 yield locale_dir
+ 
+     @property
+     def pofiles(self) -> Generator[Tuple[str, str], None, None]:
+         for locale_dir in self.locale_dirs:
+-            basedir = path.join(locale_dir, self.language, 'LC_MESSAGES')
+-            for root, dirnames, filenames in os.walk(basedir):
+-                # skip dot-directories
+-                for dirname in dirnames:
+-                    if dirname.startswith('.'):
+-                        dirnames.remove(dirname)
+-
+-                for filename in filenames:
+-                    if filename.endswith('.po'):
+-                        fullpath = path.join(root, filename)
+-                        yield basedir, relpath(fullpath, basedir)
++            # Look for .po files in both the language directory and LC_MESSAGES subdirectory
++            language_dir = path.join(locale_dir, self.language)
++            lc_messages_dir = path.join(language_dir, 'LC_MESSAGES')
++            
++            # Check language directory for .po files
++            if path.exists(language_dir):
++                for root, dirnames, filenames in os.walk(language_dir):
++                    # skip dot-directories
++                    for dirname in dirnames:
++                        if dirname.startswith('.'):
++                            dirnames.remove(dirname)
++
++                    for filename in filenames:
++                        if filename.endswith('.po'):
++                            fullpath = path.join(root, filename)
++                            # Return LC_MESSAGES as the basedir for consistency
++                            # Only yield files that are directly in the language directory, not subdirectories
++                            if root == language_dir:
++                                yield lc_messages_dir, filename
++            
++            # Check LC_MESSAGES directory for .po files
++            if path.exists(lc_messages_dir):
++                for root, dirnames, filenames in os.walk(lc_messages_dir):
++                    # skip dot-directories
++                    for dirname in dirnames:
++                        if dirname.startswith('.'):
++                            dirnames.remove(dirname)
++
++                    for filename in filenames:
++                        if filename.endswith('.po'):
++                            fullpath = path.join(root, filename)
++                            yield lc_messages_dir, relpath(fullpath, lc_messages_dir)
+ 
+     @property
+     def catalogs(self) -> Generator[CatalogInfo, None, None]:
+diff --git a/test_complete_scenario.py b/test_complete_scenario.py
+new file mode 100644
+index 000000000..29030988c
+--- /dev/null
++++ b/test_complete_scenario.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python3
++"""
++Complete test to simulate the exact scenario from the GitHub issue.
++This tests the full translation loading process.
++"""
++
++import os
++import tempfile
++import shutil
++from pathlib import Path
++from sphinx.util.i18n import CatalogRepository
++from sphinx.locale import init
++
++def test_complete_scenario():
++    """Test the complete translation loading scenario."""
++    
++    # Create a temporary directory structure
++    with tempfile.TemporaryDirectory() as temp_dir:
++        temp_path = Path(temp_dir)
++        
++        # Create source directory structure
++        srcdir = temp_path / "source"
++        srcdir.mkdir()
++        
++        # Create locale directory structure like the user would
++        locale_dir = srcdir / "locale" / "da" / "LC_MESSAGES"
++        locale_dir.mkdir(parents=True, exist_ok=True)
++        
++        # Create a test sphinx.po file with custom translations
++        po_file = locale_dir / "sphinx.po"
++        po_content = '''# Danish translations for Sphinx.
++# Copyright (C) 2020 Sphinx Team
++# This file is distributed under the same license as the Sphinx package.
++# FIRST AUTHOR <EMAIL@ADDRESS>, 2020.
++#
++#, fuzzy
++msgid ""
++msgstr ""
++"Project-Id-Version: Sphinx 1.0\\n"
++"Report-Msgid-Bugs-To: \\n"
++"POT-Creation-Date: 2020-01-01 00:00+0000\\n"
++"PO-Revision-Date: 2020-01-01 00:00+0000\\n"
++"Last-Translator: FULL NAME <EMAIL@ADDRESS>\\n"
++"Language-Team: da <LL@li.org>\\n"
++"Language: da\\n"
++"MIME-Version: 1.0\\n"
++"Content-Type: text/plain; charset=UTF-8\\n"
++"Content-Transfer-Encoding: 8bit\\n"
++"Plural-Forms: nplurals=2; plural=(n != 1);\\n"
++
++msgid "Fig. %s"
++msgstr "Foobar %s"
++
++msgid "Listing %s"
++msgstr "Whatever %s"
++'''
++        po_file.write_text(po_content, encoding='utf-8')
++        
++        print("=== Testing complete translation scenario ===")
++        
++        # Test 1: Normal case with existing LC_MESSAGES directory
++        print("\n1. Testing with existing LC_MESSAGES directory:")
++        repo = CatalogRepository(str(srcdir), ["locale"], "da", "utf-8")
++        
++        locale_dirs = list(repo.locale_dirs)
++        print(f"   Locale directories found: {locale_dirs}")
++        
++        pofiles = list(repo.pofiles)
++        print(f"   PO files found: {pofiles}")
++        
++        catalogs = list(repo.catalogs)
++        print(f"   Catalogs found: {catalogs}")
++        
++        # Test 2: Simulate the case where LC_MESSAGES doesn't exist yet
++        print("\n2. Testing with locale directory but no LC_MESSAGES (simulating initial setup):")
++        
++        # Remove LC_MESSAGES directory to simulate the case where it doesn't exist yet
++        shutil.rmtree(locale_dir)
++        
++        # Create just the language directory without LC_MESSAGES
++        (srcdir / "locale" / "da").mkdir(parents=True, exist_ok=True)
++        
++        repo2 = CatalogRepository(str(srcdir), ["locale"], "da", "utf-8")
++        locale_dirs2 = list(repo2.locale_dirs)
++        print(f"   Locale directories found: {locale_dirs2}")
++        
++        # Now the locale directory should be found even without LC_MESSAGES
++        if locale_dirs2:
++            print("   ✓ SUCCESS: Locale directory found without LC_MESSAGES")
++        else:
++            print("   ✗ FAIL: Locale directory not found without LC_MESSAGES")
++        
++        # Test 3: Test the locale.init function which is what Sphinx actually uses
++        print("\n3. Testing locale.init function:")
++        
++        # Create the LC_MESSAGES directory again and add the PO file
++        locale_dir.mkdir(parents=True, exist_ok=True)
++        po_file.write_text(po_content, encoding='utf-8')
++        
++        # Test with the locale directory that should now be found
++        locale_dirs_list = [None, str(srcdir / "locale")]
++        translator, has_translation = init(locale_dirs_list, "da")
++        
++        print(f"   Translation loaded: {has_translation}")
++        if has_translation:
++            # Test if our custom translation is used
++            result = translator.gettext("Fig. %s")
++            print(f"   Translation of 'Fig. %s': '{result}'")
++            
++            if result == "Foobar %s":
++                print("   ✓ SUCCESS: Custom translation is being used!")
++            else:
++                print(f"   ✗ FAIL: Expected 'Foobar %s' but got '{result}'")
++        else:
++            print("   ✗ FAIL: No translation loaded")
++
++if __name__ == "__main__":
++    test_complete_scenario()
+\ No newline at end of file
+diff --git a/test_no_lc_messages_initially.py b/test_no_lc_messages_initially.py
+new file mode 100644
+index 000000000..c79f81e19
+--- /dev/null
++++ b/test_no_lc_messages_initially.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python3
++"""
++Test the scenario where LC_MESSAGES directory doesn't exist initially.
++This simulates the exact issue reported in the GitHub issue.
++"""
++
++import os
++import tempfile
++import shutil
++from pathlib import Path
++from sphinx.util.i18n import CatalogRepository
++from sphinx.locale import init
++from os import path
++
++def test_no_lc_messages_initially():
++    """Test the scenario where LC_MESSAGES directory doesn't exist initially."""
++    
++    # Create a temporary directory structure
++    with tempfile.TemporaryDirectory() as temp_dir:
++        temp_path = Path(temp_dir)
++        
++        # Create source directory structure (simulating a Sphinx project)
++        srcdir = temp_path / "source"
++        srcdir.mkdir()
++        
++        # Create locale directory structure WITHOUT LC_MESSAGES initially
++        # This simulates the case where user creates locale/da/sphinx.po first
++        locale_da_dir = srcdir / "locale" / "da"
++        locale_da_dir.mkdir(parents=True, exist_ok=True)
++        
++        # Create a test sphinx.po file directly in the language directory
++        po_file = locale_da_dir / "sphinx.po"
++        po_content = '''# Danish translations for Sphinx.
++# Copyright (C) 2020 Sphinx Team
++# This file is distributed under the same license as the Sphinx package.
++# FIRST AUTHOR <EMAIL@ADDRESS>, 2020.
++#
++#, fuzzy
++msgid ""
++msgstr ""
++"Project-Id-Version: Sphinx 1.0\\n"
++"Report-Msgid-Bugs-To: \\n"
++"POT-Creation-Date: 2020-01-01 00:00+0000\\n"
++"PO-Revision-Date: 2020-01-01 00:00+0000\\n"
++"Last-Translator: FULL NAME <EMAIL@ADDRESS>\\n"
++"Language-Team: da <LL@li.org>\\n"
++"Language: da\\n"
++"MIME-Version: 1.0\\n"
++"Content-Type: text/plain; charset=UTF-8\\n"
++"Content-Transfer-Encoding: 8bit\\n"
++"Plural-Forms: nplurals=2; plural=(n != 1);\\n"
++
++msgid "Fig. %s"
++msgstr "Foobar %s"
++
++msgid "Listing %s"
++msgstr "Whatever %s"
++'''
++        po_file.write_text(po_content, encoding='utf-8')
++        
++        print("=== Testing scenario: LC_MESSAGES doesn't exist initially ===")
++        
++        # Step 1: Create CatalogRepository to find .po files
++        print("\n1. Finding .po files with CatalogRepository:")
++        repo = CatalogRepository(str(srcdir), ["locale"], "da", "utf-8")
++        
++        catalogs = list(repo.catalogs)
++        print(f"   Catalogs found: {len(catalogs)}")
++        for catalog in catalogs:
++            print(f"     - {catalog.domain} in {catalog.base_dir}")
++            
++            # Step 2: Check if .mo file is outdated and needs compilation
++            print(f"       MO file exists: {path.exists(catalog.mo_path)}")
++            print(f"       PO file exists: {path.exists(catalog.po_path)}")
++            print(f"       Is outdated: {catalog.is_outdated()}")
++            
++            # Step 3: Compile .mo file if needed (this is what Sphinx does)
++            if catalog.is_outdated():
++                print("       Compiling .mo file...")
++                catalog.write_mo("da")
++                print("       ✓ .mo file compiled")
++            else:
++                print("       ✓ .mo file is up to date")
++        
++        # Step 4: Now test if the translation can be loaded
++        print("\n2. Testing translation loading after .mo compilation:")
++        
++        # Get the locale directories that were found
++        locale_dirs_list = list(repo.locale_dirs)
++        print(f"   Locale directories: {locale_dirs_list}")
++        
++        # Add None for system locale and Sphinx's built-in locale
++        all_locale_dirs = [None] + locale_dirs_list
++        
++        # Now try to load the translation
++        translator, has_translation = init(all_locale_dirs, "da")
++        print(f"   Translation loaded: {has_translation}")
++        
++        if has_translation:
++            # Test if our custom translation is used
++            result = translator.gettext("Fig. %s")
++            print(f"   Translation of 'Fig. %s': '{result}'")
++            
++            if result == "Foobar %s":
++                print("   ✓ SUCCESS: Custom translation is being used!")
++                print("   ✓ The issue has been FIXED!")
++            else:
++                print(f"   ✗ FAIL: Expected 'Foobar %s' but got '{result}'")
++        else:
++            print("   ✗ FAIL: No translation loaded")
++            
++            # Check if .mo file exists in the expected location
++            mo_file = srcdir / "locale" / "da" / "LC_MESSAGES" / "sphinx.mo"
++            print(f"   .mo file exists: {mo_file.exists()}")
++
++if __name__ == "__main__":
++    test_no_lc_messages_initially()
+\ No newline at end of file
+diff --git a/test_sphinx_build_process.py b/test_sphinx_build_process.py
+new file mode 100644
+index 000000000..5eff466e7
+--- /dev/null
++++ b/test_sphinx_build_process.py
+@@ -0,0 +1,116 @@
++#!/usr/bin/env python3
++"""
++Test that simulates the actual Sphinx build process to verify the fix works.
++"""
++
++import os
++import tempfile
++import shutil
++from pathlib import Path
++from sphinx.util.i18n import CatalogRepository
++from sphinx.locale import init
++from os import path
++
++def test_sphinx_build_process():
++    """Test that simulates the actual Sphinx build process."""
++    
++    # Create a temporary directory structure
++    with tempfile.TemporaryDirectory() as temp_dir:
++        temp_path = Path(temp_dir)
++        
++        # Create source directory structure (simulating a Sphinx project)
++        srcdir = temp_path / "source"
++        srcdir.mkdir()
++        
++        # Create locale directory structure like the user would
++        locale_dir = srcdir / "locale" / "da" / "LC_MESSAGES"
++        locale_dir.mkdir(parents=True, exist_ok=True)
++        
++        # Create a test sphinx.po file with custom translations
++        po_file = locale_dir / "sphinx.po"
++        po_content = '''# Danish translations for Sphinx.
++# Copyright (C) 2020 Sphinx Team
++# This file is distributed under the same license as the Sphinx package.
++# FIRST AUTHOR <EMAIL@ADDRESS>, 2020.
++#
++#, fuzzy
++msgid ""
++msgstr ""
++"Project-Id-Version: Sphinx 1.0\\n"
++"Report-Msgid-Bugs-To: \\n"
++"POT-Creation-Date: 2020-01-01 00:00+0000\\n"
++"PO-Revision-Date: 2020-01-01 00:00+0000\\n"
++"Last-Translator: FULL NAME <EMAIL@ADDRESS>\\n"
++"Language-Team: da <LL@li.org>\\n"
++"Language: da\\n"
++"MIME-Version: 1.0\\n"
++"Content-Type: text/plain; charset=UTF-8\\n"
++"Content-Transfer-Encoding: 8bit\\n"
++"Plural-Forms: nplurals=2; plural=(n != 1);\\n"
++
++msgid "Fig. %s"
++msgstr "Foobar %s"
++
++msgid "Listing %s"
++msgstr "Whatever %s"
++'''
++        po_file.write_text(po_content, encoding='utf-8')
++        
++        print("=== Testing Sphinx build process simulation ===")
++        
++        # Simulate the Sphinx build process step by step
++        
++        # Step 1: Create CatalogRepository to find .po files
++        print("\n1. Finding .po files with CatalogRepository:")
++        repo = CatalogRepository(str(srcdir), ["locale"], "da", "utf-8")
++        
++        catalogs = list(repo.catalogs)
++        print(f"   Catalogs found: {len(catalogs)}")
++        for catalog in catalogs:
++            print(f"     - {catalog.domain} in {catalog.base_dir}")
++            
++            # Step 2: Check if .mo file is outdated and needs compilation
++            print(f"       MO file exists: {path.exists(catalog.mo_path)}")
++            print(f"       PO file exists: {path.exists(catalog.po_path)}")
++            print(f"       Is outdated: {catalog.is_outdated()}")
++            
++            # Step 3: Compile .mo file if needed (this is what Sphinx does)
++            if catalog.is_outdated():
++                print("       Compiling .mo file...")
++                catalog.write_mo("da")
++                print("       ✓ .mo file compiled")
++            else:
++                print("       ✓ .mo file is up to date")
++        
++        # Step 4: Now test if the translation can be loaded
++        print("\n2. Testing translation loading after .mo compilation:")
++        
++        # Get the locale directories that were found
++        locale_dirs_list = list(repo.locale_dirs)
++        print(f"   Locale directories: {locale_dirs_list}")
++        
++        # Add None for system locale and Sphinx's built-in locale
++        all_locale_dirs = [None] + locale_dirs_list
++        
++        # Now try to load the translation
++        translator, has_translation = init(all_locale_dirs, "da")
++        print(f"   Translation loaded: {has_translation}")
++        
++        if has_translation:
++            # Test if our custom translation is used
++            result = translator.gettext("Fig. %s")
++            print(f"   Translation of 'Fig. %s': '{result}'")
++            
++            if result == "Foobar %s":
++                print("   ✓ SUCCESS: Custom translation is being used!")
++            else:
++                print(f"   ✗ FAIL: Expected 'Foobar %s' but got '{result}'")
++        else:
++            print("   ✗ FAIL: No translation loaded")
++            
++            # Check if .mo file exists in the expected location
++            mo_file = locale_dir / "sphinx.mo"
++            print(f"   .mo file exists: {mo_file.exists()}")
++
++if __name__ == "__main__":
++    test_sphinx_build_process()
+\ No newline at end of file
+diff --git a/tox.ini b/tox.ini
+index a61299979..e2baccc07 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -28,7 +28,7 @@ setenv =
+     PYTHONWARNINGS = all,ignore::ImportWarning:importlib._bootstrap_external,ignore::DeprecationWarning:site,ignore::DeprecationWarning:distutils
+     PYTEST_ADDOPTS = --color yes
+ commands=
+-    pytest --durations 25 {posargs}
++    pytest -rA --durations 25 {posargs}
+ 
+ [testenv:flake8]
+ basepython = python3

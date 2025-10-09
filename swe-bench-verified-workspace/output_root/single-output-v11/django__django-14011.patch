@@ -1,0 +1,308 @@
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index 14dab517c9..379e1004dc 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -11,6 +11,7 @@ import logging
+ import socket
+ import socketserver
+ import sys
++import threading
+ from wsgiref import simple_server
+ 
+ from django.core.exceptions import ImproperlyConfigured
+@@ -81,6 +82,30 @@ class ThreadedWSGIServer(socketserver.ThreadingMixIn, WSGIServer):
+     """A threaded version of the WSGIServer"""
+     daemon_threads = True
+ 
++    def process_request_thread(self, request, client_address):
++        """Same as in BaseServer but as a thread.
++
++        In addition, exception handling is done here.
++        """
++        try:
++            super().process_request_thread(request, client_address)
++        finally:
++            # Close database connections created in this request thread
++            # This prevents "database is being accessed by other users" errors
++            # during test database destruction
++            from django.db import connections
++            # Create a temporary connection to trigger connection initialization
++            # which will mark it as belonging to this thread
++            temp_conn = connections['default']
++            try:
++                # This will create a connection specific to this thread
++                temp_conn.connect()
++                # Now close all connections that belong to this thread
++                connections.close_all()
++            except:
++                # If connection fails, still try to close any open connections
++                connections.close_all()
++
+ 
+ class ServerHandler(simple_server.ServerHandler):
+     http_version = '1.1'
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..ee29ab095c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where ThreadedWSGIServer doesn't close 
++database connections properly after each thread, causing OperationalError
++when destroy_test_db() is called.
++"""
++
++import os
++import django
++from django.conf import settings
++from django.test import LiveServerTestCase
++from django.db import connections
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++    django.setup()
++
++class TestLiveServer(LiveServerTestCase):
++    """Test case that uses LiveServerTestCase to reproduce the issue"""
++    
++    def test_basic(self):
++        """A simple test that should trigger the issue"""
++        # Just a basic test to start the live server
++        self.assertTrue(True)
++
++def run_tests():
++    """Run the test multiple times to reproduce the race condition"""
++    print("Running LiveServerTestCase multiple times to reproduce the issue...")
++    
++    for i in range(10):
++        print(f"Running test iteration {i+1}")
++        try:
++            # Create a test suite with our test case
++            from django.test.runner import DiscoverRunner
++            runner = DiscoverRunner()
++            result = runner.run_tests(['reproduce_issue'], verbosity=1)
++            
++            if not result:
++                print(f"Iteration {i+1}: Test passed")
++            else:
++                print(f"Iteration {i+1}: Test failed")
++                
++        except Exception as e:
++            print(f"Iteration {i+1}: Error occurred - {e}")
++            # Check if it's the specific database connection error
++            if "database is being accessed by other users" in str(e):
++                print("SUCCESS: Reproduced the database connection issue!")
++                return True
++    
++    print("Could not reproduce the issue after 10 iterations")
++    return False
++
++if __name__ == '__main__':
++    run_tests()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..43e1613338
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify that ThreadedWSGIServer properly closes database connections
++after each request thread by checking if the process_request_thread method is called.
++"""
++
++import os
++import django
++from django.conf import settings
++from django.test import LiveServerTestCase
++from django.db import connections
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++    django.setup()
++
++class TestLiveServer(LiveServerTestCase):
++    """Test case that uses LiveServerTestCase"""
++    
++    def test_server_starts_and_stops(self):
++        """Test that the server can start and stop without database connection issues"""
++        # This should work without throwing "database is being accessed by other users" errors
++        self.assertTrue(True)
++
++def run_test():
++    """Run the test to verify the fix"""
++    print("Testing ThreadedWSGIServer database connection cleanup...")
++    
++    try:
++        from django.test.runner import DiscoverRunner
++        runner = DiscoverRunner(verbosity=2)
++        result = runner.run_tests(['simple_test'], verbosity=2)
++        
++        if result:
++            print("Test failed")
++            return False
++        else:
++            print("Test passed - no database connection issues detected")
++            return True
++            
++    except Exception as e:
++        print(f"Error during test: {e}")
++        # Check if it's the specific database connection error
++        if "database is being accessed by other users" in str(e):
++            print("FAIL: Database connection issue still exists!")
++            return False
++        return False
++
++if __name__ == '__main__':
++    run_test()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..317e9b91ad
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python3
++"""
++Test script to verify that ThreadedWSGIServer properly closes database connections
++after each request thread.
++"""
++
++import os
++import django
++from django.conf import settings
++from django.test import LiveServerTestCase
++from django.db import connections
++import threading
++import time
++import requests
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        ROOT_URLCONF='test_urls',
++    )
++    django.setup()
++
++# Create a simple URL pattern inline
++from django.urls import path
++from django.http import HttpResponse
++from django.conf.urls import include
++
++def simple_view(request):
++    """A simple view that uses database connection"""
++    from django.contrib.auth.models import User
++    # This will use a database connection
++    count = User.objects.count()
++    return HttpResponse(f"User count: {count}")
++
++# Configure URL patterns directly
++settings.ROOT_URLCONF = __name__
++urlpatterns = [
++    path('test/', simple_view),
++]
++
++class TestLiveServer(LiveServerTestCase):
++    """Test case that uses LiveServerTestCase and makes actual HTTP requests"""
++    
++    def test_multiple_requests(self):
++        """Make multiple requests to trigger threaded behavior"""
++        # Make several requests concurrently to trigger threading
++        url = f"{self.live_server_url}/test/"
++        
++        def make_request():
++            try:
++                response = requests.get(url, timeout=5)
++                return response.status_code == 200
++            except:
++                return False
++        
++        # Create multiple threads to make requests
++        threads = []
++        results = []
++        
++        for i in range(5):
++            thread = threading.Thread(target=lambda: results.append(make_request()))
++            threads.append(thread)
++            thread.start()
++        
++        # Wait for all threads to complete
++        for thread in threads:
++            thread.join(timeout=10)
++        
++        # Check that all requests succeeded
++        self.assertTrue(all(results), "All requests should succeed")
++
++def run_test():
++    """Run the test to verify the fix"""
++    print("Testing ThreadedWSGIServer database connection cleanup...")
++    
++    try:
++        from django.test.runner import DiscoverRunner
++        runner = DiscoverRunner(verbosity=2)
++        result = runner.run_tests(['test_fix'], verbosity=2)
++        
++        if result:
++            print("Test failed")
++            return False
++        else:
++            print("Test passed - database connections are being properly closed")
++            return True
++            
++    except Exception as e:
++        print(f"Error during test: {e}")
++        # Check if it's the specific database connection error
++        if "database is being accessed by other users" in str(e):
++            print("FAIL: Database connection issue still exists!")
++            return False
++        return False
++
++if __name__ == '__main__':
++    run_test()
+\ No newline at end of file

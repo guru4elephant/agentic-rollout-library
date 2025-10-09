@@ -1,0 +1,429 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index 28374272f4..f90d35cf18 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -516,16 +516,27 @@ class Field(RegisterLookupMixin):
+     def __eq__(self, other):
+         # Needed for @total_ordering
+         if isinstance(other, Field):
++            # Fields from different models should not be equal
++            if hasattr(self, 'model') and hasattr(other, 'model') and self.model != other.model:
++                return False
+             return self.creation_counter == other.creation_counter
+         return NotImplemented
+ 
+     def __lt__(self, other):
+         # This is needed because bisect does not take a comparison function.
+         if isinstance(other, Field):
++            # Fields from different models should be ordered by model first,
++            # then by creation_counter to maintain existing behavior for same-model fields
++            if hasattr(self, 'model') and hasattr(other, 'model') and self.model != other.model:
++                # Order by model to ensure consistent ordering
++                return str(self.model) < str(other.model)
+             return self.creation_counter < other.creation_counter
+         return NotImplemented
+ 
+     def __hash__(self):
++        # Include model in hash to distinguish fields from different models
++        if hasattr(self, 'model'):
++            return hash((self.creation_counter, self.model))
+         return hash(self.creation_counter)
+ 
+     def __deepcopy__(self, memodict):
+diff --git a/edge_case_test.py b/edge_case_test.py
+new file mode 100644
+index 0000000000..cff229e58d
+--- /dev/null
++++ b/edge_case_test.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the django directory to the Python path
++sys.path.insert(0, '/testbed')
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.fields import IntegerField
++
++def test_mixed_fields():
++    """Test comparison between field with model and field without model"""
++    class TestModel(models.Model):
++        class Meta:
++            app_label = 'test'
++        
++        myfield = models.IntegerField()
++
++    # Field attached to a model
++    attached_field = TestModel._meta.get_field('myfield')
++    
++    # Field not attached to any model
++    detached_field = IntegerField()
++    
++    # These should not be equal since one has a model and the other doesn't
++    assert attached_field != detached_field, "Attached field should not equal detached field"
++    assert detached_field != attached_field, "Detached field should not equal attached field"
++    
++    # Hash should be different
++    assert hash(attached_field) != hash(detached_field), "Hashes should be different"
++    
++    # Set should contain both
++    assert len({attached_field, detached_field}) == 2, "Set should contain both fields"
++    
++    # Ordering should work consistently
++    # Since one has model and one doesn't, they should be ordered consistently
++    result1 = attached_field < detached_field
++    result2 = detached_field < attached_field
++    assert result1 != result2, "Only one should be less than the other"
++    
++    print("✓ Mixed fields test passed")
++
++if __name__ == "__main__":
++    test_mixed_fields()
++    print("🎉 Edge case test passed!")
+\ No newline at end of file
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..29d12a3238
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,134 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the django directory to the Python path
++sys.path.insert(0, '/testbed')
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.fields import IntegerField
++
++def test_original_issue():
++    """Test the original issue reported in the GitHub issue"""
++    class A(models.Model):
++        class Meta:
++            abstract = True
++            app_label = 'test'
++        
++        myfield = models.IntegerField()
++
++    class B(A):
++        class Meta:
++            app_label = 'test'
++
++    class C(A):
++        class Meta:
++            app_label = 'test'
++
++    b_field = B._meta.get_field('myfield')
++    c_field = C._meta.get_field('myfield')
++    
++    # The original issue: fields should NOT be equal
++    assert b_field != c_field, "Fields from different models should not be equal"
++    assert len({b_field, c_field}) == 2, "Set should contain both fields"
++    assert hash(b_field) != hash(c_field), "Fields should have different hashes"
++    
++    print("✓ Original issue test passed")
++
++def test_same_model_fields():
++    """Test that fields from the same model still work correctly"""
++    class D(models.Model):
++        class Meta:
++            app_label = 'test'
++        
++        field1 = models.IntegerField()
++        field2 = models.CharField(max_length=100)
++
++    d_field1 = D._meta.get_field('field1')
++    d_field2 = D._meta.get_field('field2')
++    
++    # Fields from same model should work as before
++    assert d_field1 != d_field2, "Different fields from same model should not be equal"
++    assert len({d_field1, d_field2}) == 2, "Set should contain both fields"
++    
++    # Ordering should be based on creation_counter for same model
++    if d_field1.creation_counter < d_field2.creation_counter:
++        assert d_field1 < d_field2, "Field with lower creation_counter should be less"
++        assert not (d_field2 < d_field1), "Field with higher creation_counter should not be less"
++    else:
++        assert d_field2 < d_field1, "Field with lower creation_counter should be less"
++        assert not (d_field1 < d_field2), "Field with higher creation_counter should not be less"
++    
++    print("✓ Same model fields test passed")
++
++def test_detached_fields():
++    """Test fields that are not attached to any model"""
++    field1 = IntegerField()
++    field2 = IntegerField()
++    
++    # Detached fields should work as before
++    assert field1 != field2, "Different detached fields should not be equal"
++    assert len({field1, field2}) == 2, "Set should contain both detached fields"
++    
++    # Ordering should be based on creation_counter
++    if field1.creation_counter < field2.creation_counter:
++        assert field1 < field2, "Detached field with lower creation_counter should be less"
++        assert not (field2 < field1), "Detached field with higher creation_counter should not be less"
++    else:
++        assert field2 < field1, "Detached field with lower creation_counter should be less"
++        assert not (field1 < field2), "Detached field with higher creation_counter should not be less"
++    
++    print("✓ Detached fields test passed")
++
++def test_consistency():
++    """Test that comparisons are consistent (a == b and b == a should be same)"""
++    class E(models.Model):
++        class Meta:
++            app_label = 'test'
++        
++        field1 = models.IntegerField()
++
++    class F(models.Model):
++        class Meta:
++            app_label = 'test'
++        
++        field1 = models.IntegerField()
++
++    e_field = E._meta.get_field('field1')
++    f_field = F._meta.get_field('field1')
++    
++    # Consistency check
++    assert (e_field == f_field) == (f_field == e_field), "Equality should be symmetric"
++    assert (e_field < f_field) != (f_field < e_field), "Only one should be less than the other"
++    
++    print("✓ Consistency test passed")
++
++if __name__ == "__main__":
++    test_original_issue()
++    test_same_model_fields()
++    test_detached_fields()
++    test_consistency()
++    print("\n🎉 All tests passed! The fix is working correctly.")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..f8e7b3c217
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the django directory to the Python path
++sys.path.insert(0, '/testbed')
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++class A(models.Model):
++    class Meta:
++        abstract = True
++        app_label = 'test'
++    
++    myfield = models.IntegerField()
++
++class B(A):
++    class Meta:
++        app_label = 'test'
++
++class C(A):
++    class Meta:
++        app_label = 'test'
++
++# Test the issue
++b_field = B._meta.get_field('myfield')
++c_field = C._meta.get_field('myfield')
++
++print("B field creation_counter:", b_field.creation_counter)
++print("C field creation_counter:", c_field.creation_counter)
++print("B field model:", b_field.model)
++print("C field model:", c_field.model)
++
++print("B field == C field:", b_field == c_field)
++print("len({B field, C field}):", len({b_field, c_field}))
++
++# Test hash values
++print("Hash of B field:", hash(b_field))
++print("Hash of C field:", hash(c_field))
++
++# Test less than comparison
++print("B field < C field:", b_field < c_field)
++print("C field < B field:", c_field < b_field)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..9c5a840a79
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,101 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++
++# Add the django directory to the Python path
++sys.path.insert(0, '/testbed')
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++class A(models.Model):
++    class Meta:
++        abstract = True
++        app_label = 'test'
++    
++    myfield = models.IntegerField()
++
++class B(A):
++    class Meta:
++        app_label = 'test'
++
++class C(A):
++    class Meta:
++        app_label = 'test'
++
++# Test 1: Fields from different models with same creation_counter
++b_field = B._meta.get_field('myfield')
++c_field = C._meta.get_field('myfield')
++
++print("=== Test 1: Fields from different models ===")
++print("B field creation_counter:", b_field.creation_counter)
++print("C field creation_counter:", c_field.creation_counter)
++print("B field == C field:", b_field == c_field)
++print("len({B field, C field}):", len({b_field, c_field}))
++print("Hash of B field:", hash(b_field))
++print("Hash of C field:", hash(c_field))
++print("B field < C field:", b_field < c_field)
++print("C field < B field:", c_field < b_field)
++
++# Test 2: Fields from same model
++class D(models.Model):
++    class Meta:
++        app_label = 'test'
++    
++    field1 = models.IntegerField()
++    field2 = models.CharField(max_length=100)
++
++d_field1 = D._meta.get_field('field1')
++d_field2 = D._meta.get_field('field2')
++
++print("\n=== Test 2: Fields from same model ===")
++print("D field1 creation_counter:", d_field1.creation_counter)
++print("D field2 creation_counter:", d_field2.creation_counter)
++print("D field1 == D field2:", d_field1 == d_field2)
++print("len({D field1, D field2}):", len({d_field1, d_field2}))
++print("D field1 < D field2:", d_field1 < d_field2)
++print("D field2 < D field1:", d_field2 < d_field1)
++
++# Test 3: Fields without model attribute (edge case)
++print("\n=== Test 3: Fields without model attribute ===")
++# Create a field instance directly (not attached to a model)
++from django.db.models.fields import IntegerField
++field_without_model = IntegerField()
++field_without_model2 = IntegerField()
++
++print("Field without model creation_counter:", field_without_model.creation_counter)
++print("Field without model2 creation_counter:", field_without_model2.creation_counter)
++print("Field without model == Field without model2:", field_without_model == field_without_model2)
++print("len({Field without model, Field without model2}):", len({field_without_model, field_without_model2}))
++print("Field without model < Field without model2:", field_without_model < field_without_model2)
++
++# Test 4: Comparison with non-Field objects
++print("\n=== Test 4: Comparison with non-Field objects ===")
++print("B field == 'string':", b_field == 'string')
++try:
++    result = b_field < 'string'
++    print("B field < 'string':", result)
++except TypeError as e:
++    print("B field < 'string': TypeError (expected):", str(e))
+\ No newline at end of file

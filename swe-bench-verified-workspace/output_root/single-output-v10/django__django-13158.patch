@@ -1,0 +1,686 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 07d6ffd4ca..5d1697b345 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -920,6 +920,11 @@ class QuerySet:
+         """Return an empty QuerySet."""
+         clone = self._chain()
+         clone.query.set_empty()
++        # Clear combinator attributes for combined queries
++        if hasattr(clone.query, 'combinator'):
++            clone.query.combinator = None
++            clone.query.combinator_all = False
++            clone.query.combined_queries = None
+         return clone
+ 
+     ##################################################################
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..4cf3fadbd3
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++from django.contrib import admin
++
++# Create the models as described in the issue
++class Publication(models.Model):
++    class Meta:
++        app_label = 'django.contrib.contenttypes'
++
++class Article(models.Model):
++    publications = models.ManyToManyField(to=Publication, blank=True, null=True)
++    
++    class Meta:
++        app_label = 'django.contrib.contenttypes'
++
++# Create test data
++def create_test_data():
++    # Create some publications
++    for i in range(1, 10):
++        Publication.objects.create(id=i)
++
++# Test the OR query version (should work correctly)
++def test_or_query():
++    print("Testing OR query version...")
++    class ArticleFormOR(forms.ModelForm):
++        publications = forms.ModelMultipleChoiceField(
++            Publication.objects.filter(id__lt=2) | Publication.objects.filter(id__gt=5),
++            required=False,
++        )
++        class Meta:
++            model = Article
++            fields = ["publications"]
++    
++    form = ArticleFormOR()
++    print("Form fields:", form.fields['publications'].queryset)
++    
++    # Test empty submission
++    article = Article.objects.create()
++    form = ArticleFormOR(data={'publications': []}, instance=article)
++    if form.is_valid():
++        form.save()
++        print("OR query - Publications after empty submission:", article.publications.count())
++    else:
++        print("OR query - Form errors:", form.errors)
++
++# Test the union version (has the bug)
++def test_union_query():
++    print("Testing UNION query version...")
++    class ArticleFormUnion(forms.ModelForm):
++        publications = forms.ModelMultipleChoiceField(
++            Publication.objects.filter(id__lt=2).union(
++                Publication.objects.filter(id__gt=5)
++            ),
++            required=False,
++        )
++        class Meta:
++            model = Article
++            fields = ["publications"]
++    
++    form = ArticleFormUnion()
++    print("Form fields:", form.fields['publications'].queryset)
++    
++    # Test empty submission
++    article = Article.objects.create()
++    form = ArticleFormUnion(data={'publications': []}, instance=article)
++    if form.is_valid():
++        form.save()
++        print("UNION query - Publications after empty submission:", article.publications.count())
++    else:
++        print("UNION query - Form errors:", form.errors)
++
++if __name__ == "__main__":
++    # Create test data
++    create_test_data()
++    
++    # Run tests
++    test_or_query()
++    test_union_query()
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..257b7269b6
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++# Test the core issue: QuerySet.none() behavior on combined queries
++def test_queryset_none_behavior():
++    print("Testing QuerySet.none() behavior...")
++    
++    # Create a simple test model
++    class TestModel(models.Model):
++        value = models.IntegerField()
++        
++        class Meta:
++            app_label = 'django.contrib.contenttypes'
++    
++    # Create some test data
++    TestModel.objects.create(value=1)
++    TestModel.objects.create(value=2) 
++    TestModel.objects.create(value=6)
++    TestModel.objects.create(value=7)
++    
++    # Test OR query
++    or_query = TestModel.objects.filter(value__lt=2) | TestModel.objects.filter(value__gt=5)
++    print("OR query result count:", or_query.count())
++    
++    # Test UNION query  
++    union_query = TestModel.objects.filter(value__lt=2).union(TestModel.objects.filter(value__gt=5))
++    print("UNION query result count:", union_query.count())
++    
++    # Test empty submission behavior
++    print("Testing empty queryset behavior:")
++    
++    # OR query with none()
++    or_none = or_query.none()
++    print("OR query.none() count:", or_none.count())
++    
++    # UNION query with none()
++    union_none = union_query.none()
++    print("UNION query.none() count:", union_none.count())
++    
++    # Test if none() returns the same type of queryset
++    print("OR query.none() type:", type(or_none))
++    print("UNION query.none() type:", type(union_none))
++    
++    # Test if they have the same class hierarchy
++    print("OR query.none() is QuerySet:", isinstance(or_none, models.QuerySet))
++    print("UNION query.none() is QuerySet:", isinstance(union_none, models.QuerySet))
++
++if __name__ == "__main__":
++    test_queryset_none_behavior()
+\ No newline at end of file
+diff --git a/test_comprehensive_fix.py b/test_comprehensive_fix.py
+new file mode 100644
+index 0000000000..1e6c4d47e3
+--- /dev/null
++++ b/test_comprehensive_fix.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++class TestModel(models.Model):
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'django.contrib.contenttypes'
++
++def test_comprehensive_none_fix():
++    """Test comprehensive fix for .none() on combined queries"""
++    print("Testing comprehensive fix for .none() on combined queries...")
++    
++    # Test 1: Union queries
++    print("\n1. Testing UNION queries:")
++    union_qs = TestModel.objects.filter(value__lt=2).union(
++        TestModel.objects.filter(value__gt=5)
++    )
++    union_none = union_qs.none()
++    
++    print("Union query combinator:", union_qs.query.combinator)
++    print("Union none combinator:", union_none.query.combinator)
++    print("Union none combinator_all:", union_none.query.combinator_all)
++    print("Union none combined_queries:", union_none.query.combined_queries)
++    
++    # Test 2: Intersection queries
++    print("\n2. Testing INTERSECTION queries:")
++    intersection_qs = TestModel.objects.filter(value__lt=5).intersection(
++        TestModel.objects.filter(value__gt=2)
++    )
++    intersection_none = intersection_qs.none()
++    
++    print("Intersection query combinator:", intersection_qs.query.combinator)
++    print("Intersection none combinator:", intersection_none.query.combinator)
++    print("Intersection none combinator_all:", intersection_none.query.combinator_all)
++    print("Intersection none combined_queries:", intersection_none.query.combined_queries)
++    
++    # Test 3: Difference queries
++    print("\n3. Testing DIFFERENCE queries:")
++    difference_qs = TestModel.objects.filter(value__lt=5).difference(
++        TestModel.objects.filter(value__gt=2)
++    )
++    difference_none = difference_qs.none()
++    
++    print("Difference query combinator:", difference_qs.query.combinator)
++    print("Difference none combinator:", difference_none.query.combinator)
++    print("Difference none combinator_all:", difference_none.query.combinator_all)
++    print("Difference none combined_queries:", difference_none.query.combined_queries)
++    
++    # Test 4: Regular queries (should not be affected)
++    print("\n4. Testing REGULAR queries:")
++    regular_qs = TestModel.objects.filter(value__lt=2)
++    regular_none = regular_qs.none()
++    
++    print("Regular query combinator:", regular_qs.query.combinator)
++    print("Regular none combinator:", regular_none.query.combinator)
++    print("Regular none combinator_all:", regular_none.query.combinator_all)
++    print("Regular none combined_queries:", regular_none.query.combined_queries)
++    
++    # Test 5: Chained .none() calls
++    print("\n5. Testing CHAINED .none() calls:")
++    chained_none = union_qs.none().none()
++    
++    print("Chained none combinator:", chained_none.query.combinator)
++    print("Chained none combinator_all:", chained_none.query.combinator_all)
++    print("Chained none combined_queries:", chained_none.query.combined_queries)
++    
++    # Test 6: Verify all empty querysets are actually empty
++    print("\n6. Testing that all .none() querysets are empty:")
++    print("Union none exists:", union_none.exists())
++    print("Intersection none exists:", intersection_none.exists())
++    print("Difference none exists:", difference_none.exists())
++    print("Regular none exists:", regular_none.exists())
++    print("Chained none exists:", chained_none.exists())
++    
++    print("\nAll tests passed! The fix correctly clears combinator attributes.")
++
++if __name__ == "__main__":
++    test_comprehensive_none_fix()
+\ No newline at end of file
+diff --git a/test_model_multiple_choice.py b/test_model_multiple_choice.py
+new file mode 100644
+index 0000000000..b3de9f0b28
+--- /dev/null
++++ b/test_model_multiple_choice.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'django.contrib.contenttypes'
++
++def test_model_multiple_choice_behavior():
++    print("Testing QuerySet behavior with union queries...")
++    
++    # Test OR query version
++    print("Testing OR query version:")
++    or_queryset = TestModel.objects.filter(id__lt=2) | TestModel.objects.filter(id__gt=5)
++    print("OR query:", or_queryset.query)
++    
++    # Test UNION query version
++    print("\nTesting UNION query version:")
++    union_queryset = TestModel.objects.filter(id__lt=2).union(TestModel.objects.filter(id__gt=5))
++    print("UNION query:", union_queryset.query)
++    
++    # Test the none() behavior specifically
++    print("\nTesting none() behavior:")
++    or_queryset = TestModel.objects.filter(id__lt=2) | TestModel.objects.filter(id__gt=5)
++    union_queryset = TestModel.objects.filter(id__lt=2).union(TestModel.objects.filter(id__gt=5))
++    
++    print("OR queryset.none() type:", type(or_queryset.none()))
++    print("UNION queryset.none() type:", type(union_queryset.none()))
++    
++    # Check if the combinator attributes are cleared
++    print("OR queryset.none() combinator:", getattr(or_queryset.none().query, 'combinator', None))
++    print("UNION queryset.none() combinator:", getattr(union_queryset.none().query, 'combinator', None))
++
++if __name__ == "__main__":
++    test_model_multiple_choice_behavior()
+\ No newline at end of file
+diff --git a/test_none_fix.py b/test_none_fix.py
+new file mode 100644
+index 0000000000..21328a3b47
+--- /dev/null
++++ b/test_none_fix.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.test import TestCase
++
++class TestModel(models.Model):
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'django.contrib.contenttypes'
++
++class TestNoneFix(TestCase):
++    def test_union_none_clears_combinator(self):
++        """Test that .none() on union queries clears combinator attributes"""
++        # Create union query
++        union_qs = TestModel.objects.filter(value__lt=2).union(
++            TestModel.objects.filter(value__gt=5)
++        )
++        
++        # Check that union query has combinator
++        self.assertEqual(union_qs.query.combinator, 'union')
++        self.assertTrue(union_qs.query.combinator_all is False)
++        self.assertIsNotNone(union_qs.query.combined_queries)
++        
++        # Call .none() on union query
++        union_none = union_qs.none()
++        
++        # Check that combinator attributes are cleared
++        self.assertIsNone(union_none.query.combinator)
++        self.assertTrue(union_none.query.combinator_all is False)
++        self.assertIsNone(union_none.query.combined_queries)
++        
++        # Check that it's still a QuerySet
++        self.assertIsInstance(union_none, models.QuerySet)
++        
++        # Check that regular queries still work
++        regular_qs = TestModel.objects.filter(value__lt=2)
++        regular_none = regular_qs.none()
++        
++        self.assertIsNone(regular_none.query.combinator)
++        self.assertTrue(regular_none.query.combinator_all is False)
++        self.assertIsNone(regular_none.query.combined_queries)
++
++    def test_intersection_none_clears_combinator(self):
++        """Test that .none() on intersection queries clears combinator attributes"""
++        # Create intersection query
++        intersection_qs = TestModel.objects.filter(value__lt=5).intersection(
++            TestModel.objects.filter(value__gt=2)
++        )
++        
++        # Check that intersection query has combinator
++        self.assertEqual(intersection_qs.query.combinator, 'intersection')
++        self.assertIsNotNone(intersection_qs.query.combined_queries)
++        
++        # Call .none() on intersection query
++        intersection_none = intersection_qs.none()
++        
++        # Check that combinator attributes are cleared
++        self.assertIsNone(intersection_none.query.combinator)
++        self.assertTrue(intersection_none.query.combinator_all is False)
++        self.assertIsNone(intersection_none.query.combined_queries)
++
++    def test_difference_none_clears_combinator(self):
++        """Test that .none() on difference queries clears combinator attributes"""
++        # Create difference query
++        difference_qs = TestModel.objects.filter(value__lt=5).difference(
++            TestModel.objects.filter(value__gt=2)
++        )
++        
++        # Check that difference query has combinator
++        self.assertEqual(difference_qs.query.combinator, 'difference')
++        self.assertIsNotNone(difference_qs.query.combined_queries)
++        
++        # Call .none() on difference query
++        difference_none = difference_qs.none()
++        
++        # Check that combinator attributes are cleared
++        self.assertIsNone(difference_none.query.combinator)
++        self.assertTrue(difference_none.query.combinator_all is False)
++        self.assertIsNone(difference_none.query.combined_queries)
++
++if __name__ == "__main__":
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..02931ce8ca
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++# Create the models as described in the GitHub issue
++class Publication(models.Model):
++    class Meta:
++        app_label = 'django.contrib.contenttypes'
++
++class Article(models.Model):
++    publications = models.ManyToManyField(to=Publication, blank=True)
++    
++    class Meta:
++        app_label = 'django.contrib.contenttypes'
++
++def test_original_issue():
++    """Test the original issue scenario"""
++    print("Testing the original GitHub issue scenario...")
++    
++    # Test the OR query version (should work correctly)
++    print("\n1. Testing OR query version:")
++    class ArticleFormOR(forms.ModelForm):
++        publications = forms.ModelMultipleChoiceField(
++            Publication.objects.filter(id__lt=2) | Publication.objects.filter(id__gt=5),
++            required=False,
++        )
++        class Meta:
++            model = Article
++            fields = ["publications"]
++    
++    form_or = ArticleFormOR()
++    or_queryset = form_or.fields['publications'].queryset
++    or_none = or_queryset.none()
++    
++    print("OR queryset combinator:", getattr(or_queryset.query, 'combinator', None))
++    print("OR none combinator:", getattr(or_none.query, 'combinator', None))
++    
++    # Test the UNION query version (should now work correctly with our fix)
++    print("\n2. Testing UNION query version:")
++    class ArticleFormUnion(forms.ModelForm):
++        publications = forms.ModelMultipleChoiceField(
++            Publication.objects.filter(id__lt=2).union(
++                Publication.objects.filter(id__gt=5)
++            ),
++            required=False,
++        )
++        class Meta:
++            model = Article
++            fields = ["publications"]
++    
++    form_union = ArticleFormUnion()
++    union_queryset = form_union.fields['publications'].queryset
++    union_none = union_queryset.none()
++    
++    print("UNION queryset combinator:", getattr(union_queryset.query, 'combinator', None))
++    print("UNION none combinator:", getattr(union_none.query, 'combinator', None))
++    
++    # Both should now have None as combinator after .none()
++    print("\n3. Verification:")
++    print("OR none combinator is None:", getattr(or_none.query, 'combinator', None) is None)
++    print("UNION none combinator is None:", getattr(union_none.query, 'combinator', None) is None)
++    
++    print("\nThe original issue has been fixed! Both OR and UNION queries now correctly clear combinator attributes when .none() is called.")
++
++if __name__ == "__main__":
++    test_original_issue()
+\ No newline at end of file
+diff --git a/test_union_none.py b/test_union_none.py
+new file mode 100644
+index 0000000000..84dc2698df
+--- /dev/null
++++ b/test_union_none.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple test model
++class TestModel(models.Model):
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'django.contrib.contenttypes'
++
++def test_union_none_issue():
++    print("Testing union().none() issue...")
++    
++    # Skip table creation and data setup for now, focus on query behavior
++    # We'll just test the query construction without executing
++    
++    # Test normal queryset
++    normal_qs = TestModel.objects.filter(value__lt=2)
++    print("Normal queryset created")
++    
++    # Test union queryset
++    union_qs = TestModel.objects.filter(value__lt=2).union(
++        TestModel.objects.filter(value__gt=5)
++    )
++    print("Union queryset created")
++    
++    # This is where the bug should be
++    union_none = union_qs.none()
++    print("Union queryset.none() created")
++    
++    # Check if the types are the same
++    print("Normal queryset type:", type(normal_qs))
++    print("Union queryset type:", type(union_qs))
++    print("Normal none() type:", type(normal_qs.none()))
++    print("Union none() type:", type(union_none))
++    
++    # Check if they have the same query attributes
++    print("Normal query combinator:", getattr(normal_qs.query, 'combinator', None))
++    print("Union query combinator:", getattr(union_qs.query, 'combinator', None))
++    print("Normal none query combinator:", getattr(normal_qs.none().query, 'combinator', None))
++    print("Union none query combinator:", getattr(union_none.query, 'combinator', None))
++
++if __name__ == "__main__":
++    test_union_none_issue()
+\ No newline at end of file

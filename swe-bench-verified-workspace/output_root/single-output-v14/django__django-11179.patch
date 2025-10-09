@@ -1,0 +1,318 @@
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index 92fe4affb9..18ad2a7802 100644
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -277,6 +277,8 @@ class Collector:
+             if self.can_fast_delete(instance):
+                 with transaction.mark_for_rollback_on_error():
+                     count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)
++                # Clear the PK after successful deletion
++                setattr(instance, model._meta.pk.attname, None)
+                 return count, {model._meta.label: count}
+ 
+         with transaction.atomic(using=self.using, savepoint=False):
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..c5babfb7b5
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db import connection
++
++# Create a simple model without any dependencies
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create database tables
++with connection.cursor() as cursor:
++    cursor.execute('CREATE TABLE IF NOT EXISTS test_testmodel (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100))')
++
++def test_fast_delete_pk_cleared():
++    """Test that fast delete path clears PK"""
++    print("Testing fast delete PK clearance...")
++    
++    # Create instance
++    instance = TestModel.objects.create(name='fast_delete_test')
++    original_pk = instance.pk
++    print(f"Created instance with PK: {original_pk}")
++    
++    # Delete instance (should use fast delete path)
++    instance.delete()
++    
++    # Check if PK is cleared
++    if instance.pk is None:
++        print("✓ PK cleared after fast delete")
++        return True
++    else:
++        print(f"✗ PK NOT cleared after fast delete: {instance.pk}")
++        return False
++
++def test_normal_delete_pk_cleared():
++    """Test that normal delete path clears PK"""
++    print("Testing normal delete PK clearance...")
++    
++    # Create multiple instances to force normal delete path
++    instances = [
++        TestModel.objects.create(name='normal_delete_1'),
++        TestModel.objects.create(name='normal_delete_2')
++    ]
++    original_pks = [inst.pk for inst in instances]
++    print(f"Created instances with PKs: {original_pks}")
++    
++    # Delete instances one by one (should use normal path)
++    for instance in instances:
++        instance.delete()
++    
++    # Check if all PKs are cleared
++    all_cleared = all(inst.pk is None for inst in instances)
++    if all_cleared:
++        print("✓ All PKs cleared after normal delete")
++        return True
++    else:
++        current_pks = [inst.pk for inst in instances]
++        print(f"✗ PKs NOT cleared after normal delete: {current_pks}")
++        return False
++
++def test_edge_cases():
++    """Test edge cases"""
++    print("Testing edge cases...")
++    
++    # Test with multiple fast deletes
++    results = []
++    for i in range(3):
++        instance = TestModel.objects.create(name=f'edge_case_{i}')
++        instance.delete()
++        results.append(instance.pk is None)
++    
++    if all(results):
++        print("✓ All edge case PKs cleared")
++        return True
++    else:
++        print(f"✗ Some edge case PKs NOT cleared")
++        return False
++
++if __name__ == '__main__':
++    print("Running comprehensive deletion tests...\n")
++    
++    tests = [
++        test_fast_delete_pk_cleared,
++        test_normal_delete_pk_cleared,
++        test_edge_cases
++    ]
++    
++    results = []
++    for test in tests:
++        results.append(test())
++        print()
++    
++    all_passed = all(results)
++    print(f"Overall result: {'PASS' if all_passed else 'FAIL'}")
++    print(f"Tests passed: {sum(results)}/{len(results)}")
++    
++    if all_passed:
++        print("\n🎉 All tests passed! The fix is working correctly.")
++    else:
++        print("\n❌ Some tests failed. Please check the implementation.")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..fd6a9f4f35
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core.management import execute_from_command_line
++
++# Create a simple model without any dependencies
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create database tables
++from django.db import connection
++connection.cursor().execute('CREATE TABLE IF NOT EXISTS test_testmodel (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100))')
++
++# Test the issue
++def test_delete_clears_pk():
++    # Create a test instance
++    instance = TestModel.objects.create(name='test')
++    original_pk = instance.pk
++    print(f"Created instance with PK: {original_pk}")
++    
++    # Delete the instance
++    instance.delete()
++    
++    # Check if PK is cleared
++    if instance.pk is None:
++        print("✓ PK is properly cleared after delete()")
++        return True
++    else:
++        print(f"✗ PK is NOT cleared after delete(). Current PK: {instance.pk}")
++        return False
++
++if __name__ == '__main__':
++    result = test_delete_clears_pk()
++    print(f"Test result: {'PASS' if result else 'FAIL'}")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..9ec7fbdb05
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,101 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db import connection
++
++# Create a simple model without any dependencies
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create database tables
++connection.cursor().execute('CREATE TABLE IF NOT EXISTS test_testmodel (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100))')
++
++def test_single_instance_fast_delete():
++    """Test single instance with no dependencies (fast delete path)"""
++    print("Testing single instance fast delete...")
++    instance = TestModel.objects.create(name='test1')
++    original_pk = instance.pk
++    instance.delete()
++    
++    if instance.pk is None:
++        print("✓ Single instance PK cleared")
++        return True
++    else:
++        print(f"✗ Single instance PK NOT cleared: {instance.pk}")
++        return False
++
++def test_multiple_instances_normal_delete():
++    """Test multiple instances (normal delete path)"""
++    print("Testing multiple instances normal delete...")
++    instances = [
++        TestModel.objects.create(name='test2'),
++        TestModel.objects.create(name='test3')
++    ]
++    original_pks = [inst.pk for inst in instances]
++    
++    # Delete one by one (should use normal path)
++    for instance in instances:
++        instance.delete()
++    
++    all_cleared = all(inst.pk is None for inst in instances)
++    if all_cleared:
++        print("✓ Multiple instances PKs cleared")
++        return True
++    else:
++        pks = [inst.pk for inst in instances]
++        print(f"✗ Multiple instances PKs NOT cleared: {pks}")
++        return False
++
++def test_query_set_delete():
++    """Test queryset delete (should not affect instance PKs)"""
++    print("Testing queryset delete...")
++    instance1 = TestModel.objects.create(name='test4')
++    instance2 = TestModel.objects.create(name='test5')
++    original_pk1, original_pk2 = instance1.pk, instance2.pk
++    
++    # Delete using queryset
++    TestModel.objects.filter(name__in=['test4', 'test5']).delete()
++    
++    # Instance PKs should remain unchanged after queryset delete
++    if instance1.pk == original_pk1 and instance2.pk == original_pk2:
++        print("✓ Instance PKs unchanged after queryset delete")
++        return True
++    else:
++        print(f"✗ Instance PKs changed after queryset delete: {instance1.pk}, {instance2.pk}")
++        return False
++
++if __name__ == '__main__':
++    results = []
++    
++    results.append(test_single_instance_fast_delete())
++    results.append(test_multiple_instances_normal_delete()) 
++    results.append(test_query_set_delete())
++    
++    all_passed = all(results)
++    print(f"\nOverall result: {'PASS' if all_passed else 'FAIL'}")
++    print(f"Tests passed: {sum(results)}/{len(results)}")
+\ No newline at end of file

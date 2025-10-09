@@ -1,0 +1,210 @@
+diff --git a/debug_resampling.py b/debug_resampling.py
+new file mode 100644
+index 0000000000..df6fb14dfe
+--- /dev/null
++++ b/debug_resampling.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++"""
++Debug the resampling process that causes the error
++"""
++import numpy as np
++import matplotlib.colors as colors
++import matplotlib.image as mimage
++
++def debug_resampling():
++    """Debug the resampling process"""
++    # Create the same data as in the test
++    data = np.full((5, 5), -1, dtype=np.float64)
++    data[0:2, :] = 1E20
++    
++    print("Original data:", data)
++    print("Original data min/max:", data.min(), data.max())
++    
++    # Create LogNorm with vmin=100, vmax=data.max() (which is 1E20)
++    norm = colors.LogNorm(vmin=100, vmax=data.max())
++    print("Original norm vmin/vmax:", norm.vmin, norm.vmax)
++    
++    # Simulate the resampling process
++    # First, let's see what happens when we scale the data
++    A = data
++    a_min = A.min()
++    a_max = A.max()
++    print("a_min, a_max:", a_min, a_max)
++    
++    # Check if all masked
++    if a_min is np.ma.masked:
++        a_min, a_max = np.int32(0), np.int32(1)
++        print("All masked, setting a_min/a_max to:", a_min, a_max)
++    
++    # Determine scaled_dtype
++    if A.dtype.kind == 'f':
++        scaled_dtype = np.dtype(np.float64 if A.dtype.itemsize > 4 else np.float32)
++        print("scaled_dtype:", scaled_dtype)
++    
++    # Scale the vrange
++    vmin, vmax = norm.vmin, norm.vmax
++    if vmin is np.ma.masked:
++        vmin, vmax = a_min, a_max
++    
++    vrange = np.array([vmin, vmax], dtype=scaled_dtype)
++    print("vrange before scaling:", vrange)
++    
++    # Apply the same scaling as the data
++    offset = .1
++    frac = .8
++    
++    # Scale vrange through the same pipeline as data
++    vrange -= a_min
++    print("vrange after subtracting a_min:", vrange)
++    
++    if a_min != a_max:
++        vrange /= ((a_max - a_min) / frac)
++        print("vrange after scaling:", vrange)
++    
++    vrange += offset
++    print("vrange after adding offset:", vrange)
++    
++    # Now these are the s_vmin, s_vmax values that get passed to norm
++    s_vmin, s_vmax = vrange
++    print("s_vmin, s_vmax:", s_vmin, s_vmax)
++    
++    # Check what happens when we transform these
++    trf = norm._trf
++    try:
++        t_s_vmin, t_s_vmax = trf.transform([s_vmin, s_vmax])
++        print("Transformed s_vmin, s_vmax:", t_s_vmin, t_s_vmax)
++        print("Are they finite?", np.isfinite([t_s_vmin, t_s_vmax]))
++    except Exception as e:
++        print("Transform error:", e)
++
++if __name__ == "__main__":
++    debug_resampling()
+\ No newline at end of file
+diff --git a/debug_transform.py b/debug_transform.py
+new file mode 100644
+index 0000000000..81d970bcd2
+--- /dev/null
++++ b/debug_transform.py
+@@ -0,0 +1,47 @@
++#!/usr/bin/env python3
++"""
++Debug the transform operation that's causing the error
++"""
++import numpy as np
++import matplotlib.colors as colors
++
++def debug_transform():
++    """Debug the transform operation that fails"""
++    data = np.full((5, 5), -1, dtype=np.float64)
++    data[0:2, :] = 1E20
++    
++    print("Data:", data)
++    print("Data max:", data.max())
++    print("Data min:", data.min())
++    
++    # Create LogNorm with vmin=100, vmax=data.max() (which is 1E20)
++    norm = colors.LogNorm(vmin=100, vmax=data.max())
++    
++    print("Norm vmin:", norm.vmin)
++    print("Norm vmax:", norm.vmax)
++    
++    # Access the transform directly
++    trf = norm._trf
++    print("Transform type:", type(trf))
++    
++    # Test the transform on vmin and vmax
++    try:
++        t_vmin, t_vmax = trf.transform([norm.vmin, norm.vmax])
++        print("t_vmin:", t_vmin)
++        print("t_vmax:", t_vmax)
++        print("Are they finite?", np.isfinite([t_vmin, t_vmax]))
++        print("All finite?", np.isfinite([t_vmin, t_vmax]).all())
++    except Exception as e:
++        print("Transform error:", e)
++    
++    # Test with extreme values that might cause issues
++    extreme_values = [1e-300, 1e300, -1, 0, 1e20, 1e30]
++    for val in extreme_values:
++        try:
++            result = trf.transform([val])
++            print(f"transform({val}) = {result[0]}, finite: {np.isfinite(result[0])}")
++        except Exception as e:
++            print(f"transform({val}) error: {e}")
++
++if __name__ == "__main__":
++    debug_transform()
+\ No newline at end of file
+diff --git a/lib/matplotlib/colors.py b/lib/matplotlib/colors.py
+index e0c42c5b69..260e658b95 100644
+--- a/lib/matplotlib/colors.py
++++ b/lib/matplotlib/colors.py
+@@ -1488,7 +1488,7 @@ def _make_norm_from_scale(scale_cls, base_norm_cls=None, *, init=None):
+             t_vmin, t_vmax = self._trf.transform([self.vmin, self.vmax])
+             if not np.isfinite([t_vmin, t_vmax]).all():
+                 raise ValueError("Invalid vmin or vmax")
+-            value, is_scalar = self.process_value(value)
++            value, is_scalar = self.process_value( value)
+             rescaled = value * (t_vmax - t_vmin)
+             rescaled += t_vmin
+             value = (self._trf
+diff --git a/lib/matplotlib/image.py b/lib/matplotlib/image.py
+index 95bb42d75c..bf217a04ab 100644
+--- a/lib/matplotlib/image.py
++++ b/lib/matplotlib/image.py
+@@ -533,8 +533,14 @@ class _ImageBase(martist.Artist, cm.ScalarMappable):
+                 # that may have moved input values in/out of range
+                 s_vmin, s_vmax = vrange
+                 if isinstance(self.norm, mcolors.LogNorm):
++                    # Ensure both vmin and vmax are positive and valid for log transform
+                     if s_vmin < 0:
+                         s_vmin = max(s_vmin, np.finfo(scaled_dtype).eps)
++                    if s_vmax < 0:
++                        s_vmax = max(s_vmax, np.finfo(scaled_dtype).eps)
++                    # Also ensure vmin != vmax to avoid division by zero
++                    if s_vmin == s_vmax:
++                        s_vmax = s_vmin + np.finfo(scaled_dtype).eps
+                 with cbook._setattr_cm(self.norm,
+                                        vmin=s_vmin,
+                                        vmax=s_vmax,
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..8763cd7b1b
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,34 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the test_huge_range_log issue
++"""
++import numpy as np
++import matplotlib.colors as colors
++import matplotlib.pyplot as plt
++
++def test_huge_range_log():
++    """Reproduce the failing test case"""
++    data = np.full((5, 5), -1, dtype=np.float64)
++    data[0:2, :] = 1E20
++    
++    print("Data:", data)
++    print("Data max:", data.max())
++    print("Data min:", data.min())
++    
++    # Create LogNorm with vmin=100, vmax=data.max() (which is 1E20)
++    norm = colors.LogNorm(vmin=100, vmax=data.max())
++    
++    print("Norm vmin:", norm.vmin)
++    print("Norm vmax:", norm.vmax)
++    
++    # Try to apply the normalization
++    try:
++        result = norm(data)
++        print("Normalization successful")
++        print("Result:", result)
++    except Exception as e:
++        print("Error:", e)
++        print("Error type:", type(e))
++
++if __name__ == "__main__":
++    test_huge_range_log()
+\ No newline at end of file

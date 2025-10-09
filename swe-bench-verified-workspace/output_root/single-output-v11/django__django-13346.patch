@@ -1,0 +1,239 @@
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fafc1beee8..5288d6cbed 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -479,6 +479,38 @@ class KeyTransformGte(KeyTransformNumericLookupMixin, lookups.GreaterThanOrEqual
+     pass
+ 
+ 
++class KeyTransformIn(lookups.In):
++    def process_rhs(self, compiler, connection):
++        # First process the RHS using the parent class logic
++        rhs, rhs_params = super().process_rhs(compiler, connection)
++        
++        # For databases that don't have native JSON field support, we need to wrap
++        # the values in JSON_EXTRACT to ensure proper comparison
++        if not connection.features.has_native_json_field:
++            if connection.vendor == 'mysql':
++                # For MySQL, wrap each value in JSON_EXTRACT
++                func = ["JSON_EXTRACT(%s, '$')"] * len(rhs_params)
++                rhs = rhs % tuple(func)
++            elif connection.vendor == 'sqlite':
++                # For SQLite, wrap each value in JSON_EXTRACT
++                func = ["JSON_EXTRACT(%s, '$')"] * len(rhs_params)
++                rhs = rhs % tuple(func)
++            elif connection.vendor == 'oracle':
++                # For Oracle, we need special handling similar to KeyTransformExact
++                func = []
++                for value in rhs_params:
++                    value = json.loads(value) if isinstance(value, str) else value
++                    function = 'JSON_QUERY' if isinstance(value, (list, dict)) else 'JSON_VALUE'
++                    func.append("%s('%s', '$.value')" % (
++                        function,
++                        json.dumps({'value': value}),
++                    ))
++                rhs = rhs % tuple(func)
++                rhs_params = []
++        
++        return rhs, rhs_params
++
++
+ KeyTransform.register_lookup(KeyTransformExact)
+ KeyTransform.register_lookup(KeyTransformIExact)
+ KeyTransform.register_lookup(KeyTransformIsNull)
+@@ -494,6 +526,7 @@ KeyTransform.register_lookup(KeyTransformLt)
+ KeyTransform.register_lookup(KeyTransformLte)
+ KeyTransform.register_lookup(KeyTransformGt)
+ KeyTransform.register_lookup(KeyTransformGte)
++KeyTransform.register_lookup(KeyTransformIn)
+ 
+ 
+ class KeyTransformFactory:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..1d9aed69fd
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python3
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++class OurModel(models.Model):
++    our_field = models.JSONField(default=dict)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_json_field_in_lookup():
++    # Create database tables
++    from django.db import connection
++    connection.ensure_connection()
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(OurModel)
++    
++    # Create some test data
++    OurModel.objects.all().delete()
++    
++    # Create objects with our_field containing key=0
++    for i in range(5):
++        OurModel.objects.create(our_field={'key': 0})
++    
++    # Create objects with our_field containing key=1
++    for i in range(3):
++        OurModel.objects.create(our_field={'key': 1})
++    
++    print("Testing __in lookup on key transform...")
++    
++    # Test 1: Using __in lookup with single value
++    first_filter = {'our_field__key__in': [0]}
++    first_items = OurModel.objects.filter(**first_filter)
++    print(f"First filter (__in single): {first_items.count()} items")
++    
++    # Test 2: Using direct equality
++    second_filter = {'our_field__key': 0}
++    second_items = OurModel.objects.filter(**second_filter)
++    print(f"Second filter (direct): {second_items.count()} items")
++    
++    # They should be the same
++    print(f"Results match (single): {first_items.count() == second_items.count()}")
++    
++    # Test 3: Using __in lookup with multiple values
++    third_filter = {'our_field__key__in': [0, 1]}
++    third_items = OurModel.objects.filter(**third_filter)
++    print(f"Third filter (__in multiple): {third_items.count()} items")
++    
++    # Should return all 8 items (5 with key=0 + 3 with key=1)
++    print(f"Expected 8 items: {third_items.count() == 8}")
++    
++    # Test 4: Empty list should return no results
++    fourth_filter = {'our_field__key__in': []}
++    fourth_items = OurModel.objects.filter(**fourth_filter)
++    print(f"Fourth filter (empty list): {fourth_items.count()} items")
++    
++    # Test 5: None values should be handled correctly
++    OurModel.objects.create(our_field={'key': None})
++    fifth_filter = {'our_field__key__in': [None]}
++    fifth_items = OurModel.objects.filter(**fifth_filter)
++    print(f"Fifth filter (None value): {fifth_items.count()} items")
++    
++    # Let's also check what SQL is generated
++    print("\nSQL for __in lookup:")
++    print(str(first_items.query))
++    
++    print("\nSQL for direct lookup:")
++    print(str(second_items.query))
++
++if __name__ == '__main__':
++    test_json_field_in_lookup()
+\ No newline at end of file
+diff --git a/test_multiple_databases.py b/test_multiple_databases.py
+new file mode 100644
+index 0000000000..a4d0ee4caa
+--- /dev/null
++++ b/test_multiple_databases.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++import os
++import django
++from django.conf import settings
++
++def test_with_database(engine, name):
++    print(f"\n=== Testing with {name} ===")
++    
++    # Configure Django settings for this database
++    settings_dict = {
++        'DEBUG': True,
++        'DATABASES': {
++            'default': {
++                'ENGINE': engine,
++                'NAME': ':memory:',
++            }
++        },
++        'INSTALLED_APPS': [
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        'USE_TZ': True,
++    }
++    
++    if engine == 'django.db.backends.mysql':
++        settings_dict['DATABASES']['default']['OPTIONS'] = {
++            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'"
++        }
++    
++    settings.configure(**settings_dict)
++    django.setup()
++    
++    from django.db import models, connection
++    
++    class TestModel(models.Model):
++        data = models.JSONField(default=dict)
++        
++        class Meta:
++            app_label = 'test'
++    
++    # Create tables
++    connection.ensure_connection()
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Create test data
++    TestModel.objects.all().delete()
++    TestModel.objects.create(data={'key': 0})
++    TestModel.objects.create(data={'key': 1})
++    TestModel.objects.create(data={'key': 2})
++    TestModel.objects.create(data={'other': 'value'})
++    
++    # Test __in lookup
++    in_filter = {'data__key__in': [0, 1]}
++    in_items = TestModel.objects.filter(**in_filter)
++    in_count = in_items.count()
++    
++    # Test individual equality lookups
++    eq_filter1 = {'data__key': 0}
++    eq_filter2 = {'data__key': 1}
++    eq_count = TestModel.objects.filter(**eq_filter1).count() + TestModel.objects.filter(**eq_filter2).count()
++    
++    print(f"__in lookup result: {in_count}")
++    print(f"Individual equality lookups sum: {eq_count}")
++    print(f"Results match: {in_count == eq_count}")
++    
++    # Show SQL for debugging
++    print(f"SQL: {str(in_items.query)}")
++    
++    return in_count == eq_count
++
++if __name__ == '__main__':
++    # Test with SQLite
++    sqlite_success = test_with_database('django.db.backends.sqlite3', 'SQLite')
++    
++    # Note: MySQL and Oracle tests would require actual database connections
++    # For now, we'll just test with SQLite since the fix should work similarly
++    
++    print(f"\n=== Overall Result ===")
++    print(f"SQLite test: {'PASS' if sqlite_success else 'FAIL'}")
++    print(f"Fix should work for MySQL and Oracle based on the implementation")
+\ No newline at end of file

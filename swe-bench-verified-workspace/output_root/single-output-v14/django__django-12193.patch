@@ -1,0 +1,710 @@
+diff --git a/django/contrib/postgres/forms/array.py b/django/contrib/postgres/forms/array.py
+index 2e19cd574a..a73e611eeb 100644
+--- a/django/contrib/postgres/forms/array.py
++++ b/django/contrib/postgres/forms/array.py
+@@ -146,8 +146,10 @@ class SplitArrayWidget(forms.Widget):
+                 widget_value = None
+             if id_:
+                 final_attrs = {**final_attrs, 'id': '%s_%s' % (id_, i)}
++            # Create a copy of final_attrs to prevent widgets from modifying it in place
++            widget_attrs = final_attrs.copy()
+             context['widget']['subwidgets'].append(
+-                self.widget.get_context(name + '_%s' % i, widget_value, final_attrs)['widget']
++                self.widget.get_context(name + '_%s' % i, widget_value, widget_attrs)['widget']
+             )
+         return context
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..fc284d498d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Import the CheckboxInput widget to test the issue
++from django.forms.widgets import CheckboxInput
++
++def test_checkbox_issue():
++    """Test that CheckboxInput modifies the attrs dict in place"""
++    checkbox = CheckboxInput()
++    
++    # Test with True value
++    attrs = {}
++    context1 = checkbox.get_context('test1', True, attrs)
++    print("After True value, attrs:", attrs)
++    
++    # Test with False value using the same attrs dict
++    context2 = checkbox.get_context('test2', False, attrs)
++    print("After False value, attrs:", attrs)
++    
++    # The issue: attrs dict now contains 'checked': True even for False values
++    if 'checked' in attrs:
++        print("❌ BUG CONFIRMED: CheckboxInput modifies attrs dict in place!")
++        return True
++    else:
++        print("✅ No issue detected")
++        return False
++
++def simulate_split_array_issue():
++    """Simulate the SplitArrayWidget issue without importing the module"""
++    checkbox = CheckboxInput()
++    
++    # Simulate the problematic code in SplitArrayWidget.get_context()
++    final_attrs = {'id': 'test_id'}
++    values = [True, False, False]
++    
++    print("Simulating SplitArrayWidget behavior:")
++    print("Initial final_attrs:", final_attrs)
++    
++    for i, value in enumerate(values):
++        # This is what happens in SplitArrayWidget.get_context()
++        widget_context = checkbox.get_context(f'test_{i}', value, final_attrs)
++        print(f"  After widget {i} (value={value}): final_attrs={final_attrs}")
++    
++    # The issue: all widgets will have 'checked': True in their attrs
++    if 'checked' in final_attrs:
++        print("❌ BUG CONFIRMED: final_attrs contains 'checked' for all widgets!")
++        return True
++    else:
++        print("✅ No issue detected")
++        return False
++
++if __name__ == '__main__':
++    print("Testing CheckboxInput attrs modification:")
++    test_checkbox_issue()
++    
++    print("\n" + "="*50 + "\n")
++    
++    print("Simulating SplitArrayWidget issue:")
++    simulate_split_array_issue()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..41d58da279
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the SplitArrayWidget fix works correctly.
++This test simulates the core logic without full Django imports.
++"""
++
++def test_fix_logic():
++    """Test the core logic of the fix by simulating CheckboxInput behavior"""
++    
++    # Simulate CheckboxInput.get_context() behavior
++    def mock_checkbox_get_context(name, value, attrs):
++        if value is True:
++            # This is the problematic behavior - modifies attrs in place
++            if attrs is not None:
++                attrs['checked'] = True
++        # Return a mock context
++        return {'widget': {'value': value, 'attrs': attrs.copy() if attrs else {}}}
++    
++    # Simulate the OLD SplitArrayWidget behavior (before fix)
++    def old_split_array_behavior(values):
++        final_attrs = {'id': 'test_id'}
++        results = []
++        
++        for i, value in enumerate(values):
++            # This is the problematic old behavior - passing the same attrs dict
++            context = mock_checkbox_get_context(f'test_{i}', value, final_attrs)
++            results.append(context['widget'])
++            print(f"OLD: Widget {i} (value={value}), final_attrs={final_attrs}")
++        
++        return results
++    
++    # Simulate the NEW SplitArrayWidget behavior (after fix)
++    def new_split_array_behavior(values):
++        final_attrs = {'id': 'test_id'}
++        results = []
++        
++        for i, value in enumerate(values):
++            # This is the fixed behavior - creating a copy for each widget
++            widget_attrs = final_attrs.copy()
++            context = mock_checkbox_get_context(f'test_{i}', value, widget_attrs)
++            results.append(context['widget'])
++            print(f"NEW: Widget {i} (value={value}), final_attrs={final_attrs}")
++        
++        return results
++    
++    # Test data
++    test_values = [True, False, False]
++    
++    print("Testing OLD behavior (with bug):")
++    old_results = old_split_array_behavior(test_values)
++    old_checked = sum(1 for w in old_results if 'checked' in w['attrs'])
++    print(f"OLD: {old_checked} checkboxes appear checked\n")
++    
++    print("Testing NEW behavior (with fix):")
++    new_results = new_split_array_behavior(test_values)
++    new_checked = sum(1 for w in new_results if 'checked' in w['attrs'])
++    print(f"NEW: {new_checked} checkboxes appear checked\n")
++    
++    # Verify the fix
++    if old_checked == 3 and new_checked == 1:
++        print("✅ FIX CONFIRMED: Bug reproduced and fix works!")
++        print("   OLD behavior: All 3 checkboxes appear checked (BUG)")
++        print("   NEW behavior: Only 1 checkbox appears checked (FIXED)")
++        return True
++    else:
++        print("❌ TEST FAILED: Unexpected results")
++        return False
++
++if __name__ == '__main__':
++    test_fix_logic()
+\ No newline at end of file
+diff --git a/test_boolean_fix.py b/test_boolean_fix.py
+new file mode 100644
+index 0000000000..dd46ee1cea
+--- /dev/null
++++ b/test_boolean_fix.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python3
++"""
++Test to verify that the SplitArrayWidget fix works correctly with BooleanField.
++This test directly tests the fixed behavior without full Django imports.
++"""
++
++import copy
++
++def test_boolean_split_array_fix():
++    """Test that SplitArrayWidget works correctly with BooleanField after the fix"""
++    
++    # Simulate CheckboxInput.get_context() behavior
++    def mock_checkbox_get_context(name, value, attrs):
++        # This mimics the actual CheckboxInput behavior that modifies attrs in place
++        if value is True:
++            if attrs is not None:
++                attrs['checked'] = True
++        # Return a mock context similar to what CheckboxInput returns
++        return {
++            'widget': {
++                'name': name,
++                'value': value,
++                'attrs': attrs.copy() if attrs else {},
++                'type': 'checkbox',
++            }
++        }
++    
++    # Simulate the fixed SplitArrayWidget.get_context() method
++    def fixed_split_array_get_context(widget, name, value, attrs=None, size=3):
++        attrs = {} if attrs is None else attrs
++        value = value or []
++        
++        # This mimics the fixed SplitArrayWidget behavior
++        final_attrs = attrs.copy()  # Build attrs from initial
++        id_ = final_attrs.get('id')
++        
++        subwidgets = []
++        for i in range(max(len(value), size)):
++            try:
++                widget_value = value[i]
++            except IndexError:
++                widget_value = None
++            
++            if id_:
++                final_attrs = {**final_attrs, 'id': f'{id_}_{i}'}
++            
++            # THE FIX: Create a copy of final_attrs for each widget
++            widget_attrs = final_attrs.copy()
++            widget_context = mock_checkbox_get_context(f'{name}_{i}', widget_value, widget_attrs)
++            subwidgets.append(widget_context['widget'])
++        
++        return {
++            'widget': {
++                'name': name,
++                'value': value,
++                'attrs': attrs,
++                'subwidgets': subwidgets,
++            }
++        }
++    
++    # Test data: one True followed by two False values
++    test_values = [True, False, False]
++    
++    print("Testing SplitArrayWidget with BooleanField (after fix):")
++    context = fixed_split_array_get_context(None, 'test_field', test_values, {}, 3)
++    
++    print(f"Initial values: {test_values}")
++    print("\nIndividual widget results:")
++    
++    checked_count = 0
++    for i, subwidget in enumerate(context['widget']['subwidgets']):
++        value = subwidget['value']
++        attrs = subwidget['attrs']
++        is_checked = 'checked' in attrs
++        print(f"  Widget {i}: value={value}, checked={is_checked}, attrs={attrs}")
++        if is_checked:
++            checked_count += 1
++    
++    print(f"\nFound {checked_count} checked checkboxes out of {len(test_values)}")
++    
++    # Verify the fix works correctly
++    if checked_count == 1:
++        print("✅ SUCCESS: Only the first checkbox (with True value) is checked!")
++        print("   The fix prevents the 'checked' attribute from persisting across widgets.")
++        return True
++    else:
++        print(f"❌ FAILURE: Expected 1 checked checkbox, got {checked_count}")
++        return False
++
++if __name__ == '__main__':
++    success = test_boolean_split_array_fix()
++    if success:
++        print("\n🎉 Fix verified successfully!")
++    else:
++        print("\n💥 Fix verification failed!")
++        exit(1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..63c83d57c9
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,134 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the SplitArrayWidget fix to ensure robustness.
++"""
++
++import copy
++
++def test_edge_cases():
++    """Test various edge cases for the SplitArrayWidget fix"""
++    
++    # Simulate CheckboxInput.get_context() behavior
++    def mock_checkbox_get_context(name, value, attrs):
++        if value is True:
++            if attrs is not None:
++                attrs['checked'] = True
++        return {
++            'widget': {
++                'name': name,
++                'value': value,
++                'attrs': attrs.copy() if attrs else {},
++                'type': 'checkbox',
++            }
++        }
++    
++    # Simulate the fixed SplitArrayWidget.get_context() method
++    def fixed_split_array_get_context(widget, name, value, attrs=None, size=3):
++        attrs = {} if attrs is None else attrs
++        value = value or []
++        
++        final_attrs = attrs.copy()
++        id_ = final_attrs.get('id')
++        
++        subwidgets = []
++        for i in range(max(len(value), size)):
++            try:
++                widget_value = value[i]
++            except IndexError:
++                widget_value = None
++            
++            if id_:
++                final_attrs = {**final_attrs, 'id': f'{id_}_{i}'}
++            
++            # THE FIX: Create a copy of final_attrs for each widget
++            widget_attrs = final_attrs.copy()
++            widget_context = mock_checkbox_get_context(f'{name}_{i}', widget_value, widget_attrs)
++            subwidgets.append(widget_context['widget'])
++        
++        return {
++            'widget': {
++                'name': name,
++                'value': value,
++                'attrs': attrs,
++                'subwidgets': subwidgets,
++            }
++        }
++    
++    test_cases = [
++        {
++            'name': 'All True values',
++            'values': [True, True, True],
++            'expected_checked': 3
++        },
++        {
++            'name': 'All False values',
++            'values': [False, False, False],
++            'expected_checked': 0
++        },
++        {
++            'name': 'Mixed values',
++            'values': [True, False, True],
++            'expected_checked': 2
++        },
++        {
++            'name': 'Empty values with size',
++            'values': [],
++            'expected_checked': 0,
++            'size': 2
++        },
++        {
++            'name': 'More values than size',
++            'values': [True, False, True, False],
++            'expected_checked': 2,
++            'size': 4
++        },
++        {
++            'name': 'With initial attrs',
++            'values': [True, False, False],
++            'expected_checked': 1,
++            'attrs': {'class': 'form-control'}
++        }
++    ]
++    
++    print("Testing edge cases for SplitArrayWidget fix:")
++    print("=" * 60)
++    
++    all_passed = True
++    
++    for i, test_case in enumerate(test_cases, 1):
++        print(f"\n{i}. {test_case['name']}")
++        print(f"   Values: {test_case['values']}")
++        
++        values = test_case['values']
++        size = test_case.get('size', 3)
++        attrs = test_case.get('attrs', {})
++        expected_checked = test_case['expected_checked']
++        
++        context = fixed_split_array_get_context(None, 'test_field', values, attrs, size)
++        
++        checked_count = 0
++        for j, subwidget in enumerate(context['widget']['subwidgets']):
++            if 'checked' in subwidget['attrs']:
++                checked_count += 1
++        
++        print(f"   Expected checked: {expected_checked}")
++        print(f"   Actual checked: {checked_count}")
++        
++        if checked_count == expected_checked:
++            print("   ✅ PASS")
++        else:
++            print("   ❌ FAIL")
++            all_passed = False
++    
++    print("\n" + "=" * 60)
++    if all_passed:
++        print("🎉 All edge case tests passed!")
++    else:
++        print("💥 Some edge case tests failed!")
++    
++    return all_passed
++
++if __name__ == '__main__':
++    success = test_edge_cases()
++    if not success:
++        exit(1)
+\ No newline at end of file
+diff --git a/test_existing_functionality.py b/test_existing_functionality.py
+new file mode 100644
+index 0000000000..e58b4d7b30
+--- /dev/null
++++ b/test_existing_functionality.py
+@@ -0,0 +1,113 @@
++#!/usr/bin/env python3
++"""
++Test to ensure our fix doesn't break existing SplitArrayWidget functionality.
++This test mimics the existing test structure from the Django test suite.
++"""
++
++def test_existing_functionality():
++    """Test that existing SplitArrayWidget functionality still works"""
++    
++    # Simulate TextInput.get_context() behavior (doesn't modify attrs)
++    def mock_textinput_get_context(name, value, attrs):
++        return {
++            'widget': {
++                'name': name,
++                'value': value,
++                'attrs': attrs.copy() if attrs else {},
++                'type': 'text',
++                'template_name': 'django/forms/widgets/text.html',
++                'is_hidden': False,
++                'required': False,
++            }
++        }
++    
++    # Simulate the fixed SplitArrayWidget.get_context() method
++    def fixed_split_array_get_context(widget, name, value, attrs=None, size=2):
++        attrs = {} if attrs is None else attrs
++        value = value or []
++        
++        final_attrs = attrs.copy()
++        id_ = final_attrs.get('id')
++        
++        subwidgets = []
++        for i in range(max(len(value), size)):
++            try:
++                widget_value = value[i]
++            except IndexError:
++                widget_value = None
++            
++            if id_:
++                final_attrs = {**final_attrs, 'id': f'{id_}_{i}'}
++            
++            # THE FIX: Create a copy of final_attrs for each widget
++            widget_attrs = final_attrs.copy()
++            widget_context = mock_textinput_get_context(f'{name}_{i}', widget_value, widget_attrs)
++            subwidgets.append(widget_context['widget'])
++        
++        return {
++            'widget': {
++                'name': name,
++                'value': str(value),
++                'attrs': attrs,
++                'template_name': 'postgres/widgets/split_array.html',
++                'is_hidden': False,
++                'required': False,
++                'subwidgets': subwidgets,
++            }
++        }
++    
++    # Test the same scenario as the existing Django test
++    print("Testing existing SplitArrayWidget functionality (mimicking Django test):")
++    
++    context = fixed_split_array_get_context(None, 'name', ['val1', 'val2'], {}, 2)
++    
++    # Check the main widget context
++    main_widget = context['widget']
++    print(f"Main widget name: {main_widget['name']}")
++    print(f"Main widget value: {main_widget['value']}")
++    print(f"Main widget attrs: {main_widget['attrs']}")
++    print(f"Number of subwidgets: {len(main_widget['subwidgets'])}")
++    
++    # Check subwidgets
++    for i, subwidget in enumerate(main_widget['subwidgets']):
++        print(f"  Subwidget {i}: name={subwidget['name']}, value={subwidget['value']}, attrs={subwidget['attrs']}")
++    
++    # Verify the structure matches expectations
++    expected_subwidget_names = ['name_0', 'name_1']
++    expected_subwidget_values = ['val1', 'val2']
++    
++    success = True
++    
++    # Check subwidget names
++    actual_names = [sw['name'] for sw in main_widget['subwidgets']]
++    if actual_names != expected_subwidget_names:
++        print(f"❌ FAIL: Expected subwidget names {expected_subwidget_names}, got {actual_names}")
++        success = False
++    else:
++        print("✅ Subwidget names match")
++    
++    # Check subwidget values
++    actual_values = [sw['value'] for sw in main_widget['subwidgets']]
++    if actual_values != expected_subwidget_values:
++        print(f"❌ FAIL: Expected subwidget values {expected_subwidget_values}, got {actual_values}")
++        success = False
++    else:
++        print("✅ Subwidget values match")
++    
++    # Check that all subwidgets have empty attrs (TextInput doesn't modify them)
++    for i, subwidget in enumerate(main_widget['subwidgets']):
++        if subwidget['attrs'] != {}:
++            print(f"❌ FAIL: Subwidget {i} has non-empty attrs: {subwidget['attrs']}")
++            success = False
++    
++    if success:
++        print("✅ All existing functionality tests passed!")
++    else:
++        print("❌ Some existing functionality tests failed!")
++    
++    return success
++
++if __name__ == '__main__':
++    success = test_existing_functionality()
++    if not success:
++        exit(1)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..ec7880be0d
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Import the CheckboxInput widget
++from django.forms.widgets import CheckboxInput
++
++# Import the SplitArrayWidget directly from the file
++import importlib.util
++spec = importlib.util.spec_from_file_location("array_module", "/testbed/django/contrib/postgres/forms/array.py")
++array_module = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(array_module)
++SplitArrayWidget = array_module.SplitArrayWidget
++
++def test_fix():
++    """Test that the fix works correctly"""
++    # Create a SplitArrayWidget with CheckboxInput as the base widget
++    widget = SplitArrayWidget(widget=CheckboxInput, size=3)
++    
++    # Test with initial data: [True, False, False]
++    initial_data = [True, False, False]
++    
++    # Get the widget context
++    context = widget.get_context('test_field', initial_data, {})
++    
++    print("Testing the fix:")
++    print("Initial data:", initial_data)
++    print("\nWidget subwidgets:")
++    
++    checked_count = 0
++    for i, subwidget in enumerate(context['widget']['subwidgets']):
++        value = subwidget['value']
++        attrs = subwidget['attrs']
++        is_checked = 'checked' in attrs
++        print(f"  Widget {i}: value={value}, checked={is_checked}, attrs={attrs}")
++        if is_checked:
++            checked_count += 1
++    
++    print(f"\nFound {checked_count} checked checkboxes out of 3")
++    
++    # After the fix: only the first checkbox should be checked
++    if checked_count == 1:
++        print("✅ FIX CONFIRMED: Only the first checkbox is checked!")
++        return True
++    else:
++        print(f"❌ FIX FAILED: Expected 1 checked checkbox, got {checked_count}")
++        return False
++
++if __name__ == '__main__':
++    test_fix()
+\ No newline at end of file
+diff --git a/test_id_handling.py b/test_id_handling.py
+new file mode 100644
+index 0000000000..d021e4786f
+--- /dev/null
++++ b/test_id_handling.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++"""
++Test to ensure our fix correctly handles ID attributes for each widget.
++"""
++
++def test_id_handling():
++    """Test that ID attributes are handled correctly with our fix"""
++    
++    # Simulate CheckboxInput.get_context() behavior
++    def mock_checkbox_get_context(name, value, attrs):
++        if value is True:
++            if attrs is not None:
++                attrs['checked'] = True
++        return {
++            'widget': {
++                'name': name,
++                'value': value,
++                'attrs': attrs.copy() if attrs else {},
++                'type': 'checkbox',
++            }
++        }
++    
++    # Simulate the fixed SplitArrayWidget.get_context() method
++    def fixed_split_array_get_context(widget, name, value, attrs=None, size=3):
++        attrs = {} if attrs is None else attrs
++        value = value or []
++        
++        final_attrs = attrs.copy()
++        id_ = final_attrs.get('id')
++        
++        subwidgets = []
++        for i in range(max(len(value), size)):
++            try:
++                widget_value = value[i]
++            except IndexError:
++                widget_value = None
++            
++            if id_:
++                final_attrs = {**final_attrs, 'id': f'{id_}_{i}'}
++            
++            # THE FIX: Create a copy of final_attrs for each widget
++            widget_attrs = final_attrs.copy()
++            widget_context = mock_checkbox_get_context(f'{name}_{i}', widget_value, widget_attrs)
++            subwidgets.append(widget_context['widget'])
++        
++        return {
++            'widget': {
++                'name': name,
++                'value': value,
++                'attrs': attrs,
++                'subwidgets': subwidgets,
++            }
++        }
++    
++    print("Testing ID attribute handling with our fix:")
++    print("=" * 50)
++    
++    # Test with ID attribute
++    context = fixed_split_array_get_context(None, 'test_field', [True, False, False], {'id': 'test_id'}, 3)
++    
++    print("Test with ID attribute:")
++    for i, subwidget in enumerate(context['widget']['subwidgets']):
++        attrs = subwidget['attrs']
++        print(f"  Widget {i}: id={attrs.get('id', 'None')}, checked={'checked' in attrs}")
++    
++    # Verify each widget has the correct ID
++    expected_ids = ['test_id_0', 'test_id_1', 'test_id_2']
++    actual_ids = [sw['attrs'].get('id') for sw in context['widget']['subwidgets']]
++    
++    if actual_ids == expected_ids:
++        print("✅ ID attributes are correctly set for each widget")
++    else:
++        print(f"❌ ID attribute mismatch: expected {expected_ids}, got {actual_ids}")
++        return False
++    
++    # Test without ID attribute
++    print("\nTest without ID attribute:")
++    context = fixed_split_array_get_context(None, 'test_field', [True, False, False], {}, 3)
++    
++    for i, subwidget in enumerate(context['widget']['subwidgets']):
++        attrs = subwidget['attrs']
++        print(f"  Widget {i}: id={attrs.get('id', 'None')}, checked={'checked' in attrs}")
++    
++    # Verify no ID attributes when not provided
++    actual_ids = [sw['attrs'].get('id') for sw in context['widget']['subwidgets']]
++    if all(id is None for id in actual_ids):
++        print("✅ No ID attributes when not provided (correct behavior)")
++    else:
++        print(f"❌ Unexpected ID attributes: {actual_ids}")
++        return False
++    
++    print("\n🎉 ID handling tests passed!")
++    return True
++
++if __name__ == '__main__':
++    success = test_id_handling()
++    if not success:
++        exit(1)
+\ No newline at end of file

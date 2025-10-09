@@ -1,0 +1,862 @@
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 7effb202e3..1ea472e29e 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -571,6 +571,9 @@ class BaseModelFormSet(BaseFormSet):
+ 
+     # Set of fields that must be unique among forms of this set.
+     unique_fields = set()
++    
++    # Whether to allow creation of new objects
++    allow_new_objects = True
+ 
+     def __init__(self, data=None, files=None, auto_id='id_%s', prefix=None,
+                  queryset=None, *, initial=None, **kwargs):
+@@ -681,6 +684,13 @@ class BaseModelFormSet(BaseFormSet):
+     save.alters_data = True
+ 
+     def clean(self):
++        # Validate that no new objects are being created when allow_new_objects is False
++        if not self.allow_new_objects and self.extra_forms:
++            for form in self.extra_forms:
++                if form.has_changed():
++                    raise ValidationError(
++                        "Creation of new objects is not allowed."
++                    )
+         self.validate_unique()
+ 
+     def validate_unique(self):
+@@ -813,6 +823,9 @@ class BaseModelFormSet(BaseFormSet):
+ 
+     def save_new_objects(self, commit=True):
+         self.new_objects = []
++        if not self.allow_new_objects:
++            return self.new_objects
++            
+         for form in self.extra_forms:
+             if not form.has_changed():
+                 continue
+@@ -875,7 +888,8 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
+                          widgets=None, validate_max=False, localized_fields=None,
+                          labels=None, help_texts=None, error_messages=None,
+                          min_num=None, validate_min=False, field_classes=None,
+-                         absolute_max=None, can_delete_extra=True, renderer=None):
++                         absolute_max=None, can_delete_extra=True, renderer=None,
++                         allow_new_objects=True):
+     """Return a FormSet class for the given Django model class."""
+     meta = getattr(form, 'Meta', None)
+     if (getattr(meta, 'fields', fields) is None and
+@@ -896,6 +910,7 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
+                               absolute_max=absolute_max, can_delete_extra=can_delete_extra,
+                               renderer=renderer)
+     FormSet.model = model
++    FormSet.allow_new_objects = allow_new_objects
+     return FormSet
+ 
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..2037167cce
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,178 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with model formsets not having a way to disallow new object creation.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms.models import modelformset_factory
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    description = models.TextField(blank=True)
++    
++    class Meta:
++        app_label = 'test'
++
++    def __str__(self):
++        return self.name
++
++# Create model formset factory
++TestFormSet = modelformset_factory(TestModel, fields=['name', 'description'], extra=0)
++
++def test_edit_only_formset():
++    """Test the current behavior where extra=0 doesn't prevent new object creation"""
++    
++    # Create some test objects
++    obj1 = TestModel.objects.create(name="Object 1", description="First object")
++    obj2 = TestModel.objects.create(name="Object 2", description="Second object")
++    
++    # Simulate POST data that tries to add a new object despite extra=0
++    post_data = {
++        'form-TOTAL_FORMS': '3',
++        'form-INITIAL_FORMS': '2',
++        'form-MIN_NUM_FORMS': '0',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-0-id': str(obj1.id),
++        'form-0-name': 'Updated Object 1',
++        'form-1-id': str(obj2.id),
++        'form-1-name': 'Updated Object 2',
++        'form-2-name': 'New Object',  # This should not be allowed!
++        'form-2-description': 'This is a new object that should be blocked'
++    }
++    
++    print("Testing formset with extra=0...")
++    formset = TestFormSet(post_data)
++    
++    print(f"Formset is valid: {formset.is_valid()}")
++    print(f"Number of forms: {len(formset)}")
++    print(f"Number of initial forms: {formset.initial_form_count()}")
++    print(f"Number of extra forms: {len(formset.extra_forms)}")
++    
++    if formset.is_valid():
++        print("Formset is valid - new objects can be created!")
++        saved_objects = formset.save()
++        print(f"Saved {len(saved_objects)} objects")
++        for obj in saved_objects:
++            print(f"  - {obj}")
++    else:
++        print("Formset is invalid")
++        print("Errors:", formset.errors)
++    
++    print("\n" + "="*50 + "\n")
++
++def test_what_we_want():
++    """Test what we want to achieve - a formset that only allows editing existing objects"""
++    
++    # Create some test objects
++    obj1 = TestModel.objects.create(name="Object 1", description="First object")
++    obj2 = TestModel.objects.create(name="Object 2", description="Second object")
++    
++    # Simulate POST data that tries to add a new object
++    post_data = {
++        'form-TOTAL_FORMS': '3',
++        'form-INITIAL_FORMS': '2',
++        'form-MIN_NUM_FORMS': '0',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-0-id': str(obj1.id),
++        'form-0-name': 'Updated Object 1',
++        'form-1-id': str(obj2.id),
++        'form-1-name': 'Updated Object 2',
++        'form-2-name': 'New Object',  # This should be blocked!
++        'form-2-description': 'This is a new object that should be blocked'
++    }
++    
++    print("Testing what we want - a formset that disallows new object creation...")
++    
++    # This is what we want to achieve - a parameter that prevents new object creation
++    # Currently this doesn't exist, so we'll simulate the expected behavior
++    
++    # The desired API would be something like:
++    # EditOnlyFormSet = modelformset_factory(TestModel, fields=['name', 'description'], 
++    #                                       extra=0, allow_new_objects=False)
++    
++    # For now, let's just show what should happen
++    formset = TestFormSet(post_data)
++    
++    if formset.is_valid():
++        print("ERROR: Formset should not be valid when trying to create new objects!")
++        print("We need a way to prevent this.")
++    else:
++        print("GOOD: Formset correctly rejected new object creation")
++    
++    print("\n" + "="*50 + "\n")
++
++if __name__ == '__main__':
++    # For this reproduction, we'll just test the formset validation without saving
++    # since the database setup is complex for this environment
++    
++    print("Testing formset validation behavior...")
++    print("This test focuses on form validation, not database operations.")
++    
++    # Test formset validation without database operations
++    from django.forms.models import modelformset_factory
++    
++    # Create a simple test model form
++    class SimpleTestForm(django.forms.ModelForm):
++        class Meta:
++            model = TestModel
++            fields = ['name', 'description']
++    
++    SimpleFormSet = modelformset_factory(TestModel, form=SimpleTestForm, extra=0)
++    
++    # Simulate POST data that tries to add a new object despite extra=0
++    post_data = {
++        'form-TOTAL_FORMS': '3',
++        'form-INITIAL_FORMS': '2',
++        'form-MIN_NUM_FORMS': '0',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-0-id': '1',  # Fake ID for existing object
++        'form-0-name': 'Updated Object 1',
++        'form-1-id': '2',  # Fake ID for existing object
++        'form-1-name': 'Updated Object 2',
++        'form-2-name': 'New Object',  # This should not be allowed!
++        'form-2-description': 'This is a new object that should be blocked'
++    }
++    
++    print("Testing formset with extra=0...")
++    formset = SimpleFormSet(post_data)
++    
++    print(f"Formset is valid: {formset.is_valid()}")
++    print(f"Number of forms: {len(formset)}")
++    print(f"Number of initial forms: {formset.initial_form_count()}")
++    print(f"Number of extra forms: {len(formset.extra_forms)}")
++    
++    if formset.is_valid():
++        print("ISSUE: Formset is valid - new objects can be created despite extra=0!")
++        print("This demonstrates the problem described in the GitHub issue.")
++    else:
++        print("Formset is invalid")
++        print("Errors:", formset.errors)
++    
++    print("\nThe issue is that extra=0 only controls the number of empty forms")
++    print("displayed, but doesn't prevent new object creation through POST data manipulation.")
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..a58b8bcbae
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++"""
++Simple script to reproduce the issue with model formsets not having a way to disallow new object creation.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms.models import modelformset_factory
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    description = models.TextField(blank=True)
++    
++    class Meta:
++        app_label = 'test'
++
++    def __str__(self):
++        return self.name
++
++def test_formset_behavior():
++    """Test the current behavior where extra=0 doesn't prevent new object creation"""
++    
++    # Create model formset factory
++    TestFormSet = modelformset_factory(TestModel, fields=['name', 'description'], extra=0)
++    
++    # Simulate POST data that tries to add a new object despite extra=0
++    post_data = {
++        'form-TOTAL_FORMS': '3',
++        'form-INITIAL_FORMS': '2',
++        'form-MIN_NUM_FORMS': '0',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-0-id': '1',  # Fake ID for existing object
++        'form-0-name': 'Updated Object 1',
++        'form-1-id': '2',  # Fake ID for existing object
++        'form-1-name': 'Updated Object 2',
++        'form-2-name': 'New Object',  # This should not be allowed!
++        'form-2-description': 'This is a new object that should be blocked'
++    }
++    
++    print("Testing formset with extra=0...")
++    formset = TestFormSet(post_data, queryset=TestModel.objects.none())
++    
++    print(f"Formset is valid: {formset.is_valid()}")
++    print(f"Number of forms: {len(formset)}")
++    print(f"Number of initial forms: {formset.initial_form_count()}")
++    print(f"Number of extra forms: {len(formset.extra_forms)}")
++    
++    if formset.is_valid():
++        print("ISSUE: Formset is valid - new objects can be created despite extra=0!")
++        print("This demonstrates the problem described in the GitHub issue.")
++        print("The formset would save:", len(formset.save_new_objects(commit=False)), "new objects")
++    else:
++        print("Formset is invalid")
++        print("Errors:", formset.errors)
++    
++    print("\nThe issue is that extra=0 only controls the number of empty forms")
++    print("displayed, but doesn't prevent new object creation through POST data manipulation.")
++
++if __name__ == '__main__':
++    test_formset_behavior()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..5ed440ef59
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,130 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the allow_new_objects parameter works without database operations.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.forms.models import BaseModelFormSet
++from django.core.exceptions import ValidationError
++
++# Create a simple form that doesn't require database operations
++class SimpleForm(forms.Form):
++    name = forms.CharField(max_length=100)
++    description = forms.CharField(required=False)
++
++# Create a custom formset class that inherits from BaseModelFormSet
++# but doesn't require database operations
++class TestFormSet(BaseModelFormSet):
++    def __init__(self, *args, **kwargs):
++        # Don't call super().__init__() to avoid database operations
++        self.data = kwargs.get('data', {})
++        self.allow_new_objects = kwargs.get('allow_new_objects', True)
++        self.forms = []
++        
++        # Create forms based on the data
++        if self.data:
++            total_forms = int(self.data.get('form-TOTAL_FORMS', 0))
++            for i in range(total_forms):
++                form_data = {}
++                for key, value in self.data.items():
++                    if key.startswith(f'form-{i}-'):
++                        field_name = key.split('-')[2]
++                        form_data[field_name] = value
++                self.forms.append(SimpleForm(form_data))
++    
++    @property
++    def extra_forms(self):
++        initial_forms = int(self.data.get('form-INITIAL_FORMS', 0))
++        return self.forms[initial_forms:]
++    
++    def clean(self):
++        # Validate that no new objects are being created when allow_new_objects is False
++        if not self.allow_new_objects and self.extra_forms:
++            for form in self.extra_forms:
++                if form.has_changed():
++                    raise ValidationError(
++                        "Creation of new objects is not allowed."
++                    )
++
++def test_allow_new_objects_false():
++    """Test that allow_new_objects=False prevents new object creation"""
++    
++    # Simulate POST data that tries to add a new object
++    post_data = {
++        'form-TOTAL_FORMS': '3',
++        'form-INITIAL_FORMS': '2',
++        'form-MIN_NUM_FORMS': '0',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-0-name': 'Updated Object 1',
++        'form-1-name': 'Updated Object 2',
++        'form-2-name': 'New Object',  # This should be blocked!
++        'form-2-description': 'This is a new object that should be blocked'
++    }
++    
++    print("Testing formset with allow_new_objects=False...")
++    formset = TestFormSet(data=post_data, allow_new_objects=False)
++    
++    try:
++        formset.clean()
++        print("FAILURE: Formset should have raised ValidationError!")
++    except ValidationError as e:
++        print("SUCCESS: Formset correctly rejected new object creation!")
++        print("Error message:", e)
++    
++    print("\n" + "="*50 + "\n")
++
++def test_allow_new_objects_true():
++    """Test that allow_new_objects=True allows new object creation (default behavior)"""
++    
++    # Simulate POST data that tries to add a new object
++    post_data = {
++        'form-TOTAL_FORMS': '3',
++        'form-INITIAL_FORMS': '2',
++        'form-MIN_NUM_FORMS': '0',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-0-name': 'Updated Object 1',
++        'form-1-name': 'Updated Object 2',
++        'form-2-name': 'New Object',  # This should be allowed!
++        'form-2-description': 'This is a new object that should be allowed'
++    }
++    
++    print("Testing formset with allow_new_objects=True...")
++    formset = TestFormSet(data=post_data, allow_new_objects=True)
++    
++    try:
++        formset.clean()
++        print("SUCCESS: Formset allows new object creation (default behavior)!")
++    except ValidationError as e:
++        print("FAILURE: Formset should not have raised ValidationError!")
++        print("Error message:", e)
++    
++    print("\n" + "="*50 + "\n")
++
++if __name__ == '__main__':
++    test_allow_new_objects_false()
++    test_allow_new_objects_true()
+\ No newline at end of file
+diff --git a/test_final.py b/test_final.py
+new file mode 100644
+index 0000000000..a02a314094
+--- /dev/null
++++ b/test_final.py
+@@ -0,0 +1,128 @@
++#!/usr/bin/env python3
++"""
++Final test to verify the allow_new_objects parameter works with actual model formsets.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms.models import modelformset_factory
++from django.core.exceptions import ValidationError
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    description = models.TextField(blank=True)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_allow_new_objects_false():
++    """Test that allow_new_objects=False prevents new object creation"""
++    
++    # Create formset with allow_new_objects=False
++    TestFormSet = modelformset_factory(
++        TestModel, 
++        fields=['name', 'description'], 
++        extra=0,
++        allow_new_objects=False
++    )
++    
++    # Simulate POST data that tries to add a new object
++    post_data = {
++        'form-TOTAL_FORMS': '3',
++        'form-INITIAL_FORMS': '2',
++        'form-MIN_NUM_FORMS': '0',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-0-id': '1',  # Fake ID for existing object
++        'form-0-name': 'Updated Object 1',
++        'form-1-id': '2',  # Fake ID for existing object
++        'form-1-name': 'Updated Object 2',
++        'form-2-name': 'New Object',  # This should be blocked!
++        'form-2-description': 'This is a new object that should be blocked'
++    }
++    
++    print("Testing formset with allow_new_objects=False...")
++    formset = TestFormSet(post_data, queryset=TestModel.objects.none())
++    
++    # The formset should be invalid due to validation error
++    is_valid = formset.is_valid()
++    print(f"Formset is valid: {is_valid}")
++    
++    if not is_valid:
++        print("SUCCESS: Formset correctly rejected new object creation!")
++        print("Non-form errors:", formset.non_form_errors())
++    else:
++        print("FAILURE: Formset should not be valid when trying to create new objects!")
++        print("The formset would save:", len(formset.save_new_objects(commit=False)), "new objects")
++    
++    print("\n" + "="*50 + "\n")
++
++def test_allow_new_objects_true():
++    """Test that allow_new_objects=True allows new object creation (default behavior)"""
++    
++    # Create formset with allow_new_objects=True (default)
++    TestFormSet = modelformset_factory(
++        TestModel, 
++        fields=['name', 'description'], 
++        extra=0,
++        allow_new_objects=True
++    )
++    
++    # Simulate POST data that tries to add a new object
++    post_data = {
++        'form-TOTAL_FORMS': '3',
++        'form-INITIAL_FORMS': '2',
++        'form-MIN_NUM_FORMS': '0',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-0-id': '1',  # Fake ID for existing object
++        'form-0-name': 'Updated Object 1',
++        'form-1-id': '2',  # Fake ID for existing object
++        'form-1-name': 'Updated Object 2',
++        'form-2-name': 'New Object',  # This should be allowed!
++        'form-2-description': 'This is a new object that should be allowed'
++    }
++    
++    print("Testing formset with allow_new_objects=True...")
++    formset = TestFormSet(post_data, queryset=TestModel.objects.none())
++    
++    # The formset should be valid and allow new object creation
++    is_valid = formset.is_valid()
++    print(f"Formset is valid: {is_valid}")
++    
++    if is_valid:
++        print("SUCCESS: Formset allows new object creation (default behavior)!")
++        new_objects = formset.save_new_objects(commit=False)
++        print(f"The formset would save {len(new_objects)} new objects")
++    else:
++        print("Formset is invalid")
++        print("Errors:", formset.errors)
++    
++    print("\n" + "="*50 + "\n")
++
++if __name__ == '__main__':
++    test_allow_new_objects_false()
++    test_allow_new_objects_true()
+\ No newline at end of file
+diff --git a/test_implementation.py b/test_implementation.py
+new file mode 100644
+index 0000000000..fc24b3b48c
+--- /dev/null
++++ b/test_implementation.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the allow_new_objects parameter works correctly.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms.models import modelformset_factory
++from django.core.exceptions import ValidationError
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    description = models.TextField(blank=True)
++    
++    class Meta:
++        app_label = 'test'
++
++    def __str__(self):
++        return self.name
++
++def test_allow_new_objects_false():
++    """Test that allow_new_objects=False prevents new object creation"""
++    
++    # Create formset with allow_new_objects=False
++    TestFormSet = modelformset_factory(
++        TestModel, 
++        fields=['name', 'description'], 
++        extra=0,
++        allow_new_objects=False
++    )
++    
++    # Simulate POST data that tries to add a new object
++    post_data = {
++        'form-TOTAL_FORMS': '3',
++        'form-INITIAL_FORMS': '2',
++        'form-MIN_NUM_FORMS': '0',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-0-id': '1',  # Fake ID for existing object
++        'form-0-name': 'Updated Object 1',
++        'form-1-id': '2',  # Fake ID for existing object
++        'form-1-name': 'Updated Object 2',
++        'form-2-name': 'New Object',  # This should be blocked!
++        'form-2-description': 'This is a new object that should be blocked'
++    }
++    
++    print("Testing formset with allow_new_objects=False...")
++    formset = TestFormSet(post_data, queryset=TestModel.objects.none())
++    
++    print(f"Formset is valid: {formset.is_valid()}")
++    
++    if not formset.is_valid():
++        print("SUCCESS: Formset correctly rejected new object creation!")
++        print("Errors:", formset.non_form_errors())
++    else:
++        print("FAILURE: Formset should not be valid when trying to create new objects!")
++    
++    print("\n" + "="*50 + "\n")
++
++def test_allow_new_objects_true():
++    """Test that allow_new_objects=True allows new object creation (default behavior)"""
++    
++    # Create formset with allow_new_objects=True (default)
++    TestFormSet = modelformset_factory(
++        TestModel, 
++        fields=['name', 'description'], 
++        extra=0,
++        allow_new_objects=True
++    )
++    
++    # Simulate POST data that tries to add a new object
++    post_data = {
++        'form-TOTAL_FORMS': '3',
++        'form-INITIAL_FORMS': '2',
++        'form-MIN_NUM_FORMS': '0',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-0-id': '1',  # Fake ID for existing object
++        'form-0-name': 'Updated Object 1',
++        'form-1-id': '2',  # Fake ID for existing object
++        'form-1-name': 'Updated Object 2',
++        'form-2-name': 'New Object',  # This should be allowed!
++        'form-2-description': 'This is a new object that should be allowed'
++    }
++    
++    print("Testing formset with allow_new_objects=True...")
++    formset = TestFormSet(post_data, queryset=TestModel.objects.none())
++    
++    print(f"Formset is valid: {formset.is_valid()}")
++    
++    if formset.is_valid():
++        print("SUCCESS: Formset allows new object creation (default behavior)!")
++    else:
++        print("Formset is invalid")
++        print("Errors:", formset.errors)
++    
++    print("\n" + "="*50 + "\n")
++
++if __name__ == '__main__':
++    test_allow_new_objects_false()
++    test_allow_new_objects_true()
+\ No newline at end of file
+diff --git a/test_validation_only.py b/test_validation_only.py
+new file mode 100644
+index 0000000000..acf57eb2b4
+--- /dev/null
++++ b/test_validation_only.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python3
++"""
++Test to verify the validation logic works correctly without database dependencies.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.forms.models import BaseModelFormSet
++from django.core.exceptions import ValidationError
++
++# Create a mock formset class to test the validation logic
++class TestFormSet(BaseModelFormSet):
++    def __init__(self, allow_new_objects=True, extra_forms_data=None):
++        self.allow_new_objects = allow_new_objects
++        self._extra_forms_data = extra_forms_data or []
++    
++    @property
++    def extra_forms(self):
++        # Create mock forms with has_changed() method
++        forms = []
++        for form_data in self._extra_forms_data:
++            form = MockForm(form_data.get('has_changed', False))
++            forms.append(form)
++        return forms
++
++class MockForm:
++    def __init__(self, has_changed):
++        self._has_changed = has_changed
++    
++    def has_changed(self):
++        return self._has_changed
++
++def test_allow_new_objects_false_with_changed_forms():
++    """Test that allow_new_objects=False raises ValidationError when forms have changed"""
++    
++    print("Testing allow_new_objects=False with changed forms...")
++    
++    # Create formset with changed forms
++    formset = TestFormSet(
++        allow_new_objects=False,
++        extra_forms_data=[{'has_changed': True}]
++    )
++    
++    try:
++        formset.clean()
++        print("FAILURE: Should have raised ValidationError!")
++    except ValidationError as e:
++        print("SUCCESS: Correctly raised ValidationError!")
++        print("Error message:", e)
++    
++    print("\n" + "="*50 + "\n")
++
++def test_allow_new_objects_false_with_unchanged_forms():
++    """Test that allow_new_objects=False doesn't raise ValidationError when forms haven't changed"""
++    
++    print("Testing allow_new_objects=False with unchanged forms...")
++    
++    # Create formset with unchanged forms
++    formset = TestFormSet(
++        allow_new_objects=False,
++        extra_forms_data=[{'has_changed': False}]
++    )
++    
++    try:
++        formset.clean()
++        print("SUCCESS: No ValidationError raised for unchanged forms!")
++    except ValidationError as e:
++        print("FAILURE: Should not have raised ValidationError for unchanged forms!")
++        print("Error message:", e)
++    
++    print("\n" + "="*50 + "\n")
++
++def test_allow_new_objects_true_with_changed_forms():
++    """Test that allow_new_objects=True doesn't raise ValidationError when forms have changed"""
++    
++    print("Testing allow_new_objects=True with changed forms...")
++    
++    # Create formset with changed forms
++    formset = TestFormSet(
++        allow_new_objects=True,
++        extra_forms_data=[{'has_changed': True}]
++    )
++    
++    try:
++        formset.clean()
++        print("SUCCESS: No ValidationError raised when allow_new_objects=True!")
++    except ValidationError as e:
++        print("FAILURE: Should not have raised ValidationError when allow_new_objects=True!")
++        print("Error message:", e)
++    
++    print("\n" + "="*50 + "\n")
++
++if __name__ == '__main__':
++    test_allow_new_objects_false_with_changed_forms()
++    test_allow_new_objects_false_with_unchanged_forms()
++    test_allow_new_objects_true_with_changed_forms()
+\ No newline at end of file

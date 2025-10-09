@@ -1,0 +1,642 @@
+diff --git a/django/utils/timezone.py b/django/utils/timezone.py
+index bb2b6b9594..48ab5bb282 100644
+--- a/django/utils/timezone.py
++++ b/django/utils/timezone.py
+@@ -73,7 +73,20 @@ def get_current_timezone_name():
+ 
+ def _get_timezone_name(timezone):
+     """Return the name of ``timezone``."""
+-    return str(timezone)
++    tz_str = str(timezone)
++    # Handle Etc/GMT timezones by converting them to simple offset format
++    if tz_str.startswith('Etc/GMT'):
++        # Etc/GMT-10 means UTC+10, Etc/GMT+10 means UTC-10
++        # We need to reverse the sign for the offset format
++        offset_part = tz_str[7:]  # Get the part after 'Etc/GMT'
++        if offset_part.startswith('+'):
++            return '-' + offset_part[1:]
++        elif offset_part.startswith('-'):
++            return '+' + offset_part[1:]
++        else:
++            # Handle case where there's no sign (shouldn't happen with Etc/GMT)
++            return tz_str
++    return tz_str
+ 
+ # Timezone selection functions.
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..7441314d35
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++"""Script to reproduce the timezone conversion issue."""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_TZ=True,
++        TIME_ZONE='UTC',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from django.utils import timezone
++import pytz
++
++def test_timezone_conversion():
++    """Test the timezone conversion behavior."""
++    print("Testing timezone conversion behavior...")
++    
++    # Test with pytz
++    tz_pytz = pytz.timezone("Etc/GMT-10")
++    tz_name_pytz = timezone._get_timezone_name(tz_pytz)
++    print(f"pytz Etc/GMT-10: {tz_name_pytz}")
++    
++    # Test with positive offset
++    tz_pytz_plus = pytz.timezone("Etc/GMT+10")
++    tz_name_pytz_plus = timezone._get_timezone_name(tz_pytz_plus)
++    print(f"p2ytz Etc/GMT+10: {tz_name_pytz_plus}")
++    
++    # Test database operations
++    from django.db.backends.postgresql.operations import DatabaseOperations
++    
++    ops = DatabaseOperations()
++    
++    print("\nTesting _prepare_tzname_delta function:")
++    print(f"_prepare_tzname_delta('+10'): {ops._prepare_tzname_delta('+10')}")
++    print(f"_prepare_tzname_delta('-10'): {ops._prepare_tzname_delta('-10')}")
++    print(f"_prepare_tzname_delta('Etc/GMT-10'): {ops._prepare_tzname_delta('Etc/GMT-10')}")
++    print(f"_prepare_tzname_delta('Etc/GMT+10'): {ops._prepare_tzname_delta('Etc/GMT+10')}")
++
++if __name__ == "__main__":
++    test_timezone_conversion()
+\ No newline at end of file
+diff --git a/test_all_backends.py b/test_all_backends.py
+new file mode 100644
+index 0000000000..2999689aa7
+--- /dev/null
++++ b/test_all_backends.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""Test script to verify the fix works with all database backends."""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_TZ=True,
++        TIME_ZONE='UTC',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from django.utils import timezone
++import pytz
++
++def test_postgresql_behavior():
++    """Test PostgreSQL-like _prepare_tzname_delta behavior."""
++    def _prepare_tzname_delta_postgresql(tzname):
++        if '+' in tzname:
++            return tzname.replace('+', '-')
++        elif '-' in tzname:
++            return tzname.replace('-', '+')
++        return tzname
++    
++    print("Testing PostgreSQL-like behavior:")
++    tz = pytz.timezone("Etc/GMT-10")
++    tz_name = timezone._get_timezone_name(tz)
++    prepared_tz = _prepare_tzname_delta_postgresql(tz_name)
++    print(f"  Etc/GMT-10 -> {tz_name} -> {prepared_tz}")
++    
++    expected = ("+10", "-10")
++    if (tz_name, prepared_tz) == expected:
++        print("  ✓ PostgreSQL behavior is correct!")
++    else:
++        print(f"  ✗ Expected: {expected}, Got: {(tz_name, prepared_tz)}")
++
++def test_mysql_oracle_behavior():
++    """Test MySQL/Oracle-like _prepare_tzname_delta behavior."""
++    def _prepare_tzname_delta_mysql_oracle(tzname):
++        if '+' in tzname:
++            return tzname[tzname.find('+'):]
++        elif '-' in tzname:
++            return tzname[tzname.find('-'):]
++        return tzname
++    
++    print("Testing MySQL/Oracle-like behavior:")
++    tz = pytz.timezone("Etc/GMT-10")
++    tz_name = timezone._get_timezone_name(tz)
++    prepared_tz = _prepare_tzname_delta_mysql_oracle(tz_name)
++    print(f"  Etc/GMT-10 -> {tz_name} -> {prepared_tz}")
++    
++    expected = ("+10", "+10")
++    if (tz_name, prepared_tz) == expected:
++        print("  ✓ MySQL/Oracle behavior is correct!")
++    else:
++        print(f"  ✗ Expected: {expected}, Got: {(tz_name, prepared_tz)}")
++
++def test_regular_timezones():
++    """Test that regular timezones are not affected."""
++    print("Testing regular timezones:")
++    
++    regular_tz = pytz.timezone("Europe/London")
++    tz_name = timezone._get_timezone_name(regular_tz)
++    print(f"  Europe/London -> {tz_name}")
++    
++    if tz_name == "Europe/London":
++        print("  ✓ Regular timezones are not affected!")
++    else:
++        print(f"  ✗ Expected: Europe/London, Got: {tz_name}")
++
++if __name__ == "__main__":
++    test_postgresql_behavior()
++    print()
++    test_mysql_oracle_behavior()
++    print()
++    test_regular_timezones()
+\ No newline at end of file
+diff --git a/test_database_operations.py b/test_database_operations.py
+new file mode 100644
+index 0000000000..ec0f716a3a
+--- /dev/null
++++ b/test_database_operations.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++"""Test script to verify database operations work correctly."""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_TZ=True,
++        TIME_ZONE='UTC',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.postgresql',
++                'NAME': 'test',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from django.utils import timezone
++import pytz
++
++# Mock the DatabaseOperations to test _prepare_tzname_delta
++class MockDatabaseOperations:
++    def _prepare_tzname_delta(self, tzname):
++        if '+' in tzname:
++            return tzname.replace('+', '-')
++        elif '-' in tzname:
++            return tzname.replace('-', '+')
++        return tzname
++
++def test_database_operations():
++    """Test database operations with timezone names."""
++    print("Testing database operations with timezone names...")
++    
++    ops = MockDatabaseOperations()
++    
++    # Test Etc/GMT timezones
++    timezones_to_test = [
++        "Etc/GMT-10",  # 10 hours ahead of UTC -> should become +10 -> _prepare_tzname_delta should return -10
++        "Etc/GMT+10",  # 10 hours behind UTC -> should become -10 -> _prepare_tzname_delta should return +10
++        "Etc/GMT-5",   # 5 hours ahead of UTC -> should become +5 -> _prepare_tzname_delta should return -5
++        "Etc/GMT+5",   # 5 hours behind UTC -> should become -5 -> _prepare_tzname_delta should return +5
++    ]
++    
++    for tz_name in timezones_to_test:
++        tz = pytz.timezone(tz_name)
++        tz_str = timezone._get_timezone_name(tz)
++        prepared_tz = ops._prepare_tzname_delta(tz_str)
++        print(f"{tz_name:15} -> {tz_str:5} -> {prepared_tz:5}")
++
++if __name__ == "__main__":
++    test_database_operations()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..4bba9378f6
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""Test script to verify edge cases work correctly."""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_TZ=True,
++        TIME_ZONE='UTC',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from django.utils import timezone
++import pytz
++
++def test_edge_cases():
++    """Test edge cases for timezone name handling."""
++    print("Testing edge cases for timezone name handling...")
++    
++    # Test various timezone formats
++    test_cases = [
++        "Etc/GMT-0",    # Edge case: GMT-0
++        "Etc/GMT+0",    # Edge case: GMT+0  
++        "Etc/GMT-1",    # Single digit
++        "Etc/GMT-12",   # Maximum offset
++        "Etc/GMT+12",   # Maximum offset
++        "Etc/GMT-14",   # Beyond maximum (should still work)
++        "Etc/GMT+14",   # Beyond maximum (should still work)
++        "Etc/UTC",      # Should not be modified
++        "Etc/GMT",      # Should not be modified (no offset)
++        "UTC",          # Should not be modified
++        "Europe/London", # Should not be modified
++    ]
++    
++    for tz_name in test_cases:
++        try:
++            tz = pytz.timezone(tz_name)
++            tz_str = timezone._get_timezone_name(tz)
++            print(f"{tz_name:15} -> {tz_str}")
++        except Exception as e:
++            print(f"{tz_name:15} -> ERROR: {e}")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_final_verification.py b/test_final_verification.py
+new file mode 100644
+index 0000000000..528c4bce87
+--- /dev/null
++++ b/test_final_verification.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""Final verification test for the timezone fix."""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_TZ=True,
++        TIME_ZONE='UTC',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from django.utils import timezone
++import pytz
++from django.db.backends.postgresql.operations import DatabaseOperations
++
++def test_final_verification():
++    """Final verification that the fix works as expected."""
++    print("Final verification of timezone fix...")
++    
++    # Test the specific case mentioned in the issue
++    tz = pytz.timezone("Etc/GMT-10")
++    tz_name = timezone._get_timezone_name(tz)
++    print(f"Timezone name for Etc/GMT-10: {tz_name}")
++    
++    # Test database operations
++    ops = DatabaseOperations()
++    prepared_tz = ops._prepare_tzname_delta(tz_name)
++    print(f"Prepared for database: {prepared_tz}")
++    
++    # Verify this matches the expected behavior from the issue
++    # Django 3.1: "+10" -> _prepare_tzname_delta("-10") 
++    # Django 3.2 (before fix): "Etc/GMT-10" -> _prepare_tzname_delta("Etc/GMT+10") WRONG!
++    # Django 3.2 (after fix): "+10" -> _prepare_tzname_delta("-10") CORRECT!
++    
++    expected_tz_name = "+10"
++    expected_prepared_tz = "-10"
++    
++    if tz_name == expected_tz_name and prepared_tz == expected_prepared_tz:
++        print("✓ Fix is working correctly!")
++        print(f"  Expected: {expected_tz_name} -> {expected_prepared_tz}")
++        print(f"  Got:      {tz_name} -> {prepared_tz}")
++    else:
++        print("✗ Fix is not working correctly!")
++        print(f"  Expected: {expected_tz_name} -> {expected_prepared_tz}")
++        print(f"  Got:      {tz_name} -> {prepared_tz}")
++    
++    # Test the reverse case
++    tz_reverse = pytz.timezone("Etc/GMT+10")
++    tz_name_reverse = timezone._get_timezone_name(tz_reverse)
++    prepared_tz_reverse = ops._prepare_tzname_delta(tz_name_reverse)
++    
++    expected_tz_name_reverse = "-10"
++    expected_prepared_tz_reverse = "+10"
++    
++    if tz_name_reverse == expected_tz_name_reverse and prepared_tz_reverse == expected_prepared_tz_reverse:
++        print("✓ Reverse case is working correctly!")
++        print(f"  Expected: {expected_tz_name_reverse} -> {expected_prepared_tz_reverse}")
++        print(f"  Got:      {tz_name_reverse} -> {prepared_tz_reverse}")
++    else:
++        print("✗ Reverse case is not working correctly!")
++        print(f"  Expected: {expected_tz_name_reverse} -> {expected_prepared_tz_reverse}")
++        print(f"  Got:      {tz_name_reverse} -> {prepared_tz_reverse}")
++
++if __name__ == "__main__":
++    test_final_verification()
+\ No newline at end of file
+diff --git a/test_simple_verification.py b/test_simple_verification.py
+new file mode 100644
+index 0000000000..203f6566b1
+--- /dev/null
++++ b/test_simple_verification.py
+@@ -0,0 +1,100 @@
++#!/usr/bin/env python3
++"""Simple verification test for the timezone fix."""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_TZ=True,
++        TIME_ZONE='UTC',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from django.utils import timezone
++import pytz
++
++def _prepare_tzname_delta(tzname):
++    """Replicate the _prepare_tzname_delta function from PostgreSQL operations."""
++    if '+' in tzname:
++        return tzname.replace('+', '-')
++    elif '-' in tzname:
++        return tzname.replace('-', '+')
++    return tzname
++
++def test_simple_verification():
++    """Simple verification that the fix works as expected."""
++    print("Simple verification of timezone fix...")
++    
++    # Test the specific case mentioned in the issue
++    tz = pytz.timezone("Etc/GMT-10")
++    tz_name = timezone._get_timezone_name(tz)
++    print(f"Timezone name for Etc/GMT-10: {tz_name}")
++    
++    # Test the database operation simulation
++    prepared_tz = _prepare_tzname_delta(tz_name)
++    print(f"Prepared for database: {prepared_tz}")
++    
++    # Verify this matches the expected behavior from the issue
++    # Django 3.1: "+10" -> _prepare_tzname_delta("-10") 
++    # Django 3.2 (before fix): "Etc/GMT-10" -> _prepare_tzname_delta("Etc/GMT+10") WRONG!
++    # Django 3.2 (after fix): "+10" -> _prepare_tzname_delta("-10") CORRECT!
++    
++    expected_tz_name = "+10"
++    expected_prepared_tz = "-10"
++    
++    if tz_name == expected_tz_name and prepared_tz == expected_prepared_tz:
++        print("✓ Fix is working correctly!")
++        print(f"  Expected: {expected_tz_name} -> {expected_prepared_tz}")
++        print(f"  Got:      {tz_name} -> {prepared_tz}")
++    else:
++        print("✗ Fix is not working correctly!")
++        print(f"  Expected: {expected_tz_name} -> {expected_prepared_tz}")
++        print(f"  Got:      {tz_name} -> {prepared_tz}")
++    
++    # Test the reverse case
++    tz_reverse = pytz.timezone("Etc/GMT+10")
++    tz_name_reverse = timezone._get_timezone_name(tz_reverse)
++    prepared_tz_reverse = _prepare_tzname_delta(tz_name_reverse)
++    
++    expected_tz_name_reverse = "-10"
++    expected_prepared_tz_reverse = "+10"
++    
++    if tz_name_reverse == expected_tz_name_reverse and prepared_tz_reverse == expected_prepared_tz_reverse:
++        print("✓ Reverse case is working correctly!")
++        print(f"  Expected: {expected_tz_name_reverse} -> {expected_prepared_tz_reverse}")
++        print(f"  Got:      {tz_name_reverse} -> {prepared_tz_reverse}")
++    else:
++        print("✗ Reverse case is not working correctly!")
++        print(f"  Expected: {expected_tz_name_reverse} -> {expected_prepared_tz_reverse}")
++        print(f"  Got:      {tz_name_reverse} -> {prepared_tz_reverse}")
++    
++    # Test that regular timezones are not affected
++    regular_tz = pytz.timezone("Europe/London")
++    regular_tz_name = timezone._get_timezone_name(regular_tz)
++    prepared_regular_tz = _prepare_tzname_delta(regular_tz_name)
++    
++    print(f"\nRegular timezone test:")
++    print(f"Europe/London -> {regular_tz_name} -> {prepared_regular_tz}")
++    
++    if regular_tz_name == "Europe/London" and prepared_regular_tz == "Europe/London":
++        print("✓ Regular timezones are not affected!")
++    else:
++        print("✗ Regular timezones are affected!")
++
++if __name__ == "__main__":
++    test_simple_verification()
+\ No newline at end of file
+diff --git a/test_timezone_names.py b/test_timezone_names.py
+new file mode 100644
+index 0000000000..446fe18d3b
+--- /dev/null
++++ b/test_timezone_names.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++"""Test script to understand timezone name behavior."""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_TZ=True,
++        TIME_ZONE='UTC',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from django.utils import timezone
++import pytz
++
++def test_timezone_names():
++    """Test various timezone names and their behavior."""
++    print("Testing timezone name behavior...")
++    
++    # Test Etc/GMT timezones
++    timezones_to_test = [
++        "Etc/GMT-10",  # 10 hours ahead of UTC
++        "Etc/GMT+10",  # 10 hours behind UTC
++        "Etc/GMT-5",   # 5 hours ahead of UTC
++        "Etc/GMT+5",   # 5 hours behind UTC
++        "UTC",
++        "Europe/London",
++    ]
++    
++    for tz_name in timezones_to_test:
++        try:
++            tz = pytz.timezone(tz_name)
++            tz_str = timezone._get_timezone_name(tz)
++            print(f"{tz_name:15} -> {tz_str}")
++        except Exception as e:
++            print(f"{tz_name:15} -> ERROR: {e}")
++
++if __name__ == "__main__":
++    test_timezone_names()
+\ No newline at end of file
+diff --git a/test_zoneinfo.py b/test_zoneinfo.py
+new file mode 100644
+index 0000000000..06cf4223fd
+--- /dev/null
++++ b/test_zoneinfo.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++"""Test script to verify zoneinfo timezones work correctly."""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_TZ=True,
++        TIME_ZONE='UTC',
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from django.utils import timezone
++
++def test_zoneinfo_timezones():
++    """Test zoneinfo timezones if available."""
++    print("Testing zoneinfo timezones (if available)...")
++    
++    try:
++        from zoneinfo import ZoneInfo
++        
++        # Test Etc/GMT timezones with zoneinfo
++        timezones_to_test = [
++            "Etc/GMT-10",  # 10 hours ahead of UTC
++            "Etc/GMT+10",  # 10 hours behind UTC
++            "Etc/GMT-5",   # 5 hours ahead of UTC
++            "Etc/GMT+5",   # 5 hours behind UTC
++        ]
++        
++        for tz_name in timezones_to_test:
++            try:
++                tz = ZoneInfo(tz_name)
++                tz_str = timezone._get_timezone_name(tz)
++                print(f"zoneinfo {tz_name:12} -> {tz_str}")
++            except Exception as e:
++                print(f"zoneinfo {tz_name:12} -> ERROR: {e}")
++                
++    except ImportError:
++        print("zoneinfo not available, skipping zoneinfo tests")
++
++if __name__ == "__main__":
++    test_zoneinfo_timezones()
+\ No newline at end of file

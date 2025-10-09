@@ -1,0 +1,477 @@
+diff --git a/django/db/backends/ddl_references.py b/django/db/backends/ddl_references.py
+index c06386a2fa..a0c04a37cc 100644
+--- a/django/db/backends/ddl_references.py
++++ b/django/db/backends/ddl_references.py
+@@ -47,11 +47,15 @@ class Table(Reference):
+         self.quote_name = quote_name
+ 
+     def references_table(self, table):
+-        return self.table == table
++        # Handle both string table names and Table instances
++        table_name = table.table if isinstance(table, Table) else table
++        return self.table == table_name
+ 
+     def rename_table_references(self, old_table, new_table):
+-        if self.table == old_table:
+-            self.table = new_table
++        # Handle both string table names and Table instances
++        old_table_name = old_table.table if isinstance(old_table, Table) else old_table
++        if self.table == old_table_name:
++            self.table = new_table.table if isinstance(new_table, Table) else new_table
+ 
+     def __str__(self):
+         return self.quote_name(self.table)
+@@ -65,10 +69,16 @@ class TableColumns(Table):
+         self.columns = columns
+ 
+     def references_column(self, table, column):
+-        return self.table == table and column in self.columns
++        # Handle both string table names and Table instances
++        table_name = table.table if isinstance(table, Table) else table
++        self_table_name = self.table.table if isinstance(self.table, Table) else self.table
++        return self_table_name == table_name and column in self.columns
+ 
+     def rename_column_references(self, table, old_column, new_column):
+-        if self.table == table:
++        # Handle both string table names and Table instances
++        table_name = table.table if isinstance(table, Table) else table
++        self_table_name = self.table.table if isinstance(self.table, Table) else self.table
++        if self_table_name == table_name:
+             for index, column in enumerate(self.columns):
+                 if column == old_column:
+                     self.columns[index] = new_column
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..f995192844
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,100 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++from django.db.backends.ddl_references import Table, Columns
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_columns_constructor():
++    print("Testing Columns constructor with Table instance...")
++    
++    # Create a Table instance
++    table_instance = Table('test_table', lambda name: f'"{name}"')
++    
++    try:
++        # This should trigger the issue - passing Table instance instead of string
++        columns = Columns(table_instance, ['name'], lambda name: f'"{name}"')
++        print("SUCCESS: Columns constructor completed without error")
++        print(f"Result: {columns}")
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++def test_references_column_issue():
++    print("Testing references_column issue...")
++    
++    schema_editor = connection.schema_editor()
++    table_instance = Table('test_table', schema_editor.quote_name)
++    
++    # Create Columns instance with Table instance as table parameter
++    columns = Columns(table_instance, ['name'], schema_editor.quote_name)
++    
++    # Test references_column - this should return False due to the bug
++    result = columns.references_column('test_table', 'name')
++    print(f"references_column('test_table', 'name') returned: {result}")
++    
++    # This should return True but will return False due to the bug
++    if result:
++        print("SUCCESS: references_column works correctly")
++    else:
++        print("BUG CONFIRMED: references_column returned False when it should return True")
++        
++    # Test with Table instance - this should work
++    result2 = columns.references_column(table_instance, 'name')
++    print(f"references_column(table_instance, 'name') returned: {result2}")
++
++def test_index_columns_method():
++    print("Testing _index_columns method...")
++    
++    schema_editor = connection.schema_editor()
++    table_instance = Table('test_table', schema_editor.quote_name)
++    
++    try:
++        # This should trigger the issue - passing Table instance instead of string
++        result = schema_editor._index_columns(table_instance, ['name'], (), ())
++        print("SUCCESS: _index_columns completed without error")
++        print(f"Result: {result}")
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    test_columns_constructor()
++    print()
++    test_references_column_issue()
++    print()
++    test_index_columns_method()
++    test_index_columns_method()
+\ No newline at end of file
+diff --git a/test_backwards_compatibility.py b/test_backwards_compatibility.py
+new file mode 100644
+index 0000000000..5006da9213
+--- /dev/null
++++ b/test_backwards_compatibility.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.backends.ddl_references import Table, Columns
++
++def test_backwards_compatibility():
++    """Test that the fix doesn't break existing functionality"""
++    print("Testing backwards compatibility...")
++    
++    # Test 1: Traditional usage with string table names
++    columns1 = Columns('test_table', ['name'], lambda name: f'"{name}"')
++    result1 = columns1.references_column('test_table', 'name')
++    print(f"1. String table: references_column('test_table', 'name') = {result1} (should be True)")
++    
++    # Test 2: Traditional usage with non-matching table
++    result2 = columns1.references_column('other_table', 'name')
++    print(f"2. String table: references_column('other_table', 'name') = {result2} (should be False)")
++    
++    # Test 3: Traditional usage with non-matching column
++    result3 = columns1.references_column('test_table', 'other_column')
++    print(f"3. String table: references_column('test_table', 'other_column') = {result3} (should be False)")
++    
++    # Test 4: Table instance usage (the new functionality)
++    table_instance = Table('test_table', lambda name: f'"{name}"')
++    columns2 = Columns(table_instance, ['name'], lambda name: f'"{name}"')
++    result4 = columns2.references_column('test_table', 'name')
++    print(f"4. Table instance: references_column('test_table', 'name') = {result4} (should be True)")
++    
++    # Test 5: Table instance with Table instance parameter
++    result5 = columns2.references_column(table_instance, 'name')
++    print(f"5. Table instance: references_column(table_instance, 'name') = {result5} (should be True)")
++    
++    # Verify all tests passed
++    expected_results = [result1, result2, result3, result4, result5]
++    expected_values = [True, False, False, True, True]
++    
++    all_passed = all(actual == expected for actual, expected in zip(expected_results, expected_values))
++    
++    if all_passed:
++        print("✅ ALL BACKWARDS COMPATIBILITY TESTS PASSED!")
++        return True
++    else:
++        print("❌ SOME BACKWARDS COMPATIBILITY TESTS FAILED!")
++        for i, (actual, expected) in enumerate(zip(expected_results, expected_values), 1):
++            if actual != expected:
++                print(f"  Test {i} failed: expected {expected}, got {actual}")
++        return False
++
++if __name__ == '__main__':
++    success = test_backwards_compatibility()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_end_to_end.py b/test_end_to_end.py
+new file mode 100644
+index 0000000000..fd8c66b383
+--- /dev/null
++++ b/test_end_to_end.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++
++# Create a simple model with unique constraint
++class TestModel(models.Model):
++    name = models.CharField(max_length=100, unique=True)
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_create_unique_sql():
++    """Test that _create_unique_sql works correctly with the fix"""
++    print("Testing _create_unique_sql method end-to-end...")
++    
++    schema_editor = connection.schema_editor()
++    model = TestModel
++    
++    try:
++        # This should work without errors now
++        result = schema_editor._create_unique_sql(model, ['name'])
++        print("✅ SUCCESS: _create_unique_sql completed without error")
++        print(f"Result type: {type(result)}")
++        print(f"Result string representation: {str(result)}")
++        
++        # Test that the result can be used in references_column
++        if hasattr(result, 'references_column'):
++            ref_result = result.references_column('test_testmodel', 'name')
++            print(f"result.references_column('test_testmodel', 'name') = {ref_result}")
++            
++            if ref_result:
++                print("✅ SUCCESS: references_column works correctly in the Statement")
++            else:
++                print("❌ WARNING: references_column returned False - this might indicate an issue")
++        
++        return True
++        
++    except Exception as e:
++        print(f"❌ ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == '__main__':
++    success = test_create_unique_sql()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_fixes.py b/test_fixes.py
+new file mode 100644
+index 0000000000..077f879b22
+--- /dev/null
++++ b/test_fixes.py
+@@ -0,0 +1,101 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.backends.ddl_references import Table, Columns
++
++def test_all_fixes():
++    print("Testing all fixes for Table and Columns classes...")
++    
++    schema_editor = connection.schema_editor()
++    table_instance = Table('test_table', schema_editor.quote_name)
++    
++    # Test 1: references_column with string table name
++    columns = Columns(table_instance, ['name'], schema_editor.quote_name)
++    result1 = columns.references_column('test_table', 'name')
++    print(f"1. references_column('test_table', 'name'): {result1} (should be True)")
++    
++    # Test 2: references_column with Table instance
++    result2 = columns.references_column(table_instance, 'name')
++    print(f"2. references_column(table_instance, 'name'): {result2} (should be True)")
++    
++    # Test 3: references_column with non-matching table
++    result3 = columns.references_column('other_table', 'name')
++    print(f"3. references_column('other_table', 'name'): {result3} (should be False)")
++    
++    # Test 4: references_column with non-matching column
++    result4 = columns.references_column('test_table', 'other_column')
++    print(f"4. references_column('test_table', 'other_column'): {result4} (should be False)")
++    
++    # Test 5: references_table with string table name
++    result5 = table_instance.references_table('test_table')
++    print(f"5. table_instance.references_table('test_table'): {result5} (should be True)")
++    
++    # Test 6: references_table with Table instance
++    other_table = Table('test_table', schema_editor.quote_name)
++    result6 = table_instance.references_table(other_table)
++    print(f"6. table_instance.references_table(other_table): {result6} (should be True)")
++    
++    # Test 7: rename_table_references
++    table_instance2 = Table('test_table', schema_editor.quote_name)
++    table_instance2.rename_table_references('test_table', 'renamed_table')
++    print(f"7. table_instance2.table after rename: {table_instance2.table} (should be 'renamed_table')")
++    
++    # Test 8: rename_column_references with string table name
++    columns2 = Columns(table_instance, ['name'], schema_editor.quote_name)
++    columns2.rename_column_references('test_table', 'name', 'renamed_name')
++    print(f"8. columns2.columns after rename: {columns2.columns} (should be ['renamed_name'])")
++    
++    # Test 9: rename_column_references with Table instance
++    columns3 = Columns(table_instance, ['name'], schema_editor.quote_name)
++    columns3.rename_column_references(table_instance, 'name', 'renamed_name2')
++    print(f"9. columns3.columns after rename: {columns3.columns} (should be ['renamed_name2'])")
++    
++    # Verify all tests passed
++    expected_results = [
++        (result1, True),
++        (result2, True),
++        (result3, False),
++        (result4, False),
++        (result5, True),
++        (result6, True),
++        (table_instance2.table, 'renamed_table'),
++        (columns2.columns, ['renamed_name']),
++        (columns3.columns, ['renamed_name2'])
++    ]
++    
++    all_passed = all(actual == expected for actual, expected in expected_results)
++    
++    if all_passed:
++        print("\n✅ ALL TESTS PASSED! The fixes are working correctly.")
++    else:
++        print("\n❌ SOME TESTS FAILED!")
++        for i, (actual, expected) in enumerate(expected_results, 1):
++            if actual != expected:
++                print(f"  Test {i} failed: expected {expected}, got {actual}")
++
++if __name__ == '__main__':
++    test_all_fixes()
+\ No newline at end of file
+diff --git a/test_minimal.py b/test_minimal.py
+new file mode 100644
+index 0000000000..035a00d98f
+--- /dev/null
++++ b/test_minimal.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.backends.ddl_references import Table, Columns
++
++def test_references_column_fix():
++    """Test that the fix for references_column works correctly"""
++    print("Testing references_column fix...")
++    
++    # Create a Table instance
++    table_instance = Table('test_table', lambda name: f'"{name}"')
++    
++    # Create Columns instance with Table instance as table parameter
++    columns = Columns(table_instance, ['name'], lambda name: f'"{name}"')
++    
++    # Test the specific case mentioned in the issue
++    # This should return True after the fix, but would return False before
++    result = columns.references_column('test_table', 'name')
++    
++    print(f"columns.references_column('test_table', 'name') = {result}")
++    
++    if result:
++        print("✅ SUCCESS: The fix works! references_column now correctly returns True")
++        return True
++    else:
++        print("❌ FAILURE: The fix didn't work. references_column still returns False")
++        return False
++
++if __name__ == '__main__':
++    success = test_references_column_fix()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

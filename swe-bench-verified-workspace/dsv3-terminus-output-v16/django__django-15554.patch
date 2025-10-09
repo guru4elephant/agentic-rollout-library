@@ -1,0 +1,649 @@
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 0000000000..d2da3bf6a6
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q, FilteredRelation
++
++# Create simple test models
++class Author(models.Model):
++    name = models.CharField(max_length=50)
++    
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=255)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE, related_name='books')
++    price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
++    
++    class Meta:
++        app_label = 'test'
++
++def debug_table_alias():
++    from django.db.models.sql.query import Query
++    
++    # Create a query object
++    query = Query(Author)
++    
++    # Create some filtered relations
++    fr1 = FilteredRelation("books", condition=Q(books__price__lt=100))
++    fr2 = FilteredRelation("books", condition=Q(books__price__gte=100))
++    
++    # Set their aliases (this is what add_filtered_relation does)
++    fr1.alias = "cheap_books"
++    fr2.alias = "expensive_books"
++    
++    # Test table_alias method with these filtered relations
++    alias1, is_new1 = query.table_alias("test_book", filtered_relation=fr1)
++    alias2, is_new2 = query.table_alias("test_book", filtered_relation=fr2)
++    
++    print(f"First alias: {alias1}, is_new: {is_new1}")
++    print(f"Second alias: {alias2}, is_new: {is_new2}")
++    print(f"Are aliases different? {alias1 != alias2}")
++    
++    # Test again to see if they're still different
++    alias3, is_new3 = query.table_alias("test_book", filtered_relation=fr1)
++    alias4, is_new4 = query.table_alias("test_book", filtered_relation=fr2)
++    
++    print(f"Third alias: {alias3}, is_new: {is_new3}")
++    print(f"Fourth alias: {alias4}, is_new: {is_new4}")
++    print(f"Are aliases still different? {alias3 != alias4}")
++
++if __name__ == '__main__':
++    debug_table_alias()
+\ No newline at end of file
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 54f3258eac..dea738e0b9 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -809,9 +809,13 @@ class Query(BaseExpression):
+             alias_list.append(alias)
+         else:
+             # The first occurrence of a table uses the table name directly.
+-            alias = (
+-                filtered_relation.alias if filtered_relation is not None else table_name
+-            )
++            # For filtered relations, always generate a unique alias to ensure
++            # multiple FilteredRelation instances with the same relation path
++            # get separate JOINs.
++            if filtered_relation is not None:
++                alias = "%s%d" % (self.alias_prefix, len(self.alias_map) + 1)
++            else:
++                alias = table_name
+             self.table_map[table_name] = [alias]
+         self.alias_refcount[alias] = 1
+         return alias, True
+@@ -1800,7 +1804,12 @@ class Query(BaseExpression):
+         for join in path:
+             if join.filtered_relation:
+                 filtered_relation = join.filtered_relation.clone()
+-                table_alias = filtered_relation.alias
++                # Generate a unique table alias for filtered relations to ensure
++                # multiple FilteredRelation instances with the same relation path
++                # get separate JOINs.
++                table_alias, _ = self.table_alias(
++                    opts.db_table, create=True, filtered_relation=filtered_relation
++                )
+             else:
+                 filtered_relation = None
+                 table_alias = None
+diff --git a/reproduce_from_test.py b/reproduce_from_test.py
+new file mode 100644
+index 0000000000..30c0bbf05a
+--- /dev/null
++++ b/reproduce_from_test.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings based on the test setup
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.filtered_relation',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Q, FilteredRelation
++from tests.filtered_relation.models import Author, Book, Editor
++
++def test_multiple_filtered_relations():
++    from django.db import connection
++    
++    # Create tables using Django's schema editor
++    with connection.schema_editor() as schema_editor:
++        for model in [Author, Book, Editor]:
++            schema_editor.create_model(model)
++    
++    # Create test data similar to the test setup
++    author1 = Author.objects.create(name="Alice")
++    author2 = Author.objects.create(name="Jane")
++    editor_a = Editor.objects.create(name="a")
++    editor_b = Editor.objects.create(name="b")
++    
++    book1 = Book.objects.create(
++        title="Poem by Alice",
++        editor=editor_a,
++        author=author1,
++    )
++    book2 = Book.objects.create(
++        title="The book by Jane A",
++        editor=editor_b,
++        author=author2,
++    )
++    
++    # Test multiple FilteredRelation with same relation but different conditions
++    qs = Author.objects.annotate(
++        book_editor_a=FilteredRelation(
++            "book",
++            condition=Q(
++                book__title__icontains="book", book__editor_id=editor_a.pk
++            ),
++        ),
++        book_editor_b=FilteredRelation(
++            "book",
++            condition=Q(
++                book__title__icontains="book", book__editor_id=editor_b.pk
++            ),
++        ),
++    )
++    
++    # Print the generated SQL to see the issue
++    print("Generated SQL:")
++    print(str(qs.query))
++    print("\n" + "="*50 + "\n")
++    
++    # Try to execute the query
++    try:
++        results = list(qs)
++        print("Query executed successfully")
++        print(f"Number of results: {len(results)}")
++        for result in results:
++            print(f"{result.name}: {result}")
++    except Exception as e:
++        print(f"Error executing query: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    test_multiple_filtered_relations()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..960deb254f
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,125 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q, F, Case, When
++from django.db.models import FilteredRelation
++
++# Create test models
++class Zone(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class MyModel(models.Model):
++    name = models.CharField(max_length=100)
++    zone = models.ForeignKey(Zone, on_delete=models.CASCADE, null=True)
++    
++    class Meta:
++        app_label = 'test'
++
++class MyRelation(models.Model):
++    my_model = models.ForeignKey(MyModel, on_delete=models.CASCADE, related_name='myrelations')
++    
++    class Meta:
++        app_label = 'test'
++
++class Nested(models.Model):
++    my_relation = models.ForeignKey(MyRelation, on_delete=models.CASCADE, related_name='nested')
++    is_all = models.BooleanField(default=False)
++    zone = models.ForeignKey(Zone, on_delete=models.CASCADE, null=True)
++    price = models.DecimalField(max_digits=10, decimal_places=2)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_multiple_filtered_relations():
++    from django.db import connection
++    
++    # Create tables using Django's schema editor
++    with connection.schema_editor() as schema_editor:
++        for model in [Zone, MyModel, MyRelation, Nested]:
++            schema_editor.create_model(model)
++    
++    # Create test data
++    zone1 = Zone.objects.create(name='Zone1')
++    zone2 = Zone.objects.create(name='Zone2')
++    
++    model1 = MyModel.objects.create(name='Model1', zone=zone1)
++    model2 = MyModel.objects.create(name='Model2', zone=zone2)
++    
++    relation1 = MyRelation.objects.create(my_model=model1)
++    relation2 = MyRelation.objects.create(my_model=model2)
++    
++    # Create nested entries - one with is_all=True and one with specific zone
++    Nested.objects.create(my_relation=relation1, is_all=True, price=100.00)
++    Nested.objects.create(my_relation=relation1, zone=zone1, price=150.00)
++    
++    Nested.objects.create(my_relation=relation2, is_all=True, price=200.00)
++    Nested.objects.create(my_relation=relation2, zone=zone2, price=250.00)
++    
++    # Test the issue: multiple FilteredRelation with same relation but different conditions
++    qs = MyModel.objects.all()
++    
++    qs = qs.alias(
++        relation_zone=FilteredRelation(
++            "myrelations__nested",
++            condition=Q(myrelations__nested__zone=F("zone"))
++        ),
++        relation_all=FilteredRelation(
++            "myrelations__nested", 
++            condition=Q(myrelations__nested__is_all=True)
++        ),
++        price_zone=F("relation_zone__price")
++    ).annotate(
++        price_final=Case(
++            When(
++                price_zone__isnull=True,
++                then=F("relation_all__price"),
++            ),
++            default=F("price_zone")
++        )
++    )
++    
++    # Print the generated SQL to see the issue
++    print("Generated SQL:")
++    print(str(qs.query))
++    print("\n" + "="*50 + "\n")
++    
++    # Try to execute the query
++    try:
++        results = list(qs)
++        print("Query executed successfully")
++        print(f"Number of results: {len(results)}")
++        for result in results:
++            print(f"{result.name}: {result.price_final}")
++    except Exception as e:
++        print(f"Error executing query: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    test_multiple_filtered_relations()
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..573515092b
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q, F, Case, When
++from django.db.models import FilteredRelation
++
++# Create simple test models based on the filtered_relation test structure
++class Author(models.Model):
++    name = models.CharField(max_length=50)
++    
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=255)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE, related_name='books', related_query_name='book')
++    
++    class Meta:
++        app_label = 'test'
++
++def test_multiple_filtered_relations():
++    from django.db import connection
++    
++    # Create tables using Django's schema editor
++    with connection.schema_editor() as schema_editor:
++        for model in [Author, Book]:
++            schema_editor.create_model(model)
++    
++    # Create test data
++    author1 = Author.objects.create(name="Alice")
++    author2 = Author.objects.create(name="Bob")
++    
++    Book.objects.create(title="Book by Alice", author=author1)
++    Book.objects.create(title="Another Book by Alice", author=author1)
++    Book.objects.create(title="Book by Bob", author=author2)
++    
++    # Test the issue: multiple FilteredRelation with same relation but different conditions
++    qs = Author.objects.all()
++    
++    qs = qs.annotate(
++        book_alice=FilteredRelation(
++            "book",
++            condition=Q(book__title__icontains="alice")
++        ),
++        book_bob=FilteredRelation(
++            "book", 
++            condition=Q(book__title__icontains="bob")
++        )
++    )
++    
++    # Print the generated SQL to see the issue
++    print("Generated SQL:")
++    print(str(qs.query))
++    print("\n" + "="*50 + "\n")
++    
++    # Try to execute the query
++    try:
++        results = list(qs)
++        print("Query executed successfully")
++        print(f"Number of results: {len(results)}")
++        for result in results:
++            print(f"{result.name}: {result}")
++    except Exception as e:
++        print(f"Error executing query: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    test_multiple_filtered_relations()
+\ No newline at end of file
+diff --git a/simple_reproduce_final.py b/simple_reproduce_final.py
+new file mode 100644
+index 0000000000..f1ac947dd8
+--- /dev/null
++++ b/simple_reproduce_final.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q, FilteredRelation
++
++# Create simple test models without GenericForeignKey
++class Author(models.Model):
++    name = models.CharField(max_length=50)
++    
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=255)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE, related_name='books', related_query_name='book')
++    
++    class Meta:
++        app_label = 'test'
++
++def test_multiple_filtered_relations():
++    from django.db import connection
++    
++    # Create tables using Django's schema editor
++    with connection.schema_editor() as schema_editor:
++        for model in [Author, Book]:
++            schema_editor.create_model(model)
++    
++    # Create test data
++    author1 = Author.objects.create(name="Alice")
++    author2 = Author.objects.create(name="Bob")
++    
++    Book.objects.create(title="Book by Alice", author=author1)
++    Book.objects.create(title="Another Book by Alice", author=author1)
++    Book.objects.create(title="Book by Bob", author=author2)
++    
++    # Test the issue: multiple FilteredRelation with same relation but different conditions
++    qs = Author.objects.annotate(
++        book_alice=FilteredRelation(
++            "book",
++            condition=Q(book__title__icontains="alice")
++        ),
++        book_bob=FilteredRelation(
++            "book", 
++            condition=Q(book__title__icontains="bob")
++        )
++    )
++    
++    # Print the generated SQL to see the issue
++    print("Generated SQL:")
++    print(str(qs.query))
++    print("\n" + "="*50 + "\n")
++    
++    # Try to execute the query
++    try:
++        results = list(qs)
++        print("Query executed successfully")
++        print(f"Number of results: {len(results)}")
++        for result in results:
++            print(f"{result.name}: {result}")
++    except Exception as e:
++        print(f"Error executing query: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    test_multiple_filtered_relations()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..ba3af6d458
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q, F, Case, When
++from django.db.models import FilteredRelation
++
++# Create simple test models
++class Author(models.Model):
++    name = models.CharField(max_length=50)
++    
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=255)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE, related_name='books', related_query_name='book')
++    price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_multiple_filtered_relations():
++    from django.db import connection
++    
++    # Create tables using Django's schema editor
++    with connection.schema_editor() as schema_editor:
++        for model in [Author, Book]:
++            schema_editor.create_model(model)
++    
++    # Create test data
++    author1 = Author.objects.create(name="Alice")
++    author2 = Author.objects.create(name="Bob")
++    
++    Book.objects.create(title="Book by Alice", author=author1, price=100.00)
++    Book.objects.create(title="Another Book by Alice", author=author1, price=150.00)
++    Book.objects.create(title="Book by Bob", author=author2, price=200.00)
++    
++    # Test multiple FilteredRelation with same relation but different conditions
++    qs = Author.objects.annotate(
++        cheap_books=FilteredRelation(
++            "book",
++            condition=Q(book__price__lt=120)
++        ),
++        expensive_books=FilteredRelation(
++            "book", 
++            condition=Q(book__price__gte=120)
++        )
++    )
++    
++    # Print the generated SQL to see if multiple JOINs are created
++    print("Generated SQL:")
++    sql = str(qs.query)
++    print(sql)
++    print("\n" + "="*50 + "\n")
++    
++    # Count the number of JOINs for the book table
++    join_count = sql.lower().count('join {} book'.format(connection.ops.quote_name('test_book')))
++    print(f"Number of JOINs for book table: {join_count}")
++    
++    # Try to execute the query
++    try:
++        results = list(qs)
++        print("Query executed successfully")
++        print(f"Number of results: {len(results)}")
++        for result in results:
++            print(f"{result.name}: cheap_books={hasattr(result, 'cheap_books')}, expensive_books={hasattr(result, 'expensive_books')}")
++    except Exception as e:
++        print(f"Error executing query: {e}")
++        import traceback
++        traceback.print_exc()
++    
++    return join_count > 1  # Should be True if fix works
++
++if __name__ == '__main__':
++    success = test_multiple_filtered_relations()
++    if success:
++        print("\n✅ SUCCESS: Multiple JOINs were generated for the same relation!")
++    else:
++        print("\n❌ FAILURE: Only one JOIN was generated for the same relation!")
+\ No newline at end of file

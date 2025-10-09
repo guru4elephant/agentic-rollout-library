@@ -1,0 +1,313 @@
+diff --git a/django/core/validators.py b/django/core/validators.py
+index a385819510..9e96720a11 100644
+--- a/django/core/validators.py
++++ b/django/core/validators.py
+@@ -101,6 +101,10 @@ class URLValidator(RegexValidator):
+     def __call__(self, value):
+         if not isinstance(value, str):
+             raise ValidationError(self.message, code=self.code, params={'value': value})
++        # Check for control characters (LF, CR, tab) that are stripped by urlsplit()
++        # in Python versions with bpo-43882 fix
++        if any(c in value for c in ('\n', '\r', '\t')):
++            raise ValidationError(self.message, code=self.code, params={'value': value})
+         # Check if the scheme is valid.
+         scheme = value.split('://')[0].lower()
+         if scheme not in self.schemes:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..a1af0308bf
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++        SECRET_KEY='test-key-for-validation',
++    )
++    django.setup()
++
++from django.core.validators import URLValidator
++from django.core.exceptions import ValidationError
++
++def test_url_validator_issue():
++    """Test the URLValidator with the specific cases that fail due to bpo-43882"""
++    
++    validator = URLValidator()
++    
++    # Test cases from the issue that should raise ValidationError but don't on Python >= 3.9.7
++    test_cases = [
++        'http://www.djangoproject.com/\n',
++        'http://[::ffff:192.9.5.5]\n'
++    ]
++    
++    print("Testing URLValidator with bpo-43882 related cases...")
++    print("=" * 60)
++    
++    for i, url in enumerate(test_cases, 1):
++        print(f"Test {i}: {repr(url)}")
++        try:
++            validator(url)
++            print(f"  ❌ FAIL: Expected ValidationError but none was raised")
++            print(f"  This indicates the issue exists - URL with newline was accepted")
++        except ValidationError as e:
++            print(f"  ✅ PASS: ValidationError correctly raised: {e}")
++        print()
++
++if __name__ == "__main__":
++    test_url_validator_issue()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..2a88958483
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++        SECRET_KEY='test-key-for-validation',
++    )
++    django.setup()
++
++from django.core.validators import URLValidator
++from django.core.exceptions import ValidationError
++
++def test_comprehensive():
++    """Comprehensive test for control characters in URLs"""
++    
++    validator = URLValidator()
++    
++    # Test control characters in different positions
++    test_cases = [
++        # Control characters at the end
++        'http://example.com/\n',
++        'http://example.com/\r',
++        'http://example.com/\t',
++        # Control characters in the middle
++        'http://example.com/path\nwith/newline',
++        'http://example.com/path\rwith/carriage',
++        'http://example.com/path\twith/tab',
++        # Control characters at the beginning (should still be invalid scheme)
++        '\nhttp://example.com/',
++        '\rhttp://example.com/',
++        '\thttp://example.com/',
++        # Multiple control characters
++        'http://example.com/\n\r\t',
++        'http://example.com/path\nwith\nmultiple\nnewlines',
++        # Mixed control characters
++        'http://example.com/path\nwith\tmixed\rcontrols',
++    ]
++    
++    print("Comprehensive test for control characters in URLs...")
++    print("=" * 60)
++    
++    for i, url in enumerate(test_cases, 1):
++        print(f"Test {i}: {repr(url)}")
++        try:
++            validator(url)
++            print(f"  ❌ FAIL: Expected ValidationError but none was raised")
++        except ValidationError as e:
++            print(f"  ✅ PASS: ValidationError correctly raised")
++        print()
++
++if __name__ == "__main__":
++    test_comprehensive()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..2a1c22e78d
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++        SECRET_KEY='test-key-for-validation',
++    )
++    django.setup()
++
++from django.core.validators import URLValidator
++from django.core.exceptions import ValidationError
++
++def test_edge_cases():
++    """Test edge cases to ensure the fix doesn't break valid URLs"""
++    
++    validator = URLValidator()
++    
++    # Test cases that should work (valid URLs)
++    valid_urls = [
++        'http://www.djangoproject.com/',
++        'https://example.com/path',
++        'ftp://ftp.example.com',
++        'http://[::ffff:192.9.5.5]',
++        'http://localhost:8000',
++    ]
++    
++    # Test cases that should fail (contain control characters)
++    invalid_urls = [
++        'http://www.djangoproject.com/\n',
++        'http://[::ffff:192.9.5.5]\n',
++        'http://example.com/\t',
++        'http://example.com/\r',
++        'http://example.com/path\nwith\nnewlines',
++    ]
++    
++    print("Testing edge cases for URLValidator fix...")
++    print("=" * 60)
++    
++    print("Valid URLs (should pass):")
++    for i, url in enumerate(valid_urls, 1):
++        print(f"  Test {i}: {repr(url)}")
++        try:
++            validator(url)
++            print(f"    ✅ PASS: URL accepted")
++        except ValidationError as e:
++            print(f"    ❌ FAIL: Unexpected ValidationError: {e}")
++        print()
++    
++    print("Invalid URLs (should fail):")
++    for i, url in enumerate(invalid_urls, 1):
++        print(f"  Test {i}: {repr(url)}")
++        try:
++            validator(url)
++            print(f"    ❌ FAIL: Expected ValidationError but none was raised")
++        except ValidationError as e:
++            print(f"    ✅ PASS: ValidationError correctly raised")
++        print()
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_urlsplit_behavior.py b/test_urlsplit_behavior.py
+new file mode 100644
+index 0000000000..769ac5028b
+--- /dev/null
++++ b/test_urlsplit_behavior.py
+@@ -0,0 +1,31 @@
++#!/usr/bin/env python3
++
++from urllib.parse import urlsplit
++
++def test_urlsplit_behavior():
++    """Test how urlsplit behaves with control characters"""
++    
++    test_urls = [
++        'http://www.djangoproject.com/\n',
++        'http://[::ffff:192.9.5.5]\n',
++        'http://example.com/\t',
++        'http://example.com/\r',
++        'http://example.com/ normal',
++    ]
++    
++    print("Testing urlsplit behavior with control characters...")
++    print("=" * 60)
++    
++    for url in test_urls:
++        print(f"Input: {repr(url)}")
++        try:
++            result = urlsplit(url)
++            print(f"  Result: {result}")
++            print(f"  Netloc: {repr(result.netloc)}")
++            print(f"  Path: {repr(result.path)}")
++        except Exception as e:
++            print(f"  Error: {e}")
++        print()
++
++if __name__ == "__main__":
++    test_urlsplit_behavior()
+\ No newline at end of file
+diff --git a/test_valid_urls.py b/test_valid_urls.py
+new file mode 100644
+index 0000000000..fa37fba194
+--- /dev/null
++++ b/test_valid_urls.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++        SECRET_KEY='test-key-for-validation',
++    )
++    django.setup()
++
++from django.core.validators import URLValidator
++from django.core.exceptions import ValidationError
++
++def test_valid_urls():
++    """Test that valid URLs still work correctly"""
++    
++    validator = URLValidator()
++    
++    # Various valid URLs that should pass
++    valid_urls = [
++        'http://example.com/',
++        'https://example.com/path',
++        'ftp://ftp.example.com',
++        'http://localhost:8000',
++        'http://127.0.0.1:8000',
++        'http://[::1]:8000',
++        'http://[2001:db8::1]:8000',
++        'http://example.com/path?query=value',
++        'http://example.com/path#fragment',
++        'http://example.com/path?query=value#fragment',
++        'http://subdomain.example.com/',
++        'http://example.com/path-with-dashes',
++        'http://example.com/path_with_underscores',
++        'http://example.com/path.with.dots',
++        'http://example.com/path%20with%20spaces',
++    ]
++    
++    print("Testing valid URLs to ensure they still work...")
++    print("=" * 60)
++    
++    for i, url in enumerate(valid_urls, 1):
++        print(f"Test {i}: {repr(url)}")
++        try:
++            validator(url)
++            print(f"  ✅ PASS: URL accepted")
++        except ValidationError as e:
++            print(f"  ❌ FAIL: Unexpected ValidationError: {e}")
++        print()
++
++if __name__ == "__main__":
++    test_valid_urls()
+\ No newline at end of file

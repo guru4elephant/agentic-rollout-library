@@ -1,0 +1,296 @@
+diff --git a/debug_collection.py b/debug_collection.py
+new file mode 100644
+index 000000000..a7f053adb
+--- /dev/null
++++ b/debug_collection.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++"""
++Debug script to understand exactly what pytest is collecting.
++"""
++
++import os
++import tempfile
++import subprocess
++import sys
++
++def debug_collection():
++    """Debug what pytest is collecting."""
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create the exact same structure as in the GitHub issue
++        foobar_dir = os.path.join(tmpdir, 'foobar')
++        os.makedirs(foobar_dir)
++        
++        # Create __init__.py with assert False (exactly as in the issue)
++        with open(os.path.join(foobar_dir, '__init__.py'), 'w') as f:
++            f.write('assert False\n')
++        
++        # Create a simple test file (exactly as in the issue)
++        test_file = os.path.join(tmpdir, 'test_foo.py')
++        with open(test_file, 'w') as f:
++            f.write('def test_example():\n')
++            f.write('    assert True\n')
++        
++        # Change to the temporary directory
++        original_cwd = os.getcwd()
++        os.chdir(tmpdir)
++        
++        try:
++            # Run pytest with very verbose output to see what's being collected
++            result = subprocess.run([
++                sys.executable, '-m', 'pytest', '--collect-only', '-v', '--tb=short'
++            ], capture_output=True, text=True, cwd=tmpdir)
++            
++            print("STDOUT:")
++            print(result.stdout)
++            print("STDERR:")
++            print(result.stderr)
++            print("Return code:", result.returncode)
++            
++            # Also check what happens with specific file patterns
++            result2 = subprocess.run([
++                sys.executable, '-m', 'pytest', '--collect-only', '-v', 'foobar/__init__.py'
++            ], capture_output=True, text=True, cwd=tmpdir)
++            
++            print("\n=== Specific file collection ===")
++            print("STDOUT:")
++            print(result2.stdout)
++            print("STDERR:")
++            print(result2.stderr)
++            print("Return code:", result2.returncode)
++                
++        finally:
++            os.chdir(original_cwd)
++
++if __name__ == '__main__':
++    debug_collection()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..188e4e1a8
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the pytest 5.2.3 regression issue.
++The issue is that pytest tries to collect __init__.py files when it shouldn't.
++"""
++
++import os
++import tempfile
++import shutil
++import subprocess
++import sys
++
++def test_reproduce_issue():
++    # Create a temporary directory for the test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create the problematic directory structure
++        foobar_dir = os.path.join(tmpdir, 'foobar')
++        os.makedirs(foobar_dir)
++        
++        # Create __init__.py with assert False to trigger the error
++        with open(os.path.join(foobar_dir, '__init__.py'), 'w') as f:
++            f.write('assert False\n')
++        
++        # Create a simple test file
++        test_file = os.path.join(tmpdir, 'test_foo.py')
++        with open(test_file, 'w') as f:
++            f.write('def test_example():\n')
++            f.write('    assert True\n')
++        
++        # Change to the temporary directory
++        original_cwd = os.getcwd()
++        os.chdir(tmpdir)
++        
++        try:
++            # Run pytest and capture the output
++            result = subprocess.run([
++                sys.executable, '-m', 'pytest', '--collect-only', '-v'
++            ], capture_output=True, text=True, cwd=tmpdir)
++            
++            print("STDOUT:")
++            print(result.stdout)
++            print("STDERR:")
++            print(result.stderr)
++            print("Return code:", result.returncode)
++            
++            # Check if pytest tried to collect the __init__.py file
++            if 'foobar/__init__.py' in result.stderr or 'foobar/__init__.py' in result.stdout:
++                print("ERROR: pytest is incorrectly collecting __init__.py files!")
++                return False
++            else:
++                print("SUCCESS: pytest is not collecting __init__.py files")
++                return True
++                
++        finally:
++            os.chdir(original_cwd)
++
++if __name__ == '__main__':
++    success = test_reproduce_issue()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/src/_pytest/python.py b/src/_pytest/python.py
+index 306e5f217..4bd8f1fdf 100644
+--- a/src/_pytest/python.py
++++ b/src/_pytest/python.py
+@@ -178,7 +178,7 @@ def pytest_collect_file(path, parent):
+     if ext == ".py":
+         if not parent.session.isinitpath(path):
+             if not path_matches_patterns(
+-                path, parent.config.getini("python_files") + ["__init__.py"]
++                path, parent.config.getini("python_files")
+             ):
+                 return
+         ihook = parent.session.gethookproxy(path)
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 000000000..909eaed5d
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix doesn't break normal pytest functionality.
++"""
++
++import os
++import tempfile
++import subprocess
++import sys
++
++def test_normal_collection():
++    """Test that normal Python files are still collected correctly."""
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create a normal test file
++        test_file = os.path.join(tmpdir, 'test_normal.py')
++        with open(test_file, 'w') as f:
++            f.write('def test_normal():\n')
++            f.write('    assert True\n')
++        
++        # Create a package with __init__.py (should NOT be collected)
++        pkg_dir = os.path.join(tmpdir, 'mypackage')
++        os.makedirs(pkg_dir)
++        init_file = os.path.join(pkg_dir, '__init__.py')
++        with open(init_file, 'w') as f:
++            f.write('assert False  # This should not be collected\n')
++        
++        # Create a test file inside the package (should be collected)
++        pkg_test_file = os.path.join(pkg_dir, 'test_package.py')
++        with open(pkg_test_file, 'w') as f:
++            f.write('def test_package():\n')
++            f.write('    assert True\n')
++        
++        # Change to the temporary directory
++        original_cwd = os.getcwd()
++        os.chdir(tmpdir)
++        
++        try:
++            # Run pytest and capture the output
++            result = subprocess.run([
++                sys.executable, '-m', 'pytest', '--collect-only', '-v'
++            ], capture_output=True, text=True, cwd=tmpdir)
++            
++            print("STDOUT:")
++            print(result.stdout)
++            print("STDERR:")
++            print(result.stderr)
++            print("Return code:", result.returncode)
++            
++            # Check that normal test files are collected
++            if 'test_normal.py' not in result.stdout:
++                print("ERROR: Normal test file not collected!")
++                return False
++            
++            if 'test_package.py' not in result.stdout:
++                print("ERROR: Package test file not collected!")
++                return False
++            
++            # Check that __init__.py is NOT collected
++            if 'mypackage/__init__.py' in result.stderr or 'mypackage/__init__.py' in result.stdout:
++                print("ERROR: __init__.py file is still being collected!")
++                return False
++            
++            print("SUCCESS: Normal collection works correctly, __init__.py is ignored")
++            return True
++                
++        finally:
++            os.chdir(original_cwd)
++
++if __name__ == '__main__':
++    success = test_normal_collection()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 000000000..db8e44c31
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++"""
++Test script that exactly reproduces the original GitHub issue scenario.
++"""
++
++import os
++import tempfile
++import subprocess
++import sys
++
++def test_original_issue():
++    """Test the exact scenario from the GitHub issue."""
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create the exact same structure as in the GitHub issue
++        foobar_dir = os.path.join(tmpdir, 'foobar')
++        os.makedirs(foobar_dir)
++        
++        # Create __init__.py with assert False (exactly as in the issue)
++        with open(os.path.join(foobar_dir, '__init__.py'), 'w') as f:
++            f.write('assert False\n')
++        
++        # Create a simple test file (exactly as in the issue)
++        test_file = os.path.join(tmpdir, 'test_foo.py')
++        with open(test_file, 'w') as f:
++            f.write('def test_example():\n')
++            f.write('    assert True\n')
++        
++        # Change to the temporary directory
++        original_cwd = os.getcwd()
++        os.chdir(tmpdir)
++        
++        try:
++            # Run pytest exactly as it would be run in the issue
++            result = subprocess.run([
++                sys.executable, '-m', 'pytest'
++            ], capture_output=True, text=True, cwd=tmpdir)
++            
++            print("STDOUT:")
++            print(result.stdout)
++            print("STDERR:")
++            print(result.stderr)
++            print("Return code:", result.returncode)
++            
++            # The original issue was that pytest 5.2.3 would try to collect 
++            # foobar/__init__.py as a test module and fail with AssertionError
++            # We expect this to NOT happen anymore
++            
++            if 'foobar/__init__.py' in result.stderr and 'AssertionError' in result.stderr:
++                print("ERROR: pytest is still collecting __init__.py files!")
++                return False
++                
++            # We expect the test to pass (return code 0)
++            if result.returncode == 0:
++                print("SUCCESS: pytest no longer collects __init__.py files")
++                return True
++            else:
++                print("ERROR: pytest failed with return code", result.returncode)
++                return False
++                
++        finally:
++            os.chdir(original_cwd)
++
++if __name__ == '__main__':
++    success = test_original_issue()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

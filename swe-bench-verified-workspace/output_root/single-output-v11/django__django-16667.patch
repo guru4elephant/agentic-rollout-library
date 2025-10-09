@@ -1,0 +1,307 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..833ee58804
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,138 @@
++#!/usr/bin/env python3
++"""Comprehensive test to verify the SelectDateWidget fix."""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.forms import SelectDateWidget
++from django.http import QueryDict
++
++class TestForm(forms.Form):
++    my_date = forms.DateField(widget=SelectDateWidget())
++
++def test_normal_cases():
++    """Test that normal date inputs still work correctly."""
++    print("Testing normal cases...")
++    
++    # Valid date
++    query_dict = QueryDict('my_date_day=15&my_date_month=4&my_date_year=2023')
++    form = TestForm(query_dict)
++    assert form.is_valid(), f"Form should be valid but got errors: {form.errors}"
++    assert form.cleaned_data['my_date'].strftime('%Y-%m-%d') == '2023-04-15'
++    print("✓ Valid date works correctly")
++    
++    # Empty values
++    query_dict = QueryDict('my_date_day=&my_date_month=&my_date_year=')
++    form = TestForm(query_dict)
++    assert not form.is_valid(), "Empty values should make form invalid"
++    print("✓ Empty values handled correctly")
++
++def test_overflow_cases():
++    """Test that overflow cases are handled gracefully."""
++    print("Testing overflow cases...")
++    
++    # Very large year (original issue)
++    query_dict = QueryDict('my_date_day=1&my_date_month=1&my_date_year=1234567821345678')
++    form = TestForm(query_dict)
++    try:
++        is_valid = form.is_valid()
++        assert not is_valid, "Very large year should make form invalid"
++        print("✓ Very large year handled gracefully")
++    except OverflowError:
++        assert False, "OverflowError should not be raised"
++    
++    # Very large month
++    query_dict = QueryDict('my_date_day=1&my_date_month=9999999999&my_date_year=2023')
++    form = TestForm(query_dict)
++    try:
++        is_valid = form.is_valid()
++        assert not is_valid, "Very large month should make form invalid"
++        print("✓ Very large month handled gracefully")
++    except OverflowError:
++        assert False, "OverflowError should not be raised"
++    
++    # Very large day
++    query_dict = QueryDict('my_date_day=9999999999&my_date_month=1&my_date_year=2023')
++    form = TestForm(query_dict)
++    try:
++        is_valid = form.is_valid()
++        assert not is_valid, "Very large day should make form invalid"
++        print("✓ Very large day handled gracefully")
++    except OverflowError:
++        assert False, "OverflowError should not be raised"
++
++def test_edge_cases():
++    """Test various edge cases."""
++    print("Testing edge cases...")
++    
++    # Negative values
++    test_cases = [
++        ('my_date_day=-1&my_date_month=1&my_date_year=2023', 'negative day'),
++        ('my_date_day=1&my_date_month=-1&my_date_year=2023', 'negative month'),
++        ('my_date_day=1&my_date_month=1&my_date_year=-2023', 'negative year'),
++    ]
++    
++    for query_string, description in test_cases:
++        query_dict = QueryDict(query_string)
++        form = TestForm(query_dict)
++        try:
++            is_valid = form.is_valid()
++            assert not is_valid, f"{description} should make form invalid"
++            print(f"✓ {description} handled gracefully")
++        except Exception as e:
++            assert False, f"Unexpected exception for {description}: {e}"
++
++def test_value_from_datadict_directly():
++    """Test the value_from_datadict method directly."""
++    print("Testing value_from_datadict method directly...")
++    
++    widget = SelectDateWidget()
++    data = {
++        'my_date_day': '1',
++        'my_date_month': '1', 
++        'my_date_year': '1234567821345678'
++    }
++    
++    try:
++        result = widget.value_from_datadict(data, {}, 'my_date')
++        # Should return a string like "1234567821345678-1-1" instead of raising OverflowError
++        assert isinstance(result, str), f"Expected string, got {type(result)}: {result}"
++        assert result == "1234567821345678-1-1", f"Unexpected result: {result}"
++        print("✓ value_from_datadict handles overflow correctly")
++    except OverflowError:
++        assert False, "OverflowError should not be raised in value_from_datadict"
++
++if __name__ == '__main__':
++    print("Running comprehensive SelectDateWidget tests...")
++    
++    try:
++        test_normal_cases()
++        test_overflow_cases()
++        test_edge_cases()
++        test_value_from_datadict_directly()
++        
++        print("\n✅ All tests passed! The fix works correctly.")
++        
++    except AssertionError as e:
++        print(f"\n❌ Test failed: {e}")
++        sys.exit(1)
++    except Exception as e:
++        print(f"\n❌ Unexpected error: {e}")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/django/forms/widgets.py b/django/forms/widgets.py
+index 842b73e95c..f4bc74b7cd 100644
+--- a/django/forms/widgets.py
++++ b/django/forms/widgets.py
+@@ -1157,7 +1157,7 @@ class SelectDateWidget(Widget):
+             input_format = formats.sanitize_strftime_format(input_format)
+             try:
+                 date_value = datetime.date(int(y), int(m), int(d))
+-            except ValueError:
++            except (ValueError, OverflowError):
+                 # Return pseudo-ISO dates with zeros for any unselected values,
+                 # e.g. '2017-0-23'.
+                 return "%s-%s-%s" % (y or 0, m or 0, d or 0)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e616e2fc03
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++"""Script to reproduce the OverflowError issue with SelectDateWidget."""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.forms import SelectDateWidget
++from django.http import QueryDict
++
++class ReproForm(forms.Form):
++    my_date = forms.DateField(widget=SelectDateWidget())
++
++def test_overflow_error():
++    """Test that reproduces the OverflowError issue."""
++    # Create a query dict with a very large year value
++    query_dict = QueryDict('my_date_day=1&my_date_month=1&my_date_year=1234567821345678')
++    
++    form = ReproForm(query_dict)
++    
++    try:
++        is_valid = form.is_valid()
++        print(f"Form validation result: {is_valid}")
++        if not is_valid:
++            print(f"Form errors: {form.errors}")
++    except OverflowError as e:
++        print(f"OverflowError caught: {e}")
++        return False
++    except Exception as e:
++        print(f"Other error caught: {e}")
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    print("Testing SelectDateWidget OverflowError...")
++    success = test_overflow_error()
++    if success:
++        print("Test passed - no OverflowError occurred")
++    else:
++        print("Test failed - OverflowError occurred")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..34efe9d88a
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""Script to test edge cases for the SelectDateWidget fix."""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django import forms
++from django.forms import SelectDateWidget
++from django.http import QueryDict
++
++class ReproForm(forms.Form):
++    my_date = forms.DateField(widget=SelectDateWidget())
++
++def test_edge_cases():
++    """Test various edge cases for the OverflowError fix."""
++    test_cases = [
++        # Original issue case
++        ('my_date_day=1&my_date_month=1&my_date_year=1234567821345678', 'Very large year'),
++        # Other large values
++        ('my_date_day=9999999999&my_date_month=1&my_date_year=2023', 'Very large day'),
++        ('my_date_day=1&my_date_month=9999999999&my_date_year=2023', 'Very large month'),
++        # Negative values
++        ('my_date_day=-1&my_date_month=1&my_date_year=2023', 'Negative day'),
++        ('my_date_day=1&my_date_month=-1&my_date_year=2023', 'Negative month'),
++        ('my_date_day=1&my_date_month=1&my_date_year=-2023', 'Negative year'),
++        # Zero values
++        ('my_date_day=0&my_date_month=1&my_date_year=2023', 'Zero day'),
++        ('my_date_day=1&my_date_month=0&my_date_year=2023', 'Zero month'),
++        ('my_date_day=1&my_date_month=1&my_date_year=0', 'Zero year'),
++        # Empty values
++        ('my_date_day=&my_date_month=1&my_date_year=2023', 'Empty day'),
++        ('my_date_day=1&my_date_month=&my_date_year=2023', 'Empty month'),
++        ('my_date_day=1&my_date_month=1&my_date_year=', 'Empty year'),
++    ]
++    
++    all_passed = True
++    
++    for query_string, description in test_cases:
++        print(f"\nTesting: {description}")
++        query_dict = QueryDict(query_string)
++        form = ReproForm(query_dict)
++        
++        try:
++            is_valid = form.is_valid()
++            print(f"  Form validation result: {is_valid}")
++            if not is_valid:
++                print(f"  Form errors: {form.errors}")
++        except Exception as e:
++            print(f"  ERROR: {type(e).__name__}: {e}")
++            all_passed = False
++    
++    return all_passed
++
++if __name__ == '__main__':
++    print("Testing SelectDateWidget edge cases...")
++    success = test_edge_cases()
++    if success:
++        print("\nAll tests passed - no exceptions occurred")
++    else:
++        print("\nSome tests failed - exceptions occurred")
++        sys.exit(1)
+\ No newline at end of file

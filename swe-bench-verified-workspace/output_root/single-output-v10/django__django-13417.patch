@@ -1,0 +1,394 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 85cd8311a7..3e81aafb83 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1225,6 +1225,11 @@ class QuerySet:
+         if self.query.extra_order_by or self.query.order_by:
+             return True
+         elif self.query.default_ordering and self.query.get_meta().ordering:
++            # Check if GROUP BY operations would remove ordering
++            if self.query.group_by is not None:
++                # If there's a GROUP BY clause, ordering from model Meta.ordering
++                # will be removed in the final SQL, so we should return False
++                return False
+             return True
+         else:
+             return False
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..f4c689af3c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with QuerySet.ordered property being incorrect
++for GROUP BY queries on models with Meta.ordering.
++"""
++
++import os
++import sys
++import django
++import uuid
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count
++
++# Create a simple model with default ordering
++class Foo(models.Model):
++    uuid = models.UUIDField(primary_key=True, default=uuid.uuid4)
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        ordering = ['name']
++        app_label = 'test'
++
++def test_ordered_property():
++    print("Testing QuerySet.ordered property issue...")
++    
++    # Test 1: Basic queryset with default ordering
++    qs = Foo.objects.all()
++    print(f"Test 1 - Basic queryset:")
++    print(f"  SQL: {str(qs.query)}")
++    print(f"  qs.ordered: {qs.ordered}")
++    print(f"  qs.query.default_ordering: {qs.query.default_ordering}")
++    print()
++    
++    # Test 2: Annotated queryset with GROUP BY
++    qs2 = Foo.objects.annotate(Count("pk")).all()
++    print(f"Test 2 - Annotated queryset:")
++    print(f"  SQL: {str(qs2.query)}")
++    print(f"  q2.ordered: {qs2.ordered}")
++    print(f"  qs2.query.default_ordering: {qs2.query.default_ordering}")
++    print()
++    
++    # The issue: qs2.ordered should be False because GROUP BY removes ORDER BY
++    # but currently it returns True
++    
++    if qs2.ordered:
++        print("BUG CONFIRMED: qs2.ordered returns True but should return False")
++        print("because GROUP BY operations remove ORDER BY from the SQL query")
++        return False
++    else:
++        print("Bug appears to be fixed!")
++        return True
++
++if __name__ == "__main__":
++    import uuid
++    test_ordered_property()
+\ No newline at end of file
+diff --git a/test_basic_functionality.py b/test_basic_functionality.py
+new file mode 100644
+index 0000000000..b03ab68358
+--- /dev/null
++++ b/test_basic_functionality.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++"""
++Test to ensure basic functionality is not broken by our fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model with default ordering
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField()
++
++    class Meta:
++        ordering = ['name']
++        app_label = 'test'
++
++def test_basic_functionality():
++    print("Testing basic functionality...")
++    
++    # Test 1: Basic all() query
++    qs = TestModel.objects.all()
++    assert qs.ordered == True, "Basic queryset should be ordered"
++    print("✓ Basic queryset ordered property works")
++    
++    # Test 2: Filter query
++    qs2 = TestModel.objects.filter(value=42)
++    assert qs2.ordered == True, "Filtered queryset should be ordered"
++    print("✓ Filtered queryset ordered property works")
++    
++    # Test 3: Order by specific field
++    qs3 = TestModel.objects.order_by('value')
++    assert qs3.ordered == True, "Explicitly ordered queryset should be ordered"
++    print("✓ Explicitly ordered queryset ordered property works")
++    
++    # Test 4: Values query
++    qs4 = TestModel.objects.values('name')
++    assert qs4.ordered == True, "Values queryset should be ordered"
++    print("✓ Values queryset ordered property works")
++    
++    # Test 5: Empty queryset (using none() method)
++    empty_qs = TestModel.objects.none()
++    assert empty_qs.ordered == True, "Empty queryset should be ordered"
++    print("✓ Empty queryset ordered property works")
++    
++    print("All basic functionality tests passed!")
++
++if __name__ == "__main__":
++    test_basic_functionality()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..81777a3c72
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,111 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the QuerySet.ordered property fix
++handles various edge cases correctly.
++"""
++
++import os
++import sys
++import django
++import uuid
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count, F
++
++# Create a simple model with default ordering
++class Foo(models.Model):
++    uuid = models.UUIDField(primary_key=True, default=uuid.uuid4)
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        ordering = ['name']
++        app_label = 'test'
++
++def test_comprehensive_ordered_property():
++    print("Testing comprehensive QuerySet.ordered property scenarios...")
++    
++    # Test 1: Basic queryset with default ordering
++    qs = Foo.objects.all()
++    print(f"Test 1 - Basic queryset:")
++    print(f"  SQL: {str(qs.query)}")
++    print(f"  qs.ordered: {qs.ordered}")
++    print(f"  qs.query.default_ordering: {qs.query.default_ordering}")
++    assert qs.ordered == True, "Basic queryset should be ordered"
++    print()
++    
++    # Test 2: Annotated queryset with GROUP BY (the main issue)
++    qs2 = Foo.objects.annotate(Count("pk")).all()
++    print(f"Test 2 - Annotated queryset:")
++    print(f"  SQL: {str(qs2.query)}")
++    print(f"  qs2.ordered: {qs2.ordered}")
++    print(f"  qs2.query.default_ordering: {qs2.query.default_ordering}")
++    assert qs2.ordered == False, "Annotated queryset should NOT be ordered due to GROUP BY"
++    print()
++    
++    # Test 3: Explicit order_by should still work
++    qs3 = Foo.objects.annotate(Count("pk")).order_by('name')
++    print(f"Test 3 - Annotated with explicit order_by:")
++    print(f"  SQL: {str(qs3.query)}")
++    print(f"  qs3.ordered: {qs3.ordered}")
++    print(f"  qs3.query.default_ordering: {qs3.query.default_ordering}")
++    assert qs3.ordered == True, "Explicit order_by should still result in ordered queryset"
++    print()
++    
++    # Test 4: Values queryset with GROUP BY
++    qs4 = Foo.objects.values('name').annotate(count=Count('pk'))
++    print(f"Test 4 - Values + annotated queryset:")
++    print(f"  SQL: {str(qs4.query)}")
++    print(f"  qs4.ordered: {qs4.ordered}")
++    print(f"  qs4.query.default_ordering: {qs4.query.default_ordering}")
++    assert qs4.ordered == False, "Values + annotated queryset should NOT be ordered due to GROUP BY"
++    print()
++    
++    # Test 5: Queryset without default ordering
++    class Bar(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test'
++    
++    qs5 = Bar.objects.all()
++    print(f"Test 5 - Queryset without default ordering:")
++    print(f"  SQL: {str(qs5.query)}")
++    print(f"  qs5.ordered: {qs5.ordered}")
++    print(f"  qs5.query.default_ordering: {qs5.query.default_ordering}")
++    assert qs5.ordered == False, "Queryset without default ordering should not be ordered"
++    print()
++    
++    # Test 6: Queryset with explicit order_by but no default ordering
++    qs6 = Bar.objects.order_by('name')
++    print(f"Test 6 - Queryset with explicit order_by but no default ordering:")
++    print(f"  SQL: {str(qs6.query)}")
++    print(f"  qs6.ordered: {qs6.ordered}")
++    print(f"  qs6.query.default_ordering: {qs6.query.default_ordering}")
++    assert qs6.ordered == True, "Queryset with explicit order_by should be ordered"
++    print()
++    
++    print("All tests passed! The fix correctly handles all edge cases.")
++
++if __name__ == "__main__":
++    test_comprehensive_ordered_property()
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..60458b20f3
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++"""
++Test to specifically verify the GitHub issue is fixed.
++This reproduces the exact scenario described in the issue.
++"""
++
++import os
++import sys
++import django
++import uuid
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count
++
++# Create the exact model from the GitHub issue
++class Foo(models.Model):
++    uuid = models.UUIDField(primary_key=True, default=uuid.uuid4)
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        ordering = ['name']
++        app_label = 'test'
++
++def test_github_issue():
++    print("Testing the exact GitHub issue scenario...")
++    
++    # Reproduce the exact code from the GitHub issue
++    qs = Foo.objects.all()
++    
++    # SQL should include ORDER BY
++    sql = str(qs.query)
++    print(f"qs SQL: {sql}")
++    assert "ORDER BY" in sql, "Basic queryset should have ORDER BY"
++    
++    # These should be True as described in the issue
++    print(f"qs.ordered: {qs.ordered}")
++    print(f"qs.query.default_ordering: {qs.query.default_ordering}")
++    assert qs.ordered == True, "Basic queryset should be ordered"
++    assert qs.query.default_ordering == True, "Default ordering should be True"
++    print()
++    
++    ############################################
++    
++    # This is the problematic case from the issue
++    qs2 = Foo.objects.annotate(Count("pk")).all()
++    
++    # SQL should NOT include ORDER BY due to GROUP BY
++    sql2 = str(qs2.query)
++    print(f"qs2 SQL: {sql2}")
++    assert "ORDER BY" not in sql2, "Annotated queryset should NOT have ORDER BY due to GROUP BY"
++    assert "GROUP BY" in sql2, "Annotated queryset should have GROUP BY"
++    
++    # This is the fix: qs2.ordered should now be False
++    print(f"qs2.ordered: {qs2.ordered}")
++    print(f"qs2.query.default_ordering: {qs2.query.default_ordering}")
++    
++    # Before the fix: qs2.ordered was incorrectly True
++    # After the fix: qs2.ordered should correctly be False
++    assert qs2.ordered == False, "Annotated queryset should NOT be ordered due to GROUP BY"
++    assert qs2.query.default_ordering == True, "Default ordering should still be True"
++    print()
++    
++    print("✅ GitHub issue is FIXED!")
++    print("✅ qs2.ordered now correctly returns False for GROUP BY queries")
++    print("✅ The ordered property accurately reflects the final SQL query")
++
++if __name__ == "__main__":
++    test_github_issue()
+\ No newline at end of file

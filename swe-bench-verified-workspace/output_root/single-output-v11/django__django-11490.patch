@@ -1,0 +1,165 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index a44adfc760..7ea2814497 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -425,7 +425,9 @@ class SQLCompiler:
+                 # If the columns list is limited, then all combined queries
+                 # must have the same columns list. Set the selects defined on
+                 # the query on all combined queries, if not already set.
+-                if not compiler.query.values_select and self.query.values_select:
++                if (not compiler.query.values_select and self.query.values_select) or \
++                   (compiler.query.values_select and self.query.values_select and 
++                    compiler.query.values_select != self.query.values_select):
+                     compiler.query.set_values((
+                         *self.query.extra_select,
+                         *self.query.values_select,
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..d2e89cd5da
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple test model
++class ReservedName(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++def test_issue():
++    from django.db import connection
++    connection.ensure_connection()
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(ReservedName)
++    
++    # Create test data
++    ReservedName.objects.create(name='a', order=2)
++    
++    # Test the issue
++    qs1 = ReservedName.objects.all()
++    
++    print("Testing values_list('name', 'order'):")
++    result1 = qs1.union(qs1).values_list('name', 'order').get()
++    print(f"Result: {result1}")
++    
++    print("\nTesting values_list('order'):")
++    result2 = qs1.union(qs1).values_list('order').get()
++    print(f"Result: {result2}")
++    
++    # Expected: ('a', 2) for first, (2) for second
++    # Actual bug: both return ('a', 2)
++
++if __name__ == '__main__':
++    test_issue()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..65444741d2
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple test model
++class ReservedName(models.Model):
++    name = models.CharField(max_length=100)
++    order = models.IntegerField()
++
++    class Meta:
++        app_label = 'test'
++
++def test_edge_cases():
++    from django.db import connection
++    connection.ensure_connection()
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(ReservedName)
++    
++    # Create test data
++    ReservedName.objects.create(name='a', order=2)
++    ReservedName.objects.create(name='b', order=3)
++    
++    qs1 = ReservedName.objects.all()
++    
++    print("=== Test 1: Original issue ===")
++    print("values_list('name', 'order'):", list(qs1.union(qs1).values_list('name', 'order')))
++    print("values_list('order'):", list(qs1.union(qs1).values_list('order')))
++    
++    print("\n=== Test 2: Multiple unions ===")
++    qs2 = ReservedName.objects.filter(order=2)
++    qs3 = ReservedName.objects.filter(order=3)
++    print("Union of qs2 and qs3 with values_list('name'):", list(qs2.union(qs3).values_list('name')))
++    print("Union of qs2 and qs3 with values_list('order'):", list(qs2.union(qs3).values_list('order')))
++    
++    print("\n=== Test 3: No values_list (should work as before) ===")
++    # Skip this test as it's not directly related to our fix
++    
++    print("\n=== Test 4: Empty values_select (should work as before) ===")
++    print("Union with empty values_list:", list(qs1.union(qs1).values_list()))
++    
++    print("\n=== Test 5: Chained values_list calls ===")
++    union_qs = qs1.union(qs1)
++    print("First values_list('name', 'order'):", list(union_qs.values_list('name', 'order')))
++    print("Second values_list('order'):", list(union_qs.values_list('order')))
++
++if __name__ == '__main__':
++    test_edge_cases()
+\ No newline at end of file

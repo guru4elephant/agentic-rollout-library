@@ -1,0 +1,726 @@
+diff --git a/django/db/migrations/autodetector.py b/django/db/migrations/autodetector.py
+index bf9c2acd26..f1238a3504 100644
+--- a/django/db/migrations/autodetector.py
++++ b/django/db/migrations/autodetector.py
+@@ -824,7 +824,7 @@ class MigrationAutodetector:
+         for app_label, model_name, field_name in sorted(self.new_field_keys - self.old_field_keys):
+             old_model_name = self.renamed_models.get((app_label, model_name), model_name)
+             old_model_state = self.from_state.models[app_label, old_model_name]
+-            new_model_state = self.to_state.models[app_label, old_model_name]
++            new_model_state = self.to_state.models[app_label, model_name]
+             field = new_model_state.get_field(field_name)
+             # Scan to see if this is actually a rename!
+             field_dec = self.deep_deconstruct(field)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..16dbe2a5d5
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the migration autodetector crash when renaming a model and field.
++"""
++
++import os
++import sys
++import tempfile
++import shutil
++from django.core.management import execute_from_command_line
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'test_one',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def create_test_app():
++    """Create a test app with models to reproduce the issue"""
++    # Create test_one app directory
++    test_one_dir = 'test_one'
++    if not os.path.exists(test_one_dir):
++        os.makedirs(test_one_dir)
++    
++    # Create __init__.py
++    with open(os.path.join(test_one_dir, '__init__.py'), 'w') as f:
++        f.write('')
++    
++    # Create apps.py
++    apps_content = '''
++from django.apps import AppConfig
++
++class TestOneConfig(AppConfig):
++    default_auto_field = 'django.db.models.BigAutoField'
++    name = 'test_one'
++'''
++    with open(os.path.join(test_one_dir, 'apps.py'), 'w') as f:
++        f.write(apps_content)
++    
++    # Create models.py with initial model
++    models_content = '''
++from django.db import models
++
++class MyModel(models.Model):
++    my_field = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_one'
++'''
++    with open(os.path.join(test_one_dir, 'models.py'), 'w') as f:
++        f.write(models_content)
++
++def run_makemigrations():
++    """Run makemigrations to trigger the bug"""
++    print("Running makemigrations...")
++    try:
++        # First create initial migration
++        execute_from_command_line(['manage.py', 'makemigrations', 'test_one', '--name', 'initial'])
++        print("Initial migration created successfully!")
++        
++        # Now update the model to rename both model and field
++        models_content_updated = '''
++from django.db import models
++
++class MyModel2(models.Model):
++    my_field_renamed = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_one'
++'''
++        with open('test_one/models.py', 'w') as f:
++            f.write(models_content_updated)
++        
++        # Clear migration cache to force detection
++        import django.db.migrations.state
++        django.db.migrations.state._states_cache.clear()
++        
++        # This should trigger the bug
++        execute_from_command_line(['manage.py', 'makemigrations', 'test_one'])
++        print("Makemigrations completed successfully!")
++    except Exception as e:
++        print(f"Error occurred: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    # Create test app
++    create_test_app()
++    
++    # Run makemigrations
++    run_makemigrations()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..239f042d4b
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the fix for the KeyError in generate_renamed_fields.
++"""
++
++import os
++import sys
++from django.conf import settings
++from django.db.migrations.state import ProjectState, ModelState
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_complete_scenario():
++    """Test the complete scenario that was causing the KeyError"""
++    
++    print("Testing the complete scenario...")
++    
++    # Create initial state with MyModel and my_field
++    initial_models = {
++        ('test_one', 'mymodel'): ModelState(
++            'test_one', 'MyModel', [
++                ('id', models.AutoField(primary_key=True)),
++                ('my_field', models.CharField(max_length=100)),
++            ]
++        )
++    }
++    
++    # Create new state with MyModel2 and my_field_renamed
++    new_models = {
++        ('test_one', 'mymodel2'): ModelState(
++            'test_one', 'MyModel2', [
++                ('id', models.AutoField(primary_key=True)),
++                ('my_field_renamed', models.CharField(max_length=100)),
++            ]
++        )
++    }
++    
++    from_state = ProjectState(initial_models)
++    to_state = ProjectState(new_models)
++    
++    # Create autodetector
++    from django.db.migrations.autodetector import MigrationAutodetector
++    from django.db.migrations.questioner import MigrationQuestioner
++    
++    # Create a mock questioner that answers "yes" to rename questions
++    class MockQuestioner(MigrationQuestioner):
++        def ask_rename_model(self, old_model_state, new_model_state):
++            print(f"Would rename model {old_model_state.name} to {new_model_state.name}")
++            return True
++            
++        def ask_rename(self, model_name, old_name, new_name, field):
++            print(f"Would rename field {old_name} to {new_name} in model {model_name}")
++            return True
++    
++    questioner = MockQuestioner()
++    autodetector = MigrationAutodetector(from_state, to_state, questioner)
++    
++    # Simulate the state after generate_renamed_models has been called
++    autodetector.renamed_models = {('test_one', 'mymodel2'): 'mymodel'}
++    autodetector.renamed_models_rel = {}
++    
++    # Set up the model keys to simulate the scenario
++    autodetector.old_model_keys = {('test_one', 'mymodel')}
++    autodetector.new_model_keys = {('test_one', 'mymodel2')}
++    autodetector.old_field_keys = {('test_one', 'mymodel', 'my_field')}
++    autodetector.new_field_keys = {('test_one', 'mymodel2', 'my_field_renamed')}
++    
++    try:
++        # Test the specific methods that were involved in the original issue
++        
++        # First, test generate_renamed_models (this should set up renamed_models)
++        print("Testing generate_renamed_models...")
++        autodetector.generate_renamed_models()
++        print(f"Renamed models: {autodetector.renamed_models}")
++        
++        # Then test generate_renamed_fields (this was causing the KeyError)
++        print("Testing generate_renamed_fields...")
++        autodetector.generate_renamed_fields()
++        print(f"Renamed fields: {autodetector.renamed_fields}")
++        
++        print("Success! All methods completed without KeyError.")
++        
++    except KeyError as e:
++        print(f"KeyError occurred: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    except Exception as e:
++        print(f"Other error occurred: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    
++    return True
++
++if __name__ == '__main__':
++    success = test_complete_scenario()
++    if success:
++        print("\n✅ Fix is working correctly!")
++    else:
++        print("\n❌ Fix is not working!")
+\ No newline at end of file
+diff --git a/test_final.py b/test_final.py
+new file mode 100644
+index 0000000000..91a8acec85
+--- /dev/null
++++ b/test_final.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++"""
++Final test to verify the fix for the KeyError in generate_renamed_fields.
++"""
++
++import os
++import sys
++from django.conf import settings
++from django.db.migrations.state import ProjectState, ModelState
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_keyerror_fix():
++    """Test the specific KeyError fix in generate_renamed_fields"""
++    
++    print("Testing the KeyError fix in generate_renamed_fields...")
++    
++    # Create initial state with MyModel and my_field
++    initial_models = {
++        ('test_one', 'mymodel'): ModelState(
++            'test_one', 'MyModel', [
++                ('id', models.AutoField(primary_key=True)),
++                ('my_field', models.CharField(max_length=100)),
++            ]
++        )
++    }
++    
++    # Create new state with MyModel2 and my_field_renamed
++    new_models = {
++        ('test_one', 'mymodel2'): ModelState(
++            'test_one', 'MyModel2', [
++                ('id', models.AutoField(primary_key=True)),
++                ('my_field_renamed', models.CharField(max_length=100)),
++            ]
++        )
++    }
++    
++    from_state = ProjectState(initial_models)
++    to_state = ProjectState(new_models)
++    
++    # Create autodetector
++    from django.db.migrations.autodetector import MigrationAutodetector
++    from django.db.migrations.questioner import MigrationQuestioner
++    
++    # Create a mock questioner
++    class MockQuestioner(MigrationQuestioner):
++        def ask_rename(self, model_name, old_name, new_name, field):
++            return True
++    
++    questioner = MockQuestioner()
++    autodetector = MigrationAutodetector(from_state, to_state, questioner)
++    
++    # Initialize the generated_operations attribute
++    autodetector.generated_operations = {}
++    
++    # Set up the renamed_models dictionary to simulate the scenario
++    autodetector.renamed_models = {('test_one', 'mymodel2'): 'mymodel'}
++    
++    # Set up field keys to simulate the scenario
++    autodetector.old_field_keys = {('test_one', 'mymodel', 'my_field')}
++    autodetector.new_field_keys = {('test_one', 'mymodel2', 'my_field_renamed')}
++    
++    try:
++        # Call the specific method that was causing the KeyError
++        print("Calling generate_renamed_fields...")
++        autodetector.generate_renamed_fields()
++        print(f"Renamed fields: {autodetector.renamed_fields}")
++        
++        print("✅ Success! No KeyError occurred in generate_renamed_fields.")
++        return True
++        
++    except KeyError as e:
++        print(f"❌ KeyError occurred: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    except Exception as e:
++        print(f"❌ Other error occurred: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == '__main__':
++    success = test_keyerror_fix()
++    if success:
++        print("\n🎉 Fix is working correctly!")
++    else:
++        print("\n💥 Fix is not working!")
+\ No newline at end of file
+diff --git a/test_github_issue.py b/test_github_issue.py
+new file mode 100644
+index 0000000000..c092de0b50
+--- /dev/null
++++ b/test_github_issue.py
+@@ -0,0 +1,116 @@
++#!/usr/bin/env python3
++"""
++Test to verify the specific GitHub issue is fixed.
++This test reproduces the exact scenario described in the issue.
++"""
++
++import os
++import sys
++from django.conf import settings
++from django.db.migrations.state import ProjectState, ModelState
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_github_issue_scenario():
++    """
++    Test the exact scenario from GitHub issue:
++    - Rename model MyModel to MyModel2
++    - Rename field my_field to my_field_renamed
++    - This should not cause a KeyError
++    """
++    
++    print("Testing the exact GitHub issue scenario...")
++    
++    # Create initial state with MyModel and my_field
++    initial_models = {
++        ('test_one', 'mymodel'): ModelState(
++            'test_one', 'MyModel', [
++                ('id', models.AutoField(primary_key=True)),
++                ('my_field', models.CharField(max_length=100)),
++            ]
++        )
++    }
++    
++    # Create new state with MyModel2 and my_field_renamed
++    new_models = {
++        ('test_one', 'mymodel2'): ModelState(
++            'test_one', 'MyModel2', [
++                ('id', models.AutoField(primary_key=True)),
++                ('my_field_renamed', models.CharField(max_length=100)),
++            ]
++        )
++    }
++    
++    from_state = ProjectState(initial_models)
++    to_state = ProjectState(new_models)
++    
++    # Create autodetector
++    from django.db.migrations.autodetector import MigrationAutodetector
++    from django.db.migrations.questioner import MigrationQuestioner
++    
++    # Create a mock questioner that answers "yes" to rename questions
++    class MockQuestioner(MigrationQuestioner):
++        def ask_rename_model(self, old_model_state, new_model_state):
++            return True
++            
++        def ask_rename(self, model_name, old_name, new_name, field):
++            return True
++    
++    questioner = MockQuestioner()
++    autodetector = MigrationAutodetector(from_state, to_state, questioner)
++    
++    # Initialize the generated_operations attribute
++    autodetector.generated_operations = {}
++    
++    # Set up model keys to simulate the scenario
++    autodetector.old_model_keys = {('test_one', 'mymodel')}
++    autodetector.new_model_keys = {('test_one', 'mymodel2')}
++    autodetector.old_field_keys = {('test_one', 'mymodel', 'my_field')}
++    autodetector.new_field_keys = {('test_one', 'mymodel2', 'my_field_renamed')}
++    
++    try:
++        # First, generate renamed models (this sets up renamed_models)
++        print("Step 1: Generating renamed models...")
++        autodetector.generate_renamed_models()
++        print(f"Renamed models: {autodetector.renamed_models}")
++        
++        # Then, generate renamed fields (this was causing the KeyError)
++        print("Step 2: Generating renamed fields...")
++        autodetector.generate_renamed_fields()
++        print(f"Renamed fields: {autodetector.renamed_fields}")
++        
++        print("✅ Success! No KeyError occurred.")
++        return True
++        
++    except KeyError as e:
++        print(f"❌ KeyError occurred: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    except Exception as e:
++        print(f"❌ Other error occurred: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == '__main__':
++    success = test_github_issue_scenario()
++    if success:
++        print("\n🎉 The GitHub issue has been fixed!")
++        print("The migration autodetector no longer crashes when renaming a model and field in a single step.")
++    else:
++        print("\n💥 The GitHub issue is NOT fixed!")
+\ No newline at end of file
+diff --git a/test_one/__init__.py b/test_one/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/test_one/apps.py b/test_one/apps.py
+new file mode 100644
+index 0000000000..1d7c2c63ad
+--- /dev/null
++++ b/test_one/apps.py
+@@ -0,0 +1,6 @@
++
++from django.apps import AppConfig
++
++class TestOneConfig(AppConfig):
++    default_auto_field = 'django.db.models.BigAutoField'
++    name = 'test_one'
+diff --git a/test_one/migrations/0001_initial.py b/test_one/migrations/0001_initial.py
+new file mode 100644
+index 0000000000..8a2ace7dc1
+--- /dev/null
++++ b/test_one/migrations/0001_initial.py
+@@ -0,0 +1,21 @@
++# Generated by Django 4.1.dev20220131103324 on 2025-10-08 09:11
++
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++
++    initial = True
++
++    dependencies = [
++    ]
++
++    operations = [
++        migrations.CreateModel(
++            name='MyModel',
++            fields=[
++                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
++                ('my_field', models.CharField(max_length=100)),
++            ],
++        ),
++    ]
+diff --git a/test_one/migrations/__init__.py b/test_one/migrations/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/test_one/models.py b/test_one/models.py
+new file mode 100644
+index 0000000000..7826209d22
+--- /dev/null
++++ b/test_one/models.py
+@@ -0,0 +1,8 @@
++
++from django.db import models
++
++class MyModel2(models.Model):
++    my_field_renamed = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_one'
+diff --git a/test_reproduce.py b/test_reproduce.py
+new file mode 100644
+index 0000000000..2de53f83e7
+--- /dev/null
++++ b/test_reproduce.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""
++Direct test to reproduce the migration autodetector crash.
++"""
++
++import os
++import sys
++from django.conf import settings
++from django.db.migrations.autodetector import MigrationAutodetector
++from django.db.migrations.state import ProjectState, ModelState
++from django.db.migrations.questioner import MigrationQuestioner
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_rename_model_and_field():
++    """Test the scenario where both model and field are renamed"""
++    
++    # Create initial state with MyModel and my_field
++    initial_models = {
++        ('test_one', 'mymodel'): ModelState(
++            'test_one', 'MyModel', [
++                ('id', models.AutoField(primary_key=True)),
++                ('my_field', models.CharField(max_length=100)),
++            ]
++        )
++    }
++    
++    # Create new state with MyModel2 and my_field_renamed
++    new_models = {
++        ('test_one', 'mymodel2'): ModelState(
++            'test_one', 'MyModel2', [
++                ('id', models.AutoField(primary_key=True)),
++                ('my_field_renamed', models.CharField(max_length=100)),
++            ]
++        )
++    }
++    
++    from_state = ProjectState(initial_models)
++    to_state = ProjectState(new_models)
++    
++    # Create a mock questioner that answers "yes" to rename questions
++    class MockQuestioner(MigrationQuestioner):
++        def ask_rename_model(self, old_model_state, new_model_state):
++            return True
++            
++        def ask_rename(self, model_name, old_name, new_name, field):
++            return True
++    
++    questioner = MockQuestioner()
++    
++    # Create autodetector and try to generate changes
++    autodetector = MigrationAutodetector(from_state, to_state, questioner)
++    
++    try:
++        # Create a minimal graph for testing
++        from django.db.migrations.graph import MigrationGraph
++        graph = MigrationGraph()
++        
++        changes = autodetector.changes(graph=graph)
++        print("Success! No crash occurred.")
++        print(f"Generated changes: {changes}")
++    except KeyError as e:
++        print(f"KeyError occurred: {e}")
++        import traceback
++        traceback.print_exc()
++    except Exception as e:
++        print(f"Other error occurred: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    test_rename_model_and_field()
+\ No newline at end of file
+diff --git a/test_simple.py b/test_simple.py
+new file mode 100644
+index 0000000000..ecca680f6d
+--- /dev/null
++++ b/test_simple.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the fix for the KeyError in generate_renamed_fields.
++"""
++
++import os
++import sys
++from django.conf import settings
++from django.db.migrations.state import ProjectState, ModelState
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++def test_generate_renamed_fields():
++    """Test the specific method that was causing the KeyError"""
++    
++    # Create initial state with MyModel and my_field
++    initial_models = {
++        ('test_one', 'mymodel'): ModelState(
++            'test_one', 'MyModel', [
++                ('id', models.AutoField(primary_key=True)),
++                ('my_field', models.CharField(max_length=100)),
++            ]
++        )
++    }
++    
++    # Create new state with MyModel2 and my_field_renamed
++    new_models = {
++        ('test_one', 'mymodel2'): ModelState(
++            'test_one', 'MyModel2', [
++                ('id', models.AutoField(primary_key=True)),
++                ('my_field_renamed', models.CharField(max_length=100)),
++            ]
++        )
++    }
++    
++    from_state = ProjectState(initial_models)
++    to_state = ProjectState(new_models)
++    
++    # Create autodetector
++    from django.db.migrations.autodetector import MigrationAutodetector
++    from django.db.migrations.questioner import MigrationQuestioner
++    
++    # Create a mock questioner
++    class MockQuestioner(MigrationQuestioner):
++        def ask_rename_model(self, old_model_state, new_model_state):
++            return True
++            
++        def ask_rename(self, model_name, old_name, new_name, field):
++            return True
++    
++    questioner = MockQuestioner()
++    autodetector = MigrationAutodetector(from_state, to_state, questioner)
++    
++    # Set up the renamed_models dictionary to simulate the scenario
++    autodetector.renamed_models = {('test_one', 'mymodel2'): 'mymodel'}
++    
++    # Set up field keys
++    autodetector.old_field_keys = {('test_one', 'mymodel', 'my_field')}
++    autodetector.new_field_keys = {('test_one', 'mymodel2', 'my_field_renamed')}
++    
++    try:
++        # Call the specific method that was causing the issue
++        autodetector.generate_renamed_fields()
++        print("Success! No KeyError occurred in generate_renamed_fields.")
++        print(f"Renamed fields: {autodetector.renamed_fields}")
++    except KeyError as e:
++        print(f"KeyError occurred: {e}")
++        import traceback
++        traceback.print_exc()
++    except Exception as e:
++        print(f"Other error occurred: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    test_generate_renamed_fields()
+\ No newline at end of file

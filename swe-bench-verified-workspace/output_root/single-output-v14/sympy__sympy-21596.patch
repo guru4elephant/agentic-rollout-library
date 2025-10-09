@@ -1,0 +1,227 @@
+diff --git a/debug_intersection.py b/debug_intersection.py
+new file mode 100644
+index 0000000000..d1559d6692
+--- /dev/null
++++ b/debug_intersection.py
+@@ -0,0 +1,32 @@
++#!/usr/bin/env python3
++
++from sympy import symbols, Lambda, imageset, S, Reals, FiniteSet
++
++# Test the specific issue
++n = symbols('n', integer=True)
++im = (n - 1)*(n + 1)
++print("im =", im)
++
++# Simulate what happens in the intersection code
++from sympy.solvers.solvers import solve_linear
++from sympy.core.mul import Mul
++
++# This is what happens in line 307
++args = list(Mul.make_args(im))
++print("Mul.make_args(im) =", args)
++
++solutions = [solve_linear(i, 0) for i in args if n in i.free_symbols]
++print("solve_linear results:", solutions)
++
++x, xis = zip(*solutions)
++print("x =", x)
++print("xis =", xis)
++
++# The problematic line
++finite_set = FiniteSet(xis)
++print("FiniteSet(xis) =", finite_set)
++print("Type:", type(finite_set))
++
++# What we should get instead
++correct_finite_set = FiniteSet(*xis)
++print("FiniteSet(*xis) =", correct_finite_set)
+\ No newline at end of file
+diff --git a/debug_intersection_detailed.py b/debug_intersection_detailed.py
+new file mode 100644
+index 0000000000..1ad674237d
+--- /dev/null
++++ b/debug_intersection_detailed.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++
++from sympy import symbols, Lambda, imageset, S, Reals, FiniteSet, Dummy, Eq
++from sympy.solvers.solvers import solve_linear
++from sympy.core.mul import Mul
++from sympy.sets import Intersection
++
++# Test the specific issue
++n = symbols('n', integer=True)
++f = n + (n - 1)*(n + 1)*S.ImaginaryUnit
++S1 = imageset(Lambda(n, f), S.Integers)
++
++print("S1 =", S1)
++print("f =", f)
++
++# Simulate the intersection logic
++from sympy.core.function import expand_complex
++from sympy.solvers.solvers import denoms
++
++n_ = Dummy(n.name, real=True)
++f_ = f.subs(n, n_)
++
++re, im = f_.as_real_imag()
++im = expand_complex(im)
++
++re = re.subs(n_, n)
++im = im.subs(n_, n)
++
++print("re =", re)
++print("im =", im)
++
++ifree = im.free_symbols
++print("ifree =", ifree)
++print("n =", n)
++
++lam = Lambda(n, re)
++
++if im.is_zero:
++    print("im.is_zero = True")
++elif im.is_zero is False:
++    print("im.is_zero = False")
++    print("Should return EmptySet")
++else:
++    print("im.is_zero =", im.is_zero)
++    print("ifree != {n}:", ifree != {n})
++    
++    if ifree != {n}:
++        print("Should return None")
++    else:
++        print("Processing imaginary part...")
++        args = list(Mul.make_args(im))
++        print("Mul.make_args(im) =", args)
++        
++        solutions = [solve_linear(i, 0) for i in args if n in i.free_symbols]
++        print("solve_linear results:", solutions)
++        
++        if solutions:
++            x, xis = zip(*solutions)
++            print("x =", x)
++            print("xis =", xis)
++            
++            if x and all(i == n for i in x):
++                base_set = S.Integers - FiniteSet(*xis)
++                print("base_set after subtraction:", base_set)
++                result = imageset(lam, base_set)
++                print("Final result:", result)
++            else:
++                base_set = S.Integers - ConditionSet(n, Eq(im, 0), S.Integers)
++                print("base_set after condition subtraction:", base_set)
++                result = imageset(lam, base_set)
++                print("Final result:", result)
++        else:
++            print("No solutions found")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..b9b7c5597d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,23 @@
++#!/usr/bin/env python3
++
++from sympy import symbols, Lambda, imageset, S, Reals
++from sympy.sets import Intersection
++
++# Reproduce the issue from the GitHub issue
++n = symbols('n', integer=True)
++S1 = imageset(Lambda(n, n + (n - 1)*(n + 1)*S.ImaginaryUnit), S.Integers)
++
++print("S1 =", S1)
++print("2 in S1:", 2 in S1)
++print("2 in S1.intersect(Reals):", 2 in S1.intersect(Reals))
++
++# Let's also check what S1.intersect(Reals) evaluates to
++intersection = S1.intersect(Reals)
++print("S1.intersect(Reals) =", intersection)
++print("Type of intersection:", type(intersection))
++
++# Check if 2 is in the intersection
++print("2 in intersection:", 2 in intersection)
++
++# According to the issue, the correct output should be {-1, 1}
++print("Expected intersection: {-1, 1}")
+\ No newline at end of file
+diff --git a/sympy/sets/handlers/intersection.py b/sympy/sets/handlers/intersection.py
+index c54dc8f72a..cd3adcb075 100644
+--- a/sympy/sets/handlers/intersection.py
++++ b/sympy/sets/handlers/intersection.py
+@@ -306,9 +306,11 @@ def intersection_sets(self, other): # noqa:F811
+             # univarite imaginary part in same variable
+             x, xis = zip(*[solve_linear(i, 0) for i in Mul.make_args(im) if n in i.free_symbols])
+             if x and all(i == n for i in x):
+-                base_set -= FiniteSet(xis)
++                # Return the finite set of values where imaginary part is zero
++                return FiniteSet(*(re.subs(n, val) for val in xis))
+             else:
+-                base_set -= ConditionSet(n, Eq(im, 0), S.Integers)
++                # Use condition set approach for more complex cases
++                base_set = ConditionSet(n, Eq(im, 0), S.Integers)
+         # exclude values that make denominators 0
+         for i in denoms(f):
+             if i.has(n):
+@@ -316,9 +318,12 @@ def intersection_sets(self, other): # noqa:F811
+                 if sol != []:
+                     x, xis = sol
+                     if x and all(i == n for i in x):
+-                        base_set -= FiniteSet(xis)
++                        # Filter out values that make denominators zero
++                        valid_xis = [val for val in xis if not any(denom.subs(n, val) == 0 for denom in denoms(f))]
++                        return FiniteSet(*(re.subs(n, val) for val in valid_xis))
+                 else:
+-                    base_set -= ConditionSet(n, Eq(i, 0), S.Integers)
++                    # Use condition set approach for more complex cases
++                    base_set = ConditionSet(n, Eq(im, 0) & Eq(i, 0), S.Integers)
+         return imageset(lam, base_set)
+ 
+     elif isinstance(other, Interval):
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..207546536d
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,38 @@
++#!/usr/bin/env python3
++
++from sympy import symbols, Lambda, imageset, S, Reals
++
++# Test edge cases to ensure our fix doesn't break anything
++
++# Test case 1: Simple real image set
++n = symbols('n', integer=True)
++S_simple = imageset(Lambda(n, n), S.Integers)
++print("Simple real set:", S_simple)
++print("Intersection with Reals:", S_simple.intersect(Reals))
++print()
++
++# Test case 2: Pure imaginary image set  
++S_imaginary = imageset(Lambda(n, n*S.ImaginaryUnit), S.Integers)
++print("Pure imaginary set:", S_imaginary)
++print("Intersection with Reals:", S_imaginary.intersect(Reals))
++print()
++
++# Test case 3: Complex image set with no real solutions
++S_complex = imageset(Lambda(n, n + (n + 1)*S.ImaginaryUnit), S.Integers)
++print("Complex set with no real solutions:", S_complex)
++print("Intersection with Reals:", S_complex.intersect(Reals))
++print()
++
++# Test case 4: Another case with real solutions
++S_another = imageset(Lambda(n, n + (n**2 - 4)*S.ImaginaryUnit), S.Integers)
++print("Another complex set:", S_another)
++print("Intersection with Reals:", S_another.intersect(Reals))
++print()
++
++# Test case 5: The original issue case
++S_original = imageset(Lambda(n, n + (n - 1)*(n + 1)*S.ImaginaryUnit), S.Integers)
++print("Original issue set:", S_original)
++print("Intersection with Reals:", S_original.intersect(Reals))
++print("2 in intersection:", 2 in S_original.intersect(Reals))
++print("-1 in intersection:", -1 in S_original.intersect(Reals))
++print("1 in intersection:", 1 in S_original.intersect(Reals))
+\ No newline at end of file

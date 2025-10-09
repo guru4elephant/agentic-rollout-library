@@ -1,0 +1,345 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..7931aadc5
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,34 @@
++#!/usr/bin/env python3
++"""Reproduce the Windows path casing issue with pytest 5.1.2"""
++
++import os
++import sys
++from _pytest.pathlib import unique_path
++from py.path import local
++
++def test_unique_path_lowercase_issue():
++    """Test that unique_path converts paths to lowercase on Windows"""
++    # Simulate the path from the issue
++    original_path = local('c:\\Azure\\KMS\\ComponentTest\\Python\\PIsys\\conftest.py')
++    print(f"Original path: {original_path}")
++    
++    # Simulate what happens on Windows - normcase converts to lowercase
++    from os.path import normcase
++    simulated_windows_path = type(original_path)(normcase(str(original_path)))
++    print(f"Simulated Windows normalized path: {simulated_windows_path}")
++    
++    # Check if the path was converted to lowercase
++    if str(simulated_windows_path).lower() == str(simulated_windows_path):
++        print("ERROR: Path was converted to lowercase!")
++        print("This would cause ModuleNotFoundError: No module named 'python'")
++        return False
++    else:
++        print("Path case preserved correctly")
++        return True
++
++if __name__ == "__main__":
++    if test_unique_path_lowercase_issue():
++        print("Test passed - no issue detected")
++    else:
++        print("Test failed - issue reproduced")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/src/_pytest/config/__init__.py b/src/_pytest/config/__init__.py
+index 3a0eca546..e6e133c5c 100644
+--- a/src/_pytest/config/__init__.py
++++ b/src/_pytest/config/__init__.py
+@@ -435,9 +435,9 @@ class PytestPluginManager(PluginManager):
+         # Use realpath to avoid loading the same conftest twice
+         # with build systems that create build directories containing
+         # symlinks to actual files.
+-        conftestpath = unique_path(conftestpath)
++        normalized_conftestpath = unique_path(conftestpath)
+         try:
+-            return self._conftestpath2mod[conftestpath]
++            return self._conftestpath2mod[normalized_conftestpath]
+         except KeyError:
+             pkgpath = conftestpath.pypkgpath()
+             if pkgpath is None:
+@@ -454,8 +454,8 @@ class PytestPluginManager(PluginManager):
+                 raise ConftestImportFailure(conftestpath, sys.exc_info())
+ 
+             self._conftest_plugins.add(mod)
+-            self._conftestpath2mod[conftestpath] = mod
+-            dirpath = conftestpath.dirpath()
++            self._conftestpath2mod[normalized_conftestpath] = mod
++            dirpath = normalized_conftestpath.dirpath()
+             if dirpath in self._dirpath2confmods:
+                 for path, mods in self._dirpath2confmods.items():
+                     if path and path.relto(dirpath) or path == dirpath:
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 000000000..1fdc02846
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++"""Test the fix for Windows path casing issue"""
++
++import os
++import sys
++import tempfile
++import shutil
++from _pytest.config import PytestPluginManager
++from py.path import local
++
++def test_windows_path_casing_fix():
++    """Test that the fix preserves original path case for imports"""
++    
++    # Create a temporary directory structure with mixed case
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create directory structure: /tmp/TestDir/Python/Module/conftest.py
++        test_dir = local(tmpdir).join("TestDir")
++        test_dir.mkdir()
++        python_dir = test_dir.join("Python")
++        python_dir.mkdir()
++        module_dir = python_dir.join("Module")
++        module_dir.mkdir()
++        
++        # Create conftest.py file
++        conftest_file = module_dir.join("conftest.py")
++        conftest_file.write("test_var = 'success'")
++        
++        # Create __init__.py files to make them packages
++        test_dir.join("__init__.py").write("")
++        python_dir.join("__init__.py").write("")
++        module_dir.join("__init__.py").write("")
++        
++        # Add the temporary directory to Python path
++        sys.path.insert(0, str(test_dir))
++        
++        try:
++            # Create plugin manager and try to import the conftest
++            plugin_manager = PytestPluginManager()
++            
++            # This should work without throwing ModuleNotFoundError
++            plugin_manager._importconftest(conftest_file)
++            
++            # Check that the conftest was loaded correctly
++            normalized_path = plugin_manager._conftestpath2mod.keys()
++            print(f"Normalized paths in cache: {list(normalized_path)}")
++            
++            # Verify the original path case is preserved in the module
++            imported_module = plugin_manager._conftestpath2mod[list(normalized_path)[0]]
++            print(f"Imported module file: {imported_module.__file__}")
++            
++            # Check that the variable from conftest is accessible
++            assert hasattr(imported_module, 'test_var')
++            assert imported_module.test_var == 'success'
++            
++            print("SUCCESS: Conftest imported correctly with original path case preserved")
++            return True
++            
++        except Exception as e:
++            print(f"ERROR: {e}")
++            return False
++        finally:
++            # Clean up Python path
++            sys.path.remove(str(test_dir))
++
++if __name__ == "__main__":
++    if test_windows_path_casing_fix():
++        print("Test passed - fix is working correctly")
++        sys.exit(0)
++    else:
++        print("Test failed - fix needs more work")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_github_issue_reproduction.py b/test_github_issue_reproduction.py
+new file mode 100644
+index 000000000..4b7de4255
+--- /dev/null
++++ b/test_github_issue_reproduction.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++"""Reproduce the exact issue from GitHub issue #5792"""
++
++import os
++import sys
++import tempfile
++from unittest.mock import patch
++from _pytest.config import PytestPluginManager
++from py.path import local
++
++def simulate_windows_normcase(path):
++    """Simulate Windows normcase behavior - convert to lowercase"""
++    return path.lower()
++
++def test_github_issue_reproduction():
++    """Test the exact scenario from the GitHub issue"""
++    
++    # Create a temporary directory structure that matches the issue
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create directory structure: /tmp/Azure/KMS/ComponentTest/Python/PIsys/conftest.py
++        azure_dir = local(tmpdir).join("Azure")
++        azure_dir.mkdir()
++        kms_dir = azure_dir.join("KMS")
++        kms_dir.mkdir()
++        componenttest_dir = kms_dir.join("ComponentTest")
++        componenttest_dir.mkdir()
++        python_dir = componenttest_dir.join("Python")
++        python_dir.mkdir()
++        pisys_dir = python_dir.join("PIsys")
++        pisys_dir.mkdir()
++        
++        # Create conftest.py file
++        conftest_file = pisys_dir.join("conftest.py")
++        conftest_file.write("import pytest\n\n@pytest.fixture\ndef sample_fixture():\n    return 'sample'")
++        
++        # Create __init__.py files to make them packages
++        azure_dir.join("__init__.py").write("")
++        kms_dir.join("__init__.py").write("")
++        componenttest_dir.join("__init__.py").write("")
++        python_dir.join("__init__.py").write("")
++        pisys_dir.join("__init__.py").write("")
++        
++        # Add the temporary directory to Python path
++        sys.path.insert(0, str(azure_dir))
++        
++        try:
++            # Mock normcase to simulate Windows behavior
++            with patch('_pytest.pathlib.normcase', simulate_windows_normcase):
++                # Create plugin manager and try to import the conftest
++                plugin_manager = PytestPluginManager()
++                
++                # This should work without throwing ModuleNotFoundError: No module named 'python'
++                plugin_manager._importconftest(conftest_file)
++                
++                # Check that the conftest was loaded correctly
++                normalized_paths = list(plugin_manager._conftestpath2mod.keys())
++                print(f"Normalized paths in cache: {normalized_paths}")
++                
++                # Verify the module was imported successfully
++                imported_module = plugin_manager._conftestpath2mod[normalized_paths[0]]
++                print(f"Imported module file: {imported_module.__file__}")
++                
++                # Check that the fixture from conftest is accessible
++                assert hasattr(imported_module, 'sample_fixture')
++                
++                # Verify that the cached path is normalized (lowercase)
++                cached_path = str(normalized_paths[0])
++                assert cached_path.lower() == cached_path, "Cached path should be normalized to lowercase"
++                
++                # But the actual module file path should preserve original case
++                actual_module_path = imported_module.__file__
++                assert "Azure" in actual_module_path, "Module file path should preserve 'Azure' case"
++                assert "KMS" in actual_module_path, "Module file path should preserve 'KMS' case"
++                assert "ComponentTest" in actual_module_path, "Module file path should preserve 'ComponentTest' case"
++                assert "Python" in actual_module_path, "Module file path should preserve 'Python' case"
++                assert "PIsys" in actual_module_path, "Module file path should preserve 'PIsys' case"
++                
++                print("SUCCESS: GitHub issue reproduction test passed")
++                print("No ModuleNotFoundError: No module named 'python'")
++                return True
++                
++        except Exception as e:
++            print(f"ERROR: {e}")
++            import traceback
++            traceback.print_exc()
++            return False
++        finally:
++            # Clean up Python path
++            sys.path.remove(str(azure_dir))
++
++if __name__ == "__main__":
++    if test_github_issue_reproduction():
++        print("Test passed - GitHub issue #5792 is fixed")
++        sys.exit(0)
++    else:
++        print("Test failed - GitHub issue #5792 is not fixed")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_windows_simulation.py b/test_windows_simulation.py
+new file mode 100644
+index 000000000..438d82a1f
+--- /dev/null
++++ b/test_windows_simulation.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++"""Test that simulates Windows path casing issue"""
++
++import os
++import sys
++import tempfile
++from unittest.mock import patch
++from _pytest.config import PytestPluginManager
++from _pytest.pathlib import unique_path
++from py.path import local
++
++def simulate_windows_normcase(path):
++    """Simulate Windows normcase behavior - convert to lowercase"""
++    return path.lower()
++
++def test_windows_path_casing_simulation():
++    """Test that our fix handles Windows path casing correctly"""
++    
++    # Create a temporary directory structure with mixed case
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create directory structure: /tmp/TestDir/Python/Module/conftest.py
++        test_dir = local(tmpdir).join("TestDir")
++        test_dir.mkdir()
++        python_dir = test_dir.join("Python")
++        python_dir.mkdir()
++        module_dir = python_dir.join("Module")
++        module_dir.mkdir()
++        
++        # Create conftest.py file
++        conftest_file = module_dir.join("conftest.py")
++        conftest_file.write("test_var = 'success'")
++        
++        # Create __init__.py files to make them packages
++        test_dir.join("__init__.py").write("")
++        python_dir.join("__init__.py").write("")
++        module_dir.join("__init__.py").write("")
++        
++        # Add the temporary directory to Python path
++        sys.path.insert(0, str(test_dir))
++        
++        try:
++            # Mock normcase to simulate Windows behavior
++            with patch('_pytest.pathlib.normcase', simulate_windows_normcase):
++                # Create plugin manager and try to import the conftest
++                plugin_manager = PytestPluginManager()
++                
++                # This should work without throwing ModuleNotFoundError
++                plugin_manager._importconftest(conftest_file)
++                
++                # Check that the conftest was loaded correctly
++                normalized_paths = list(plugin_manager._conftestpath2mod.keys())
++                print(f"Normalized paths in cache: {normalized_paths}")
++                
++                # Verify the module was imported successfully
++                imported_module = plugin_manager._conftestpath2mod[normalized_paths[0]]
++                print(f"Imported module file: {imported_module.__file__}")
++                
++                # Check that the variable from conftest is accessible
++                assert hasattr(imported_module, 'test_var')
++                assert imported_module.test_var == 'success'
++                
++                # Verify that the cached path is normalized (lowercase)
++                cached_path = str(normalized_paths[0])
++                assert cached_path.lower() == cached_path, "Cached path should be normalized to lowercase"
++                
++                # But the actual module file path should preserve original case
++                actual_module_path = imported_module.__file__
++                assert actual_module_path != actual_module_path.lower(), "Module file path should preserve original case"
++                
++                print("SUCCESS: Windows path casing simulation passed")
++                return True
++                
++        except Exception as e:
++            print(f"ERROR: {e}")
++            import traceback
++            traceback.print_exc()
++            return False
++        finally:
++            # Clean up Python path
++            sys.path.remove(str(test_dir))
++
++if __name__ == "__main__":
++    if test_windows_path_casing_simulation():
++        print("Test passed - fix handles Windows path casing correctly")
++        sys.exit(0)
++    else:
++        print("Test failed - fix needs more work")
++        sys.exit(1)
+\ No newline at end of file

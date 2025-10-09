@@ -1,0 +1,192 @@
+diff --git a/debug_optimizer.py b/debug_optimizer.py
+new file mode 100644
+index 0000000000..a9be108945
+--- /dev/null
++++ b/debug_optimizer.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++
++from django.db import migrations
++from django.db.migrations.optimizer import MigrationOptimizer
++
++def debug_optimizer():
++    """Debug the optimizer behavior"""
++    
++    # Create the operations sequence from the issue
++    operations = [
++        migrations.AlterUniqueTogether(
++            name='mymodel',
++            unique_together=set(),
++        ),
++        migrations.AlterIndexTogether(
++            name='mymodel',
++            index_together=set(),
++        ),
++        migrations.AlterUniqueTogether(
++            name='mymodel',
++            unique_together={("col",)},
++        ),
++        migrations.AlterIndexTogether(
++            name='mymodel',
++            index_together={("col",)},
++        ),
++    ]
++    
++    print("Original operations:")
++    for i, op in enumerate(operations):
++        print(f"{i}: {op}")
++    
++    # Test individual reduce calls
++    print("\nTesting individual reduce calls:")
++    
++    # Test operation 0.reduce(operation 2)
++    result1 = operations[0].reduce(operations[2], 'testapp')
++    print(f"op0.reduce(op2): {result1}")
++    
++    # Test operation 1.reduce(operation 3)  
++    result2 = operations[1].reduce(operations[3], 'testapp')
++    print(f"op1.reduce(op3): {result2}")
++    
++    # Test operation 2.reduce(operation 0) - reverse order
++    result3 = operations[2].reduce(operations[0], 'testapp')
++    print(f"op2.reduce(op0): {result3}")
++    
++    # Test operation 3.reduce(operation 1) - reverse order
++    result4 = operations[3].reduce(operations[1], 'testapp')
++    print(f"op3.reduce(op1): {result4}")
++
++if __name__ == "__main__":
++    debug_optimizer()
+\ No newline at end of file
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index c120f5d32d..3176783ddd 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -528,6 +528,18 @@ class AlterTogetherOptionOperation(ModelOptionOperation):
+     def migration_name_fragment(self):
+         return 'alter_%s_%s' % (self.name_lower, self.option_name)
+ 
++    def reduce(self, operation, app_label):
++        if (isinstance(operation, self.__class__) and 
++            self.name_lower == operation.name_lower):
++            # If we have two AlterTogether operations on the same model,
++            # we can optimize them into the second operation
++            return [operation]
++        elif (isinstance(operation, AlterTogetherOptionOperation) and
++              self.name_lower == operation.name_lower):
++            # Different AlterTogether operations on the same model can optimize through each other
++            return True
++        return super().reduce(operation, app_label)
++
+ 
+ class AlterUniqueTogether(AlterTogetherOptionOperation):
+     """
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..b7cbb34fd1
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++
++from django.db import migrations
++from django.db.migrations.optimizer import MigrationOptimizer
++
++def test_optimization():
++    """Test case to reproduce the issue described in the GitHub issue"""
++    
++    # Create the operations sequence from the issue
++    operations = [
++        migrations.AlterUniqueTogether(
++            name='mymodel',
++            unique_together=set(),
++        ),
++        migrations.AlterIndexTogether(
++            name='mymodel',
++            index_together=set(),
++        ),
++        migrations.AlterUniqueTogether(
++            name='mymodel',
++            unique_together={("col",)},
++        ),
++        migrations.AlterIndexTogether(
++            name='mymodel',
++            index_together={("col",)},
++        ),
++    ]
++    
++    print("Original operations:")
++    for i, op in enumerate(operations):
++        print(f"{i}: {op}")
++    
++    # Try to optimize
++    optimizer = MigrationOptimizer()
++    optimized_operations = optimizer.optimize(operations, 'testapp')
++    
++    print("\nOptimized operations:")
++    for i, op in enumerate(optimized_operations):
++        print(f"{i}: {op}")
++    
++    # Expected result should be only 2 operations instead of 4
++    expected_operations = [
++        migrations.AlterUniqueTogether(
++            name='mymodel',
++            unique_together={("col",)},
++        ),
++        migrations.AlterIndexTogether(
++            name='mymodel',
++            index_together={("col",)},
++        ),
++    ]
++    
++    print("\nExpected operations:")
++    for i, op in enumerate(expected_operations):
++        print(f"{i}: {op}")
++    
++    # Check if optimization worked
++    if len(optimized_operations) == len(expected_operations):
++        print("\n✓ Optimization successful!")
++        return True
++    else:
++        print(f"\n✗ Optimization failed! Expected {len(expected_operations)} operations, got {len(optimized_operations)}")
++        return False
++
++if __name__ == "__main__":
++    test_optimization()
+\ No newline at end of file
+diff --git a/test_optimize_through.py b/test_optimize_through.py
+new file mode 100644
+index 0000000000..d314629d0d
+--- /dev/null
++++ b/test_optimize_through.py
+@@ -0,0 +1,29 @@
++#!/usr/bin/env python3
++
++from django.db import migrations
++
++def test_optimize_through():
++    """Test what 'optimize through' means"""
++    
++    op1 = migrations.AlterIndexTogether(
++        name='mymodel',
++        index_together=set(),
++    )
++    
++    op2 = migrations.AlterUniqueTogether(
++        name='mymodel',
++        unique_together={("col",)},
++    )
++    
++    # Test if op1 can optimize through op2
++    result = op1.reduce(op2, 'testapp')
++    print(f"AlterIndexTogether.reduce(AlterUniqueTogether): {result}")
++    print(f"Should return True for 'optimize through': {result is True}")
++    
++    # Test the reverse
++    result2 = op2.reduce(op1, 'testapp')
++    print(f"AlterUniqueTogether.reduce(AlterIndexTogether): {result2}")
++    print(f"Should return True for 'optimize through': {result2 is True}")
++
++if __name__ == "__main__":
++    test_optimize_through()
+\ No newline at end of file

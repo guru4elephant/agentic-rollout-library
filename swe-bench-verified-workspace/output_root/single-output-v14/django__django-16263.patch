@@ -1,0 +1,239 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 9735ce10c8..aef41274a7 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -550,6 +550,8 @@ class Query(BaseExpression):
+         Perform a COUNT() query using the current filter constraints.
+         """
+         obj = self.clone()
++        # Clear all annotations for count queries since they're not needed
++        obj.annotations = {}
+         obj.add_annotation(Count("*"), alias="__count", is_summary=True)
+         return obj.get_aggregation(using, ["__count"])["__count"]
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e865068e09
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create simple models to reproduce the issue
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class Chapter(models.Model):
++    book = models.ForeignKey(Book, on_delete=models.CASCADE, related_name='chapters')
++    title = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the issue
++from django.db.models import Count
++
++print("Testing count queries with annotations...")
++
++# Test the issue - count with unused annotation
++print("\n1. Query with unused annotation:")
++qs = Book.objects.annotate(Count('chapters'))
++
++# Check the SQL generated
++print("\nSQL generated for count with annotation:")
++try:
++    sql = qs.query.get_count(qs.db)
++    print(sql)
++except Exception as e:
++    print(f"Error generating SQL: {e}")
++
++# Compare with simple count
++print("\n2. Simple count query:")
++simple_qs = Book.objects.all()
++
++# Check the SQL generated for simple count
++print("\nSQL generated for simple count:")
++try:
++    simple_sql = simple_qs.query.get_count(simple_qs.db)
++    print(simple_sql)
++except Exception as e:
++    print(f"Error generating SQL: {e}")
++
++print("\nCompare the SQL statements to see if annotations are stripped")
+\ No newline at end of file
+diff --git a/reproduce_simple.py b/reproduce_simple.py
+new file mode 100644
+index 0000000000..ca3e84f036
+--- /dev/null
++++ b/reproduce_simple.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Let's examine the SQL query generation directly
++from django.db.models.sql.query import Query
++from django.db.models.sql.compiler import SQLCompiler
++from django.db.models import Count
++from django.db import connection
++
++# Create a simple query with annotation
++query = Query(model=None)
++query.add_annotation(Count('some_field'), alias='count_field')
++
++print("Query with annotation:")
++print("Annotations:", query.annotations)
++print("Annotation select:", query.annotation_select)
++
++# Try to get count SQL
++print("\nCount SQL generation:")
++try:
++    count_query = query.clone()
++    count_query.add_annotation(Count("*"), alias="__count", is_summary=True)
++    compiler = SQLCompiler(count_query, connection=connection)
++    sql, params = compiler.as_sql()
++    print("SQL:", sql)
++    print("Params:", params)
++except Exception as e:
++    print("Error:", e)
++    import traceback
++    traceback.print_exc()
++
++# Compare with simple query
++print("\nSimple query without annotation:")
++simple_query = Query(model=None)
++print("Annotations:", simple_query.annotations)
++print("Annotation select:", simple_query.annotation_select)
++
++print("\nSimple count SQL generation:")
++try:
++    simple_count_query = simple_query.clone()
++    simple_count_query.add_annotation(Count("*"), alias="__count", is_summary=True)
++    simple_compiler = SQLCompiler(simple_count_query, connection=connection)
++    simple_sql, simple_params = simple_compiler.as_sql()
++    print("SQL:", simple_sql)
++    print("Params:", simple_params)
++except Exception as e:
++    print("Error:", e)
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..efe701beb5
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Test our fix by examining the SQL generation directly
++from django.db.models.sql.query import Query
++from django.db.models import Count
++from django.db import connection
++
++print("Testing the strip_unused_annotations fix...")
++
++# Create a query with an annotation
++query = Query(model=None)
++query.add_annotation(Count('some_field'), alias='count_field')
++
++print("Before strip_unused_annotations:")
++print("Annotations:", query.annotations.keys())
++
++# Test our new method
++query.strip_unused_annotations()
++
++print("After strip_unused_annotations:")
++print("Annotations:", query.annotations.keys())
++
++# Test with a query that might have references
++print("\nTesting with a more complex scenario...")
++query2 = Query(model=None)
++query2.add_annotation(Count('field1'), alias='count1')
++query2.add_annotation(Count('field2'), alias='count2')
++
++print("Before strip_unused_annotations:")
++print("Annotations:", query2.annotations.keys())
++
++query2.strip_unused_annotations()
++
++print("After strip_unused_annotations:")
++print("Annotations:", query2.annotations.keys())
++
++print("\nTest completed!")
+\ No newline at end of file

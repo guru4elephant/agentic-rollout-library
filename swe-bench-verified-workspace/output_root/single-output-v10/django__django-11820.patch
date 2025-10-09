@@ -1,0 +1,372 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..eb648711b3
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '.')
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++    django.setup()
++
++from django.db import models
++from django.core import checks
++
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Test cases
++test_cases = [
++    # Valid cases
++    ('author__pk', True, "Primary key of related field"),
++    ('author__id', True, "ID of related field"),
++    
++    # Invalid cases
++    ('author__nonexistent', False, "Non-existent field on related model"),
++    ('author__name__pk', False, "PK after non-relation field"),
++    ('nonexistent__pk', False, "PK after non-existent relation"),
++    ('title__pk', False, "PK after non-relation field"),
++]
++
++print("Testing comprehensive ordering scenarios:")
++print("=" * 50)
++
++for field_name, should_be_valid, description in test_cases:
++    class TestModel(models.Model):
++        book = models.ForeignKey(Book, on_delete=models.CASCADE)
++        
++        class Meta:
++            app_label = 'test_app'
++            ordering = [field_name]
++    
++    errors = TestModel.check()
++    e015_errors = [e for e in errors if e.id == 'models.E015']
++    
++    if should_be_valid:
++        if e015_errors:
++            print(f"❌ FAILED: {description} ({field_name})")
++            print(f"   Expected valid, but got E015 error: {e015_errors[0]}")
++        else:
++            print(f"✅ PASSED: {description} ({field_name})")
++    else:
++        if e015_errors:
++            print(f"✅ PASSED: {description} ({field_name})")
++        else:
++            print(f"❌ FAILED: {description} ({field_name})")
++            print(f"   Expected E015 error, but got none")
++
++print("\n" + "=" * 50)
++print("Test completed.")
+\ No newline at end of file
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 0000000000..1e8201ed50
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '.')
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++    django.setup()
++
++from django.db import models
++from django.core.exceptions import FieldDoesNotExist
++
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Let's manually trace what happens with author__pk
++print("Debugging author__pk validation:")
++print("=" * 40)
++
++cls = Book
++field = 'author__pk'
++parts = field.split('__')
++print(f"Parts: {parts}")
++
++_cls = cls
++prev_fld = None
++
++for i, part in enumerate(parts):
++    print(f"\nProcessing part {i}: '{part}'")
++    print(f"Current _cls: {_cls}")
++    print(f"Current prev_fld: {prev_fld}")
++    
++    fld = None
++    try:
++        fld = _cls._meta.get_field(part)
++        print(f"Successfully got field: {fld}")
++        if fld.is_relation:
++            print(f"Field is a relation")
++            _cls = fld.get_path_info()[-1].to_opts.model
++            prev_fld = fld
++            print(f"New _cls: {_cls}")
++            print(f"New prev_fld: {prev_fld}")
++        else:
++            print(f"Field is not a relation")
++    except (FieldDoesNotExist, AttributeError) as e:
++        print(f"FieldDoesNotExist exception: {e}")
++        print(f"fld: {fld}")
++        print(f"part: '{part}', i: {i}, len(parts)-1: {len(parts)-1}")
++        print(f"prev_fld: {prev_fld}")
++        if prev_fld:
++            print(f"prev_fld.is_relation: {prev_fld.is_relation}")
++        
++        # Check our condition
++        condition = (part == 'pk' and i == len(parts) - 1 and prev_fld is not None and prev_fld.is_relation)
++        print(f"Special case condition: {condition}")
++        
++        if condition:
++            print("Would continue (skip error)")
++        else:
++            print("Would raise E015 error")
+\ No newline at end of file
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 3ce711f3f1..97721428d2 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -1705,14 +1705,30 @@ class Model(metaclass=ModelBase):
+         # Check related fields.
+         for field in related_fields:
+             _cls = cls
+-            fld = None
+-            for part in field.split(LOOKUP_SEP):
++            prev_fld = None
++            parts = field.split(LOOKUP_SEP)
++            for i, part in enumerate(parts):
++                fld = None  # Initialize fld for each iteration
+                 try:
+                     fld = _cls._meta.get_field(part)
+                     if fld.is_relation:
+                         _cls = fld.get_path_info()[-1].to_opts.model
++                        prev_fld = fld  # Store the relation field for potential pk check
+                 except (FieldDoesNotExist, AttributeError):
+-                    if fld is None or fld.get_transform(part) is None:
++                    # Special case: 'pk' as the last part of a related field path
++                    # is valid only when we're accessing the primary key of a related model
++                    if part == 'pk' and i == len(parts) - 1 and prev_fld is not None and prev_fld.is_relation:
++                        continue
++                    if fld is None:
++                        errors.append(
++                            checks.Error(
++                                "'ordering' refers to the nonexistent field, "
++                                "related field, or lookup '%s'." % field,
++                                obj=cls,
++                                id='models.E015',
++                            )
++                        )
++                    elif fld.get_transform(part) is None:
+                         errors.append(
+                             checks.Error(
+                                 "'ordering' refers to the nonexistent field, "
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..99c262f86f
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '.')
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++    django.setup()
++
++from django.db import models
++from django.core import checks
++
++class Option(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class SomeModel(models.Model):
++    option = models.ForeignKey(Option, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ['option__pk']  # This should NOT raise E015 error
++
++# Check the model
++errors = SomeModel.check()
++for error in errors:
++    print(f"Error: {error}")
++    if error.id == 'models.E015':
++        print("CONFIRMED: E015 error is incorrectly raised for option__pk")
++        sys.exit(1)
++
++print("SUCCESS: No E015 error raised for option__pk")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..ad97847bc0
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++sys.path.insert(0, '.')
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++    django.setup()
++
++from django.db import models
++from django.core import checks
++
++class Option(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class SomeModel(models.Model):
++    option = models.ForeignKey(Option, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ['option__pk']  # This should NOT raise E015 error
++
++class AnotherModel(models.Model):
++    option = models.ForeignKey(Option, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ['option__name__pk']  # This should raise E015 error (invalid)
++
++class ThirdModel(models.Model):
++    option = models.ForeignKey(Option, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ['option__nonexistent']  # This should raise E015 error (invalid)
++
++# Test cases
++print("Testing option__pk (should be valid):")
++errors = SomeModel.check()
++e015_errors = [e for e in errors if e.id == 'models.E015']
++if e015_errors:
++    print(f"FAILED: E015 error raised: {e015_errors}")
++else:
++    print("SUCCESS: No E015 error")
++
++print("\nTesting option__name__pk (should be invalid):")
++errors = AnotherModel.check()
++e015_errors = [e for e in errors if e.id == 'models.E015']
++if e015_errors:
++    print("SUCCESS: E015 error correctly raised for invalid field")
++else:
++    print("FAILED: No E015 error for invalid field")
++
++print("\nTesting option__nonexistent (should be invalid):")
++errors = ThirdModel.check()
++e015_errors = [e for e in errors if e.id == 'models.E015']
++if e015_errors:
++    print("SUCCESS: E015 error correctly raised for invalid field")
++else:
++    print("FAILED: No E015 error for invalid field")
+\ No newline at end of file

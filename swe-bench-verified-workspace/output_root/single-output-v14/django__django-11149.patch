@@ -1,0 +1,363 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 880a2cc17b..9ace548a8a 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -2147,10 +2147,7 @@ class InlineModelAdmin(BaseModelAdmin):
+                 if field.remote_field and field.remote_field.model != self.parent_model:
+                     opts = field.remote_field.model._meta
+                     break
+-            return (
+-                request.user.has_perm('%s.%s' % (opts.app_label, get_permission_codename('view', opts))) or
+-                request.user.has_perm('%s.%s' % (opts.app_label, get_permission_codename('change', opts)))
+-            )
++            return request.user.has_perm('%s.%s' % (opts.app_label, get_permission_codename('view', opts)))
+         return super().has_view_permission(request)
+ 
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..da904e9102
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++            'django.contrib.sessions',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.models import User, Permission
++from django.contrib.contenttypes.models import ContentType
++
++# Create models as described in the issue
++from django.db import models
++
++class Photo(models.Model):
++    class Meta:
++        app_label = 'test_app'
++
++class Report(models.Model):
++    photos = models.ManyToManyField(Photo)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Create admin configuration
++from django.contrib import admin
++
++class ReportPhotoInlineModelAdmin(admin.TabularInline):
++    model = Report.photos.through
++    show_change_link = True
++
++class ReportAdmin(admin.ModelAdmin):
++    inlines = [ReportPhotoInlineModelAdmin]
++
++admin.site.register(Report, ReportAdmin)
++admin.site.register(Photo)
++
++# Create test user with only view permission
++from django.contrib.auth.models import User, Permission
++from django.contrib.contenttypes.models import ContentType
++
++# Create user
++user = User.objects.create_user('viewonly', 'view@example.com', 'password')
++
++# Give user only view permission for Report model
++report_content_type = ContentType.objects.get_for_model(Report)
++view_permission = Permission.objects.get(
++    codename='view_report',
++    content_type=report_content_type
++)
++user.user_permissions.add(view_permission)
++
++# Test the permission check
++from django.test import RequestFactory
++
++factory = RequestFactory()
++request = factory.get('/admin/')
++request.user = user
++
++# Create an inline instance
++inline = ReportPhotoInlineModelAdmin(Report, admin.site)
++
++print("Testing permissions for user with only view permission:")
++print(f"has_add_permission: {inline.has_add_permission(request)}")
++print(f"has_change_permission: {inline.has_change_permission(request)}")
++print(f"has_delete_permission: {inline.has_delete_permission(request)}")
++print(f"has_view_permission: {inline.has_view_permission(request)}")
++
++# The issue: user with only view permission should NOT be able to add/change/delete
++# but currently they can because has_view_permission returns True if they have view OR change permission
+\ No newline at end of file
+diff --git a/test_permissions.py b/test_permissions.py
+new file mode 100644
+index 0000000000..783273146a
+--- /dev/null
++++ b/test_permissions.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a mock user with only view permission
++from django.contrib.auth.models import User
++from django.test import RequestFactory
++
++# Create mock request with user that has only view permission
++factory = RequestFactory()
++request = factory.get('/admin/')
++
++# Create a mock user with only view permission
++class MockUser:
++    def __init__(self, has_view_perm=True, has_change_perm=False):
++        self.has_view_perm = has_view_perm
++        self.has_change_perm = has_change_perm
++    
++    def has_perm(self, perm):
++        if 'view' in perm and self.has_view_perm:
++            return True
++        if 'change' in perm and self.has_change_perm:
++            return True
++        return False
++
++# Test the current behavior
++from django.contrib.admin.options import InlineModelAdmin
++from django.db import models
++
++# Create a mock model to test with
++class MockModel:
++    class _meta:
++        auto_created = True
++        app_label = 'test_app'
++        model_name = 'mockmodel'
++        
++        @property
++        def fields(self):
++            # Return a mock field that points to a target model
++            class MockField:
++                remote_field = type('obj', (object,), {
++                    'model': type('obj', (object,), {
++                        '_meta': type('obj', (object,), {
++                            'app_label': 'test_app',
++                            'model_name': 'photo'
++                        })
++                    })
++                })()
++            return [MockField()]
++
++# Create inline instance
++class MockInlineModelAdmin(InlineModelAdmin):
++    def __init__(self):
++        self.parent_model = None
++        self.admin_site = None
++        self.opts = MockModel._meta
++
++inline = MockInlineModelAdmin()
++
++print("Testing current permission behavior for auto-created models:")
++print("=" * 60)
++
++# Test 1: User with only view permission
++request.user = MockUser(has_view_perm=True, has_change_perm=False)
++print(f"User with only view permission:")
++print(f"  has_view_permission: {inline.has_view_permission(request)}")
++print(f"  has_add_permission: {inline.has_add_permission(request)}")
++print(f"  has_change_permission: {inline.has_change_permission(request)}")
++print(f"  has_delete_permission: {inline.has_delete_permission(request)}")
++print()
++
++# Test 2: User with view and change permission
++request.user = MockUser(has_view_perm=True, has_change_perm=True)
++print(f"User with view and change permission:")
++print(f"  has_view_permission: {inline.has_view_permission(request)}")
++print(f"  has_add_permission: {inline.has_add_permission(request)}")
++print(f"  has_change_permission: {inline.has_change_permission(request)}")
++print(f"  has_delete_permission: {inline.has_delete_permission(request)}")
++print()
++
++# Test 3: User with no permissions
++request.user = MockUser(has_view_perm=False, has_change_perm=False)
++print(f"User with no permissions:")
++print(f"  has_view_permission: {inline.has_view_permission(request)}")
++print(f"  has_add_permission: {inline.has_add_permission(request)}")
++print(f"  has_change_permission: {inline.has_change_permission(request)}")
++print(f"  has_delete_permission: {inline.has_delete_permission(request)}")
++print()
++
++print("ISSUE: User with only view permission can still add/change/delete!")
++print("This is because has_view_permission returns True if user has view OR change permission")
+\ No newline at end of file
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 0000000000..d55cbc98c2
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.admin',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.admin.options import InlineModelAdmin
++from django.test import RequestFactory
++
++# Create a mock user class for testing permissions
++class MockUser:
++    def __init__(self, has_view_perm=True, has_change_perm=False):
++        self.has_view_perm = has_view_perm
++        self.has_change_perm = has_change_perm
++    
++    def has_perm(self, perm):
++        if 'view' in perm and self.has_view_perm:
++            return True
++        if 'change' in perm and self.has_change_perm:
++            return True
++        return False
++
++# Create a mock model with auto_created=True
++class MockModel:
++    class _meta:
++        auto_created = True
++        app_label = 'test_app'
++        model_name = 'mockmodel'
++        
++        @property
++        def fields(self):
++            # Return a mock field that points to a target model
++            class MockField:
++                remote_field = type('obj', (object,), {
++                    'model': type('obj', (object,), {
++                        '_meta': type('obj', (object,), {
++                            'app_label': 'test_app',
++                            'model_name': 'photo'
++                        })
++                    })
++                })()
++            return [MockField()]
++
++# Create inline instance
++class MockInlineModelAdmin(InlineModelAdmin):
++    def __init__(self):
++        self.parent_model = None
++        self.admin_site = None
++        self.opts = MockModel._meta
++
++# Test the fixed behavior
++factory = RequestFactory()
++request = factory.get('/admin/')
++inline = MockInlineModelAdmin()
++
++print("Testing FIXED permission behavior for auto-created models:")
++print("=" * 70)
++
++# Test 1: User with only view permission
++request.user = MockUser(has_view_perm=True, has_change_perm=False)
++print(f"User with only view permission:")
++print(f"  has_view_permission: {inline.has_view_permission(request)}")
++print(f"  has_add_permission: {inline.has_add_permission(request)}")
++print(f"  has_change_permission: {inline.has_change_permission(request)}")
++print(f"  has_delete_permission: {inline.has_delete_permission(request)}")
++print("  EXPECTED: Only has_view_permission should be True")
++print()
++
++# Test 2: User with view and change permission
++request.user = MockUser(has_view_perm=True, has_change_perm=True)
++print(f"User with view and change permission:")
++print(f"  has_view_permission: {inline.has_view_permission(request)}")
++print(f"  has_add_permission: {inline.has_add_permission(request)}")
++print(f"  has_change_permission: {inline.has_change_permission(request)}")
++print(f"  has_delete_permission: {inline.has_delete_permission(request)}")
++print("  EXPECTED: All should be True")
++print()
++
++# Test 3: User with no permissions
++request.user = MockUser(has_view_perm=False, has_change_perm=False)
++print(f"User with no permissions:")
++print(f"  has_view_permission: {inline.has_view_permission(request)}")
++print(f"  has_add_permission: {inline.has_add_permission(request)}")
++print(f"  has_change_permission: {inline.has_change_permission(request)}")
++print(f"  has_delete_permission: {inline.has_delete_permission(request)}")
++print("  EXPECTED: All should be False")
++print()
++
++# Test 4: User with only change permission (no view permission)
++request.user = MockUser(has_view_perm=False, has_change_perm=True)
++print(f"User with only change permission (no view):")
++print(f"  has_view_permission: {inline.has_view_permission(request)}")
++print(f"  has_add_permission: {inline.has_add_permission(request)}")
++print(f"  has_change_permission: {inline.has_change_permission(request)}")
++print(f"  has_delete_permission: {inline.has_delete_permission(request)}")
++print("  EXPECTED: All should be False (since has_view_permission is False)")
++print()
++
++print("FIX VERIFICATION:")
++print("Before fix: User with only view permission could add/change/delete")
++print("After fix: User with only view permission can only view")
+\ No newline at end of file

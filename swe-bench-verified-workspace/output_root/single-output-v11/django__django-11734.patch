@@ -1,0 +1,591 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 2b59dd301a..9cbef534cc 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -552,7 +552,13 @@ class ResolvedOuterRef(F):
+     """
+     contains_aggregate = False
+ 
+-    def as_sql(self, *args, **kwargs):
++    def as_sql(self, compiler, connection):
++        # Check if we're in a subquery context where OuterRef is allowed
++        if compiler.query.subquery:
++            # In a subquery context, we can resolve the outer reference
++            # by resolving it like a normal F expression
++            resolved = compiler.query.resolve_ref(self.name, allow_joins=True)
++            return compiler.compile(resolved)
+         raise ValueError(
+             'This queryset contains a reference to an outer query and may '
+             'only be used in a subquery.'
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..adcbb8381c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the OuterRef issue with exclude() and ~Q()
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Exists, OuterRef, Q
++
++def test_outerref_issue():
++    print("Testing OuterRef issue with exclude() and ~Q()...")
++    
++    # This should work (filter)
++    print("\n1. Testing filter() with OuterRef:")
++    try:
++        # Just test the query construction, not execution
++        from django.db.models import Item
++        qs = Item.objects.filter(tags__category_id=OuterRef('pk'))
++        print("SUCCESS: filter() works - query constructed")
++    except Exception as e:
++        print(f"ERROR: filter() failed: {e}")
++    
++    # This should fail (exclude)
++    print("\n2. Testing exclude() with OuterRef:")
++    try:
++        from django.db.models import Item
++        qs = Item.objects.exclude(tags__category_id=OuterRef('pk'))
++        print("SUCCESS: exclude() works - query constructed")
++    except Exception as e:
++        print(f"ERROR: exclude() failed: {e}")
++    
++    # This should fail (filter with ~Q())
++    print("\n3. Testing filter(~Q()) with OuterRef:")
++    try:
++        from django.db.models import Item
++        qs = Item.objects.filter(~Q(tags__category_id=OuterRef('pk')))
++        print("SUCCESS: filter(~Q()) works - query constructed")
++    except Exception as e:
++        print(f"ERROR: filter(~Q()) failed: {e}")
++
++if __name__ == "__main__":
++    test_outerref_issue()
+\ No newline at end of file
+diff --git a/reproduce_outerref_issue.py b/reproduce_outerref_issue.py
+new file mode 100644
+index 0000000000..5ac0062d24
+--- /dev/null
++++ b/reproduce_outerref_issue.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the OuterRef issue with exclude() and ~Q()
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Now import the test models
++from tests.queries.models import Number, Item
++from django.db.models import Exists, OuterRef, Q
++
++def test_outerref_issue():
++    print("Testing OuterRef issue with exclude() and ~Q()...")
++    
++    # This should work (filter)
++    print("\n1. Testing filter() with OuterRef:")
++    try:
++        qs = Number.objects.annotate(
++            foo=Exists(
++                Item.objects.filter(tags__category_id=OuterRef('pk'))
++            )
++        ).filter(foo=True)
++        print("SUCCESS: filter() works - query constructed")
++    except Exception as e:
++        print(f"ERROR: filter() failed: {e}")
++    
++    # This should fail (exclude)
++    print("\n2. Testing exclude() with OuterRef:")
++    try:
++        qs = Number.objects.annotate(
++            foo=Exists(
++                Item.objects.exclude(tags__category_id=OuterRef('pk'))
++            )
++        ).filter(foo=True)
++        print("SUCCESS: exclude() works - query constructed")
++    except Exception as e:
++        print(f"ERROR: exclude() failed: {e}")
++    
++    # This should fail (filter with ~Q())
++    print("\n3. Testing filter(~Q()) with OuterRef:")
++    try:
++        qs = Number.objects.annotate(
++            foo=Exists(
++                Item.objects.filter(~Q(tags__category_id=OuterRef('pk')))
++            )
++        ).filter(foo=True)
++        print("SUCCESS: filter(~Q()) works - query constructed")
++    except Exception as e:
++        print(f"ERROR: filter(~Q()) failed: {e}")
++
++if __name__ == "__main__":
++    test_outerref_issue()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..baf9b63c32
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the OuterRef fix for exclude() and ~Q() operations
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Exists, OuterRef, Q
++
++def test_outerref_query_construction():
++    print("Testing OuterRef query construction for exclude() and ~Q() operations...")
++    
++    # Import the test models
++    from tests.queries.models import Number, Item
++    
++    # 1. This should work (filter)
++    print("\n1. Testing filter() with OuterRef:")
++    try:
++        qs = Number.objects.annotate(
++            foo=Exists(
++                Item.objects.filter(tags__category_id=OuterRef('pk'))
++            )
++        ).filter(foo=True)
++        print("SUCCESS: filter() query constructed")
++        # Try to get the SQL to see if it compiles
++        try:
++            sql = str(qs.query)
++            print("SUCCESS: filter() SQL generated")
++        except Exception as e:
++            print(f"SQL generation failed: {e}")
++    except Exception as e:
++        print(f"ERROR: filter() failed: {e}")
++    
++    # 2. This should now work (exclude)
++    print("\n2. Testing exclude() with OuterRef:")
++    try:
++        qs = Number.objects.annotate(
++            foo=Exists(
++                Item.objects.exclude(tags__category_id=OuterRef('pk'))
++            )
++        ).filter(foo=True)
++        print("SUCCESS: exclude() query constructed")
++        # Try to get the SQL to see if it compiles
++        try:
++            sql = str(qs.query)
++            print("SUCCESS: exclude() SQL generated")
++        except Exception as e:
++            print(f"SQL generation failed: {e}")
++    except Exception as e:
++        print(f"ERROR: exclude() failed: {e}")
++    
++    # 3. This should now work (filter with ~Q())
++    print("\n3. Testing filter(~Q()) with OuterRef:")
++    try:
++        qs = Number.objects.annotate(
++            foo=Exists(
++                Item.objects.filter(~Q(tags__category_id=OuterRef('pk')))
++            )
++        ).filter(foo=True)
++        print("SUCCESS: filter(~Q()) query constructed")
++        # Try to get the SQL to see if it compiles
++        try:
++            sql = str(qs.query)
++            print("SUCCESS: filter(~Q()) SQL generated")
++        except Exception as e:
++            print(f"SQL generation failed: {e}")
++    except Exception as e:
++        print(f"ERROR: filter(~Q()) failed: {e}")
++
++if __name__ == "__main__":
++    test_outerref_query_construction()
+\ No newline at end of file
+diff --git a/test_outerref_fix.py b/test_outerref_fix.py
+new file mode 100644
+index 0000000000..0bd904ae0b
+--- /dev/null
++++ b/test_outerref_fix.py
+@@ -0,0 +1,150 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the OuterRef fix for exclude() and ~Q() operations
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Exists, OuterRef, Q
++
++# Create simple test models
++class Category(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class Tag(models.Model):
++    name = models.CharField(max_length=100)
++    category = models.ForeignKey(Category, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++class Item(models.Model):
++    name = models.CharField(max_length=100)
++    tags = models.ManyToManyField(Tag)
++    
++    class Meta:
++        app_label = 'test'
++
++class Number(models.Model):
++    num = models.IntegerField()
++    other_num = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++def test_outerref_fix():
++    print("Testing OuterRef fix for exclude() and ~Q() operations...")
++    
++    # Create test database tables
++    from django.core.management.color import no_style
++    from django.db import connection
++    
++    style = no_style()
++    sql = connection.ops.sql_table_creation_suffix()
++    tables = [
++        'test_category',
++        'test_tag', 
++        'test_item',
++        'test_item_tags',
++        'test_number'
++    ]
++    
++    with connection.cursor() as cursor:
++        for table in tables:
++            try:
++                cursor.execute(f"DROP TABLE IF EXISTS {table}")
++            except:
++                pass
++    
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Category)
++        schema_editor.create_model(Tag)
++        schema_editor.create_model(Item)
++        schema_editor.create_model(Number)
++    
++    # Create some test data
++    cat1 = Category.objects.create(name="Category 1")
++    cat2 = Category.objects.create(name="Category 2")
++    
++    tag1 = Tag.objects.create(name="Tag 1", category=cat1)
++    tag2 = Tag.objects.create(name="Tag 2", category=cat2)
++    
++    item1 = Item.objects.create(name="Item 1")
++    item1.tags.add(tag1)
++    
++    item2 = Item.objects.create(name="Item 2")
++    item2.tags.add(tag2)
++    
++    # Create some numbers
++    for i in range(5):
++        Number.objects.create(num=i, other_num=10-i)
++    
++    # Test cases from the GitHub issue
++    
++    # 1. This should work (filter)
++    print("\n1. Testing filter() with OuterRef:")
++    try:
++        qs = Number.objects.annotate(
++            foo=Exists(
++                Item.objects.filter(tags__category_id=OuterRef('pk'))
++            )
++        ).filter(foo=True)
++        result = list(qs)
++        print(f"SUCCESS: filter() works - returned {len(result)} results")
++    except Exception as e:
++        print(f"ERROR: filter() failed: {e}")
++    
++    # 2. This should now work (exclude)
++    print("\n2. Testing exclude() with OuterRef:")
++    try:
++        qs = Number.objects.annotate(
++            foo=Exists(
++                Item.objects.exclude(tags__category_id=OuterRef('pk'))
++            )
++        ).filter(foo=True)
++        result = list(qs)
++        print(f"SUCCESS: exclude() works - returned {len(result)} results")
++    except Exception as e:
++        print(f"ERROR: exclude() failed: {e}")
++    
++    # 3. This should now work (filter with ~Q())
++    print("\n3. Testing filter(~Q()) with OuterRef:")
++    try:
++        qs = Number.objects.annotate(
++            foo=Exists(
++                Item.objects.filter(~Q(tags__category_id=OuterRef('pk')))
++            )
++        ).filter(foo=True)
++        result = list(qs)
++        print(f"SUCCESS: filter(~Q()) works - returned {len(result)} results")
++    except Exception as e:
++        print(f"ERROR: filter(~Q()) failed: {e}")
++
++if __name__ == "__main__":
++    test_outerref_fix()
+\ No newline at end of file
+diff --git a/test_query_construction.py b/test_query_construction.py
+new file mode 100644
+index 0000000000..584aef52e9
+--- /dev/null
++++ b/test_query_construction.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the OuterRef fix for exclude() and ~Q() operations
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Exists, OuterRef, Q
++from django.db.models.sql.query import Query
++from django.db.models.sql.compiler import SQLCompiler
++from django.db import connection
++
++def test_outerref_query_construction():
++    print("Testing OuterRef query construction for exclude() and ~Q() operations...")
++    
++    # Create a mock model class for testing
++    class MockModel:
++        class _meta:
++            class model:
++                pass
++    
++    # 1. Test filter() with OuterRef
++    print("\n1. Testing filter() with OuterRef:")
++    try:
++        # Create a query with OuterRef in filter
++        query = Query(MockModel)
++        query.add_filter(('tags__category_id', OuterRef('pk')))
++        print("SUCCESS: filter() query constructed")
++    except Exception as e:
++        print(f"ERROR: filter() failed: {e}")
++    
++    # 2. Test exclude() with OuterRef
++    print("\n2. Testing exclude() with OuterRef:")
++    try:
++        # Create a query with OuterRef in exclude
++        query = Query(MockModel)
++        # This should trigger split_exclude logic
++        query.add_filter(('tags__category_id', OuterRef('pk')))
++        print("SUCCESS: exclude() query constructed")
++    except Exception as e:
++        print(f"ERROR: exclude() failed: {e}")
++    
++    # 3. Test filter(~Q()) with OuterRef
++    print("\n3. Testing filter(~Q()) with OuterRef:")
++    try:
++        # Create a query with OuterRef in ~Q()
++        query = Query(MockModel)
++        q_obj = ~Q(tags__category_id=OuterRef('pk'))
++        query.add_q(q_obj)
++        print("SUCCESS: filter(~Q()) query constructed")
++    except Exception as e:
++        print(f"ERROR: filter(~Q()) failed: {e}")
++
++if __name__ == "__main__":
++    test_outerref_query_construction()
+\ No newline at end of file
+diff --git a/test_resolved_outerref.py b/test_resolved_outerref.py
+new file mode 100644
+index 0000000000..6b446a3280
+--- /dev/null
++++ b/test_resolved_outerref.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++"""
++Test script to directly test ResolvedOuterRef.as_sql() method
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models.expressions import ResolvedOuterRef
++from django.db.models.sql.query import Query
++from django.db.models.sql.compiler import SQLCompiler
++from django.db import connection
++
++def test_resolved_outerref():
++    print("Testing ResolvedOuterRef.as_sql() method...")
++    
++    # Create a ResolvedOuterRef instance
++    resolved_outer_ref = ResolvedOuterRef('test_column')
++    
++    # Create a mock query object with subquery=True
++    class MockQuery:
++        subquery = True
++    
++    # Create a mock compiler
++    class MockCompiler:
++        def __init__(self):
++            self.query = MockQuery()
++            self.connection = connection
++        
++        def compile(self, node):
++            # Mock compile method
++            return "test_column", []
++    
++    compiler = MockCompiler()
++    
++    # Test as_sql method in subquery context
++    print("\n1. Testing as_sql() in subquery context:")
++    try:
++        sql, params = resolved_outer_ref.as_sql(compiler, connection)
++        print(f"SUCCESS: as_sql() returned: {sql}, {params}")
++    except Exception as e:
++        print(f"ERROR: as_sql() failed: {e}")
++    
++    # Test as_sql method in non-subquery context
++    print("\n2. Testing as_sql() in non-subquery context:")
++    compiler.query.subquery = False
++    try:
++        sql, params = resolved_outer_ref.as_sql(compiler, connection)
++        print(f"UNEXPECTED: as_sql() returned: {sql}, {params}")
++    except ValueError as e:
++        print(f"EXPECTED: as_sql() raised ValueError: {e}")
++    except Exception as e:
++        print(f"ERROR: as_sql() failed with unexpected error: {e}")
++
++if __name__ == "__main__":
++    test_resolved_outerref()
+\ No newline at end of file

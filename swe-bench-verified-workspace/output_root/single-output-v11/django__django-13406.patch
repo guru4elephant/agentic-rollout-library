@@ -1,0 +1,435 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..359b9e567f
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,71 @@
++import pickle
++from django.db.models import Sum
++from django.db import models
++from django.db.models.query import QuerySet, ValuesIterable, ModelIterable
++from django.db.models.sql.query import Query as SQLQuery
++
++# Create a simple mock model class for testing
++class MockModel:
++    def __init__(self, **kwargs):
++        for k, v in kwargs.items():
++            setattr(self, k, v)
++    
++    def __repr__(self):
++        return f"<MockModel: {self.__dict__}>"
++
++# Simulate the original issue
++print("=== Simulating the original issue ===")
++
++# Create a values query similar to the one in the issue
++sql_query = SQLQuery(MockModel)
++sql_query.values_select = ['material']
++sql_query.annotations = {'total_price': Sum('price')}
++
++# Create a queryset and assign the values query
++original_queryset = QuerySet()
++original_queryset.model = MockModel
++original_queryset.query = sql_query
++
++# Simulate what happens in the original issue: pickle the query and assign to new queryset
++print(f"Original queryset _iterable_class: {original_queryset._iterable_class}")
++
++# Pickle and unpickle the query
++pickled_query = pickle.dumps(original_queryset.query)
++unpickled_query = pickle.loads(pickled_query)
++
++print(f"Unpickled query _is_values_query: {unpickled_query._is_values_query}")
++
++# Create a new queryset and assign the unpickled query (this is what causes the issue)
++new_queryset = QuerySet()
++new_queryset.model = MockModel
++new_queryset.query = unpickled_query
++
++print(f"New queryset _iterable_class: {new_queryset._iterable_class}")
++print(f"Should be ValuesIterable: {new_queryset._iterable_class == ValuesIterable}")
++
++# Test that regular queries still work correctly
++print("\n=== Testing regular queries ===")
++regular_sql_query = SQLQuery(MockModel)
++regular_sql_query.values_select = ()  # Empty for regular queries
++
++regular_queryset = QuerySet()
++regular_queryset.model = MockModel
++regular_queryset.query = regular_sql_query
++
++print(f"Regular queryset _iterable_class: {regular_queryset._iterable_class}")
++
++# Pickle and unpickle the regular query
++pickled_regular_query = pickle.dumps(regular_queryset.query)
++unpickled_regular_query = pickle.loads(pickled_regular_query)
++
++print(f"Unpickled regular query _is_values_query: {unpickled_regular_query._is_values_query}")
++
++# Create a new queryset and assign the unpickled regular query
++new_regular_queryset = QuerySet()
++new_regular_queryset.model = MockModel
++new_regular_queryset.query = unpickled_regular_query
++
++print(f"New regular queryset _iterable_class: {new_regular_queryset._iterable_class}")
++print(f"Should be ModelIterable: {new_regular_queryset._iterable_class == ModelIterable}")
++
++print("\n=== Test completed successfully! ===")
+\ No newline at end of file
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index b48d0df9c0..8033083f87 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -211,6 +211,9 @@ class QuerySet:
+     @query.setter
+     def query(self, value):
+         self._query = value
++        # If this is a values query (from pickling), set the appropriate iterable class
++        if hasattr(value, '_is_values_query') and value._is_values_query:
++            self._iterable_class = ValuesIterable
+ 
+     def as_manager(cls):
+         # Address the circular dependency between `Queryset` and `Manager`.
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 4648daf395..f749ed7d3c 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -2348,7 +2348,25 @@ class Query(BaseExpression):
+         return (
+             connections[DEFAULT_DB_ALIAS].features.interprets_empty_strings_as_nulls and
+             field.empty_strings_allowed
+-        ) or field.null
++        )
++
++    def __getstate__(self):
++        """
++        Return the state for pickling.
++        
++        We need to preserve information about whether this query should use
++        ValuesIterable instead of ModelIterable when used in a queryset.
++        """
++        state = self.__dict__.copy()
++        # Store whether this is a values query (has values_select set)
++        state['_is_values_query'] = bool(self.values_select)
++        return state
++
++    def __setstate__(self, state):
++        """
++        Restore the state from pickling.
++        """
++        self.__dict__.update(state)
+ 
+ 
+ def get_order_dir(field, default='ASC'):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..56359a935a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,55 @@
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings first
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++        USE_TZ=True,
++    )
++django.setup()
++
++import pickle
++from django.db.models import Sum
++from django.db import models
++
++# Create a simple model
++class Toy(models.Model):
++    name = models.CharField(max_length=16)
++    material = models.CharField(max_length=16)
++    price = models.PositiveIntegerField()
++
++    class Meta:
++        app_label = 'django.contrib.auth'
++
++# Create database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Toy)
++
++# Create some test data
++Toy.objects.create(name='foo', price=10, material='wood')
++Toy.objects.create(name='bar', price=20, material='plastic')
++Toy.objects.create(name='baz', price=100, material='wood')
++
++# Test the original query
++prices = Toy.objects.values('material').annotate(total_price=Sum('price'))
++print("Original query results:")
++print(prices)
++print(f"Type of first element: {type(prices[0])}")
++
++# Test pickling and unpickling
++prices2 = Toy.objects.all()
++prices2.query = pickle.loads(pickle.dumps(prices.query))
++print("\nAfter pickling/unpickling:")
++print(f"Type of first element: {type(prices2[0])}")
++print("Trying to print the queryset:")
++print(prices2)
+\ No newline at end of file
+diff --git a/simple_reproduce.py b/simple_reproduce.py
+new file mode 100644
+index 0000000000..91366e0470
+--- /dev/null
++++ b/simple_reproduce.py
+@@ -0,0 +1,41 @@
++import pickle
++from django.db.models import Sum
++from django.db import models
++from django.db.models.query import QuerySet
++
++# Create a simple mock model class for testing
++class MockModel:
++    def __init__(self, **kwargs):
++        for k, v in kwargs.items():
++            setattr(self, k, v)
++
++# Test the issue by creating a query object and examining its state
++# Let's look at how the query object stores information about values() vs regular queries
++
++# Create a mock queryset with values()
++queryset = QuerySet()
++queryset.model = MockModel
++queryset.query.values_select = ['material']
++queryset.query.annotation_select = {'total_price': Sum('price')}
++queryset._iterable_class = None  # This should be ValuesIterable for values() queries
++
++print("Original queryset:")
++print(f"values_select: {queryset.query.values_select}")
++print(f"annotation_select: {queryset.query.annotation_select}")
++print(f"_iterable_class: {queryset._iterable_class}")
++
++# Now pickle and unpickle
++pickled_query = pickle.dumps(queryset.query)
++unpickled_query = pickle.loads(pickled_query)
++
++print("\nAfter pickling/unpickling:")
++print(f"values_select: {unpickled_query.values_select}")
++print(f"annotation_select: {unpickled_query.annotation_select}")
++
++# The issue is likely that when we unpickle, the _iterable_class is not preserved
++# Let's create a new queryset and assign the unpickled query
++new_queryset = QuerySet()
++new_queryset.model = MockModel
++new_queryset.query = unpickled_query
++
++print(f"_iterable_class after assignment: {new_queryset._iterable_class}")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..f1b66c2550
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,67 @@
++import pickle
++from django.db.models import Sum
++from django.db import models
++from django.db.models.query import QuerySet, ValuesIterable, ModelIterable
++from django.db.models.sql.query import Query as SQLQuery
++
++# Create a simple mock model class for testing
++class MockModel:
++    def __init__(self, **kwargs):
++        for k, v in kwargs.items():
++            setattr(self, k, v)
++
++# Test the fix
++print("Testing the fix...")
++
++# Create a mock queryset with values()
++queryset = QuerySet()
++queryset.model = MockModel
++
++# Create a values query
++sql_query = SQLQuery(MockModel)
++sql_query.values_select = ['material']
++sql_query.annotations = {'total_price': Sum('price')}
++
++# Assign the query to the queryset
++queryset.query = sql_query
++
++print(f"Before pickling: _iterable_class = {queryset._iterable_class}")
++
++# Pickle and unpickle the query
++pickled_query = pickle.dumps(queryset.query)
++unpickled_query = pickle.loads(pickled_query)
++
++print(f"After unpickling: _is_values_query = {unpickled_query._is_values_query}")
++
++# Create a new queryset and assign the unpickled query
++new_queryset = QuerySet()
++new_queryset.model = MockModel
++new_queryset.query = unpickled_query
++
++print(f"After assignment: _iterable_class = {new_queryset._iterable_class}")
++print(f"ValuesIterable class: {new_queryset._iterable_class == ValuesIterable}")
++
++# Test with a regular query (not values)
++print("\nTesting with regular query...")
++regular_sql_query = SQLQuery(MockModel)
++regular_sql_query.values_select = ()  # Empty for regular query
++
++regular_queryset = QuerySet()
++regular_queryset.model = MockModel
++regular_queryset.query = regular_sql_query
++
++print(f"Before pickling: _iterable_class = {regular_queryset._iterable_class}")
++
++# Pickle and unpickle the regular query
++pickled_regular_query = pickle.dumps(regular_queryset.query)
++unpickled_regular_query = pickle.loads(pickled_regular_query)
++
++print(f"After unpickling: _is_values_query = {unpickled_regular_query._is_values_query}")
++
++# Create a new queryset and assign the unpickled regular query
++new_regular_queryset = QuerySet()
++new_regular_queryset.model = MockModel
++new_regular_queryset.query = unpickled_regular_query
++
++print(f"After assignment: _iterable_class = {new_regular_queryset._iterable_class}")
++print(f"ModelIterable class: {new_regular_queryset._iterable_class == ModelIterable}")
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..f25452ef9e
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,57 @@
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings first
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++        USE_TZ=True,
++    )
++django.setup()
++
++import pickle
++from django.db.models import Sum
++from django.db import models
++
++# Create a simple model
++class Toy(models.Model):
++    name = models.CharField(max_length=16)
++    material = models.CharField(max_length=16)
++    price = models.PositiveIntegerField()
++
++    class Meta:
++        app_label = 'auth'
++
++# Create database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Toy)
++
++# Create some test data
++Toy.objects.create(name='foo', price=10, material='wood')
++Toy.objects.create(name='bar', price=20, material='plastic')
++Toy.objects.create(name='baz', price=100, material='wood')
++
++# Test the original query
++prices = Toy.objects.values('material').annotate(total_price=Sum('price'))
++print("Original query results:")
++print(prices)
++print(f"Type of first element: {type(prices[0])}")
++
++# Test pickling and unpickling
++prices2 = Toy.objects.all()
++prices2.query = pickle.loads(pickle.dumps(prices.query))
++print("\nAfter pickling/unpickling:")
++print(f"Type of first element: {type(prices2[0])}")
++print("Trying to print the queryset:")
++print(prices2)
++
++print("\n=== Test completed successfully! ===")
+\ No newline at end of file
+diff --git a/test_values_list.py b/test_values_list.py
+new file mode 100644
+index 0000000000..6381fba370
+--- /dev/null
++++ b/test_values_list.py
+@@ -0,0 +1,57 @@
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings first
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++        USE_TZ=True,
++    )
++django.setup()
++
++import pickle
++from django.db.models import Sum
++from django.db import models
++
++# Create a simple model
++class Toy(models.Model):
++    name = models.CharField(max_length=16)
++    material = models.CharField(max_length=16)
++    price = models.PositiveIntegerField()
++
++    class Meta:
++        app_label = 'auth'
++
++# Create database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Toy)
++
++# Create some test data
++Toy.objects.create(name='foo', price=10, material='wood')
++Toy.objects.create(name='bar', price=20, material='plastic')
++Toy.objects.create(name='baz', price=100, material='wood')
++
++# Test values_list query
++prices = Toy.objects.values_list('material').annotate(total_price=Sum('price'))
++print("Original values_list query results:")
++print(prices)
++print(f"Type of first element: {type(prices[0])}")
++
++# Test pickling and unpickling
++prices2 = Toy.objects.all()
++prices2.query = pickle.loads(pickle.dumps(prices.query))
++print("\nAfter pickling/unpickling:")
++print(f"Type of first element: {type(prices2[0])}")
++print("Trying to print the queryset:")
++print(prices2)
++
++print("\n=== Test completed successfully! ===")
+\ No newline at end of file

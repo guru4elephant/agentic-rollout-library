@@ -1,0 +1,195 @@
+diff --git a/debug_replace_named_groups.py b/debug_replace_named_groups.py
+new file mode 100644
+index 0000000000..0f5d645a53
+--- /dev/null
++++ b/debug_replace_named_groups.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++
++import re
++from django.contrib.admindocs.utils import named_group_matcher
++
++# Test case from the GitHub issue
++pattern = r'entries/(?P<pk>[^/.]+)/relationships/(?P<related_field>\w+)'
++
++print("Original pattern:")
++print(pattern)
++
++# Debug the regex matching
++named_group_indices = [
++    (m.start(0), m.end(0), m.group(1))
++    for m in named_group_matcher.finditer(pattern)
++]
++
++print("\nNamed group indices:")
++print(named_group_indices)
++
++# Tuples of (named capture group pattern, group name).
++group_pattern_and_name = []
++
++# Loop over the groups and their start and end indices.
++for start, end, group_name in named_group_indices:
++    print(f"\nProcessing group: {group_name} at position {start}-{end}")
++    
++    # Handle nested parentheses, e.g. '^(?P<a>(x|y))/b'.
++    unmatched_open_brackets, prev_char = 1, None
++    for idx, val in enumerate(pattern[end:]):
++        print(f"  idx={idx}, val='{val}', unmatched_open_brackets={unmatched_open_brackets}")
++        
++        # If brackets are balanced, the end of the string for the current
++        # named capture group pattern has been reached.
++        if unmatched_open_brackets == 0:
++            group_pattern_and_name.append((pattern[start:end + idx], group_name))
++            print(f"  Found end of group at idx={idx}, pattern: {pattern[start:end + idx]}")
++            break
++
++        # Check for unescaped `(` and `)`. They mark the start and end of a
++        # nested group.
++        if val == '(' and prev_char != '\\':
++            unmatched_open_brackets += 1
++            print(f"    Found '(', unmatched_open_brackets now {unmatched_open_brackets}")
++        elif val == ')' and prev_char != '\\':
++            unmatched_open_brackets -= 1
++            print(f"    Found ')', unmatched_open_brackets now {unmatched_open_brackets}")
++        prev_char = val
++        
++        # If we reach the end of the string without balancing brackets
++        if idx == len(pattern[end:]) - 1 and unmatched_open_brackets != 0:
++            print(f"  WARNING: Reached end of string without balancing brackets!")
++            print(f"  Adding partial pattern: {pattern[start:end + idx + 1]}")
++            group_pattern_and_name.append((pattern[start:end + idx + 1], group_name))
++            break
++
++print("\nGroup patterns and names:")
++print(group_pattern_and_name)
++
++# Replace the string for named capture groups with their group names.
++for group_pattern, group_name in group_pattern_and_name:
++    pattern = pattern.replace(group_pattern, group_name)
++
++print("\nFinal result:")
++print(pattern)
+\ No newline at end of file
+diff --git a/django/contrib/admindocs/utils.py b/django/contrib/admindocs/utils.py
+index 1ce4594501..d3e84463be 100644
+--- a/django/contrib/admindocs/utils.py
++++ b/django/contrib/admindocs/utils.py
+@@ -167,18 +167,17 @@ def replace_named_groups(pattern):
+         # Handle nested parentheses, e.g. '^(?P<a>(x|y))/b'.
+         unmatched_open_brackets, prev_char = 1, None
+         for idx, val in enumerate(pattern[end:]):
+-            # If brackets are balanced, the end of the string for the current
+-            # named capture group pattern has been reached.
+-            if unmatched_open_brackets == 0:
+-                group_pattern_and_name.append((pattern[start:end + idx], group_name))
+-                break
+-
+             # Check for unescaped `(` and `)`. They mark the start and end of a
+             # nested group.
+             if val == '(' and prev_char != '\\':
+                 unmatched_open_brackets += 1
+             elif val == ')' and prev_char != '\\':
+                 unmatched_open_brackets -= 1
++                # If brackets are balanced, the end of the string for the current
++                # named capture group pattern has been reached.
++                if unmatched_open_brackets == 0:
++                    group_pattern_and_name.append((pattern[start:end + idx + 1], group_name))
++                    break
+             prev_char = val
+ 
+     # Replace the string for named capture groups with their group names.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..a8baa72cc6
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,25 @@
++#!/usr/bin/env python3
++
++from django.contrib.admindocs.utils import replace_named_groups
++from django.contrib.admindocs.views import simplify_regex
++
++# Test case from the GitHub issue
++pattern = r'entries/(?P<pk>[^/.]+)/relationships/(?P<related_field>\w+)'
++
++print("Original pattern:")
++print(pattern)
++
++print("\nAfter replace_named_groups:")
++result1 = replace_named_groups(pattern)
++print(result1)
++
++print("\nAfter simplify_regex:")
++result2 = simplify_regex(pattern)
++print(result2)
++
++# Expected result should be: /entries/<pk>/relationships/<related_field>
++# (simplify_regex adds a leading slash to make it human-readable)
++expected = '/entries/<pk>/relationships/<related_field>'
++print(f"\nExpected: {expected}")
++print(f"Actual: {result2}")
++print(f"Match: {result2 == expected}")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..5e90b23d04
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++
++from django.contrib.admindocs.utils import replace_named_groups
++from django.contrib.admindocs.views import simplify_regex
++
++# Test cases to verify the fix works for various scenarios
++test_cases = [
++    # Original issue case
++    (r'entries/(?P<pk>[^/.]+)/relationships/(?P<related_field>\w+)', 
++     'entries/<pk>/relationships/<related_field>'),
++    
++    # Case with trailing slash (should work the same)
++    (r'entries/(?P<pk>[^/.]+)/relationships/(?P<related_field>\w+)/', 
++     'entries/<pk>/relationships/<related_field>/'),
++    
++    # Case with multiple nested groups
++    (r'^(?P<a>\w+)/(?P<b>(x|y))/(?P<c>\w+)$', 
++     '^<a>/<b>/<c>$'),
++    
++    # Case with escaped parentheses
++    (r'^(?P<a>\w+)/b/\(test\)/(?P<c>\w+)$', 
++     '^<a>/b/\(test\)/<c>$'),
++    
++    # Simple case
++    (r'^(?P<name>\w+)/$', 
++     '^<name>/$'),
++    
++    # Case with no trailing group
++    (r'^(?P<name>\w+)/test$', 
++     '^<name>/test$'),
++]
++
++print("Testing replace_named_groups function:")
++for i, (pattern, expected) in enumerate(test_cases):
++    result = replace_named_groups(pattern)
++    status = "✓" if result == expected else "✗"
++    print(f"{i+1}. {status} Input: {pattern}")
++    print(f"   Expected: {expected}")
++    print(f"   Got:      {result}")
++    if result != expected:
++        print(f"   MISMATCH!")
++
++print("\nTesting simplify_regex function:")
++for i, (pattern, expected_base) in enumerate(test_cases):
++    # simplify_regex adds leading slash and removes ^$? characters
++    expected_simplified = expected_base.replace('^', '').replace('$', '').replace('?', '')
++    if not expected_simplified.startswith('/'):
++        expected_simplified = '/' + expected_simplified
++    
++    result = simplify_regex(pattern)
++    status = "✓" if result == expected_simplified else "✗"
++    print(f"{i+1}. {status} Input: {pattern}")
++    print(f"   Expected: {expected_simplified}")
++    print(f"   Got:      {result}")
++    if result != expected_simplified:
++        print(f"   MISMATCH!")
+\ No newline at end of file

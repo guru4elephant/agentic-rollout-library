@@ -1,0 +1,197 @@
+diff --git a/debug_issue.py b/debug_issue.py
+new file mode 100644
+index 0000000000..1cbfebf794
+--- /dev/null
++++ b/debug_issue.py
+@@ -0,0 +1,20 @@
++from sympy.utilities.codegen import make_routine
++from sympy import MatrixSymbol
++
++# Test case 1: Array argument that doesn't appear in expression
++x = MatrixSymbol('x', 2, 1)
++expr = 1.0
++routine = make_routine('test', expr, argument_sequence=(x,), language='C99')
++
++print("Arguments:")
++for arg in routine.arguments:
++    print(f"  {arg.name}: dimensions={getattr(arg, 'dimensions', None)}")
++
++# Test case 2: Array argument that appears in expression
++x = MatrixSymbol('x', 2, 1)
++expr = x[0,0]
++routine2 = make_routine('test2', expr, argument_sequence=(x,), language='C99')
++
++print("\nArguments (when used in expression):")
++for arg in routine2.arguments:
++    print(f"  {arg.name}: dimensions={getattr(arg, 'dimensions', None)}")
+\ No newline at end of file
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..051e7768b9
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,31 @@
++from sympy.utilities.autowrap import autowrap
++from sympy import MatrixSymbol
++import numpy as np
++
++print("Testing the main issue from GitHub:")
++print("=" * 50)
++
++# Original failing case from GitHub issue
++x = MatrixSymbol('x', 2, 1)
++expr = 1.0
++f = autowrap(expr, args=(x,), backend='cython')
++
++# This should work now and return 1.0
++result = f(np.array([[1.0, 2.0]]))
++print(f"f(np.array([[1.0, 2.0]])) = {result}")
++assert result == 1.0, f"Expected 1.0, got {result}"
++
++# Test with different values to make sure it's not just returning constant
++result2 = f(np.array([[3.0, 4.0]]))
++print(f"f(np.array([[3.0, 4.0]])) = {result2}")
++assert result2 == 1.0, f"Expected 1.0, got {result2}"
++
++# Test that the working case still works
++x = MatrixSymbol('x', 2, 1)
++expr = x[0,0]  # now output depends on x
++f2 = autowrap(expr, args=(x,), backend='cython')
++result3 = f2(np.array([[5.0, 6.0]]))
++print(f"f2(np.array([[5.0, 6.0]])) = {result3}")
++assert result3 == 5.0, f"Expected 5.0, got {result3}"
++
++print("\nAll tests passed! The issue has been fixed.")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..9de45669ec
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,25 @@
++from sympy.utilities.autowrap import autowrap
++from sympy import MatrixSymbol
++import numpy as np
++
++# Test case 1: Array argument that doesn't appear in expression (should fail)
++print("Test case 1: Array argument not in expression")
++x = MatrixSymbol('x', 2, 1)
++expr = 1.0
++f = autowrap(expr, args=(x,), backend='cython')
++try:
++    result = f(np.array([[1.0, 2.0]]))
++    print(f"Result: {result}")
++except Exception as e:
++    print(f"Error: {e}")
++
++# Test case 2: Array argument that appears in expression (should work)
++print("\nTest case 2: Array argument in expression")
++x = MatrixSymbol('x', 2, 1)
++expr = x[0,0]
++f = autowrap(expr, args=(x,), backend='cython')
++try:
++    result = f(np.array([[1.0, 2.0]]))
++    print(f"Result: {result}")
++except Exception as e:
++    print(f"Error: {e}")
+\ No newline at end of file
+diff --git a/sympy/utilities/autowrap.py b/sympy/utilities/autowrap.py
+index bd6afb12d1..28809c0a51 100644
+--- a/sympy/utilities/autowrap.py
++++ b/sympy/utilities/autowrap.py
+@@ -441,9 +441,11 @@ def _prototype_arg(self, arg):
+         np_types = {'double': 'np.double_t',
+                     'int': 'np.int_t'}
+         t = arg.get_datatype('c')
+-        if arg.dimensions:
++        # Check if argument should be treated as array (has dimensions or MatrixSymbol without dimensions)
++        if arg.dimensions or (hasattr(arg.name, 'shape') and not arg.dimensions):
+             self._need_numpy = True
+-            ndim = len(arg.dimensions)
++            # Use dimensions if available, otherwise assume 2D for MatrixSymbol
++            ndim = len(arg.dimensions) if arg.dimensions else 2
+             mtype = np_types[t]
+             return mat_dec.format(mtype=mtype, ndim=ndim, name=self._string_var(arg.name))
+         else:
+@@ -458,7 +460,8 @@ def _declare_arg(self, arg):
+             return proto + " = 0"
+ 
+     def _call_arg(self, arg):
+-        if arg.dimensions:
++        # Check if argument should be treated as array (has dimensions or MatrixSymbol without dimensions)
++        if arg.dimensions or (hasattr(arg.name, 'shape') and not arg.dimensions):
+             t = arg.get_datatype('c')
+             return "<{0}*> {1}.data".format(t, self._string_var(arg.name))
+         elif isinstance(arg, ResultBase):
+diff --git a/sympy/utilities/codegen.py b/sympy/utilities/codegen.py
+index f0befb2bd7..090c277f71 100644
+--- a/sympy/utilities/codegen.py
++++ b/sympy/utilities/codegen.py
+@@ -910,7 +910,9 @@ def get_prototype(self, routine):
+         type_args = []
+         for arg in routine.arguments:
+             name = self.printer.doprint(arg.name)
+-            if arg.dimensions or isinstance(arg, ResultBase):
++            # Check if argument should be treated as pointer (array)
++            # This includes arguments with dimensions or MatrixSymbols without dimensions metadata
++            if arg.dimensions or isinstance(arg, ResultBase) or (hasattr(arg.name, 'shape') and not arg.dimensions):
+                 type_args.append((arg.get_datatype('C'), "*%s" % name))
+             else:
+                 type_args.append((arg.get_datatype('C'), name))
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..6b491677f4
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,50 @@
++from sympy.utilities.autowrap import autowrap
++from sympy import MatrixSymbol
++import numpy as np
++
++# Test case 1: Multiple array arguments, some not used
++print("Test case 1: Multiple array arguments, some not used")
++x = MatrixSymbol('x', 2, 1)
++y = MatrixSymbol('y', 3, 2)
++expr = x[0,0]  # Only uses x, not y
++f = autowrap(expr, args=(x, y), backend='cython')
++try:
++    result = f(np.array([[1.0, 2.0]]), np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]))
++    print(f"Result: {result}")
++except Exception as e:
++    print(f"Error: {e}")
++
++# Test case 2: Scalar argument + array argument not used
++print("\nTest case 2: Scalar + array argument not used")
++from sympy import Symbol
++x = MatrixSymbol('x', 2, 1)
++s = Symbol('s')
++expr = s  # Only uses scalar s, not array x
++f = autowrap(expr, args=(s, x), backend='cython')
++try:
++    result = f(5.0, np.array([[1.0, 2.0]]))
++    print(f"Result: {result}")
++except Exception as e:
++    print(f"Error: {e}")
++
++# Test case 3: Empty array argument not used
++print("\nTest case 3: Empty array argument not used")
++x = MatrixSymbol('x', 0, 0)  # Empty array
++expr = 1.0
++f = autowrap(expr, args=(x,), backend='cython')
++try:
++    result = f(np.array([]))
++    print(f"Result: {result}")
++except Exception as e:
++    print(f"Error: {e}")
++
++# Test case 4: 1D array argument not used
++print("\nTest case 4: 1D array argument not used")
++x = MatrixSymbol('x', 3, 1)  # 1D array
++expr = 1.0
++f = autowrap(expr, args=(x,), backend='cython')
++try:
++    result = f(np.array([1.0, 2.0, 3.0]))
++    print(f"Result: {result}")
++except Exception as e:
++    print(f"Error: {e}")
+\ No newline at end of file

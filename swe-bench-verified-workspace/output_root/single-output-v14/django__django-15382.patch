@@ -1,0 +1,330 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 81f8f79c71..e2e0291c2a 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -1200,6 +1200,10 @@ class Exists(Subquery):
+     template = 'EXISTS(%(subquery)s)'
+     output_field = fields.BooleanField()
+ 
++    @property
++    def empty_result_set_value(self):
++        return self.negated
++
+     def __init__(self, queryset, negated=False, **kwargs):
+         self.negated = negated
+         super().__init__(queryset, **kwargs)
+@@ -1211,13 +1215,23 @@ class Exists(Subquery):
+ 
+     def as_sql(self, compiler, connection, template=None, **extra_context):
+         query = self.query.exists(using=connection.alias)
+-        sql, params = super().as_sql(
+-            compiler,
+-            connection,
+-            template=template,
+-            query=query,
+-            **extra_context,
+-        )
++        try:
++            sql, params = super().as_sql(
++                compiler,
++                connection,
++                template=template,
++                query=query,
++                **extra_context,
++            )
++        except EmptyResultSet:
++            # Return the appropriate value for an empty EXISTS subquery
++            # Use Value to properly format the boolean value for the database
++            from .expressions import Value
++            if self.negated:
++                value_expr = Value(True, output_field=fields.BooleanField())
++            else:
++                value_expr = Value(False, output_field=fields.BooleanField())
++            return value_expr.as_sql(compiler, connection)
+         if self.negated:
+             sql = 'NOT {}'.format(sql)
+         return sql, params
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..bab1d081f3
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class MyModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_issue():
++    print("Testing the issue with Exists subquery and empty queryset...")
++    
++    # Create the issue scenario - just get the query without executing it
++    try:
++        qs = MyModel.objects.filter(~models.Exists(MyModel.objects.none()), name='test')
++        print(f"QuerySet: {qs}")
++        
++        # Try to access the query SQL without executing it
++        try:
++            sql, params = qs.query.sql_with_params()
++            print(f"SQL: {sql}")
++            print(f"Params: {params}")
++        except Exception as e:
++            print(f"Error getting SQL: {e}")
++            # Try to get the string representation which might work differently
++            print(f"Query string: {str(qs.query)}")
++            
++    except Exception as e:
++        print(f"Exception occurred: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_issue()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..1e6dfdd5f9
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class MyModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_edge_cases():
++    print("Testing edge cases for Exists subquery with empty queryset...")
++    
++    test_cases = [
++        ("Double negation", ~~models.Exists(MyModel.objects.none())),
++        ("Exists with non-empty queryset", models.Exists(MyModel.objects.all())),
++        ("Negated Exists with non-empty queryset", ~models.Exists(MyModel.objects.all())),
++    ]
++    
++    for test_name, expr in test_cases:
++        print(f"\nTesting: {test_name}")
++        try:
++            qs = MyModel.objects.filter(expr, name='test')
++            
++            # Try to get the SQL without executing the query
++            try:
++                # Access the query compiler directly
++                compiler = qs.query.get_compiler('default')
++                sql, params = compiler.as_sql()
++                print(f"SQL: {sql}")
++                print(f"Params: {params}")
++            except Exception as e:
++                print(f"Error compiling SQL: {e}")
++                
++        except Exception as e:
++            print(f"Exception occurred: {e}")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_non_negated.py b/test_non_negated.py
+new file mode 100644
+index 0000000000..8d40fccafb
+--- /dev/null
++++ b/test_non_negated.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class MyModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_non_negated():
++    print("Testing non-negated Exists subquery with empty queryset...")
++    
++    # Test the non-negated case
++    try:
++        qs = MyModel.objects.filter(models.Exists(MyModel.objects.none()), name='test')
++        
++        # Try to get the SQL without executing the query
++        try:
++            # Access the query compiler directly
++            compiler = qs.query.get_compiler('default')
++            sql, params = compiler.as_sql()
++            print(f"SQL: {sql}")
++            print(f"Params: {params}")
++            return True
++        except Exception as e:
++            print(f"Error compiling SQL: {e}")
++            import traceback
++            traceback.print_exc()
++            return False
++            
++    except Exception as e:
++        print(f"Exception occurred: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    success = test_non_negated()
++    if success:
++        print("Test completed successfully!")
++    else:
++        print("Test failed!")
+\ No newline at end of file
+diff --git a/test_query_only.py b/test_query_only.py
+new file mode 100644
+index 0000000000..ed0731e869
+--- /dev/null
++++ b/test_query_only.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Create a simple model for testing
++class MyModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_issue():
++    print("Testing the issue with Exists subquery and empty queryset...")
++    
++    # Create the issue scenario - just get the query without executing it
++    try:
++        qs = MyModel.objects.filter(~models.Exists(MyModel.objects.none()), name='test')
++        
++        # Try to get the SQL without executing the query
++        try:
++            # Access the query compiler directly
++            compiler = qs.query.get_compiler('default')
++            sql, params = compiler.as_sql()
++            print(f"SQL: {sql}")
++            print(f"Params: {params}")
++            return True
++        except Exception as e:
++            print(f"Error compiling SQL: {e}")
++            import traceback
++            traceback.print_exc()
++            return False
++            
++    except Exception as e:
++        print(f"Exception occurred: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    success = test_issue()
++    if success:
++        print("Test completed successfully!")
++    else:
++        print("Test failed!")
+\ No newline at end of file

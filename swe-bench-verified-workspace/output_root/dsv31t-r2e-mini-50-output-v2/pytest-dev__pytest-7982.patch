@@ -1,0 +1,278 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..c1bb66b94
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the symlink directory collection issue in pytest.
++This script creates a test directory structure with symlinks and tests
++if pytest collects tests from symlinked directories.
++"""
++
++import os
++import tempfile
++import shutil
++import subprocess
++import sys
++from pathlib import Path
++
++def create_test_structure():
++    """Create a test directory structure with symlinks"""
++    # Create a temporary directory
++    test_dir = Path(tempfile.mkdtemp(prefix="pytest_symlink_test_"))
++    print(f"Creating test structure in: {test_dir}")
++    
++    # Create main test directory
++    test_main = test_dir / "test_main"
++    test_main.mkdir()
++    
++    # Create a symlinked test directory
++    test_linked = test_dir / "test_linked" 
++    test_linked.mkdir()
++    
++    # Create test files in both directories
++    (test_main / "test_main.py").write_text("""
++def test_main():
++    assert True
++""")
++    
++    (test_linked / "test_linked.py").write_text("""
++def test_linked():
++    assert True
++""")
++    
++    # Create symlink from main to linked directory
++    symlink_path = test_main / "symlinked_dir"
++    symlink_path.symlink_to(test_linked, target_is_directory=True)
++    
++    print(f"Created test structure:")
++    print(f"  Main dir: {test_main}")
++    print(f"  Linked dir: {test_linked}")
++    print(f"  Symlink: {symlink_path} -> {test_linked}")
++    
++    return test_dir, test_main
++
++def run_pytest_collection(test_dir):
++    """Run pytest collection on the test directory"""
++    print("\nRunning pytest collection...")
++    
++    # Change to test directory
++    old_cwd = os.getcwd()
++    os.chdir(test_dir)
++    
++    try:
++        # Run pytest with collection only
++        result = subprocess.run([
++            sys.executable, "-m", "pytest", 
++            "test_main", 
++            "--collect-only",
++            "-v"
++        ], capture_output=True, text=True, timeout=30)
++        
++        print("Pytest output:")
++        print("STDOUT:")
++        print(result.stdout)
++        print("STDERR:")
++        print(result.stderr)
++        print(f"Return code: {result.returncode}")
++        
++        # Check if symlinked tests were collected
++        collected_tests = []
++        if "test_linked" in result.stdout:
++            collected_tests.append("test_linked")
++        if "test_main" in result.stdout:
++            collected_tests.append("test_main")
++            
++        return result.returncode == 0, collected_tests
++        
++    except subprocess.TimeoutExpired:
++        print("Pytest collection timed out")
++        return False, []
++    except Exception as e:
++        print(f"Error running pytest: {e}")
++        return False, []
++    finally:
++        os.chdir(old_cwd)
++
++def main():
++    """Main function to reproduce the issue"""
++    print("Reproducing pytest symlink directory collection issue")
++    print("=" * 60)
++    
++    # Create test structure
++    test_dir, test_main = create_test_structure()
++    
++    try:
++        # Run pytest collection
++        success, collected_tests = run_pytest_collection(test_dir)
++        
++        print("\n" + "=" * 60)
++        print("RESULTS:")
++        print(f"Pytest collection successful: {success}")
++        print(f"Collected tests: {collected_tests}")
++        
++        # Check if symlinked tests were collected
++        expected_tests = ["test_main", "test_linked"]
++        missing_tests = [test for test in expected_tests if test not in collected_tests]
++        
++        if missing_tests:
++            print(f"❌ ISSUE REPRODUCED: Missing tests: {missing_tests}")
++            print("This indicates the symlinked directory was not collected")
++            return False
++        else:
++            print("✅ All tests collected successfully")
++            return True
++            
++    finally:
++        # Cleanup
++        print(f"\nCleaning up test directory: {test_dir}")
++        shutil.rmtree(test_dir, ignore_errors=True)
++
++if __name__ == "__main__":
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/src/_pytest/pathlib.py b/src/_pytest/pathlib.py
+index f0bdb1481..64c7fec6f 100644
+--- a/src/_pytest/pathlib.py
++++ b/src/_pytest/pathlib.py
+@@ -558,7 +558,7 @@ def visit(
+     entries = sorted(os.scandir(path), key=lambda entry: entry.name)
+     yield from entries
+     for entry in entries:
+-        if entry.is_dir(follow_symlinks=False) and recurse(entry):
++        if entry.is_dir(follow_symlinks=True) and recurse(entry):
+             yield from visit(entry.path, recurse)
+ 
+ 
+diff --git a/test_symlink_edge_cases.py b/test_symlink_edge_cases.py
+new file mode 100644
+index 000000000..dc6d86560
+--- /dev/null
++++ b/test_symlink_edge_cases.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for symlink directory collection to ensure the fix is robust.
++"""
++
++import os
++import tempfile
++import shutil
++import subprocess
++import sys
++from pathlib import Path
++
++def create_edge_case_test():
++    """Create test cases for various symlink scenarios"""
++    test_dir = Path(tempfile.mkdtemp(prefix="pytest_symlink_edge_test_"))
++    print(f"Creating edge case tests in: {test_dir}")
++    
++    # Test case 1: Nested symlinks
++    nested_dir = test_dir / "nested"
++    nested_dir.mkdir()
++    
++    real_nested = test_dir / "real_nested"
++    real_nested.mkdir()
++    
++    (real_nested / "test_nested.py").write_text("""
++def test_nested():
++    assert True
++""")
++    
++    symlink_nested = nested_dir / "symlink_to_nested"
++    symlink_nested.symlink_to(real_nested, target_is_directory=True)
++    
++    # Test case 2: Symlink to non-existent directory (should be handled gracefully)
++    broken_symlink = test_dir / "broken_symlink"
++    broken_symlink.symlink_to(test_dir / "non_existent_dir", target_is_directory=True)
++    
++    # Test case 3: Regular test files
++    (test_dir / "test_regular.py").write_text("""
++def test_regular():
++    assert True
++""")
++    
++    print("Created test cases:")
++    print(f"  Nested symlink: {symlink_nested} -> {real_nested}")
++    print(f"  Broken symlink: {broken_symlink}")
++    print(f"  Regular test file: {test_dir / 'test_regular.py'}")
++    
++    return test_dir
++
++def run_pytest_collection(test_dir):
++    """Run pytest collection on the test directory"""
++    print("\nRunning pytest collection...")
++    
++    old_cwd = os.getcwd()
++    os.chdir(test_dir)
++    
++    try:
++        result = subprocess.run([
++            sys.executable, "-m", "pytest", 
++            "--collect-only",
++            "-v"
++        ], capture_output=True, text=True, timeout=30)
++        
++        print("Pytest output:")
++        print("STDOUT:")
++        print(result.stdout)
++        print("STDERR:")
++        print(result.stderr)
++        print(f"Return code: {result.returncode}")
++        
++        # Check collected tests
++        collected_tests = []
++        if "test_nested" in result.stdout:
++            collected_tests.append("test_nested")
++        if "test_regular" in result.stdout:
++            collected_tests.append("test_regular")
++            
++        return result.returncode == 0, collected_tests
++        
++    except subprocess.TimeoutExpired:
++        print("Pytest collection timed out")
++        return False, []
++    except Exception as e:
++        print(f"Error running pytest: {e}")
++        return False, []
++    finally:
++        os.chdir(old_cwd)
++
++def main():
++    """Test edge cases for symlink collection"""
++    print("Testing symlink edge cases")
++    print("=" * 60)
++    
++    test_dir = create_edge_case_test()
++    
++    try:
++        success, collected_tests = run_pytest_collection(test_dir)
++        
++        print("\n" + "=" * 60)
++        print("RESULTS:")
++        print(f"Pytest collection successful: {success}")
++        print(f"Collected tests: {collected_tests}")
++        
++        # We expect both regular and nested symlink tests to be collected
++        expected_tests = ["test_regular", "test_nested"]
++        collected_expected = [test for test in expected_tests if test in collected_tests]
++        
++        if len(collected_expected) == len(expected_tests):
++            print("✅ All expected tests collected successfully")
++            return True
++        else:
++            missing = [test for test in expected_tests if test not in collected_tests]
++            print(f"❌ Missing tests: {missing}")
++            return False
++            
++    finally:
++        print(f"\nCleaning up test directory: {test_dir}")
++        shutil.rmtree(test_dir, ignore_errors=True)
++
++if __name__ == "__main__":
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

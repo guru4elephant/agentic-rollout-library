@@ -1,0 +1,504 @@
+diff --git a/django/core/cache/backends/db.py b/django/core/cache/backends/db.py
+index 33c79c5a14..fc310b11fa 100644
+--- a/django/core/cache/backends/db.py
++++ b/django/core/cache/backends/db.py
+@@ -261,15 +261,21 @@ class DatabaseCache(BaseDatabaseCache):
+             cursor.execute("DELETE FROM %s WHERE expires < %%s" % table,
+                            [connection.ops.adapt_datetimefield_value(now)])
+             cursor.execute("SELECT COUNT(*) FROM %s" % table)
+-            num = cursor.fetchone()[0]
++            count_result = cursor.fetchone()
++            if count_result is not None:
++                num = count_result[0]
++            else:
++                num = 0
+             if num > self._max_entries:
+                 cull_num = num // self._cull_frequency
+                 cursor.execute(
+                     connection.ops.cache_key_culling_sql() % table,
+                     [cull_num])
+-                cursor.execute("DELETE FROM %s "
+-                               "WHERE cache_key < %%s" % table,
+-                               [cursor.fetchone()[0]])
++                result = cursor.fetchone()
++                if result is not None:
++                    cursor.execute("DELETE FROM %s "
++                                   "WHERE cache_key < %%s" % table,
++                                   [result[0]])
+ 
+     def clear(self):
+         db = router.db_for_write(self.cache_model_class)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..396ac9d63f
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the cache backend issue where _cull fails with
++'NoneType' object is not subscriptable when cursor.fetchone() returns None.
++"""
++
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        CACHES={
++            'default': {
++                'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
++                'LOCATION': 'my_cache_table',
++                # Set very low limits to trigger culling
++                'OPTIONS': {
++                    'MAX_ENTRIES': 1,
++                    'CULL_FREQUENCY': 1,
++                }
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.core.cache import cache
++from django.core.cache.backends.db import DatabaseCache
++
++def test_cull_issue():
++    """Test that reproduces the _cull issue when fetchone() returns None"""
++    
++    # Create a cache instance with small limits
++    cache_backend = DatabaseCache('test_cache_table', {
++        'MAX_ENTRIES': 1,
++        'CULL_FREQUENCY': 1
++    })
++    
++    # Simulate the scenario where cache_key_culling_sql() returns no results
++    # We'll mock the database operations to return None for fetchone()
++    
++    from unittest.mock import patch, MagicMock
++    
++    # Create a mock cursor that returns None for fetchone()
++    mock_cursor = MagicMock()
++    mock_cursor.fetchone.return_value = None  # This simulates the problematic scenario
++    
++    # Also mock execute to simulate the database operations
++    mock_cursor.execute = MagicMock()
++    
++    # Create a mock connection
++    mock_connection = MagicMock()
++    mock_connection.ops.quote_name.return_value = "test_table"
++    mock_connection.ops.adapt_datetimefield_value.return_value = "adapted_value"
++    mock_connection.ops.cache_key_culling_sql.return_value = "SELECT cache_key FROM %s ORDER BY cache_key LIMIT 1 OFFSET %s"
++    
++    # Mock the connections dict
++    with patch('django.core.cache.backends.db.connections') as mock_connections:
++        mock_connections.__getitem__.return_value = mock_connection
++        
++        # Mock router.db_for_write to return our mock db
++        with patch('django.core.cache.backends.db.router.db_for_write') as mock_db_for_write:
++            mock_db_for_write.return_value = 'default'
++            
++            # Try to call _cull which should trigger the error
++            try:
++                cache_backend._cull('default', mock_cursor, django.utils.timezone.now())
++                print("SUCCESS: _cull completed without error")
++            except TypeError as e:
++                if "'NoneType' object is not subscriptable" in str(e):
++                    print("CONFIRMED: Reproduced the issue!")
++                    print(f"Error: {e}")
++                else:
++                    print(f"Different error: {e}")
++            except Exception as e:
++                print(f"Unexpected error: {e}")
++
++if __name__ == '__main__':
++    test_cull_issue()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..14d0775f93
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,41 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the fix prevents the TypeError
++"""
++
++# Test the specific logic that was causing the issue
++def test_fetchone_none_handling():
++    """Test that we handle None results from fetchone() properly"""
++    
++    # Simulate the old problematic code
++    def old_behavior():
++        # This would cause: TypeError: 'NoneType' object is not subscriptable
++        result = None  # Simulating cursor.fetchone() returning None
++        return result[0]  # This line causes the error
++    
++    # Test the new fixed behavior
++    def new_behavior():
++        result = None  # Simulating cursor.fetchone() returning None
++        if result is not None:
++            return result[0]
++        return None  # Gracefully handle None case
++    
++    # Test old behavior (should fail)
++    try:
++        old_behavior()
++        print("ERROR: Old behavior should have failed!")
++    except TypeError as e:
++        if "'NoneType' object is not subscriptable" in str(e):
++            print("CONFIRMED: Original issue reproduced")
++        else:
++            print(f"Different error: {e}")
++    
++    # Test new behavior (should succeed)
++    try:
++        result = new_behavior()
++        print(f"SUCCESS: New behavior handled None gracefully, returned: {result}")
++    except Exception as e:
++        print(f"ERROR: New behavior failed: {e}")
++
++if __name__ == '__main__':
++    test_fetchone_none_handling()
+\ No newline at end of file
+diff --git a/test_edge_case.py b/test_edge_case.py
+new file mode 100644
+index 0000000000..5110475e56
+--- /dev/null
++++ b/test_edge_case.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python3
++"""
++Test to verify the fix handles the edge case where fetchone() returns None
++"""
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        CACHES={
++            'default': {
++                'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
++                'LOCATION': 'test_cache_table',
++                'OPTIONS': {
++                    'MAX_ENTRIES': 1,
++                    'CULL_FREQUENCY': 1,
++                }
++            }
++        },
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.core.cache.backends.db import DatabaseCache
++from django.db import connection
++from django.utils import timezone
++
++def test_cull_with_empty_table():
++    """Test _cull method with an empty cache table"""
++    
++    # Create cache backend
++    cache_backend = DatabaseCache('test_cache_table', {
++        'MAX_ENTRIES': 1,
++        'CULL_FREQUENCY': 1
++    })
++    
++    # Get database connection
++    db_conn = connection
++    
++    # Create a cursor
++    with db_conn.cursor() as cursor:
++        # Ensure the table exists and is empty
++        cursor.execute("DROP TABLE IF EXISTS test_cache_table")
++        cursor.execute("CREATE TABLE test_cache_table (cache_key TEXT PRIMARY KEY, value TEXT, expires DATETIME)")
++        
++        # Test the _cull method directly
++        try:
++            cache_backend._cull('default', cursor, timezone.now())
++            print("SUCCESS: _cull completed without error on empty table")
++        except TypeError as e:
++            if "'NoneType' object is not subscriptable" in str(e):
++                print("FAILED: Still getting the original error")
++                print(f"Error: {e}")
++                return False
++            else:
++                print(f"Different TypeError: {e}")
++                return False
++        except Exception as e:
++            print(f"Unexpected error: {e}")
++            return False
++    
++    return True
++
++def test_cull_with_no_culling_results():
++    """Test _cull method when cache_key_culling_sql returns no results"""
++    
++    # Create cache backend
++    cache_backend = DatabaseCache('test_cache_table', {
++        'MAX_ENTRIES': 1,
++        'CULL_FREQUENCY': 1
++    })
++    
++    # Get database connection
++    db_conn = connection
++    
++    # Create a cursor
++    with db_conn.cursor() as cursor:
++        # Ensure the table exists and has some data
++        cursor.execute("DROP TABLE IF EXISTS test_cache_table")
++        cursor.execute("CREATE TABLE test_cache_table (cache_key TEXT PRIMARY KEY, value TEXT, expires DATETIME)")
++        
++        # Add some data that will be expired and cleaned up
++        cursor.execute("INSERT INTO test_cache_table (cache_key, value, expires) VALUES ('key1', 'value1', '2000-01-01 00:00:00')")
++        
++        # Test the _cull method directly
++        try:
++            cache_backend._cull('default', cursor, timezone.now())
++            print("SUCCESS: _cull completed without error when no culling results")
++        except TypeError as e:
++            if "'NoneType' object is not subscriptable" in str(e):
++                print("FAILED: Still getting the original error")
++                print(f"Error: {e}")
++                return False
++            else:
++                print(f"Different TypeError: {e}")
++                return False
++        except Exception as e:
++            print(f"Unexpected error: {e}")
++            return False
++    
++    return True
++
++if __name__ == '__main__':
++    print("Testing _cull with empty table...")
++    success1 = test_cull_with_empty_table()
++    
++    print("Testing _cull with no culling results...")
++    success2 = test_cull_with_no_culling_results()
++    
++    if success1 and success2:
++        print("ALL TESTS PASSED: Fix successfully handles None results from fetchone()")
++    else:
++        print("SOME TESTS FAILED")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..1115341e7d
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the fix for the cache backend _cull issue.
++"""
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_fixed_cull():
++    """Test that the fixed _cull method handles None results properly"""
++    
++    # Import the module to test the actual fixed method
++    from django.core.cache.backends.db import DatabaseCache
++    
++    # Create a cache instance
++    cache_backend = DatabaseCache('test_cache_table', {
++        'MAX_ENTRIES': 1,
++        'CULL_FREQUENCY': 1
++    })
++    
++    # Test the specific scenario: what happens when fetchone() returns None
++    # We'll simulate the exact lines that were causing the issue
++    
++    class MockCursor:
++        def __init__(self):
++            self.execute_calls = []
++            self.fetchone_results = [None]  # First fetchone returns None
++        
++        def execute(self, query, params=None):
++            self.execute_calls.append((query, params))
++        
++        def fetchone(self):
++            if self.fetchone_results:
++                return self.fetchone_results.pop(0)
++            return None
++    
++    class MockConnection:
++        def __init__(self):
++            self.ops = MockOperations()
++        
++        def quote_name(self, name):
++            return f'"{name}"'
++    
++    class MockOperations:
++        def cache_key_culling_sql(self):
++            return "SELECT cache_key FROM %s ORDER BY cache_key LIMIT 1 OFFSET %s"
++        
++        def adapt_datetimefield_value(self, value):
++            return value
++    
++    # Create mock objects
++    mock_cursor = MockCursor()
++    mock_connection = MockConnection()
++    
++    # Test the fixed _cull method
++    try:
++        # Call _cull with our mock objects
++        cache_backend._cull('default', mock_cursor, django.utils.timezone.now())
++        print("SUCCESS: _cull completed without error")
++        print(f"Execute calls: {len(mock_cursor.execute_calls)}")
++        
++        # The fix should prevent the error when fetchone returns None
++        # We should see that the DELETE query was not executed when fetchone returned None
++        delete_calls = [call for call in mock_cursor.execute_calls if 'DELETE' in call[0]]
++        print(f"DELETE calls: {len(delete_calls)}")
++        
++        if len(delete_calls) == 0:
++            print("CORRECT: No DELETE executed when fetchone returned None")
++        else:
++            print("WARNING: DELETE was executed even when fetchone returned None")
++            
++    except TypeError as e:
++        if "'NoneType' object is not subscriptable" in str(e):
++            print("FAILED: The fix didn't work - still getting the original error")
++            print(f"Error: {e}")
++        else:
++            print(f"Different TypeError: {e}")
++    except Exception as e:
++        print(f"Unexpected error: {e}")
++
++if __name__ == '__main__':
++    test_fixed_cull()
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..c33db72b74
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++"""
++Test to reproduce the original issue and verify it's fixed
++"""
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        CACHES={
++            'default': {
++                'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
++                'LOCATION': 'test_cache_table',
++                'OPTIONS': {
++                    'MAX_ENTRIES': 1,
++                    'CULL_FREQUENCY': 1,
++                }
++            }
++        },
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.core.cache import cache
++from django.core.cache.backends.db import DatabaseCache
++
++def test_original_issue_reproduction():
++    """Reproduce the original issue scenario"""
++    
++    # Create cache backend with very small limits to trigger culling
++    cache_backend = DatabaseCache('test_cache_table', {
++        'MAX_ENTRIES': 1,
++        'CULL_FREQUENCY': 1
++    })
++    
++    # Create a scenario where the cache table is empty after cleaning expired entries
++    # This should cause cursor.fetchone() to return None
++    
++    # First, ensure the table is created
++    from django.core.management import call_command
++    call_command('createcachetable', 'test_cache_table')
++    
++    # Add an entry that will immediately expire
++    from django.utils import timezone
++    past_time = timezone.now().replace(year=2000)
++    
++    # Use the actual cache operations that would trigger the issue
++    try:
++        # This should trigger _cull when the cache is full
++        for i in range(5):
++            cache_backend.set(f'test_key_{i}', 'test_value', timeout=1)
++        
++        print("SUCCESS: No 'NoneType' object is not subscriptable error occurred")
++        return True
++        
++    except TypeError as e:
++        if "'NoneType' object is not subscriptable" in str(e):
++            print("FAILED: Original issue still exists")
++            print(f"Error: {e}")
++            return False
++        else:
++            print(f"Different TypeError: {e}")
++            return False
++    except Exception as e:
++        print(f"Unexpected error: {e}")
++        return False
++
++if __name__ == '__main__':
++    print("Testing original issue scenario...")
++    success = test_original_issue_reproduction()
++    
++    if success:
++        print("ORIGINAL ISSUE FIXED: No 'NoneType' object is not subscriptable errors")
++    else:
++        print("ORIGINAL ISSUE STILL EXISTS")
+\ No newline at end of file

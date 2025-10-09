@@ -1,0 +1,495 @@
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index 14dab517c9..ba8e6da01d 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -81,6 +81,23 @@ class ThreadedWSGIServer(socketserver.ThreadingMixIn, WSGIServer):
+     """A threaded version of the WSGIServer"""
+     daemon_threads = True
+ 
++    def process_request_thread(self, request, client_address):
++        """
++        Same as in BaseServer but as a thread.
++
++        In addition, exception handling is done here and database connections
++        are closed to prevent connection leaks.
++        """
++        try:
++            self.finish_request(request, client_address)
++        except Exception:
++            self.handle_error(request, client_address)
++        finally:
++            self.shutdown_request(request)
++            # Close all database connections to prevent leaks in threaded mode
++            from django.db import connections
++            connections.close_all()
++
+ 
+ class ServerHandler(simple_server.ServerHandler):
+     http_version = '1.1'
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..c7d0093755
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python3
++"""
++Final test to verify that ThreadedWSGIServer properly closes database connections.
++This test directly tests the process_request_thread method that we modified.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Minimal settings configuration
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.core.servers.basehttp import ThreadedWSGIServer
++from django.db import connections
++import socket
++import threading
++
++
++class MockRequest:
++    """Mock request object for testing"""
++    def shutdown(self, *args):
++        pass
++    def close(self):
++        pass
++
++
++def test_process_request_thread():
++    """Test that process_request_thread properly closes database connections"""
++    print("Testing process_request_thread connection cleanup...")
++    
++    # Create a threaded server
++    server = ThreadedWSGIServer(('localhost', 0), None, allow_reuse_address=False)
++    
++    # Create a database connection in the current thread
++    conn = connections['default']
++    with conn.cursor() as cursor:
++        cursor.execute("SELECT 1")
++    
++    print(f"Connection state before thread: {conn.connection is not None}")
++    
++    # Simulate what happens in a request thread
++    # We'll call the method that we modified directly
++    mock_request = MockRequest()
++    client_address = ('127.0.0.1', 12345)
++    
++    # This should trigger our connection cleanup in the finally block
++    try:
++        server.process_request_thread(mock_request, client_address)
++    except Exception as e:
++        print(f"Expected error during request processing: {e}")
++    
++    # Check if the connection was properly closed
++    print(f"Connection state after thread: {conn.connection is not None}")
++    
++    if conn.connection is None:
++        print("✅ SUCCESS: Database connection properly closed by ThreadedWSGIServer")
++        return True
++    else:
++        print("❌ FAILURE: Database connection leak detected")
++        return False
++
++
++if __name__ == '__main__':
++    success = test_process_request_thread()
++    if success:
++        print("\n🎉 Fix verified: ThreadedWSGIServer now properly closes database connections")
++        sys.exit(0)
++    else:
++        print("\n💥 Fix failed: Connection leak still exists")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_connection_leak.py b/reproduce_connection_leak.py
+new file mode 100644
+index 0000000000..c0025a89d2
+--- /dev/null
++++ b/reproduce_connection_leak.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""
++More comprehensive script to reproduce the database connection leak issue.
++This script tries to create multiple concurrent requests to trigger the race condition.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++import threading
++import time
++import requests
++from concurrent.futures import ThreadPoolExecutor
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Minimal settings configuration
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': 'test_db.sqlite3',
++            }
++        },
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.test import LiveServerTestCase
++from django.test.testcases import LiveServerThread, QuietWSGIRequestHandler
++from django.core.servers.basehttp import WSGIServer
++from django.db import connections
++
++
++class TestLiveServerWithConnectionCheck(LiveServerTestCase):
++    """Test case that checks for connection leaks"""
++    
++    def test_concurrent_requests(self):
++        """Make multiple concurrent requests to trigger potential connection leaks"""
++        url = self.live_server_url + '/nonexistent/'
++        
++        def make_request():
++            try:
++                # This should create a new connection in the thread
++                response = requests.get(url, timeout=2)
++                return response.status_code
++            except:
++                return None
++        
++        # Make multiple concurrent requests
++        with ThreadPoolExecutor(max_workers=5) as executor:
++            futures = [executor.submit(make_request) for _ in range(10)]
++            results = [f.result() for f in futures]
++        
++        print(f"Request results: {results}")
++        
++        # Check current connections
++        conn = connections['default']
++        print(f"Connection state after requests: {conn.connection is not None}")
++
++
++class NonThreadedLiveServerThread(LiveServerThread):
++    """Non-threaded version for comparison"""
++    def _create_server(self):
++        return WSGIServer((self.host, self.port), 
++                         QuietWSGIRequestHandler, 
++                         allow_reuse_address=False)
++
++
++class TestNonThreadedServer(LiveServerTestCase):
++    """Test case using non-threaded server for comparison"""
++    server_thread_class = NonThreadedLiveServerThread
++    
++    def test_concurrent_requests(self):
++        """Same test but with non-threaded server"""
++        url = self.live_server_url + '/nonexistent/'
++        
++        def make_request():
++            try:
++                response = requests.get(url, timeout=2)
++                return response.status_code
++            except:
++                return None
++        
++        with ThreadPoolExecutor(max_workers=5) as executor:
++            futures = [executor.submit(make_request) for _ in range(10)]
++            results = [f.result() for f in futures]
++        
++        print(f"Non-threaded request results: {results}")
++        conn = connections['default']
++        print(f"Non-threaded connection state: {conn.connection is not None}")
++
++
++if __name__ == '__main__':
++    print("Testing connection leak with threaded server...")
++    try:
++        test_case = TestLiveServerWithConnectionCheck()
++        test_case.setUpClass()
++        test_case.test_concurrent_requests()
++        test_case.tearDownClass()
++        print("✓ Threaded server test completed")
++    except Exception as e:
++        print(f"✗ Threaded server test failed: {e}")
++        import traceback
++        traceback.print_exc()
++    
++    print("\nTesting with non-threaded server...")
++    try:
++        test_case = TestNonThreadedServer()
++        test_case.setUpClass()
++        test_case.test_concurrent_requests()
++        test_case.tearDownClass()
++        print("✓ Non-threaded server test completed")
++    except Exception as e:
++        print(f"✗ Non-threaded server test failed: {e}")
++        import traceback
++        traceback.print_exc()
++    
++    print("\nTest completed")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e166d7e563
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with ThreadedWSGIServer not closing database connections.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Minimal settings configuration
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.test import LiveServerTestCase, TestCase
++from django.test.testcases import LiveServerThread, QuietWSGIRequestHandler
++from django.core.servers.basehttp import WSGIServer, ThreadedWSGIServer
++import threading
++import time
++
++
++class TestLiveServer(LiveServerTestCase):
++    """Test case that uses LiveServerTestCase to reproduce the issue"""
++    
++    def test_basic(self):
++        """Simple test to trigger the LiveServerThread"""
++        # This should create a threaded server and potentially leave connections open
++        self.assertTrue(True)
++
++
++class NonThreadedLiveServerThread(LiveServerThread):
++    """Non-threaded version for comparison"""
++    def _create_server(self):
++        return WSGIServer((self.host, self.port), 
++                         QuietWSGIRequestHandler, 
++                         allow_reuse_address=False)
++
++
++class MyTestWithNonThreaded(LiveServerTestCase):
++    """Test case using non-threaded server for comparison"""
++    server_thread_class = NonThreadedLiveServerThread
++    
++    def test_basic(self):
++        self.assertTrue(True)
++
++
++if __name__ == '__main__':
++    print("Testing with threaded server (should reproduce the issue)...")
++    try:
++        test_case = TestLiveServer()
++        test_case.setUpClass()
++        test_case.test_basic()
++        test_case.tearDownClass()
++        print("✓ Threaded server test completed")
++    except Exception as e:
++        print(f"✗ Threaded server test failed: {e}")
++    
++    print("\nTesting with non-threaded server (should work fine)...")
++    try:
++        test_case = MyTestWithNonThreaded()
++        test_case.setUpClass()
++        test_case.test_basic()
++        test_case.tearDownClass()
++        print("✓ Non-threaded server test completed")
++    except Exception as e:
++        print(f"✗ Non-threaded server test failed: {e}")
++    
++    print("\nTest completed")
+\ No newline at end of file
+diff --git a/test_connection_cleanup.py b/test_connection_cleanup.py
+new file mode 100644
+index 0000000000..b0d5c007d3
+--- /dev/null
++++ b/test_connection_cleanup.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python3
++"""
++Test script to verify that ThreadedWSGIServer properly closes database connections.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Minimal settings configuration
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.core.servers.basehttp import ThreadedWSGIServer
++from django.test.testcases import QuietWSGIRequestHandler
++from django.db import connections
++import threading
++import time
++import socket
++from wsgiref.simple_server import WSGIRequestHandler, make_server
++
++
++def simple_wsgi_app(environ, start_response):
++    """Simple WSGI app that uses database connection"""
++    from django.db import connection
++    # Use the connection to ensure it gets created
++    with connection.cursor() as cursor:
++        cursor.execute("SELECT 1")
++        cursor.fetchone()
++    
++    status = '200 OK'
++    headers = [('Content-type', 'text/plain')]
++    start_response(status, headers)
++    return [b"Hello World"]
++
++
++def test_threaded_server_connection_cleanup():
++    """Test that ThreadedWSGIServer properly closes database connections"""
++    print("Testing ThreadedWSGIServer connection cleanup...")
++    
++    # Create a threaded server
++    server = ThreadedWSGIServer(('localhost', 0), QuietWSGIRequestHandler, allow_reuse_address=False)
++    server.set_app(simple_wsgi_app)
++    
++    # Get the server port
++    port = server.server_address[1]
++    
++    # Start the server in a thread
++    server_thread = threading.Thread(target=server.serve_forever)
++    server_thread.daemon = True
++    server_thread.start()
++    
++    # Make a few requests to the server
++    for i in range(3):
++        try:
++            # Create a simple socket connection to trigger the server
++            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
++                s.connect(('localhost', port))
++                s.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
++                response = s.recv(1024)
++                print(f"Request {i+1}: Got response of length {len(response)}")
++        except Exception as e:
++            print(f"Request {i+1} failed: {e}")
++    
++    # Shutdown the server
++    server.shutdown()
++    server.server_close()
++    server_thread.join()
++    
++    # Check if any connections are still open
++    conn = connections['default']
++    if conn.connection is not None:
++        print("❌ Connection leak detected - connection is still open")
++        return False
++    else:
++        print("✅ No connection leak - connection properly closed")
++        return True
++
++
++if __name__ == '__main__':
++    success = test_threaded_server_connection_cleanup()
++    if success:
++        print("\n✅ Test passed: ThreadedWSGIServer properly closes database connections")
++    else:
++        print("\n❌ Test failed: Connection leak detected")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_settings.py b/test_settings.py
+new file mode 100644
+index 0000000000..7cd9bbb89b
+--- /dev/null
++++ b/test_settings.py
+@@ -0,0 +1,18 @@
++# Test settings for Django
++DEBUG = True
++
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++
++SECRET_KEY = 'test-secret-key'
++
++INSTALLED_APPS = [
++    'django.contrib.contenttypes',
++    'django.contrib.auth',
++]
++
++USE_TZ = True
+\ No newline at end of file

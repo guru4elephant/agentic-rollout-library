@@ -1,0 +1,241 @@
+diff --git a/django/contrib/contenttypes/management/__init__.py b/django/contrib/contenttypes/management/__init__.py
+index 2b5f688136..563cba2fdf 100644
+--- a/django/contrib/contenttypes/management/__init__.py
++++ b/django/contrib/contenttypes/management/__init__.py
+@@ -24,7 +24,7 @@ class RenameContentType(migrations.RunPython):
+             content_type.model = new_model
+             try:
+                 with transaction.atomic(using=db):
+-                    content_type.save(update_fields={'model'})
++                    content_type.save(using=db, update_fields={'model'})
+             except IntegrityError:
+                 # Gracefully fallback if a stale content type causes a
+                 # conflict as remove_stale_contenttypes will take care of
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..65452854d0
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where RenameContentType._rename() doesn't save 
++the content type on the correct database.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connections, DEFAULT_DB_ALIAS
++from django.db.migrations.state import ProjectState
++from django.db.migrations.operations.models import RenameModel
++from django.contrib.contenttypes.management import RenameContentType
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++            'other': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_rename_contenttype_database():
++    """Test that RenameContentType uses the correct database"""
++    from django.db.migrations.state import ProjectState
++    from django.db.migrations.operations.models import RenameModel
++    from django.contrib.contenttypes.management import RenameContentType
++    
++    print("Testing RenameContentType database usage...")
++    
++    # Create a simple test
++    app_label = 'test_app'
++    old_model = 'oldmodel'
++    new_model = 'newmodel'
++    
++    # Create RenameContentType instance
++    rename_op = RenameContentType(app_label, old_model, new_model)
++    
++    print(f"Created RenameContentType for {app_label}.{old_model} -> {app_label}.{new_model}")
++    print("The issue is that in _rename() method, content_type.save() call is missing using=db parameter")
++    print("This causes it to save to the default database instead of the specified database")
++    
++    # Let's examine the source code to confirm
++    import inspect
++    source = inspect.getsource(rename_op._rename)
++    print("\nCurrent _rename method source:")
++    print(source)
++    
++    # Look for the problematic line
++    lines = source.split('\n')
++    for i, line in enumerate(lines):
++        if 'content_type.save(' in line:
++            print(f"\nPROBLEMATIC LINE {i+1}: {line.strip()}")
++            print("This line is missing the 'using=db' parameter!")
++            print("It should be: content_type.save(using=db, update_fields={'model'})")
++
++if __name__ == '__main__':
++    test_rename_contenttype_database()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..4ab21a84bf
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++"""
++Simple script to verify that the fix has been applied to the source code.
++"""
++
++def test_fix_applied():
++    """Test that the fix has been applied to the source code"""
++    print("Testing that the fix has been applied to the source code...")
++    
++    # Read the source file
++    file_path = '/testbed/django/contrib/contenttypes/management/__init__.py'
++    
++    with open(file_path, 'r') as f:
++        content = f.read()
++    
++    # Look for the specific line that was fixed
++    lines = content.split('\n')
++    found_fixed_line = False
++    
++    for i, line in enumerate(lines, 1):
++        if 'content_type.save(' in line and 'using=db' in line:
++            print(f"✓ FIXED LINE {i}: {line.strip()}")
++            found_fixed_line = True
++            break
++        elif 'content_type.save(' in line:
++            print(f"✗ UNFIXED LINE {i}: {line.strip()}")
++            print("  The 'using=db' parameter is missing!")
++            break
++    
++    if not found_fixed_line:
++        print("✗ Could not find the content_type.save() line in the file")
++        return False
++    
++    # Also verify that the transaction.atomic context manager is still there
++    transaction_found = False
++    for i, line in enumerate(lines, 1):
++        if 'transaction.atomic(using=db)' in line:
++            print(f"✓ TRANSACTION LINE {i}: {line.strip()}")
++            transaction_found = True
++            break
++    
++    if not transaction_found:
++        print("✗ Could not find transaction.atomic(using=db) in the file")
++        return False
++    
++    print("\n✓ SUCCESS: The fix has been applied correctly!")
++    print("  - The content_type.save() call now includes using=db parameter")
++    print("  - The transaction.atomic(using=db) context manager is preserved")
++    return True
++
++if __name__ == '__main__':
++    test_fix_applied()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..0474c2b15a
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""
++Script to test that the fix for RenameContentType._rename() works correctly.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connections, DEFAULT_DB_ALIAS, transaction
++from django.db.migrations.state import ProjectState
++from django.db.migrations.operations.models import RenameModel
++from django.contrib.contenttypes.management import RenameContentType
++from django.contrib.contenttypes.models import ContentType
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++            'other': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_fixed_rename_contenttype():
++    """Test that the fixed RenameContentType uses the correct database"""
++    print("Testing fixed RenameContentType database usage...")
++    
++    # Create a simple test
++    app_label = 'test_app'
++    old_model = 'oldmodel'
++    new_model = 'newmodel'
++    
++    # Create RenameContentType instance
++    rename_op = RenameContentType(app_label, old_model, new_model)
++    
++    print(f"Created RenameContentType for {app_label}.{old_model} -> {app_label}.{new_model}")
++    
++    # Let's examine the source code to confirm the fix
++    import inspect
++    source = inspect.getsource(rename_op._rename)
++    print("\nFixed _rename method source:")
++    print(source)
++    
++    # Look for the fixed line
++    lines = source.split('\n')
++    for i, line in enumerate(lines):
++        if 'content_type.save(' in line:
++            print(f"\nFIXED LINE {i+1}: {line.strip()}")
++            if 'using=db' in line:
++                print("✓ SUCCESS: The 'using=db' parameter has been added!")
++            else:
++                print("✗ FAILURE: The 'using=db' parameter is still missing!")
++    
++    # Test that the method signature is correct
++    print("\nTesting method signature...")
++    sig = inspect.signature(ContentType.save)
++    print(f"ContentType.save signature: {sig}")
++    
++    # Check if 'using' parameter exists
++    if 'using' in sig.parameters:
++        print("✓ ContentType.save accepts 'using' parameter")
++    else:
++        print("✗ ContentType.save does not accept 'using' parameter")
++
++if __name__ == '__main__':
++    test_fixed_rename_contenttype()
+\ No newline at end of file
