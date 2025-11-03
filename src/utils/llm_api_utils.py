@@ -201,7 +201,7 @@ def create_openai_api_handle_async(
                 timeout=timeout
             ) as response:
                 response.raise_for_status()
-                data = await response.json()
+                data = await response.json(content_type=None)
 
             choice = data['choices'][0]
             message = choice['message']

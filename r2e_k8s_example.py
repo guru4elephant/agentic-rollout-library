@@ -368,9 +368,11 @@ async def process_single_instance(
         # Use async context manager for automatic cleanup
         async with K8SToolExecutionNode(
                 name=f"R2EK8SExecutor-{pod_suffix}",
-                namespace="qianfan-train-cpu-ns",
-                node_selector={"nvme": "ok"},
-                kubeconfig_path="./cpu_config2",
+                #namespace="qianfan-train-cpu-ns",
+                namespace="rl-training",
+                #node_selector={"nvme": "ok"},
+                #kubeconfig_path="./cpu_config2",
+                kubeconfig_path="./swe-bench-verified-workspace/config_cce_new",
                 image=image,
                 pod_name=pod_name,
                 environment={

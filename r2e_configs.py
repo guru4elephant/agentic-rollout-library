@@ -288,6 +288,8 @@ Follow these steps to resolve the issue:
 6. When viewing large files, use specific line-ranges, usually within 50 to 100 lines) as required
 7. NOTE: The repository is at '/testbed' and the current working directory is already '/testbed', so DO NOT include 'testbed/' or 'testbed.' in relative paths in bash commands or reproduction python files.
 8. Use pip source http://pip.baidu.com/pypi/simple if you need to install new package with python
+
+You are only allowed to call **ONE** function each time!
 """
 
 
