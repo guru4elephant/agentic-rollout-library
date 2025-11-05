@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-R2E Agent K8S Example - R2E-style tool execution in Kubernetes pods.
+DeepSeek V3.1 Agent K8S Example - DeepSeek-style tool execution in Kubernetes pods.
 
-This example demonstrates an R2E-style agent that executes commands
-in Kubernetes pods using the R2E prompt format and tools (bash, file_editor, search, finish).
+This example demonstrates a DeepSeek-style agent that executes commands
+in Kubernetes pods using the DeepSeek completion format and tools (bash, str_replace_editor).
 """
 import os
 import sys
@@ -12,6 +12,7 @@ import asyncio
 import time
 import threading
 import warnings
+import re
 from pathlib import Path
 from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -19,8 +20,6 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 
 # Suppress aiohttp ResourceWarning about unclosed client sessions
-# These warnings are triggered when the program exits and sessions are cleaned up by GC
-# The sessions are properly managed by connection pooling and will be closed on exit
 warnings.filterwarnings('ignore', category=ResourceWarning)
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -34,13 +33,133 @@ from core import (
     get_timeline
 )
 from utils import create_openai_api_handle_async
-from r2e_configs import (
-    CUSTOM_TOOL_DESCRIPTIONS,
-    parse_xml_action_custom,
-    SYSTEM_PROMPT_TEMPLATE,
-    QUERY_PROMPT_TEMPLATE,
-    DEFAULT_TEMPLATE_VARIABLES
-)
+
+
+# DeepSeek special tokens
+TOOL_CALLS_BEGIN = "<｜tool▁calls▁begin｜>"
+TOOL_CALL_BEGIN = "<｜tool▁call▁begin｜>"
+TOOL_CALL_END = "<｜tool▁call▁end｜>"
+TOOL_CALLS_END = "<｜tool▁calls▁end｜>"
+TOOL_SEP = "<｜tool▁sep｜>"
+TOOL_OUTPUT_BEGIN = "<｜tool▁output▁begin｜>"
+TOOL_OUTPUT_END = "<｜tool▁output▁end｜>"
+END_OF_SENTENCE = "<｜end▁of▁sentence｜>"
+
+
+# System prompt for DeepSeek
+DEEPSEEK_SYSTEM_PROMPT = """You are a helpful software engineer assistant.
+
+## Tools
+You have access to the following tools:
+
+### bash
+Description: Run commands in a bash shell
+* When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
+* You don't have access to the internet via this tool.
+* You do have access to a mirror of common linux and python packages via apt and pip.
+* State is persistent across command calls and discussions with the user.
+* To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.
+* Please avoid commands that may produce a very large amount of output.
+* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.
+
+Parameters: {"title": "BashInput", "type": "object", "properties": {"command": {"title": "Command", "description": "The bash command to run. Relative path is preferred in the command.", "type": "string"}}, "required": ["command"], "additionalProperties": false}
+
+### str_replace_editor
+Description: Custom editing tool for viewing, creating and editing files
+* State is persistent across command calls and discussions with the user
+* If `path` is a file, `view` displays the result of applying `cat -n`. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep
+* The `create` command cannot be used if the specified `path` already exists as a file
+* If a `command` generates a long output, it will be truncated and marked with `<response clipped>`
+
+Notes for using the `str_replace` command:
+* The `old_str` parameter should match EXACTLY one or more consecutive lines from the original file. Be mindful of whitespaces!
+* If the `old_str` parameter is not unique in the file, the replacement will not be performed. Make sure to include enough context in `old_str` to make it unique
+* The `new_str` parameter should contain the edited lines that should replace the `old_str`
+
+Parameters: {"title": "SweEditorInput", "type": "object", "properties": {"command": {"title": "Command", "description": "The commands to run. Allowed options are: `view`, `create`, `str_replace`, `insert`.", "enum": ["view", "create", "str_replace", "insert"], "type": "string"}, "path": {"title": "Path", "description": "Absolute path to file or directory, e.g. `/repo/file.py` or `/repo`.", "type": "string"}, "file_text": {"title": "File Text", "description": "Required parameter of `create` command, with the content of the file to be created.", "type": "string"}, "insert_line": {"title": "Insert Line", "description": "Required parameter of `insert` command. The `new_str` will be inserted AFTER the line `insert_line` of `path`.", "type": "integer"}, "new_str": {"title": "New Str", "description": "Optional parameter of `str_replace` command containing the new string (if not given, no string will be added). Required parameter of `insert` command containing the string to insert.", "type": "string"}, "old_str": {"title": "Old Str", "description": "Required parameter of `str_replace` command containing the string in `path` to replace.", "type": "string"}, "view_range": {"title": "View Range", "description": "Optional parameter of `view` command when `path` points to a file. If none is given, the full file is shown. If provided, the file will be shown in the indicated line number range, e.g. [11, 12] will show lines 11 and 12. Indexing at 1 to start. Setting `[start_line, -1]` shows all lines from `start_line` to the end of the file.", "type": "array", "items": {"type": "integer"}}}, "required": ["command", "path"], "additionalProperties": false}
+
+IMPORTANT: ALWAYS adhere to this exact format for tool use:
+<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>tool_call_name<｜tool▁sep｜>tool_call_arguments<｜tool▁call▁end｜>{additional_tool_calls}<｜tool▁calls▁end｜>
+
+Where:
+- `tool_call_name` must be an exact match to one of the available tools
+- `tool_call_arguments` must be valid JSON that strictly follows the tool's Parameters Schema
+- For multiple tool calls, chain them directly without separators or spaces"""
+
+
+def create_ds_parser():
+    """
+    Create DeepSeek-style parser for tool calls.
+    Parses the special token format used by DeepSeek V3.1.
+    
+    Format:
+    <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>tool_name<｜tool▁sep｜>{"param": "value"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>
+    """
+    def parse_tool_calls(llm_response: Dict) -> List[Dict]:
+        content = llm_response.get("content", "")
+        
+        # Check if content ends with TOOL_CALLS_END
+        if TOOL_CALLS_END not in content:
+            return []
+        
+        # Extract everything between TOOL_CALLS_BEGIN and TOOL_CALLS_END
+        if TOOL_CALLS_BEGIN not in content:
+            return []
+        
+        # Find the tool calls section
+        begin_idx = content.find(TOOL_CALLS_BEGIN)
+        end_idx = content.find(TOOL_CALLS_END)
+        
+        if begin_idx == -1 or end_idx == -1:
+            return []
+        
+        tool_calls_section = content[begin_idx + len(TOOL_CALLS_BEGIN):end_idx]
+        
+        # Parse individual tool calls
+        tool_calls = []
+        
+        # Find all tool calls between TOOL_CALL_BEGIN and TOOL_CALL_END
+        pattern = re.escape(TOOL_CALL_BEGIN) + r'(.*?)' + re.escape(TOOL_CALL_END)
+        matches = re.findall(pattern, tool_calls_section, re.DOTALL)
+        
+        for match in matches:
+            # Split by TOOL_SEP to get tool name and arguments
+            if TOOL_SEP not in match:
+                continue
+            
+            parts = match.split(TOOL_SEP, 1)
+            if len(parts) != 2:
+                continue
+            
+            tool_name = parts[0].strip()
+            tool_args_str = parts[1].strip()
+            
+            # Parse JSON arguments
+            try:
+                tool_args = json.loads(tool_args_str)
+            except json.JSONDecodeError as e:
+                print(f"⚠️  Failed to parse tool arguments as JSON: {e}")
+                print(f"   Tool: {tool_name}")
+                print(f"   Args string: {tool_args_str[:200]}")
+                continue
+            
+            # Map DeepSeek tool names to our internal tool names
+            internal_tool_name = tool_name
+            if tool_name == "bash":
+                internal_tool_name = "ds_bash_executor"
+            elif tool_name == "str_replace_editor":
+                internal_tool_name = "ds_file_editor"
+            
+            tool_call = {
+                "tool": internal_tool_name,
+                "parameters": tool_args
+            }
+            
+            tool_calls.append(tool_call)
+        
+        return tool_calls
+    
+    return parse_tool_calls
 
 
 @dataclass
@@ -49,22 +168,20 @@ class TaskProgress:
     task_id: int
     instance_id: str
     start_time: float = field(default_factory=time.time)
-    end_time: float = None  # 任务完成时间
+    end_time: float = None
     iterations: int = 0
     llm_success: int = 0
     llm_error: int = 0
     llm_timeout: int = 0
     tool_parse_fail: int = 0
     tool_exec_fail: int = 0
-    status: str = "running"  # running, success, failed, max_iter
+    status: str = "running"
 
     def elapsed_time(self) -> float:
         """Get elapsed time in seconds."""
         if self.end_time:
-            # 任务已完成，返回总耗时
             return self.end_time - self.start_time
         else:
-            # 任务进行中，返回当前耗时
             return time.time() - self.start_time
 
 
@@ -124,7 +241,6 @@ class ProgressTracker:
         with self.lock:
             if task_id in self.tasks:
                 self.tasks[task_id].status = status
-                # Record end time when task completes
                 if status in ["success", "failed", "max_iter"]:
                     self.tasks[task_id].end_time = time.time()
 
@@ -140,9 +256,9 @@ class ProgressTracker:
             return
 
         # Clear screen and print header
-        print("\033[2J\033[H", end="")  # Clear screen, move cursor to top
+        print("\033[2J\033[H", end="")
         print("=" * 175)
-        print("CONCURRENT TASK PROGRESS")
+        print("DEEPSEEK V3.1 CONCURRENT TASK PROGRESS")
         print("=" * 175)
 
         # Table header
@@ -220,36 +336,7 @@ class ProgressTracker:
         self.display_running = False
         if self.display_thread:
             self.display_thread.join(timeout=3)
-        # Print final table
         self.print_table()
-
-def create_r2e_parser():
-    """
-    Create R2E-style XML parser for tool calls.
-    Uses parse_xml_action_custom from r2e_configs.
-    """
-    def parse_tool_calls(llm_response: Dict) -> List[Dict]:
-        content = llm_response.get("content", "")
-
-        # Use the custom XML parser from r2e_configs
-        parsed = parse_xml_action_custom(content)
-
-        if parsed is None:
-            return []
-
-        # Convert to our internal tool call format
-        tool_call = {
-            "tool": parsed["tool_name"],
-            "parameters": parsed["tool_args"]
-        }
-
-        # Store thought content if present
-        if parsed.get("has_thought"):
-            tool_call["thought"] = parsed["thought_content"]
-
-        return [tool_call]
-
-    return parse_tool_calls
 
 
 async def process_single_instance(
@@ -265,17 +352,21 @@ async def process_single_instance(
     max_execution_time: float = None,
     llm_timeout: float = 120.0,
     tool_timeout: float = 300.0) -> Dict:
-    """Process a single instance from the JSONL file.
+    """Process a single instance using DeepSeek V3.1 completion format.
 
     Args:
         instance_data: Data for a single instance from JSONL
-        pod_suffix: Unique suffix for the pod name (derived from instance_id)
+        pod_suffix: Unique suffix for the pod name
+        task_id: Task ID for progress tracking
+        progress_tracker: Progress tracker instance
         output_dir: Directory to save context and log files
         enable_timeline: Enable timeline tracking
-        debug: Enable debug mode (detailed logging)
-        max_execution_time: Maximum execution time in seconds (None for no limit)
-        llm_timeout: LLM call timeout in seconds (default: 120s)
-        tool_timeout: Tool execution timeout in seconds (default: 300s)
+        debug: Enable debug mode
+        cpu_request: CPU resource request
+        memory_request: Memory resource request
+        max_execution_time: Maximum execution time in seconds
+        llm_timeout: LLM call timeout in seconds
+        tool_timeout: Tool execution timeout in seconds
 
     Returns:
         Result dictionary with instance_id and execution status
@@ -300,7 +391,7 @@ async def process_single_instance(
     progress_tracker.create_task(task_id, instance_id)
     progress_tracker.set_status(task_id, "initializing")
     
-    # Setup output files if output_dir is provided
+    # Setup output files
     log_file = None
     if output_dir:
         import os
@@ -308,17 +399,13 @@ async def process_single_instance(
         log_file_path = os.path.join(output_dir, f"{instance_id}.log")
         log_file = open(log_file_path, 'w', encoding='utf-8')
 
-    # Derive pod name from instance_id with random suffix
-    # Replace all underscores and double-dashes with single dash for valid K8S naming
-    # K8S pod names must match: [a-z0-9]([-a-z0-9]*[a-z0-9])?
+    # Derive pod name
     import random
     safe_instance_id = instance_id.replace('__', '-').replace('_', '-').replace('--', '-')
     random_suffix = random.randint(1000, 9999)
-    pod_name = f"r2e-{safe_instance_id}-{random_suffix}".lower()
+    pod_name = f"ds-{safe_instance_id}-{random_suffix}".lower()
     
-    # Truncate if too long (K8S max is 253 chars, leave margin)
     if len(pod_name) > 200:
-        # Keep prefix and suffix, truncate middle
         pod_name = f"{pod_name[:100]}-{random_suffix}"
 
     result = {
@@ -328,34 +415,37 @@ async def process_single_instance(
     }
     
     def log(message: str):
-        """Helper to write to log file if available."""
+        """Helper to write to log file."""
         if log_file:
             log_file.write(message + "\n")
             log_file.flush()
 
     try:
-        log(f"=== Starting task for instance: {instance_id} ===")
+        log(f"=== Starting DeepSeek task for instance: {instance_id} ===")
         log(f"Task ID: {task_id}")
-        log(f"Pod name: {pod_name if 'pod_name' in locals() else 'not yet assigned'}")
+        log(f"Pod name: {pod_name}")
         if max_execution_time:
             log(f"Max execution time: {max_execution_time}s ({max_execution_time/60:.1f} minutes)")
         log(f"LLM timeout: {llm_timeout}s")
         log(f"Tool timeout: {tool_timeout}s")
         
-        # Track execution start time
         execution_start_time = time.time()
+        
         # Context Engineering Node
-        context = ContextEngineeringNode(name=f"R2EK8SContext-{pod_suffix}", timeline_enabled=enable_timeline)
+        context = ContextEngineeringNode(name=f"DSK8SContext-{pod_suffix}", timeline_enabled=enable_timeline)
 
-        # LLM Node (async)
+        # LLM Node - using completion endpoint
         llm_handle = create_openai_api_handle_async(
-            base_url="base_url",
-            api_key="api_key",
-            model="deepseek-v3-1-terminus"
+            #base_url="http://211.23.3.237:27544/v1",
+            base_url="http://10.231.136.51:8080/v1",
+            api_key="sk-qq7xJtnAdB1Gv6IkHTQhDAPuUAT700vF3CMmGinILsmP2HuY",
+            #model="deepseek-v3-1-terminus",
+            model="ainf-exp3-dsv31-terminus-fed",
+            use_completion=True  # Use completion endpoint instead of chat
         )
 
         llm_node = LLMNode(
-            name=f"R2ELLM-{pod_suffix}",
+            name=f"DSLLM-{pod_suffix}",
             function_handle=llm_handle,
             model_config={
                 "temperature": 0.7,
@@ -364,28 +454,23 @@ async def process_single_instance(
             timeline_enabled=enable_timeline,
             timeout=llm_timeout
         )
-        #llm_node.set_retry_config(max_retries=3)
 
-        # Tool Parsing Node (R2E-style XML parser)
+        # Tool Parsing Node (DeepSeek-style parser)
         parser = ToolParsingNode(
-            name=f"R2EParser-{pod_suffix}",
-            parse_function=create_r2e_parser(),
+            name=f"DSParser-{pod_suffix}",
+            parse_function=create_ds_parser(),
             timeline_enabled=enable_timeline
         )
 
-        # Use the image from the instance data if provided
+        # Use the image from instance data
         image = instance_data.get("image", "python:3.11-slim")
         
-        log(f"Pod name: {pod_name}")
         log(f"Using image: {image}")
 
         # Use async context manager for automatic cleanup
         async with K8SToolExecutionNode(
-                name=f"R2EK8SExecutor-{pod_suffix}",
-                #namespace="qianfan-train-cpu-ns",
+                name=f"DSK8SExecutor-{pod_suffix}",
                 namespace="rl-training",
-                #node_selector={"nvme": "ok"},
-                #kubeconfig_path="./cpu_config2",
                 kubeconfig_path="./swe-bench-verified-workspace/config_cce_new",
                 image=image,
                 pod_name=pod_name,
@@ -393,7 +478,11 @@ async def process_single_instance(
                     "PYTHONPATH": "/testbed",
                     "PYTHONIOENCODING": "utf-8",
                     "LANG": "C.UTF-8",
-                    "LC_ALL": "C.UTF-8"
+                    "LC_ALL": "C.UTF-8",
+                    "http_proxy": "http://agent.baidu.com:8891",
+                    "https_proxy": "http://agent.baidu.com:8891",
+                    "PIP_INDEX_URL": "http://pip.baidu.com/pypi/simple",
+                    "PIP_TRUSTED_HOST": "pip.baidu.com"                    
                 },
                 cpu_request=cpu_request,
                 memory_request=memory_request,
@@ -402,46 +491,19 @@ async def process_single_instance(
         ) as k8s_executor:
             log(f"K8S executor initialized")
 
-            # Register R2E tools
+            # Register DeepSeek tools
             k8s_executor.register_tool(
-                "r2e_bash_executor",
-                "src/tools/r2e/bash_func.py"
-            )
-
-            k8s_executor.register_tool(
-                "r2e_file_editor",
-                "src/tools/r2e/file_editor.py"
+                "ds_bash_executor",
+                "src/tools/deepseek/bash_func.py"
             )
 
             k8s_executor.register_tool(
-                "r2e_search",
-                "src/tools/r2e/search_func.py"
+                "ds_file_editor",
+                "src/tools/deepseek/file_editor.py"
             )
 
-            # Finish/Submit tool
-            def finish_parse_result(result):
-                """Parse finish tool result."""
-                if isinstance(result, dict):
-                    return result
-                return {
-                    "message": "<<<Finish>>>",
-                    "status": "stop"
-                }
-
-            k8s_executor.register_tool(
-                "r2e_submit",
-                "src/tools/r2e/finish.py",
-                finish_parse_result
-            )
-
-            # Build system prompt with tool descriptions
-            system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-                r2e_file_editor=CUSTOM_TOOL_DESCRIPTIONS['r2e_file_editor'],
-                r2e_bash_executor=CUSTOM_TOOL_DESCRIPTIONS['r2e_bash_executor'],
-                r2e_search=CUSTOM_TOOL_DESCRIPTIONS['r2e_search'],
-                r2e_submit=CUSTOM_TOOL_DESCRIPTIONS['r2e_submit'],
-                **DEFAULT_TEMPLATE_VARIABLES
-            )
+            # Build system prompt
+            system_prompt = DEEPSEEK_SYSTEM_PROMPT
 
             # Add system prompt message
             context.add_message(
@@ -450,11 +512,28 @@ async def process_single_instance(
                 message_type="system_prompt"
             )
 
-            # Get problem statement from instance data
+            # Get problem statement
             issue = instance_data.get("problem_statement", "No problem statement provided")
 
-            # Build and add user query
-            query = QUERY_PROMPT_TEMPLATE.format(issue=issue)
+            # Build user query in DeepSeek format
+            query = f"""<｜User｜><uploaded_files>
+/testbed
+</uploaded_files>
+I've uploaded a code repository in the directory /testbed (not in /tmp/inputs). Consider the following PR description:
+
+<pr_description>
+{issue}
+</pr_description>
+
+Can you help me implement the necessary changes to the repository so that the requirements specified in the <pr_description> are met?
+I've already taken care of all changes to any of the test files described in the <pr_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!
+
+Your task is to make the minimal changes to non-tests files in the /testbed directory to ensure the <pr_description> is satisfied.
+
+You are only allowed to call **ONE** function each time!
+
+<｜Assistant｜></think>"""
+
             context.add_message(
                 message_content=query,
                 message_role="user",
@@ -467,6 +546,9 @@ async def process_single_instance(
             # Mark as running after pod is ready
             progress_tracker.set_status(task_id, "running")
 
+            # Accumulated prompt for completion API
+            accumulated_prompt = system_prompt + "\n\n" + query
+
             while iteration < max_iterations:
                 # Check total execution time limit
                 if max_execution_time:
@@ -477,38 +559,33 @@ async def process_single_instance(
                         result["status"] = "timeout"
                         result["error"] = f"Execution time limit reached: {elapsed_time:.1f}s"
                         progress_tracker.set_status(task_id, "failed")
-                        
-                        # Add timeout message to context
-                        context.add_message(
-                            message_content=f"Task execution stopped: Maximum execution time ({max_execution_time}s) exceeded.",
-                            message_role="system",
-                            message_type="error"
-                        )
                         break
                 
                 iteration += 1
                 progress_tracker.update_iteration(task_id, iteration)
                 log(f"\n=== Iteration {iteration}/{max_iterations} ===")
 
-                messages = context.get_llm_context()
                 try:
-                    # Call LLM and track success/error/timeout
+                    # Call LLM with accumulated prompt
                     try:
-                        log(f"Calling LLM with timeout={llm_timeout}s...")
+                        log(f"Calling LLM completion with timeout={llm_timeout}s...")
+                        
+                        # Create a single message with the accumulated prompt for completion API
+                        completion_messages = [{"role": "user", "content": accumulated_prompt}]
+                        
                         if enable_timeline:
                             llm_response = await asyncio.wait_for(
-                                llm_node.process_with_timing(messages, event_type="llm_call"),
+                                llm_node.process_with_timing(completion_messages, event_type="llm_call"),
                                 timeout=llm_timeout
                             )
                         else:
                             llm_response = await asyncio.wait_for(
-                                llm_node.process_async(messages),
+                                llm_node.process_async(completion_messages),
                                 timeout=llm_timeout
                             )
 
                         log(f"LLM Response: {llm_response.get('content', '')[:200]}...")
                         
-                        # Print raw LLM response for debugging
                         if debug:
                             print(f"\n🤖 Task {task_id} iter {iteration} - LLM Response (FULL):")
                             print(f"{llm_response.get('content', '')}")
@@ -520,14 +597,6 @@ async def process_single_instance(
                         error_msg = f"LLM call timeout after {llm_timeout}s"
                         log(f"❌ {error_msg}")
                         print(f"\n❌ Task {task_id} ({instance_id}) iter {iteration}: {error_msg}")
-                        
-                        # Add timeout error to context
-                        context.add_message(
-                            message_content=f"ERROR: {error_msg}. Task terminated.",
-                            message_role="system",
-                            message_type="error"
-                        )
-                        
                         result["status"] = "failed"
                         result["error"] = error_msg
                         progress_tracker.set_status(task_id, "failed")
@@ -536,6 +605,29 @@ async def process_single_instance(
                         progress_tracker.increment_llm_error(task_id)
                         raise
 
+                    # Append LLM response to accumulated prompt
+                    llm_content = llm_response.get('content', '')
+                    accumulated_prompt += llm_content
+
+                    # Check if response ends with TOOL_CALLS_END
+                    if not llm_content.endswith(TOOL_CALLS_END):
+                        # No tool call, task is complete
+                        log(f"LLM response doesn't end with tool calls - treating as completion")
+                        print(f"\n✅ Task {task_id} ({instance_id}): LLM completed without tool call")
+                        
+                        context.add_message(
+                            message_content=llm_content,
+                            message_role="assistant",
+                            message_type="completion"
+                        )
+                        
+                        result["status"] = "success"
+                        progress_tracker.set_status(task_id, "success")
+                        break
+
+                    # Append end of sentence marker
+                    accumulated_prompt += END_OF_SENTENCE
+
                     # Parse tool calls
                     try:
                         if enable_timeline:
@@ -543,42 +635,31 @@ async def process_single_instance(
                         else:
                             tool_calls = await parser.process_async(llm_response)
 
-                        # Print parsed tool calls for debugging
                         if debug and tool_calls and len(tool_calls) > 0:
                             print(f"📝 Parsed tool: {tool_calls[0].get('tool', 'unknown')}")
-                            print(f"📝 Tool params (FULL): {tool_calls[0].get('parameters', {})}")
+                            print(f"📝 Tool params: {tool_calls[0].get('parameters', {})}")
                             print("-" * 80)
 
                         if not tool_calls or len(tool_calls) == 0:
                             progress_tracker.increment_tool_parse_fail(task_id)
-                            log(f"Tool parsing returned empty list - treating as completion")
-                            print(f"\n⚠️  Task {task_id} ({instance_id}): Tool parsing returned empty list - treating as task completion")
-                            print(f"   LLM Response: {llm_response.get('content', '')[:500]}")
+                            log(f"Tool parsing returned empty list")
+                            print(f"\n⚠️  Task {task_id} ({instance_id}): Tool parsing failed")
                             
-                            # Add LLM response to context
                             context.add_message(
-                                message_content=llm_response['content'],
+                                message_content=llm_content,
                                 message_role="assistant",
                                 message_type="tool_call"
                             )
                             
-                            # Terminate loop when LLM doesn't call any tool
-                            result["status"] = "success"
-                            progress_tracker.set_status(task_id, "success")
+                            result["status"] = "failed"
+                            result["error"] = "Tool parsing failed"
+                            progress_tracker.set_status(task_id, "failed")
                             break
 
                     except Exception as e:
                         progress_tracker.increment_tool_parse_fail(task_id)
                         log(f"Tool parse error: {str(e)}")
                         print(f"\n❌ Task {task_id} ({instance_id}): Tool parse error: {str(e)}")
-                        print(f"   LLM Response: {llm_response.get('content', '')[:500]}")
-                        
-                        # Add error response to context and terminate
-                        context.add_message(
-                            message_content=llm_response.get('content', ''),
-                            message_role="assistant",
-                            message_type="tool_call"
-                        )
                         
                         result["status"] = "failed"
                         result["error"] = str(e)
@@ -586,17 +667,17 @@ async def process_single_instance(
                         break
 
                     context.add_message(
-                        message_content=llm_response['content'],
+                        message_content=llm_content,
                         message_role="assistant",
                         message_type="tool_call"
                     )
+
+                    # Execute tool
                     tool_call = tool_calls[0]
-                    
                     tool_name = tool_call.get('tool', 'unknown')
                     log(f"Executing tool: {tool_name}")
                     log(f"Tool parameters: {json.dumps(tool_call.get('parameters', {}), indent=2)}")
 
-                    # Execute tool
                     try:
                         if enable_timeline:
                             results = await k8s_executor.process_with_timing([tool_call], event_type="tool_execute", tool_name=tool_name)
@@ -610,28 +691,25 @@ async def process_single_instance(
                         if 'stderr' in tool_result and tool_result.get('stderr'):
                             log(f"Tool stderr:\n{tool_result.get('stderr', '')}")
 
-                        # Check if tool execution had errors
                         if isinstance(tool_result, dict) and tool_result.get("status") == "error":
                             progress_tracker.increment_tool_exec_fail(task_id)
                             error_msg = tool_result.get('error', 'Unknown error')
                             print(f"\n⚠️  Task {task_id} ({instance_id}) iter {iteration}: Tool execution error")
-                            print(f"   Tool: {tool_call.get('tool', 'unknown')}")
+                            print(f"   Tool: {tool_name}")
                             print(f"   Error: {error_msg[:300]}")
-                            # Don't continue with more error details to avoid log spam
 
                     except Exception as e:
                         progress_tracker.increment_tool_exec_fail(task_id)
                         print(f"\n❌ Task {task_id} ({instance_id}): Tool execution exception: {str(e)}")
-                        print(f"   Tool: {tool_call.get('tool', 'unknown')}")
+                        print(f"   Tool: {tool_name}")
                         raise
 
-                    # Get formatted result from parser
+                    # Format tool output for DeepSeek
                     formatted_result = tool_result.get('result', '')
 
-                    # Print formatted result for debugging
                     if debug:
                         print(f"🔧 Tool result status: {tool_result.get('status', 'unknown')}")
-                        print(f"📤 Formatted result (FULL):\n{str(formatted_result)}")
+                        print(f"📤 Formatted result:\n{str(formatted_result)[:500]}")
                         print("=" * 80)
 
                     # Ensure formatted_result is a string
@@ -640,24 +718,16 @@ async def process_single_instance(
                     elif not isinstance(formatted_result, str):
                         formatted_result = str(formatted_result)
 
-                    # Add steps remaining
-                    steps_remaining = max_iterations - iteration
-                    steps_remaining_content = f"Steps Remaining: {steps_remaining}"
+                    # Append tool output to accumulated prompt
+                    tool_output = f"{TOOL_OUTPUT_BEGIN}{formatted_result}{TOOL_OUTPUT_END}"
+                    accumulated_prompt += tool_output
 
                     # Add tool result to context
                     context.add_message(
-                        message_content=formatted_result + "\n" + steps_remaining_content,
+                        message_content=tool_output,
                         message_role="user",
                         message_type="tool_result"
                     )
-
-                    # Check for stop signal AFTER adding result to context
-                    if isinstance(tool_result, dict) and tool_result.get("status") == "stop":
-                        log(f"Finish tool executed - terminating successfully")
-                        print(f"\n✅ Task {task_id} ({instance_id}): Finish tool executed, terminating successfully")
-                        result["status"] = "success"
-                        progress_tracker.set_status(task_id, "success")
-                        break
 
                 except Exception as e:
                     import traceback
@@ -665,7 +735,6 @@ async def process_single_instance(
                     log(f"Error in agent loop: {error_msg}")
                     log(f"Traceback: {traceback.format_exc()}")
                     print(f"\n❌ Error in agent loop for task {task_id} ({instance_id}): {error_msg}")
-                    print(f"   Traceback: {traceback.format_exc()[:500]}")
                     result["error"] = error_msg
                     progress_tracker.set_status(task_id, "failed")
                     break
@@ -675,18 +744,15 @@ async def process_single_instance(
                 result["status"] = "max_iterations"
                 progress_tracker.set_status(task_id, "max_iter")
             
-            # Generate and save patch before pod is deleted (must be inside async with block)
+            # Generate and save patch
             if output_dir:
                 try:
                     log(f"Generating patch from testbed changes...")
                     
-                    # Stage all changes
                     await k8s_executor._execute_kubectl_async("cd /testbed && git add -A")
                     
-                    # Get base_commit from instance data
                     base_commit = instance_data.get('base_commit', None)
                     
-                    # Generate patch
                     if base_commit:
                         log(f"Generating patch against base_commit: {base_commit}")
                         patch_output, exit_code = await k8s_executor._execute_kubectl_async(
@@ -703,7 +769,6 @@ async def process_single_instance(
                         log(f"Patch generated successfully, size: {len(patch)} characters")
                         
                         if patch:
-                            # Log patch preview
                             lines = patch.split('\n')
                             log(f"Patch preview (first 5 lines):")
                             for line in lines[:5]:
@@ -711,7 +776,6 @@ async def process_single_instance(
                             if len(lines) > 5:
                                 log(f"  ... ({len(lines) - 5} more lines)")
                             
-                            # Save patch directly to output directory as {instance_id}.patch
                             patch_filepath = os.path.join(output_dir, f"{instance_id}.patch")
                             with open(patch_filepath, 'w', encoding='utf-8') as f:
                                 f.write(patch)
@@ -731,12 +795,10 @@ async def process_single_instance(
         log(f"Fatal error: {error_msg}")
         log(f"Traceback: {traceback.format_exc()}")
         print(f"\n❌ Fatal error processing instance {instance_id}: {error_msg}")
-        print(f"   Traceback: {traceback.format_exc()[:500]}")
         result["error"] = error_msg
         progress_tracker.set_status(task_id, "failed")
     
     finally:
-        # Log pod cleanup (the async context manager will handle actual deletion)
         log(f"Task finished, pod {pod_name} will be deleted by context manager")
         
         # Save context to file
@@ -754,7 +816,7 @@ async def process_single_instance(
                 if log_file:
                     log(f"Error saving context: {e}")
         
-        # Close aiohttp session in LLM node
+        # Close aiohttp session
         if 'llm_node' in locals() and llm_node:
             try:
                 await llm_node.close_async()
@@ -766,7 +828,6 @@ async def process_single_instance(
         if log_file:
             try:
                 log(f"=== Task completed with status: {result.get('status', 'unknown')} ===")
-                log(f"=== Pod {pod_name} cleanup delegated to context manager ===")
                 log_file.close()
             except:
                 pass
@@ -786,22 +847,11 @@ async def main(
     llm_timeout: float = 120.0,
     tool_timeout: float = 300.0
 ):
-    """Main function to process JSONL file with concurrent execution.
-
-    Args:
-        jsonl_file: Path to the JSONL file containing instances
-        max_concurrent: Maximum number of concurrent executions
-        output_dir: Directory to save context and log files
-        enable_timeline: Enable timeline tracking for profiling
-        debug: Enable debug mode (detailed logging, no progress table)
-        max_execution_time: Maximum execution time per instance in seconds (None for no limit)
-        llm_timeout: LLM call timeout in seconds (default: 120s)
-        tool_timeout: Tool execution timeout in seconds (default: 300s)
-    """
-    # Create progress tracker
+    """Main function to process JSONL file with concurrent execution."""
+    
     progress_tracker = ProgressTracker()
 
-    print("=== R2E Agent K8S Concurrent Executor ===")
+    print("=== DeepSeek V3.1 Agent K8S Concurrent Executor ===")
     print(f"📁 JSONL file: {jsonl_file}")
     print(f"🔧 Max concurrent: {max_concurrent}")
     print(f"⏱️  Timeline tracking: {'ENABLED' if enable_timeline else 'DISABLED'}")
@@ -823,7 +873,6 @@ async def main(
                     instances.append(json.loads(line))
         print(f"📊 Loaded {len(instances)} instances from file")
         
-        # Check how many already have patch files
         if output_dir:
             import os
             existing_patches = 0
@@ -841,7 +890,7 @@ async def main(
         print(f"❌ Error loading JSONL file: {e}")
         return
 
-    # Start progress display (only if not in debug mode)
+    # Start progress display
     if not debug:
         print("\n🔄 Starting progress display...\n")
         time.sleep(1)
@@ -861,14 +910,11 @@ async def main(
                 active_tasks['count'] += 1
                 current_active = active_tasks['count']
 
-            # Log when we reach peak concurrency
             if current_active >= max_concurrent * 0.8:
                 print(f"⚡ High concurrency: {current_active}/{max_concurrent} tasks active")
 
             try:
-                # Use instance_id to derive pod suffix for idempotency
                 instance_id = instance_data.get("instance_id", f"unknown-{index}")
-                # Sanitize for K8S naming: replace all underscores and double-dashes
                 pod_suffix = instance_id.replace('__', '-').replace('_', '-').replace('--', '-')
                 return await process_single_instance(
                     instance_data,
@@ -897,10 +943,9 @@ async def main(
     # Execute all tasks
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    # Wait a bit for cleanup to complete
     await asyncio.sleep(0.5)
 
-    # Stop progress display (only if it was started)
+    # Stop progress display
     if not debug:
         progress_tracker.stop_display()
 
@@ -934,7 +979,8 @@ async def main(
                 "success": "✅",
                 "failed": "❌",
                 "timeout": "⏱️",
-                "max_iterations": "⚠️"
+                "max_iterations": "⚠️",
+                "skipped": "⏭️"
             }.get(result.get("status"), "❓")
             print(f"{status_emoji} [{idx:04d}] {result.get('instance_id', 'unknown')}: {result.get('status', 'unknown')}")
             if result.get("error"):
@@ -942,7 +988,7 @@ async def main(
         elif isinstance(result, Exception):
             print(f"🔥 [{idx:04d}] Exception: {str(result)[:100]}...")
 
-    # Print and save timeline if enabled
+    # Print timeline if enabled
     if enable_timeline:
         print("\n" + "="*60)
         print("TIMELINE PROFILING")
@@ -953,7 +999,6 @@ async def main(
         }
         print(json.dumps(timeline_data, indent=2))
         
-        # Save timeline to output directory
         if output_dir:
             try:
                 timeline_file = os.path.join(output_dir, "timeline_profile.json")
@@ -967,7 +1012,7 @@ async def main(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="R2E Agent K8S Concurrent Executor")
+    parser = argparse.ArgumentParser(description="DeepSeek V3.1 Agent K8S Concurrent Executor")
     parser.add_argument(
         "--jsonl",
         type=str,
@@ -1028,7 +1073,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Set up event loop with proper configuration for high concurrency
+    # Set up event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -1048,20 +1093,17 @@ if __name__ == "__main__":
             )
         )
         
-        # Wait for all pending tasks to complete
+        # Wait for all pending tasks
         pending = asyncio.all_tasks(loop)
         if pending:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             
     except KeyboardInterrupt:
         print("\n\nInterrupted by user, cleaning up...")
-        # Cancel all running tasks
         pending = asyncio.all_tasks(loop)
         for task in pending:
             task.cancel()
-        # Wait for cancellation to complete
         loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
     finally:
-        # Give time for cleanup
         loop.run_until_complete(asyncio.sleep(0.1))
         loop.close()

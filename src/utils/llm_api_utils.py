@@ -112,7 +112,8 @@ def create_openai_api_handle_async(
     base_url: str,
     api_key: str,
     model: str,
-    clear_proxy: bool = True
+    clear_proxy: bool = True,
+    use_completion: bool = False
 ) -> Callable:
     """
     Create an async function handle for OpenAI-compatible API using aiohttp.
@@ -122,6 +123,7 @@ def create_openai_api_handle_async(
         api_key: API key for authentication
         model: Model name to use (e.g., "gpt-4", "deepseek-v3-1-terminus")
         clear_proxy: Whether to clear proxy environment variables (default: True)
+        use_completion: Whether to use completion endpoint instead of chat endpoint (default: False)
 
     Returns:
         An async callable function that takes messages and kwargs, returns LLM response
@@ -152,6 +154,7 @@ def create_openai_api_handle_async(
 
         Args:
             messages: List of message dictionaries with 'role' and 'content'
+                      For completion endpoint: expects single message with 'content' as prompt
             **kwargs: Additional parameters (temperature, max_tokens, etc.)
 
         Returns:
@@ -177,19 +180,37 @@ def create_openai_api_handle_async(
             )
             session = aiohttp.ClientSession(connector=connector)
 
-        url = f"{base_url.rstrip('/')}/chat/completions"
+        # Choose endpoint based on use_completion flag
+        if use_completion:
+            url = f"{base_url.rstrip('/')}/completions"
+            # For completion endpoint, extract prompt from messages
+            if isinstance(messages, list) and len(messages) > 0:
+                prompt = messages[0].get('content', '')
+            else:
+                prompt = ''
+
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "temperature": kwargs.get("temperature", 0.7),
+                "max_tokens": kwargs.get("max_tokens", 8000),
+                "top_p": kwargs.get("top_p", 0.95),
+                "stream": False
+            }
+        else:
+            url = f"{base_url.rstrip('/')}/chat/completions"
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": kwargs.get("temperature", 0.7),
+                "max_tokens": kwargs.get("max_tokens", 4000),
+                "top_p": kwargs.get("top_p", 0.95),
+                "stream": False
+            }
+
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
-        }
-
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": kwargs.get("temperature", 0.7),
-            "max_tokens": kwargs.get("max_tokens", 4000),
-            "top_p": kwargs.get("top_p", 0.95),
-            "stream": False
         }
 
         try:
@@ -204,13 +225,24 @@ def create_openai_api_handle_async(
                 data = await response.json(content_type=None)
 
             choice = data['choices'][0]
-            message = choice['message']
-
-            result = {
-                "role": message.get('role', 'assistant'),
-                "content": message.get('content', ''),
-                "model": data.get('model', model)
-            }
+            
+            # Parse response based on endpoint type
+            if use_completion:
+                # Completion endpoint returns 'text' field
+                content = choice.get('text', '')
+                result = {
+                    "role": "assistant",
+                    "content": content,
+                    "model": data.get('model', model)
+                }
+            else:
+                # Chat endpoint returns 'message' object
+                message = choice['message']
+                result = {
+                    "role": message.get('role', 'assistant'),
+                    "content": message.get('content', ''),
+                    "model": data.get('model', model)
+                }
 
             if 'usage' in data:
                 result['usage'] = data['usage']

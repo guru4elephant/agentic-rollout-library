@@ -877,6 +877,7 @@ class K8SToolExecutionNode(ToolExecutionNode):
             try:
                 await self.async_manager.execute_command(self.pod_name, "mkdir -p /workspace/src/tools/r2e")
                 await self.async_manager.execute_command(self.pod_name, "mkdir -p /workspace/src/tools/mini_swe")
+                await self.async_manager.execute_command(self.pod_name, "mkdir -p /workspace/src/tools/deepseek")
                 await self.async_manager.execute_command(self.pod_name, "mkdir -p /workspace/pip_packages")
             finally:
                 if self.timeline_enabled and self._timeline:
@@ -901,13 +902,21 @@ class K8SToolExecutionNode(ToolExecutionNode):
                     pod_path = f"/workspace/src/tools/mini_swe/{filename}"
                     copy_tasks.append(self._copy_file_to_pod_async(py_file, pod_path))
 
+            # Copy all Python files from tools/deepseek
+            deepseek_dir = os.path.join(tools_dir, "deepseek")
+            if os.path.exists(deepseek_dir):
+                for py_file in glob.glob(os.path.join(deepseek_dir, "*.py")):
+                    filename = os.path.basename(py_file)
+                    pod_path = f"/workspace/src/tools/deepseek/{filename}"
+                    copy_tasks.append(self._copy_file_to_pod_async(py_file, pod_path))
+
             # Copy base_tool.py if exists
             base_tool_path = os.path.join(tools_dir, "base_tool.py")
             if os.path.exists(base_tool_path):
                 copy_tasks.append(self._copy_file_to_pod_async(base_tool_path, "/workspace/src/tools/base_tool.py"))
 
             # Copy __init__.py files
-            for init_file in ["__init__.py", "r2e/__init__.py", "mini_swe/__init__.py"]:
+            for init_file in ["__init__.py", "r2e/__init__.py", "mini_swe/__init__.py", "deepseek/__init__.py"]:
                 local_init = os.path.join(tools_dir, init_file)
                 if os.path.exists(local_init):
                     pod_init = f"/workspace/src/tools/{init_file}"

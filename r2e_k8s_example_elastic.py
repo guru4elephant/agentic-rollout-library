@@ -351,7 +351,7 @@ async def process_single_instance(
         llm_handle = create_openai_api_handle_async(
             base_url="base_url",
             api_key="api_key",
-            model="deepseek-v3-1-terminus"
+            model="isft-sft-model"
         )
 
         llm_node = LLMNode(
