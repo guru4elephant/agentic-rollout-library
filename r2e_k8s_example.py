@@ -335,8 +335,8 @@ async def process_single_instance(
 
         # LLM Node (async)
         llm_handle = create_openai_api_handle_async(
-            base_url="http://211.23.3.237:27544/v1",
-            api_key="sk-qq7xJtnAdB1Gv6IkHTQhDAPuUAT700vF3CMmGinILsmP2HuY",
+            base_url="base_url",
+            api_key="api_key",
             model="deepseek-v3-1-terminus"
         )
 
