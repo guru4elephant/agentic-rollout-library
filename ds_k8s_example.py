@@ -436,11 +436,9 @@ async def process_single_instance(
 
         # LLM Node - using completion endpoint
         llm_handle = create_openai_api_handle_async(
-            #base_url="http://211.23.3.237:27544/v1",
-            base_url="http://10.231.136.51:8080/v1",
-            api_key="sk-qq7xJtnAdB1Gv6IkHTQhDAPuUAT700vF3CMmGinILsmP2HuY",
-            #model="deepseek-v3-1-terminus",
-            model="ainf-exp3-dsv31-terminus-fed",
+            base_url="",
+            api_key="",
+            model="",
             use_completion=True  # Use completion endpoint instead of chat
         )
 
@@ -449,7 +447,7 @@ async def process_single_instance(
             function_handle=llm_handle,
             model_config={
                 "temperature": 0.7,
-                "max_tokens": 4000
+                "max_tokens": 8000
             },
             timeline_enabled=enable_timeline,
             timeout=llm_timeout
