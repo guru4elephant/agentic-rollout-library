@@ -43,6 +43,8 @@ class K8SToolExecutionNode(ToolExecutionNode):
                  cleanup_existing_pod: bool = False,
                  cpu_request: str = "0.3",
                  memory_request: str = "1Gi",
+                 dns_policy: str = None,
+                 dns_config: Dict[str, Any] = None,
                  timeline_enabled: bool = False,
                  tool_timeout: float = None):
         """
@@ -60,6 +62,10 @@ class K8SToolExecutionNode(ToolExecutionNode):
             cleanup_existing_pod: Whether to delete existing pod before creating (default: False)
             cpu_request: CPU resource request (default: "0.3" for 0.3 core)
             memory_request: Memory resource request (default: "1Gi" for 1GB)
+            dns_policy: DNS policy for the pod (None, Default, ClusterFirst, or ClusterFirstWithHostNet)
+                       Set to "None" to use custom DNS configuration via dns_config
+            dns_config: Custom DNS configuration (dict with nameservers, searches, options)
+                       Example: {"nameservers": ["8.8.8.8"], "searches": ["default.svc.cluster.local"]}
             timeline_enabled: Enable automatic timeline tracking for this node
             tool_timeout: Timeout in seconds for tool execution (None = no timeout)
         """
@@ -68,6 +74,11 @@ class K8SToolExecutionNode(ToolExecutionNode):
                 "Kodo library is required for K8S tool execution. "
                 "Install it with: pip install kodo"
             )
+
+        # Initialize pod-related attributes BEFORE calling super().__init__()
+        # because parent's __init__ may call register_tool which needs these attributes
+        self._pod_ready = None  # Will be initialized on first async access
+        self._pod_creation_started = False
 
         super().__init__(name, timeline_enabled=timeline_enabled, timeout=tool_timeout)
 
@@ -80,10 +91,12 @@ class K8SToolExecutionNode(ToolExecutionNode):
         self.cleanup_existing_pod = cleanup_existing_pod
         self.cpu_request = cpu_request
         self.memory_request = memory_request
+        self.dns_policy = dns_policy
+        self.dns_config = dns_config
 
         # Initialize Kodo async manager (will be initialized lazily)
         self.async_manager = None
-        
+
         # Keep sync runner for backward compatibility
         self.runner = ContainerRunner(
             backend="kubernetes",
@@ -96,10 +109,45 @@ class K8SToolExecutionNode(ToolExecutionNode):
 
         # Pod reference (will be created lazily on first use)
         self.pod = None
-        self._pod_ready = asyncio.Event()
-        self._pod_creation_started = False
 
         self.logger.info(f"K8S Tool Execution Node initialized (pod will be created on first use): {self.pod_name}")
+
+    def register_tool(self,
+                     name: str,
+                     script_path: str,
+                     result_parser: Callable = None) -> None:
+        """
+        Register a new tool and copy its file to the pod if pod is already created.
+
+        Args:
+            name: Tool name
+            script_path: Path to executable script for subprocess execution
+            result_parser: Optional result parser function
+        """
+        # Call parent's register_tool to register the tool in memory
+        super().register_tool(name, script_path, result_parser)
+
+        # If pod is already created, copy the tool file to pod immediately
+        if self._pod_ready is not None and self._pod_ready.is_set():
+            import os
+            if os.path.exists(script_path):
+                pod_path = self._local_to_pod_path(script_path)
+
+                # Create parent directory in pod
+                parent_dir = os.path.dirname(pod_path)
+                try:
+                    self.runner.execute_command(self.pod, f"mkdir -p {parent_dir}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to create directory {parent_dir}: {e}")
+
+                # Copy the file to pod
+                try:
+                    self._copy_file_to_pod(script_path, pod_path)
+                    self.logger.info(f"Copied tool file to pod: {script_path} -> {pod_path}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to copy tool file {script_path} to pod: {e}")
+            else:
+                self.logger.warning(f"Tool script file not found: {script_path}")
 
     async def _ensure_async_manager(self) -> None:
         """Initialize async manager if not already initialized."""
@@ -123,6 +171,10 @@ class K8SToolExecutionNode(ToolExecutionNode):
 
         Uses asyncio.Event to ensure only one coroutine creates the pod.
         """
+        # Lazy initialize _pod_ready Event (must be done in async context)
+        if self._pod_ready is None:
+            self._pod_ready = asyncio.Event()
+
         # If pod already ready, return immediately
         if self._pod_ready.is_set():
             return
@@ -138,7 +190,7 @@ class K8SToolExecutionNode(ToolExecutionNode):
         try:
             # Ensure async manager is ready
             await self._ensure_async_manager()
-            
+
             # Create pod asynchronously
             await self._create_pod_async()
 
@@ -500,6 +552,86 @@ class K8SToolExecutionNode(ToolExecutionNode):
             self.logger.error(f"kubectl exec failed: {str(e)}")
             raise
 
+    async def _create_pod_with_dns_async(self, env: dict, resources: dict) -> None:
+        """
+        Create pod with DNS configuration using kubectl.
+
+        This is used when dns_policy or dns_config is specified,
+        as kodo's start_pod may not support these parameters.
+
+        Args:
+            env: Environment variables for the pod
+            resources: Resource requests and limits
+        """
+        import json
+
+        self.logger.info(f"Creating pod with DNS configuration: {self.pod_name}")
+
+        # Build pod manifest
+        pod_manifest = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": self.pod_name,
+                "namespace": self.namespace
+            },
+            "spec": {
+                "containers": [{
+                    "name": "tool-executor",
+                    "image": self.image,
+                    "command": ["sh", "-c", "sleep infinity"],
+                    "imagePullPolicy": self.image_pull_policy,
+                    "env": [{"name": k, "value": v} for k, v in env.items()],
+                    "resources": resources
+                }],
+                "restartPolicy": "Never"
+            }
+        }
+
+        # Add node selector if specified
+        if self.node_selector:
+            pod_manifest["spec"]["nodeSelector"] = self.node_selector
+
+        # Add DNS configuration
+        if self.dns_policy:
+            pod_manifest["spec"]["dnsPolicy"] = self.dns_policy
+            self.logger.info(f"  DNS Policy: {self.dns_policy}")
+
+        if self.dns_config:
+            pod_manifest["spec"]["dnsConfig"] = self.dns_config
+            self.logger.info(f"  DNS Config: {json.dumps(self.dns_config)}")
+
+        # Convert to JSON
+        manifest_json = json.dumps(pod_manifest, indent=2)
+
+        # Create pod using kubectl
+        kubectl_cmd = [
+            "kubectl", "apply", "-f", "-",
+            "-n", self.namespace,
+            "--kubeconfig", self.kubeconfig_path
+        ]
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *kubectl_cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            stdout, stderr = await process.communicate(input=manifest_json.encode())
+
+            if process.returncode != 0:
+                error_msg = stderr.decode('utf-8', errors='replace')
+                raise RuntimeError(f"Failed to create pod with DNS config: {error_msg}")
+
+            self.logger.info(f"Pod {self.pod_name} created successfully with DNS configuration")
+            self.pod = self.pod_name
+
+        except Exception as e:
+            self.logger.error(f"Error creating pod with kubectl: {str(e)}")
+            raise
+
     async def _create_pod_async(self) -> None:
         """
         Create the persistent pod for tool execution asynchronously.
@@ -550,20 +682,44 @@ class K8SToolExecutionNode(ToolExecutionNode):
                         "memory": self.memory_request
                     }
                 }
-                
-                # Pod creation with timing
+
+                # Check if we need custom pod creation for DNS
+                if self.dns_policy or self.dns_config:
+                    # Use kubectl to create pod with DNS configuration
+                    self.logger.info("Using custom pod creation for DNS configuration")
+                    if self.timeline_enabled and self._timeline:
+                        event_id = self._timeline.start_event(self.name, "pod_creation_dns", {"attempt": attempt})
+                    try:
+                        await self._create_pod_with_dns_async(env, resources)
+                    finally:
+                        if self.timeline_enabled and self._timeline:
+                            self._timeline.end_event(event_id)
+                else:
+                    # Use standard kodo pod creation
+                    # Pod creation with timing
+                    if self.timeline_enabled and self._timeline:
+                        event_id = self._timeline.start_event(self.name, "pod_creation", {"attempt": attempt})
+                    try:
+                        self.pod = await self.async_manager.start_pod(
+                            name=self.pod_name,
+                            image=self.image,
+                            command="sleep infinity",
+                            environment=env,
+                            resources=resources,
+                            node_selector=self.node_selector
+                        )
+                        self.logger.info(f"Pod {self.pod_name} created successfully")
+                    finally:
+                        if self.timeline_enabled and self._timeline:
+                            self._timeline.end_event(event_id)
+
+                # Wait for pod to be ready
+                self.logger.info(f"Waiting for pod {self.pod_name} to be ready...")
                 if self.timeline_enabled and self._timeline:
-                    event_id = self._timeline.start_event(self.name, "pod_creation", {"attempt": attempt})
+                    event_id = self._timeline.start_event(self.name, "pod_wait_ready", {})
                 try:
-                    self.pod = await self.async_manager.start_pod(
-                        name=self.pod_name,
-                        image=self.image,
-                        command="sleep infinity",
-                        environment=env,
-                        resources=resources,
-                        node_selector=self.node_selector
-                    )
-                    self.logger.info(f"Pod {self.pod_name} created successfully")
+                    await self._wait_for_pod_ready_async()
+                    self.logger.info(f"Pod {self.pod_name} is ready")
                 finally:
                     if self.timeline_enabled and self._timeline:
                         self._timeline.end_event(event_id)
@@ -606,6 +762,80 @@ class K8SToolExecutionNode(ToolExecutionNode):
                         f"{error_type}: {error_msg}"
                     )
                     raise
+
+    async def _wait_for_pod_ready_async(self, timeout: int = 120, poll_interval: int = 2) -> None:
+        """
+        Wait for the pod to be in Running state and ready.
+
+        Args:
+            timeout: Maximum time to wait in seconds (default: 120)
+            poll_interval: Time between checks in seconds (default: 2)
+
+        Raises:
+            TimeoutError: If pod is not ready within timeout
+        """
+        import time
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            try:
+                # Check pod status using kubectl
+                check_cmd = [
+                    "kubectl", "get", "pod", self.pod_name,
+                    "-n", self.namespace,
+                    "--kubeconfig", self.kubeconfig_path,
+                    "-o", "jsonpath='{.status.phase}'"
+                ]
+
+                process = await asyncio.create_subprocess_exec(
+                    *check_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+
+                stdout, stderr = await process.communicate()
+                status = stdout.decode('utf-8', errors='replace').strip().strip("'")
+
+                if status == "Running":
+                    # Also check if containers are ready
+                    ready_cmd = [
+                        "kubectl", "get", "pod", self.pod_name,
+                        "-n", self.namespace,
+                        "--kubeconfig", self.kubeconfig_path,
+                        "-o", "jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'"
+                    ]
+
+                    process = await asyncio.create_subprocess_exec(
+                        *ready_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+
+                    stdout, stderr = await process.communicate()
+                    ready_status = stdout.decode('utf-8', errors='replace').strip().strip("'")
+
+                    if ready_status == "True":
+                        self.logger.debug(f"Pod {self.pod_name} is Running and Ready")
+                        return
+
+                    self.logger.debug(f"Pod {self.pod_name} is Running but not Ready yet")
+                elif status in ["Failed", "Unknown"]:
+                    raise RuntimeError(f"Pod {self.pod_name} is in {status} state")
+                else:
+                    self.logger.debug(f"Pod {self.pod_name} status: {status}")
+
+            except Exception as e:
+                self.logger.debug(f"Error checking pod status: {str(e)}")
+
+            # Wait before next check
+            await asyncio.sleep(poll_interval)
+
+        # Timeout reached
+        elapsed = time.time() - start_time
+        raise TimeoutError(
+            f"Pod {self.pod_name} did not become ready within {timeout} seconds "
+            f"(waited {elapsed:.1f}s)"
+        )
 
     def _create_pod(self) -> None:
         """
@@ -853,9 +1083,52 @@ class K8SToolExecutionNode(ToolExecutionNode):
             self.logger.warning(f"Error checking/deleting existing pod {self.pod_name}: {str(e)}")
             # Don't raise - we'll try to create the pod anyway
 
+    def _get_tool_directories_config(self) -> list:
+        """
+        Get the configuration of tool directories to copy to pod.
+
+        Returns:
+            List of dict with 'source_dir' (relative to tools_dir) and 'target_dir' (in pod)
+        """
+        return [
+            {"source_dir": "r2e", "target_dir": "/workspace/src/tools/r2e"},
+            {"source_dir": "mini_swe", "target_dir": "/workspace/src/tools/mini_swe"},
+            {"source_dir": "deepseek", "target_dir": "/workspace/src/tools/deepseek"},
+            {"source_dir": "miaoda", "target_dir": "/workspace/src/tools/miaoda"},
+        ]
+
+    async def _copy_directory_to_pod_async(self, source_dir: str, target_dir: str) -> list:
+        """
+        Copy all .py files from source directory to target directory in pod asynchronously.
+
+        Args:
+            source_dir: Local source directory path
+            target_dir: Target directory path in pod
+
+        Returns:
+            List of copy tasks (coroutines)
+        """
+        import os
+        import glob
+
+        copy_tasks = []
+
+        if not os.path.exists(source_dir):
+            self.logger.debug(f"Directory does not exist, skipping: {source_dir}")
+            return copy_tasks
+
+        # Copy all Python files from the directory
+        for py_file in glob.glob(os.path.join(source_dir, "*.py")):
+            filename = os.path.basename(py_file)
+            pod_path = f"{target_dir}/{filename}"
+            copy_tasks.append(self._copy_file_to_pod_async(py_file, pod_path))
+
+        return copy_tasks
+
     async def _copy_tools_to_pod_async(self) -> None:
         """
         Copy the tools directory to the pod by copying individual files asynchronously.
+        Uses configuration-based approach for flexible directory copying.
         """
         import os
         import glob
@@ -871,14 +1144,20 @@ class K8SToolExecutionNode(ToolExecutionNode):
                 self.logger.warning(f"Tools directory not found: {tools_dir}")
                 return
 
-            # Create directory structure using async manager with timing
+            # Get directory configuration
+            dir_configs = self._get_tool_directories_config()
+
+            # Create all target directories using async manager with timing
             if self.timeline_enabled and self._timeline:
                 event_id = self._timeline.start_event(self.name, "tools_mkdir", {})
             try:
-                await self.async_manager.execute_command(self.pod_name, "mkdir -p /workspace/src/tools/r2e")
-                await self.async_manager.execute_command(self.pod_name, "mkdir -p /workspace/src/tools/mini_swe")
-                await self.async_manager.execute_command(self.pod_name, "mkdir -p /workspace/src/tools/deepseek")
+                # Create workspace and pip_packages directories
+                await self.async_manager.execute_command(self.pod_name, "mkdir -p /workspace/src/tools")
                 await self.async_manager.execute_command(self.pod_name, "mkdir -p /workspace/pip_packages")
+
+                # Create all configured tool directories
+                for config in dir_configs:
+                    await self.async_manager.execute_command(self.pod_name, f"mkdir -p {config['target_dir']}")
             finally:
                 if self.timeline_enabled and self._timeline:
                     self._timeline.end_event(event_id)
@@ -886,29 +1165,14 @@ class K8SToolExecutionNode(ToolExecutionNode):
             # Collect all files to copy
             copy_tasks = []
 
-            # Copy all Python files from tools/r2e
-            r2e_dir = os.path.join(tools_dir, "r2e")
-            if os.path.exists(r2e_dir):
-                for py_file in glob.glob(os.path.join(r2e_dir, "*.py")):
-                    filename = os.path.basename(py_file)
-                    pod_path = f"/workspace/src/tools/r2e/{filename}"
-                    copy_tasks.append(self._copy_file_to_pod_async(py_file, pod_path))
-
-            # Copy all Python files from tools/mini_swe
-            mini_swe_dir = os.path.join(tools_dir, "mini_swe")
-            if os.path.exists(mini_swe_dir):
-                for py_file in glob.glob(os.path.join(mini_swe_dir, "*.py")):
-                    filename = os.path.basename(py_file)
-                    pod_path = f"/workspace/src/tools/mini_swe/{filename}"
-                    copy_tasks.append(self._copy_file_to_pod_async(py_file, pod_path))
-
-            # Copy all Python files from tools/deepseek
-            deepseek_dir = os.path.join(tools_dir, "deepseek")
-            if os.path.exists(deepseek_dir):
-                for py_file in glob.glob(os.path.join(deepseek_dir, "*.py")):
-                    filename = os.path.basename(py_file)
-                    pod_path = f"/workspace/src/tools/deepseek/{filename}"
-                    copy_tasks.append(self._copy_file_to_pod_async(py_file, pod_path))
+            # Copy Python files from all configured directories
+            for config in dir_configs:
+                source_dir = os.path.join(tools_dir, config["source_dir"])
+                target_dir = config["target_dir"]
+                tasks = await self._copy_directory_to_pod_async(source_dir, target_dir)
+                copy_tasks.extend(tasks)
+                if tasks:
+                    self.logger.debug(f"Added {len(tasks)} files from {config['source_dir']}")
 
             # Copy base_tool.py if exists
             base_tool_path = os.path.join(tools_dir, "base_tool.py")
@@ -916,20 +1180,26 @@ class K8SToolExecutionNode(ToolExecutionNode):
                 copy_tasks.append(self._copy_file_to_pod_async(base_tool_path, "/workspace/src/tools/base_tool.py"))
 
             # Copy __init__.py files
-            for init_file in ["__init__.py", "r2e/__init__.py", "mini_swe/__init__.py", "deepseek/__init__.py"]:
+            init_files = ["__init__.py"]
+            for config in dir_configs:
+                init_files.append(f"{config['source_dir']}/__init__.py")
+
+            for init_file in init_files:
                 local_init = os.path.join(tools_dir, init_file)
                 if os.path.exists(local_init):
                     pod_init = f"/workspace/src/tools/{init_file}"
                     copy_tasks.append(self._copy_file_to_pod_async(local_init, pod_init))
-            
+
             # Copy pip packages if they exist (for offline installation)
             pip_packages_dir = os.path.join(os.path.dirname(current_dir), "pip_packages")
             if os.path.exists(pip_packages_dir):
-                for wheel_file in glob.glob(os.path.join(pip_packages_dir, "*.whl")):
+                wheel_files = glob.glob(os.path.join(pip_packages_dir, "*.whl"))
+                for wheel_file in wheel_files:
                     filename = os.path.basename(wheel_file)
                     pod_path = f"/workspace/pip_packages/{filename}"
                     copy_tasks.append(self._copy_file_to_pod_async(wheel_file, pod_path))
-                self.logger.info(f"Found {len(glob.glob(os.path.join(pip_packages_dir, '*.whl')))} wheel files to copy")
+                if wheel_files:
+                    self.logger.info(f"Found {len(wheel_files)} wheel files to copy")
 
             # Execute all copy operations concurrently with timing
             if self.timeline_enabled and self._timeline:
@@ -940,16 +1210,46 @@ class K8SToolExecutionNode(ToolExecutionNode):
                 if self.timeline_enabled and self._timeline:
                     self._timeline.end_event(event_id)
 
-            self.logger.info("Tools copied to pod at /workspace/src/tools")
+            self.logger.info(f"Tools copied to pod at /workspace/src/tools ({len(copy_tasks)} files)")
 
         except Exception as e:
             self.logger.warning(f"Failed to copy tools to pod: {str(e)}")
             import traceback
             self.logger.debug(traceback.format_exc())
 
+    def _copy_directory_to_pod(self, source_dir: str, target_dir: str) -> int:
+        """
+        Copy all .py files from source directory to target directory in pod.
+
+        Args:
+            source_dir: Local source directory path
+            target_dir: Target directory path in pod
+
+        Returns:
+            Number of files copied
+        """
+        import os
+        import glob
+
+        file_count = 0
+
+        if not os.path.exists(source_dir):
+            self.logger.debug(f"Directory does not exist, skipping: {source_dir}")
+            return file_count
+
+        # Copy all Python files from the directory
+        for py_file in glob.glob(os.path.join(source_dir, "*.py")):
+            filename = os.path.basename(py_file)
+            pod_path = f"{target_dir}/{filename}"
+            self._copy_file_to_pod(py_file, pod_path)
+            file_count += 1
+
+        return file_count
+
     def _copy_tools_to_pod(self) -> None:
         """
         Copy the tools directory to the pod by copying individual files.
+        Uses configuration-based approach for flexible directory copying.
         """
         import os
         import glob
@@ -965,41 +1265,60 @@ class K8SToolExecutionNode(ToolExecutionNode):
                 self.logger.warning(f"Tools directory not found: {tools_dir}")
                 return
 
-            # Create directory structure
-            self.runner.execute_command(self.pod, "mkdir -p /workspace/src/tools/r2e")
-            self.runner.execute_command(self.pod, "mkdir -p /workspace/src/tools/mini_swe")
+            # Get directory configuration
+            dir_configs = self._get_tool_directories_config()
 
-            # Copy all Python files from tools/r2e
-            r2e_dir = os.path.join(tools_dir, "r2e")
-            if os.path.exists(r2e_dir):
-                for py_file in glob.glob(os.path.join(r2e_dir, "*.py")):
-                    filename = os.path.basename(py_file)
-                    pod_path = f"/workspace/src/tools/r2e/{filename}"
-                    self._copy_file_to_pod(py_file, pod_path)
-                    self.logger.debug(f"Copied {filename} to pod")
+            # Create workspace and pip_packages directories
+            self.runner.execute_command(self.pod, "mkdir -p /workspace/src/tools")
+            self.runner.execute_command(self.pod, "mkdir -p /workspace/pip_packages")
 
-            # Copy all Python files from tools/mini_swe
-            mini_swe_dir = os.path.join(tools_dir, "mini_swe")
-            if os.path.exists(mini_swe_dir):
-                for py_file in glob.glob(os.path.join(mini_swe_dir, "*.py")):
-                    filename = os.path.basename(py_file)
-                    pod_path = f"/workspace/src/tools/mini_swe/{filename}"
-                    self._copy_file_to_pod(py_file, pod_path)
-                    self.logger.debug(f"Copied {filename} to pod")
+            # Create all configured tool directories
+            for config in dir_configs:
+                self.runner.execute_command(self.pod, f"mkdir -p {config['target_dir']}")
+
+            # Track total files copied
+            total_files = 0
+
+            # Copy Python files from all configured directories
+            for config in dir_configs:
+                source_dir = os.path.join(tools_dir, config["source_dir"])
+                target_dir = config["target_dir"]
+                file_count = self._copy_directory_to_pod(source_dir, target_dir)
+                total_files += file_count
+                if file_count > 0:
+                    self.logger.debug(f"Copied {file_count} files from {config['source_dir']}")
 
             # Copy base_tool.py if exists
             base_tool_path = os.path.join(tools_dir, "base_tool.py")
             if os.path.exists(base_tool_path):
                 self._copy_file_to_pod(base_tool_path, "/workspace/src/tools/base_tool.py")
+                total_files += 1
 
             # Copy __init__.py files
-            for init_file in ["__init__.py", "r2e/__init__.py", "mini_swe/__init__.py"]:
+            init_files = ["__init__.py"]
+            for config in dir_configs:
+                init_files.append(f"{config['source_dir']}/__init__.py")
+
+            for init_file in init_files:
                 local_init = os.path.join(tools_dir, init_file)
                 if os.path.exists(local_init):
                     pod_init = f"/workspace/src/tools/{init_file}"
                     self._copy_file_to_pod(local_init, pod_init)
+                    total_files += 1
 
-            self.logger.info("Tools copied to pod at /workspace/src/tools")
+            # Copy pip packages if they exist (for offline installation)
+            pip_packages_dir = os.path.join(os.path.dirname(current_dir), "pip_packages")
+            if os.path.exists(pip_packages_dir):
+                wheel_files = glob.glob(os.path.join(pip_packages_dir, "*.whl"))
+                for wheel_file in wheel_files:
+                    filename = os.path.basename(wheel_file)
+                    pod_path = f"/workspace/pip_packages/{filename}"
+                    self._copy_file_to_pod(wheel_file, pod_path)
+                    total_files += 1
+                if wheel_files:
+                    self.logger.info(f"Copied {len(wheel_files)} wheel files")
+
+            self.logger.info(f"Tools copied to pod at /workspace/src/tools ({total_files} files)")
 
         except Exception as e:
             self.logger.warning(f"Failed to copy tools to pod: {str(e)}")
@@ -1151,7 +1470,8 @@ class K8SToolExecutionNode(ToolExecutionNode):
 
         # Build command line arguments
         # Use conda environment's Python if available, otherwise fall back to python3
-        cmd_parts = ['/opt/miniconda3/envs/testbed/bin/python', pod_script_path]
+        #cmd_parts = ['/opt/miniconda3/envs/testbed/bin/python', pod_script_path]
+        cmd_parts = ['python3', pod_script_path]
 
         # Handle 'command' as positional argument if present
         if 'command' in arguments:
@@ -1220,7 +1540,8 @@ class K8SToolExecutionNode(ToolExecutionNode):
         return False
     
     async def __aenter__(self):
-        """Async context manager entry."""
+        """Async context manager entry - ensure pod is ready."""
+        await self._ensure_pod_ready()
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -1248,11 +1569,12 @@ class K8SToolExecutionNode(ToolExecutionNode):
             await self.async_manager.delete_pod(self.pod_name, grace_period=0)
             
             self.logger.info(f"Pod {self.pod_name} deleted successfully")
-            
+
             self.pod = None
-            self._pod_ready.clear()
+            if self._pod_ready is not None:
+                self._pod_ready.clear()
             self._pod_creation_started = False
-            
+
             # Close async manager
             if self.async_manager and self.async_manager.client:
                 await self.async_manager.client.api_client.close()
