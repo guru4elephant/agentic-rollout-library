@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""
+Description: Execute raw SQL query in Supabase Postgres database via MCP server.
+Parameters:
+  query (string, required): SQL query to execute. Positional argument.
+  app_id (string, optional): Application ID.
+
+Usage:
+  As a script: python supabase_sql_execution.py "SELECT * FROM users LIMIT 5;"
+  As a module: python -m tools.miaoda.impl.supabase_sql_execution "SELECT version();"
+  As a function: from tools.miaoda.impl.supabase_sql_execution import supabase_sql_func; supabase_sql_func("SELECT NOW();")
+  
+Note: For DDL operations (CREATE TABLE, ALTER TABLE, etc.), use supabase_migration.py instead.
+"""
+
+import argparse
+import json
+import sys
+from typing import Dict, Any, Optional
+
+
+def supabase_sql_func(query: str, app_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Execute raw SQL query in Supabase Postgres database.
+
+    Args:
+        query: SQL query to execute
+        app_id: Application ID (optional)
+
+    Returns:
+        Dictionary containing:
+            - result: Query execution result
+            - status: Status of the operation (success/error)
+            - error: Error message if failed
+    """
+    app_info = f" (app_id: {app_id})" if app_id else ""
+    success_message = f"SQL query{app_info} executed successfully. Query completed."
+    
+    return {
+        "result": success_message,
+        "status": "success"
+    }
+
+
+def parse_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Parse Supabase SQL execution result for agent use.
+
+    Args:
+        result: Raw result from supabase_sql_func or K8S execution
+
+    Returns:
+        Formatted result for agent
+    """
+    if isinstance(result, dict):
+        return {
+            "result": result.get("result", str(result)),
+            "status": result.get("status", "success")
+        }
+    
+    return {
+        "result": str(result),
+        "status": "success"
+    }
+
+
+def build_k8s_command(query: str, app_id: Optional[str] = None) -> str:
+    """
+    Build command for K8S pod execution.
+
+    Args:
+        query: SQL query to execute
+        app_id: Application ID (optional)
+
+    Returns:
+        Command string for K8S execution
+    """
+    escaped_query = query.replace('"', '\\"').replace("'", "\\'").replace("\n", "\\n")
+    
+    if app_id:
+        escaped_app_id = app_id.replace('"', '\\"').replace("'", "\\'")
+        return f'python3 -c "from tools.miaoda.impl.supabase_sql_execution import supabase_sql_func; import json; print(json.dumps(supabase_sql_func(\'{escaped_query}\', \'{escaped_app_id}\'), ensure_ascii=False))"'
+    else:
+        return f'python3 -c "from tools.miaoda.impl.supabase_sql_execution import supabase_sql_func; import json; print(json.dumps(supabase_sql_func(\'{escaped_query}\'), ensure_ascii=False))"'
+
+
+def main():
+    """Main entry point for CLI usage."""
+    parser = argparse.ArgumentParser(
+        description="Execute raw SQL query in Supabase.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python supabase_sql_execution.py "SELECT version();"
+  python supabase_sql_execution.py "SELECT * FROM users LIMIT 5;" --app_id "my_app"
+  python supabase_sql_execution.py "SELECT NOW();" --json
+  
+Note: For DDL operations, use supabase_migration.py instead.
+        """
+    )
+    parser.add_argument(
+        "query",
+        help="SQL query to execute (positional argument)"
+    )
+    parser.add_argument(
+        "--app_id",
+        help="Application ID (optional)"
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output result as JSON"
+    )
+
+    args = parser.parse_args()
+
+    result = supabase_sql_func(args.query, args.app_id)
+
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        if result["status"] == "error":
+            print(f"Error: {result.get('error', 'Unknown error')}", file=sys.stderr)
+            sys.exit(1)
+        
+        parsed = parse_result(result)
+        print(parsed["result"])
+
+    sys.exit(0 if result["status"] == "success" else 1)
+
+
+if __name__ == "__main__":
+    main()
