@@ -34,6 +34,7 @@ from core import (
     get_timeline
 )
 from utils import create_openai_api_handle_async
+from utils import create_bedrock_claude_handle
 from r2e_configs import (
     CUSTOM_TOOL_DESCRIPTIONS,
     parse_xml_action_custom,
@@ -259,12 +260,15 @@ async def process_single_instance(
     progress_tracker: ProgressTracker,
     output_dir: str = None,
     enable_timeline: bool = False,
+    model_name: str = "kimi-k2-thinking",
     debug: bool = False,
     cpu_request: str = "0.3",
     memory_request: str = "1Gi",
     max_execution_time: float = None,
     llm_timeout: float = 120.0,
-    tool_timeout: float = 300.0) -> Dict:
+    tool_timeout: float = 300.0,
+    base_url: str = None,
+    api_key: str = None) -> Dict:
     """Process a single instance from the JSONL file.
 
     Args:
@@ -272,10 +276,13 @@ async def process_single_instance(
         pod_suffix: Unique suffix for the pod name (derived from instance_id)
         output_dir: Directory to save context and log files
         enable_timeline: Enable timeline tracking
+        model_name: Model name to use for LLM
         debug: Enable debug mode (detailed logging)
         max_execution_time: Maximum execution time in seconds (None for no limit)
         llm_timeout: LLM call timeout in seconds (default: 120s)
         tool_timeout: Tool execution timeout in seconds (default: 300s)
+        base_url: Base URL for LLM API (optional)
+        api_key: API key for LLM API (optional)
 
     Returns:
         Result dictionary with instance_id and execution status
@@ -347,19 +354,30 @@ async def process_single_instance(
         # Context Engineering Node
         context = ContextEngineeringNode(name=f"R2EK8SContext-{pod_suffix}", timeline_enabled=enable_timeline)
 
-        # LLM Node (async)
-        llm_handle = create_openai_api_handle_async(
-            base_url="base_url",
-            api_key="api_key",
-            model="deepseek-v3-1-terminus"
-        )
+        # LLM Node (async) - support both OpenAI-compatible and Bedrock
+        if "arn:aws:bedrock:us-west-2:912786614377:application-inference-profile/ecezji6cxeu2" == model_name or \
+           "us.anthropic.claude-sonnet-4-20250514-v1:0" == model_name:
+            llm_handle = create_bedrock_claude_handle(
+                endpoint_url="https://mxyf-br.miaoda.io",
+                region_name="us-west-2",
+                model_id=model_name,
+                use_cache=True  # Enable prompt caching
+            )
+            log("Using Bedrock Claude model")
+        else:
+            # OpenAI-compatible API
+            llm_handle = create_openai_api_handle_async(
+                base_url=base_url,
+                api_key=api_key,
+                model=model_name
+            )
 
         llm_node = LLMNode(
             name=f"R2ELLM-{pod_suffix}",
             function_handle=llm_handle,
             model_config={
-                "temperature": 0.7,
-                "max_tokens": 4000
+                "temperature": 1.0,
+                "max_tokens": 32000
             },
             timeline_enabled=enable_timeline,
             timeout=llm_timeout
@@ -779,12 +797,15 @@ async def main(
     max_concurrent: int = 3,
     output_dir: str = None,
     enable_timeline: bool = False,
+    model_name: str = "kimi-k2-thinking",
     debug: bool = False,
     cpu_request: str = "0.3",
     memory_request: str = "1Gi",
     max_execution_time: float = None,
     llm_timeout: float = 120.0,
-    tool_timeout: float = 300.0
+    tool_timeout: float = 300.0,
+    base_url: str = None,
+    api_key: str = None
 ):
     """Main function to process JSONL file with concurrent execution.
 
@@ -793,6 +814,7 @@ async def main(
         max_concurrent: Maximum number of concurrent executions
         output_dir: Directory to save context and log files
         enable_timeline: Enable timeline tracking for profiling
+        model_name: Model name to use for LLM
         debug: Enable debug mode (detailed logging, no progress table)
         max_execution_time: Maximum execution time per instance in seconds (None for no limit)
         llm_timeout: LLM call timeout in seconds (default: 120s)
@@ -804,6 +826,7 @@ async def main(
     print("=== R2E Agent K8S Concurrent Executor ===")
     print(f"📁 JSONL file: {jsonl_file}")
     print(f"🔧 Max concurrent: {max_concurrent}")
+    print(f"🤖 Model name: {model_name}")
     print(f"⏱️  Timeline tracking: {'ENABLED' if enable_timeline else 'DISABLED'}")
     print(f"🐛 Debug mode: {'ENABLED' if debug else 'DISABLED'}")
     if max_execution_time:
@@ -877,12 +900,15 @@ async def main(
                     progress_tracker=progress_tracker,
                     output_dir=output_dir,
                     enable_timeline=enable_timeline,
+                    model_name=model_name,
                     debug=debug,
                     cpu_request=cpu_request,
                     memory_request=memory_request,
                     max_execution_time=max_execution_time,
                     llm_timeout=llm_timeout,
-                    tool_timeout=tool_timeout
+                    tool_timeout=tool_timeout,
+                    base_url=base_url,
+                    api_key=api_key
                 )
             finally:
                 async with lock:
@@ -997,6 +1023,12 @@ if __name__ == "__main__":
         help="Enable debug mode (detailed logging, no progress table)"
     )
     parser.add_argument(
+        "--model-name",
+        type=str,
+        default="kimi-k2-thinking",
+        help="Model name to use for LLM (default: kimi-k2-thinking)"
+    )
+    parser.add_argument(
         "--cpu",
         type=str,
         default="0.3",
@@ -1026,6 +1058,18 @@ if __name__ == "__main__":
         default=300.0,
         help="Tool execution timeout in seconds (default: 300s)"
     )
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        required=True,
+        help="Base URL for LLM API (required)"
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        required=True,
+        help="API key for LLM API (required)"
+    )
     args = parser.parse_args()
 
     # Set up event loop with proper configuration for high concurrency
@@ -1039,12 +1083,15 @@ if __name__ == "__main__":
                 max_concurrent=args.concurrent,
                 output_dir=args.output_dir,
                 enable_timeline=args.timeline,
+                model_name=args.model_name,
                 debug=args.debug,
                 cpu_request=args.cpu,
                 memory_request=args.memory,
                 max_execution_time=args.max_execution_time,
                 llm_timeout=args.llm_timeout,
-                tool_timeout=args.tool_timeout
+                tool_timeout=args.tool_timeout,
+                base_url=args.base_url,
+                api_key=args.api_key
             )
         )
         

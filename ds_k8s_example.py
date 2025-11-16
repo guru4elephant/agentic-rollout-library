@@ -351,7 +351,9 @@ async def process_single_instance(
     memory_request: str = "1Gi",
     max_execution_time: float = None,
     llm_timeout: float = 120.0,
-    tool_timeout: float = 300.0) -> Dict:
+    tool_timeout: float = 300.0,
+    base_url: str = None,
+    api_key: str = None) -> Dict:
     """Process a single instance using DeepSeek V3.1 completion format.
 
     Args:
@@ -367,6 +369,8 @@ async def process_single_instance(
         max_execution_time: Maximum execution time in seconds
         llm_timeout: LLM call timeout in seconds
         tool_timeout: Tool execution timeout in seconds
+        base_url: Base URL for LLM API (optional)
+        api_key: API key for LLM API (optional)
 
     Returns:
         Result dictionary with instance_id and execution status
@@ -436,9 +440,9 @@ async def process_single_instance(
 
         # LLM Node - using completion endpoint
         llm_handle = create_openai_api_handle_async(
-            base_url="",
-            api_key="",
-            model="",
+            base_url=base_url,
+            api_key=api_key,
+            model="deepseek-v3-1-terminus",
             use_completion=True  # Use completion endpoint instead of chat
         )
 
@@ -843,7 +847,9 @@ async def main(
     memory_request: str = "1Gi",
     max_execution_time: float = None,
     llm_timeout: float = 120.0,
-    tool_timeout: float = 300.0
+    tool_timeout: float = 300.0,
+    base_url: str = None,
+    api_key: str = None
 ):
     """Main function to process JSONL file with concurrent execution."""
     
@@ -926,7 +932,9 @@ async def main(
                     memory_request=memory_request,
                     max_execution_time=max_execution_time,
                     llm_timeout=llm_timeout,
-                    tool_timeout=tool_timeout
+                    tool_timeout=tool_timeout,
+                    base_url=base_url,
+                    api_key=api_key
                 )
             finally:
                 async with lock:
@@ -1069,6 +1077,18 @@ if __name__ == "__main__":
         default=300.0,
         help="Tool execution timeout in seconds (default: 300s)"
     )
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        required=True,
+        help="Base URL for LLM API (required)"
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        required=True,
+        help="API key for LLM API (required)"
+    )
     args = parser.parse_args()
 
     # Set up event loop
@@ -1087,7 +1107,9 @@ if __name__ == "__main__":
                 memory_request=args.memory,
                 max_execution_time=args.max_execution_time,
                 llm_timeout=args.llm_timeout,
-                tool_timeout=args.tool_timeout
+                tool_timeout=args.tool_timeout,
+                base_url=args.base_url,
+                api_key=args.api_key
             )
         )
         
