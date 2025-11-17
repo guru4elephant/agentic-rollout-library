@@ -99,7 +99,7 @@ Note: For DDL operations, use supabase_migration.py instead.
         """
     )
     parser.add_argument(
-        "query",
+        "--query",
         help="SQL query to execute (positional argument)"
     )
     parser.add_argument(

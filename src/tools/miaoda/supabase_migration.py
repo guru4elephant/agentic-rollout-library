@@ -94,13 +94,14 @@ Examples:
         """
     )
     parser.add_argument(
-        "name",
+        "--name",
         help="Migration name (use snake_case, positional argument)"
     )
     parser.add_argument(
-        "query",
+        "--query",
         help="SQL query to apply (positional argument)"
     )
+
     parser.add_argument(
         "--json",
         action="store_true",

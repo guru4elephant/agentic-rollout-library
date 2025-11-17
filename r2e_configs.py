@@ -103,52 +103,77 @@ The result text or final message to submit. Defaults to an empty string if not p
 }
 
 
+def normalize_parameter_format(output: str) -> str:
+    """
+    Normalize parameter format from <parameter name="xxx"> to <parameter=xxx>.
+    Also handles variations like <parameter name='xxx'>.
+
+    Args:
+        output: The LLM output containing potential XML function calls
+
+    Returns:
+        Normalized output with standardized parameter format
+    """
+    # Pattern to match: <parameter name="param_name"> or <parameter name='param_name'>
+    # Replace with: <parameter=param_name>
+    normalized = re.sub(
+        r'<parameter\s+name=(["\'])([^"\']+)\1>',
+        r'<parameter=\2>',
+        output
+    )
+    return normalized
+
+
 def parse_xml_action_custom(output: str) -> Optional[Union[Dict[str, Any], List]]:
     """
     Custom XML parser for R2E tools.
-    
+    Supports both <parameter=name> and <parameter name="name"> formats.
+
     Args:
         output: The LLM output containing potential XML function calls
-        
+
     Returns:
         Dict with tool_name and tool_args, or None if no valid function call found
     """
     output = output.strip()
-    
+
+    # Normalize parameter format to <parameter=name>
+    output = normalize_parameter_format(output)
+
     # Check if output contains XML function call
     function_match = re.search(
         r'<function=([^>]+)>(.*?)</function>',
         output,
         re.DOTALL
     )
-    
+
     if not function_match:
         return None
-    
+
     tool_name = function_match.group(1).strip()
     params_content = function_match.group(2).strip()
-    
-    # Parse parameters
+
+    # Parse parameters (now all in <parameter=name> format after normalization)
     tool_args = {}
     param_pattern = r'<parameter=([^>]+)>(.*?)</parameter>'
     param_matches = re.findall(param_pattern, params_content, re.DOTALL)
-    
+
     for param_name, param_value in param_matches:
         tool_args[param_name.strip()] = param_value.strip()
-    
+
     # Map function names to tool names
     tool_name_mapping = {
         "file_editor": "r2e_file_editor",
-        "execute_bash": "r2e_bash_executor", 
+        "execute_bash": "r2e_bash_executor",
         "search": "r2e_search",
         "finish": "r2e_submit"
     }
-    
+
     mapped_tool_name = tool_name_mapping.get(tool_name, tool_name)
-    
+
     # Check if there's text before the function call (thought)
     text_before_function = output[:function_match.start()].strip()
-    
+
     if text_before_function:
         # When we have both thought and action, return a single ACTION step
         return {
@@ -411,6 +436,7 @@ def get_template(template_type: str = "default", prompt_type: str = "system") ->
 
 __all__ = [
     'CUSTOM_TOOL_DESCRIPTIONS',
+    'normalize_parameter_format',
     'parse_xml_action_custom',
     'CustomDescriptionWrapper',
     'generate_custom_system_prompt',

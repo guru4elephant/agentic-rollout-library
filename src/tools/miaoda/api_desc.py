@@ -133,7 +133,7 @@ Examples:
         """
     )
     parser.add_argument(
-        "api_name",
+        "--api_name",
         help="The API name to query (positional argument)"
     )
     parser.add_argument(

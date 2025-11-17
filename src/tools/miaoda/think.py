@@ -77,13 +77,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python think.py "I need to analyze the error logs first"
-  python think.py "The issue seems to be related to the authentication module"
-  python think.py "Planning to implement the feature in three steps"
+  python think.py --thought "I need to analyze the error logs first"
+  python think.py --thought "The issue seems to be related to the authentication module"
+  python think.py --thought "Planning to implement the feature in three steps"
         """
     )
     parser.add_argument(
-        "thought",
+        "--thought",
         help="The agent's thought or reasoning (positional argument)"
     )
     parser.add_argument(

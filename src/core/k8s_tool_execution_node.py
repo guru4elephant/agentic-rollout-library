@@ -248,6 +248,7 @@ class K8SToolExecutionNode(ToolExecutionNode):
             self.logger.info(f"Executing tool '{tool_name}' in K8S pod: {self.pod_name}")
 
             command = self._build_tool_command(tool_name, arguments)
+            self.logger.info(f"***** Tool Command ***** {command}")
 
             # Execute command using kubectl directly (faster and more reliable)
             # Note: Using kubectl instead of kodo async API due to performance issues
@@ -592,15 +593,6 @@ class K8SToolExecutionNode(ToolExecutionNode):
         if self.node_selector:
             pod_manifest["spec"]["nodeSelector"] = self.node_selector
 
-        # Add DNS configuration
-        if self.dns_policy:
-            pod_manifest["spec"]["dnsPolicy"] = self.dns_policy
-            self.logger.info(f"  DNS Policy: {self.dns_policy}")
-
-        if self.dns_config:
-            pod_manifest["spec"]["dnsConfig"] = self.dns_config
-            self.logger.info(f"  DNS Config: {json.dumps(self.dns_config)}")
-
         # Convert to JSON
         manifest_json = json.dumps(pod_manifest, indent=2)
 
@@ -625,7 +617,6 @@ class K8SToolExecutionNode(ToolExecutionNode):
                 error_msg = stderr.decode('utf-8', errors='replace')
                 raise RuntimeError(f"Failed to create pod with DNS config: {error_msg}")
 
-            self.logger.info(f"Pod {self.pod_name} created successfully with DNS configuration")
             self.pod = self.pod_name
 
         except Exception as e:
@@ -684,34 +675,21 @@ class K8SToolExecutionNode(ToolExecutionNode):
                 }
 
                 # Check if we need custom pod creation for DNS
-                if self.dns_policy or self.dns_config:
-                    # Use kubectl to create pod with DNS configuration
-                    self.logger.info("Using custom pod creation for DNS configuration")
+                if self.timeline_enabled and self._timeline:
+                    event_id = self._timeline.start_event(self.name, "pod_creation", {"attempt": attempt})
+                try:
+                    self.pod = await self.async_manager.start_pod(
+                        name=self.pod_name,
+                        image=self.image,
+                        command="sleep infinity",
+                        environment=env,
+                        resources=resources,
+                        node_selector=self.node_selector
+                    )
+                    self.logger.info(f"Pod {self.pod_name} created successfully")
+                finally:
                     if self.timeline_enabled and self._timeline:
-                        event_id = self._timeline.start_event(self.name, "pod_creation_dns", {"attempt": attempt})
-                    try:
-                        await self._create_pod_with_dns_async(env, resources)
-                    finally:
-                        if self.timeline_enabled and self._timeline:
-                            self._timeline.end_event(event_id)
-                else:
-                    # Use standard kodo pod creation
-                    # Pod creation with timing
-                    if self.timeline_enabled and self._timeline:
-                        event_id = self._timeline.start_event(self.name, "pod_creation", {"attempt": attempt})
-                    try:
-                        self.pod = await self.async_manager.start_pod(
-                            name=self.pod_name,
-                            image=self.image,
-                            command="sleep infinity",
-                            environment=env,
-                            resources=resources,
-                            node_selector=self.node_selector
-                        )
-                        self.logger.info(f"Pod {self.pod_name} created successfully")
-                    finally:
-                        if self.timeline_enabled and self._timeline:
-                            self._timeline.end_event(event_id)
+                        self._timeline.end_event(event_id)
 
                 # Wait for pod to be ready
                 self.logger.info(f"Waiting for pod {self.pod_name} to be ready...")

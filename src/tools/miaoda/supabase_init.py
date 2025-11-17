@@ -89,13 +89,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python supabase_init.py "my_project"
-  python supabase_init.py "my_project" --app_id "my_app"
+  python supabase_init.py --name "my_project"
+  python supabase_init.py --name "my_project" --app_id "my_app"
   python supabase_init.py "test_db" --json
         """
     )
     parser.add_argument(
-        "name",
+        "--name",
         help="Project name (positional argument)"
     )
     parser.add_argument(

@@ -411,7 +411,11 @@ async def process_single_instance(
                     "PYTHONPATH": "/testbed",
                     "PYTHONIOENCODING": "utf-8",
                     "LANG": "C.UTF-8",
-                    "LC_ALL": "C.UTF-8"
+                    "LC_ALL": "C.UTF-8",
+                    "http_proxy": "http://mt:mtstudio@10.224.65.111:8234",
+                    "https_proxy": "http://mt:mtstudio@10.224.65.111:8234",
+                    "PIP_INDEX_URL": "http://pip.baidu.com/pypi/simple",
+                    "PIP_TRUSTED_HOST": "pip.baidu.com"
                 },
                 cpu_request=cpu_request,
                 memory_request=memory_request,
@@ -440,6 +444,7 @@ async def process_single_instance(
             def finish_parse_result(result):
                 """Parse finish tool result."""
                 if isinstance(result, dict):
+                    result["status"] = "stop"
                     return result
                 return {
                     "message": "<<<Finish>>>",

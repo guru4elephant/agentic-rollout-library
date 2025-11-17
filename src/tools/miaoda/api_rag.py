@@ -133,8 +133,8 @@ Examples:
         """
     )
     parser.add_argument(
-        "query",
-        help="The query question (positional argument)"
+        "--query",
+        help="The input question (positional argument)"
     )
     parser.add_argument(
         "--app_id",
