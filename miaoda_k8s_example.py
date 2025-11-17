@@ -126,11 +126,13 @@ Parameters:
 The thought to log.
 
 ### image_search
-Description: Search for images by keyword using MCP server. Supports inputting multiple queries, each query searches images based on the provided description, and returns a set of image URLs that may meet the requirements.
+Description: Search for images by keyword using MCP server. Supports single query, searcheed images based on the provided description, and returns a set of image URLs that may meet the requirements.
 
 Parameters:
-  1.    inputs (array, required)
-Array of image descriptions, maximum 30 items. Each item is a string (1-200 characters) describing the image to search for.
+  1.    query (string, required)
+Search keyword, required
+  2.    limit (string, optional)
+Number of results to return (default: 10)
 
 ### api_rag
 Description: Query API information using RAG (Retrieval-Augmented Generation) based on user query. Retrieves relevant APIs and generates a prompt containing API usage instructions.

@@ -136,7 +136,7 @@ Examples:
         """
     )
     parser.add_argument(
-        "query",
+        "--query",
         help="Search keyword(s) (positional argument)"
     )
     parser.add_argument(
