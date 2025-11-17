@@ -126,7 +126,7 @@ Parameters:
 The thought to log.
 
 ### image_search
-Description: Search for images by keyword using MCP server. Supports single query, searcheed images based on the provided description, and returns a set of image URLs that may meet the requirements.
+Description: Search for images by keyword using MCP server. Supports single query to search images based on the provided description, and returns a set of image URLs that may meet the requirements.
 
 Parameters:
   1.    query (string, required)

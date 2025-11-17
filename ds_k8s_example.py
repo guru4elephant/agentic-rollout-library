@@ -346,6 +346,7 @@ async def process_single_instance(
     progress_tracker: ProgressTracker,
     output_dir: str = None,
     enable_timeline: bool = False,
+    model_name: str = None,
     debug: bool = False,
     cpu_request: str = "0.3",
     memory_request: str = "1Gi",
@@ -442,7 +443,7 @@ async def process_single_instance(
         llm_handle = create_openai_api_handle_async(
             base_url=base_url,
             api_key=api_key,
-            model="deepseek-v3-1-terminus",
+            model=model_name,
             use_completion=True  # Use completion endpoint instead of chat
         )
 
@@ -842,6 +843,7 @@ async def main(
     max_concurrent: int = 3,
     output_dir: str = None,
     enable_timeline: bool = False,
+    model_name: str = None,
     debug: bool = False,
     cpu_request: str = "0.3",
     memory_request: str = "1Gi",
@@ -927,6 +929,7 @@ async def main(
                     progress_tracker=progress_tracker,
                     output_dir=output_dir,
                     enable_timeline=enable_timeline,
+                    model_name=model_name,
                     debug=debug,
                     cpu_request=cpu_request,
                     memory_request=memory_request,
@@ -1072,6 +1075,12 @@ if __name__ == "__main__":
         help="LLM call timeout in seconds (default: 120s)"
     )
     parser.add_argument(
+        "--model-name",
+        type=str,
+        default="deepseek-v3-1-terminus",
+        help="model name"
+    )
+    parser.add_argument(
         "--tool-timeout",
         type=float,
         default=300.0,
@@ -1102,6 +1111,7 @@ if __name__ == "__main__":
                 max_concurrent=args.concurrent,
                 output_dir=args.output_dir,
                 enable_timeline=args.timeline,
+                model_name=args.model_name,
                 debug=args.debug,
                 cpu_request=args.cpu,
                 memory_request=args.memory,
