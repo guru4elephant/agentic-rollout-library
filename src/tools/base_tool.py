@@ -18,7 +18,8 @@ class Tool:
     def __init__(self,
                  name: str,
                  script_path: str,
-                 result_parser: Callable = None):
+                 result_parser: Callable = None,
+                 execution_mode: str = "k8s"):
         """
         Initialize a tool wrapper.
 
@@ -26,10 +27,13 @@ class Tool:
             name: Tool name
             script_path: Path to executable script for subprocess execution
             result_parser: Optional function to parse tool results
+            execution_mode: Execution mode - "local" or "k8s" (default: "k8s")
         """
         self.name = name
         self.script_path = script_path
         self.result_parser = result_parser or self._default_parser
+        self.execution_mode = execution_mode
+        self.local_module = None  # Cached module for local execution
 
 
     def parse_result(self, result: Any) -> Any:

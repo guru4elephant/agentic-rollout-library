@@ -66,6 +66,9 @@ def build_k8s_command(name: str, app_id: Optional[str] = None) -> str:
     """
     Build command for K8S pod execution.
 
+    Uses base64 encoding to avoid shell escaping issues with special characters
+    like quotes, backslashes, ampersands, semicolons, etc.
+
     Args:
         name: Project name
         app_id: Application ID (optional)
@@ -73,13 +76,16 @@ def build_k8s_command(name: str, app_id: Optional[str] = None) -> str:
     Returns:
         Command string for K8S execution
     """
-    escaped_name = name.replace('"', '\\"').replace("'", "\\'")
-    
+    import base64
+
+    # Encode parameters using base64 to completely avoid escaping issues
+    encoded_name = base64.b64encode(name.encode()).decode()
+
     if app_id:
-        escaped_app_id = app_id.replace('"', '\\"').replace("'", "\\'")
-        return f'python3 -c "from tools.miaoda.impl.supabase_init import supabase_init_func; import json; print(json.dumps(supabase_init_func(\'{escaped_name}\', \'{escaped_app_id}\'), ensure_ascii=False))"'
+        encoded_app_id = base64.b64encode(app_id.encode()).decode()
+        return f'python3 -c "import base64, json; from tools.miaoda.supabase_init import supabase_init_func; name = base64.b64decode(\'{encoded_name}\').decode(); app_id = base64.b64decode(\'{encoded_app_id}\').decode(); print(json.dumps(supabase_init_func(name, app_id), ensure_ascii=False))"'
     else:
-        return f'python3 -c "from tools.miaoda.impl.supabase_init import supabase_init_func; import json; print(json.dumps(supabase_init_func(\'{escaped_name}\'), ensure_ascii=False))"'
+        return f'python3 -c "import base64, json; from tools.miaoda.supabase_init import supabase_init_func; name = base64.b64decode(\'{encoded_name}\').decode(); print(json.dumps(supabase_init_func(name), ensure_ascii=False))"'
 
 
 def main():
@@ -96,7 +102,8 @@ Examples:
     )
     parser.add_argument(
         "--name",
-        help="Project name (positional argument)"
+        required=True,
+        help="Project name"
     )
     parser.add_argument(
         "--app_id",
@@ -109,6 +116,14 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    # Validate required parameters
+    if not args.name:
+        print(json.dumps({
+            "status": "error",
+            "error": "Missing required parameter: name"
+        }, ensure_ascii=False))
+        sys.exit(1)
 
     result = supabase_init_func(args.name, args.app_id)
 

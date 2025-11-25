@@ -115,7 +115,8 @@ class K8SToolExecutionNode(ToolExecutionNode):
     def register_tool(self,
                      name: str,
                      script_path: str,
-                     result_parser: Callable = None) -> None:
+                     result_parser: Callable = None,
+                     execution_mode: str = "k8s") -> None:
         """
         Register a new tool and copy its file to the pod if pod is already created.
 
@@ -123,12 +124,22 @@ class K8SToolExecutionNode(ToolExecutionNode):
             name: Tool name
             script_path: Path to executable script for subprocess execution
             result_parser: Optional result parser function
+            execution_mode: Execution mode - "local" or "k8s" (default: "k8s")
         """
         # Call parent's register_tool to register the tool in memory
-        super().register_tool(name, script_path, result_parser)
+        super().register_tool(name, script_path, result_parser, execution_mode)
 
-        # If pod is already created, copy the tool file to pod immediately
-        if self._pod_ready is not None and self._pod_ready.is_set():
+        # If this is a local execution tool, preload the module
+        if execution_mode == "local":
+            tool = self.tools[name]
+            try:
+                tool.local_module = self._load_local_module(script_path)
+                self.logger.info(f"Loaded local module for tool '{name}': {script_path}")
+            except Exception as e:
+                self.logger.warning(f"Failed to load local module for '{name}': {e}")
+
+        # If pod is already created, copy the tool file to pod immediately (only for k8s tools)
+        elif self._pod_ready is not None and self._pod_ready.is_set():
             import os
             if os.path.exists(script_path):
                 pod_path = self._local_to_pod_path(script_path)
@@ -204,7 +215,11 @@ class K8SToolExecutionNode(ToolExecutionNode):
 
     async def _execute_single_tool_async(self, tool_call: Dict) -> Dict:
         """
-        Execute a single tool call in a Kubernetes pod asynchronously.
+        Execute a single tool call either locally or in a Kubernetes pod asynchronously.
+
+        The execution mode is determined by the tool's execution_mode attribute:
+        - "local": Execute by calling Python function directly (fast, ~1-10ms)
+        - "k8s": Execute in K8S pod via kubectl exec (slower, ~500-2000ms)
 
         Args:
             tool_call: Tool call dictionary
@@ -212,8 +227,6 @@ class K8SToolExecutionNode(ToolExecutionNode):
         Returns:
             Execution result dictionary
         """
-        # Ensure pod is ready before executing
-        await self._ensure_pod_ready()
         tool_name = (tool_call.get("tool") or
                     tool_call.get("function") or
                     tool_call.get("name") or
@@ -244,6 +257,16 @@ class K8SToolExecutionNode(ToolExecutionNode):
             }
 
         tool = self.tools[tool_name]
+
+        # Route execution based on execution mode
+        if tool.execution_mode == "local":
+            # Execute locally - fast path, no pod needed
+            self.logger.info(f"Executing tool '{tool_name}' locally")
+            return await self._execute_tool_locally(tool_name, arguments)
+
+        # Execute in K8S pod - ensure pod is ready first
+        await self._ensure_pod_ready()
+
         try:
             self.logger.info(f"Executing tool '{tool_name}' in K8S pod: {self.pod_name}")
 
@@ -1415,6 +1438,154 @@ class K8SToolExecutionNode(ToolExecutionNode):
             f"using fallback: /workspace/src/tools/{filename}"
         )
         return f"/workspace/src/tools/{filename}"
+
+    def _load_local_module(self, script_path: str):
+        """
+        Dynamically load a local tool module for local execution.
+
+        Args:
+            script_path: Path to the tool script
+
+        Returns:
+            Loaded Python module
+
+        Raises:
+            ImportError: If module cannot be loaded
+        """
+        import importlib.util
+        import os
+
+        # Ensure script exists
+        if not os.path.exists(script_path):
+            raise ImportError(f"Script file not found: {script_path}")
+
+        # Convert path to module name
+        abs_path = os.path.abspath(script_path)
+        module_name = os.path.splitext(os.path.basename(script_path))[0]
+
+        try:
+            # Load module using importlib
+            spec = importlib.util.spec_from_file_location(module_name, abs_path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Could not create module spec for {script_path}")
+
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            return module
+        except Exception as e:
+            self.logger.error(f"Failed to load local module {script_path}: {e}")
+            raise ImportError(f"Failed to load module {script_path}: {e}")
+
+    def _get_tool_function_name(self, tool_name: str) -> str:
+        """
+        Get the function name from a tool name.
+
+        Follows the naming convention: {tool_name}_func
+        For example: miaoda_supabase_init -> supabase_init_func
+
+        Args:
+            tool_name: Tool name
+
+        Returns:
+            Function name to call in the module
+        """
+        # Remove common prefixes
+        func_name = tool_name.replace("miaoda_", "").replace("r2e_", "").replace("deepseek_", "")
+
+        # Add _func suffix if not present
+        if not func_name.endswith("_func"):
+            func_name = f"{func_name}_func"
+
+        return func_name
+
+    async def _execute_tool_locally(self, tool_name: str, arguments: Dict[str, Any]) -> Dict:
+        """
+        Execute a tool locally by calling its Python function directly.
+
+        This is much faster than K8S execution (1-10ms vs 500-2000ms) and is
+        suitable for mock tools and pure logic tools that don't need a pod environment.
+
+        Args:
+            tool_name: Name of the tool to execute
+            arguments: Tool arguments
+
+        Returns:
+            Execution result dictionary
+        """
+        tool = self.tools.get(tool_name)
+        if not tool:
+            return {
+                "tool": tool_name,
+                "error": f"Tool '{tool_name}' not found",
+                "status": "error",
+                "execution_mode": "local"
+            }
+
+        try:
+            # Get the module (should be preloaded during registration)
+            module = tool.local_module
+            if module is None:
+                # Try to load it now if not preloaded
+                module = self._load_local_module(tool.script_path)
+                tool.local_module = module
+
+            # Get the tool function
+            func_name = self._get_tool_function_name(tool_name)
+
+            if not hasattr(module, func_name):
+                return {
+                    "tool": tool_name,
+                    "error": f"Function '{func_name}' not found in module {tool.script_path}",
+                    "status": "error",
+                    "execution_mode": "local"
+                }
+
+            tool_func = getattr(module, func_name)
+
+            # Execute the function
+            self.logger.info(f"Executing tool '{tool_name}' locally: {func_name}(**{arguments})")
+            result = tool_func(**arguments)
+
+            # Ensure result is a dict
+            if not isinstance(result, dict):
+                result = {"result": str(result)}
+
+            # Parse result through the tool's result parser
+            # For local execution, wrap the result in a format similar to subprocess output
+            raw_result = {
+                "output": result,
+                "stdout": str(result),
+                "stderr": "",
+                "exit_code": 0,
+                "returncode": 0,
+                "success": True
+            }
+
+            parsed_result = tool.parse_result(raw_result)
+
+            return {
+                "tool": tool_name,
+                "result": parsed_result if parsed_result else result,
+                "status": result.get("status", "success"),
+                "execution_mode": "local",
+                "exit_code": 0
+            }
+
+        except Exception as e:
+            import traceback
+            error_detail = traceback.format_exc()
+            self.logger.error(f"Error executing tool {tool_name} locally: {str(e)}")
+            self.logger.error(f"Full traceback: {error_detail}")
+
+            return {
+                "tool": tool_name,
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "traceback": error_detail,
+                "status": "error",
+                "execution_mode": "local"
+            }
 
     def _build_tool_command(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """

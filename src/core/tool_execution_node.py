@@ -35,7 +35,8 @@ class ToolExecutionNode(BaseNode):
     def register_tool(self,
                      name: str,
                      script_path: str,
-                     result_parser: Callable = None) -> None:
+                     result_parser: Callable = None,
+                     execution_mode: str = "k8s") -> None:
         """
         Register a new tool.
 
@@ -46,14 +47,16 @@ class ToolExecutionNode(BaseNode):
             name: Tool name
             script_path: Path to executable script for subprocess execution
             result_parser: Optional result parser function
+            execution_mode: Execution mode - "local" or "k8s" (default: "k8s")
         """
         tool = Tool(
             name=name,
             script_path=script_path,
-            result_parser=result_parser
+            result_parser=result_parser,
+            execution_mode=execution_mode
         )
         self.tools[name] = tool
-        self.logger.info(f"Registered tool: {name}")
+        self.logger.info(f"Registered tool: {name} (mode: {execution_mode})")
 
     def _register_stop_tool(self) -> None:
         """

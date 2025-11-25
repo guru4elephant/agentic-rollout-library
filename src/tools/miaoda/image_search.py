@@ -38,6 +38,10 @@ def image_search_func(query: str, limit: int = 10, app_id: str = "demo_app") -> 
             - status: Status of the query (success/error)
             - error: Error message if failed
     """
+    inputs = eval(query)
+    if not isinstance(inputs, list):
+        inputs = [query]
+
     try:
         async def _call():
             async with sse_client(SERVER_URL) as streams:
@@ -46,7 +50,7 @@ def image_search_func(query: str, limit: int = 10, app_id: str = "demo_app") -> 
                     result = await session.call_tool(
                         "image_search",
                         {
-                            "inputs": query
+                            "inputs": inputs
                         }
                     )
                     return result
@@ -130,14 +134,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python image_search.py "咖啡"
-  python image_search.py "coffee" --limit 5
-  python image_search.py "sunset" --app_id "my_app" --json
+  python image_search.py --inputs '["咖啡", "牛奶"]'
+  python image_search.py --inputs '["coffee"]' --limit 5
+  python image_search.py --inputs '["sunset"]' --app_id "my_app" --json
         """
     )
     parser.add_argument(
-        "--query",
-        help="Search keyword(s) (positional argument)"
+        "--inputs",
+        type=str,
+        default="",
+        help="Search keywords (positional argument)"
     )
     parser.add_argument(
         "--limit",
@@ -158,7 +164,7 @@ Examples:
 
     args = parser.parse_args()
 
-    result = image_search_func(args.query, args.limit, args.app_id)
+    result = image_search_func(args.inputs, args.limit, args.app_id)
 
     if args.json:
         print(json.dumps(result, indent=2, ensure_ascii=False))

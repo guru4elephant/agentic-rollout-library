@@ -60,14 +60,19 @@ def build_k8s_command(thought: str) -> str:
     Build command for K8S pod execution.
     For think actions, we just echo the thought (no actual execution needed).
 
+    Uses base64 encoding to avoid shell escaping issues with special characters.
+
     Args:
         thought: The thought text
 
     Returns:
         Command string for K8S execution
     """
-    escaped_thought = thought.replace('"', '\\"').replace("'", "\\'")
-    return f'python3 -c "from tools.miaoda.impl.think import think_func; import json; print(json.dumps(think_func(\'{escaped_thought}\'), ensure_ascii=False))"'
+    import base64
+
+    # Use base64 encoding to avoid escaping issues
+    encoded_thought = base64.b64encode(thought.encode()).decode()
+    return f'python3 -c "import base64, json; from tools.miaoda.think import think_func; thought = base64.b64decode(\'{encoded_thought}\').decode(); print(json.dumps(think_func(thought), ensure_ascii=False))"'
 
 
 def main():

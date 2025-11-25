@@ -68,6 +68,11 @@ def build_k8s_command(name: str, query: str) -> str:
     """
     Build command for K8S pod execution.
 
+    Uses base64 encoding to avoid shell escaping issues with special characters
+    like quotes, backslashes, ampersands, semicolons, newlines, comments, etc.
+    This is especially important for SQL queries which often contain complex
+    characters that can break shell command parsing.
+
     Args:
         name: Migration name
         query: SQL query
@@ -75,10 +80,13 @@ def build_k8s_command(name: str, query: str) -> str:
     Returns:
         Command string for K8S execution
     """
-    escaped_name = name.replace('"', '\\"').replace("'", "\\'")
-    escaped_query = query.replace('"', '\\"').replace("'", "\\'").replace("\n", "\\n")
-    
-    return f'python3 -c "from tools.miaoda.impl.supabase_migration import supabase_migration_func; import json; print(json.dumps(supabase_migration_func(\'{escaped_name}\', \'{escaped_query}\'), ensure_ascii=False))"'
+    import base64
+
+    # Encode parameters using base64 to completely avoid escaping issues
+    encoded_name = base64.b64encode(name.encode()).decode()
+    encoded_query = base64.b64encode(query.encode()).decode()
+
+    return f'python3 -c "import base64, json; from tools.miaoda.supabase_migration import supabase_migration_func; name = base64.b64decode(\'{encoded_name}\').decode(); query = base64.b64decode(\'{encoded_query}\').decode(); print(json.dumps(supabase_migration_func(name, query), ensure_ascii=False))"'
 
 
 def main():
@@ -88,18 +96,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python supabase_migration.py "create_users_table" "CREATE TABLE users (id SERIAL PRIMARY KEY, username TEXT);"
-  python supabase_migration.py "add_index" "CREATE INDEX idx_users_email ON users(email);"
-  python supabase_migration.py "alter_table" "ALTER TABLE users ADD COLUMN created_at TIMESTAMP;" --json
+  python supabase_migration.py --name "create_users_table" --query "CREATE TABLE users (id SERIAL PRIMARY KEY, username TEXT);"
+  python supabase_migration.py --name "add_index" --query "CREATE INDEX idx_users_email ON users(email);"
+  python supabase_migration.py --name "alter_table" --query "ALTER TABLE users ADD COLUMN created_at TIMESTAMP;" --json
         """
     )
     parser.add_argument(
         "--name",
-        help="Migration name (use snake_case, positional argument)"
+        required=True,
+        help="Migration name (use snake_case)"
     )
     parser.add_argument(
         "--query",
-        help="SQL query to apply (positional argument)"
+        required=True,
+        help="SQL query to apply"
     )
 
     parser.add_argument(
@@ -109,6 +119,14 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    # Handle None values (shouldn't happen with required=True, but just in case)
+    if not args.name or not args.query:
+        print(json.dumps({
+            "status": "error",
+            "error": "Missing required parameters: name and query are required"
+        }, ensure_ascii=False))
+        sys.exit(1)
 
     result = supabase_migration_func(args.name, args.query)
 
