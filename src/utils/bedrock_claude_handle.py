@@ -110,11 +110,6 @@ class BedrockClaudeHandle:
                 system_prompts.append({
                     "text": content
                 })
-                # Add cache point for system prompts if caching is enabled
-                if self.use_cache and system_prompts:
-                    system_prompts.append({
-                        "cachePoint": {"type": "default"}
-                    })
             else:
                 # User and assistant messages
                 bedrock_messages.append({
@@ -122,7 +117,44 @@ class BedrockClaudeHandle:
                     "content": [{"text": content}]
                 })
 
+        # Add cache point to system prompts AFTER all system messages (if caching is enabled)
+        if self.use_cache and system_prompts:
+            system_prompts.append({
+                "cachePoint": {"type": "default"}
+            })
+
         return bedrock_messages, system_prompts
+
+    def _add_cache_point_to_last_message(self, bedrock_messages: List[Dict[str, Any]]) -> None:
+        """
+        Add cache point to the last user message and remove all previous cache points.
+
+        This ensures:
+        1. Only one cache point exists (avoiding the 4 cache point limit)
+        2. The entire conversation history is cached via Claude's prefix caching
+
+        Args:
+            bedrock_messages: List of messages in Bedrock format (modified in-place)
+        """
+        if not self.use_cache or not bedrock_messages:
+            return
+
+        # STEP 1: Remove ALL existing cache points from all messages
+        for message in bedrock_messages:
+            if "content" in message:
+                message["content"] = [
+                    item for item in message["content"]
+                    if not (isinstance(item, dict) and "cachePoint" in item)
+                ]
+
+        # STEP 2: Add cache point ONLY to the LAST user message
+        # Find the last user message
+        for i in range(len(bedrock_messages) - 1, -1, -1):
+            if bedrock_messages[i]["role"] == "user":
+                bedrock_messages[i]["content"].append({
+                    "cachePoint": {"type": "default"}
+                })
+                break
 
     def _call_bedrock_sync(
         self,
@@ -146,6 +178,10 @@ class BedrockClaudeHandle:
         # Convert messages to Bedrock format
         bedrock_messages, system_prompts = self._convert_messages_to_bedrock_format(messages)
 
+        # Add cache point to the last user message (and remove old cache points)
+        # This enables prompt caching for multi-turn conversations
+        self._add_cache_point_to_last_message(bedrock_messages)
+
         # Build API request
         kwargs = {
             "modelId": self.model_id,
@@ -159,6 +195,18 @@ class BedrockClaudeHandle:
         # Add system prompts if present
         if system_prompts:
             kwargs["system"] = system_prompts
+
+        # Debug: Print the request to see if cache points are present
+        if os.getenv("DEBUG_CACHE"):
+            print("\n[DEBUG] Request payload:")
+            print(f"System prompts: {json.dumps(system_prompts, indent=2)}")
+            print(f"Messages ({len(bedrock_messages)} total):")
+            for i, msg in enumerate(bedrock_messages):
+                has_cache = any(isinstance(item, dict) and "cachePoint" in item for item in msg.get("content", []))
+                cache_marker = " [CACHE POINT]" if has_cache else ""
+                print(f"  {i}: {msg['role']}{cache_marker}")
+                if has_cache:
+                    print(f"      Content: {msg['content']}")
 
         try:
             # Call Bedrock Converse API

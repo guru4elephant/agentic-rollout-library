@@ -6,7 +6,105 @@ LLM API utilities for creating API handles for different LLM providers.
 import os
 import requests
 import asyncio
+import json
+import logging
 from typing import List, Dict, Callable
+
+# Configure logger
+logger = logging.getLogger(__name__)
+
+def is_debug_enabled() -> bool:
+    """Check if debug mode is enabled via environment variables."""
+    return os.getenv('DEBUG', '').lower() in ('1', 'true', 'yes') or \
+           os.getenv('LLM_DEBUG', '').lower() in ('1', 'true', 'yes')
+
+
+def parse_pd_separated_response(response_text: str) -> Dict:
+    """
+    Parse response text that may contain multiple JSON objects (PD separated version).
+
+    PD separated models return two JSON responses:
+    1. First JSON: contains draft/prefix content
+    2. Second JSON: contains final complete response
+
+    The final content should be the concatenation of first JSON's content + second JSON's content.
+
+    Args:
+        response_text: Raw response text that may contain one or more JSON objects
+
+    Returns:
+        Merged JSON response with combined content
+
+    Raises:
+        ValueError: If no valid JSON found or if error response is returned
+    """
+    # Try to find all JSON objects in the response
+    json_objects = []
+    decoder = json.JSONDecoder()
+    pos = 0
+
+    while pos < len(response_text):
+        # Skip whitespace
+        while pos < len(response_text) and response_text[pos].isspace():
+            pos += 1
+
+        if pos >= len(response_text):
+            break
+
+        try:
+            obj, end_pos = decoder.raw_decode(response_text, pos)
+            json_objects.append(obj)
+            # raw_decode returns absolute position, not relative offset
+            pos = end_pos
+        except json.JSONDecodeError:
+            # No more valid JSON objects
+            break
+
+    if len(json_objects) == 0:
+        raise ValueError("No valid JSON found in response")
+
+    # Separate error objects from normal objects
+    error_objects = [obj for obj in json_objects if obj.get('object') == 'error']
+    normal_objects = [obj for obj in json_objects if obj.get('object') != 'error']
+
+    # If there are error objects, check if we also have normal objects
+    if error_objects:
+        if not normal_objects:
+            # Only errors, no valid response - raise the error
+            error_obj = error_objects[0]
+            error_msg = error_obj.get('message', 'Unknown error')
+            error_type = error_obj.get('type', 'Unknown type')
+            error_code = error_obj.get('code', 'Unknown code')
+            raise ValueError(f"API returned error: {error_msg} - {error_code} (type: {error_type})")
+        else:
+            # We have both errors and normal objects
+            # Log the error but continue with normal objects
+            print(f"Warning: API returned error objects along with normal response: {error_objects}")
+            # Use only normal objects for further processing
+            json_objects = normal_objects
+
+    # If only one JSON, return it as is
+    if len(json_objects) == 1:
+        return json_objects[0]
+
+    # If two or more JSONs (PD separated), merge them
+    # Use the last JSON as base and prepend content from previous JSONs
+    first_json = json_objects[0]
+    final_json = json_objects[-1]  # Use the last one as the base
+
+    # Extract content from first JSON
+    first_content = ""
+    if 'choices' in first_json and len(first_json['choices']) > 0:
+        first_message = first_json['choices'][0].get('message', {})
+        first_content = first_message.get('content', '')
+
+    # Merge: prepend first content to final content
+    if first_content and 'choices' in final_json and len(final_json['choices']) > 0:
+        final_message = final_json['choices'][0].get('message', {})
+        final_content = final_message.get('content', '')
+        final_json['choices'][0]['message']['content'] = first_content + final_content
+
+    return final_json
 
 
 def create_openai_api_handle(
@@ -74,6 +172,16 @@ def create_openai_api_handle(
             "stream": False
         }
 
+        # Debug logging for input
+        if is_debug_enabled():
+            logger.info("=" * 80)
+            logger.info("LLM API Request (sync):")
+            logger.info(f"Model: {model}")
+            logger.info(f"URL: {url}")
+            logger.info(f"Messages: {json.dumps(messages, indent=2, ensure_ascii=False)}")
+            logger.info(f"Parameters: temperature={payload['temperature']}, max_tokens={payload['max_tokens']}, top_p={payload['top_p']}")
+            logger.info("=" * 80)
+
         try:
             response = requests.post(
                 url,
@@ -83,7 +191,10 @@ def create_openai_api_handle(
                 proxies={'http': None, 'https': None}  # Disable proxy
             )
             response.raise_for_status()
-            data = response.json()
+
+            # Parse response text to handle PD separated responses (multiple JSONs)
+            response_text = response.text
+            data = parse_pd_separated_response(response_text)
 
             choice = data['choices'][0]
             message = choice['message']
@@ -97,11 +208,21 @@ def create_openai_api_handle(
             if 'usage' in data:
                 result['usage'] = data['usage']
 
+            # Debug logging for output
+            if is_debug_enabled():
+                logger.info("=" * 80)
+                logger.info("LLM API Response (sync):")
+                logger.info(f"Model: {result.get('model', 'unknown')}")
+                logger.info(f"Content: {result.get('content', '')}")
+                if 'usage' in result:
+                    logger.info(f"Usage: {json.dumps(result['usage'], indent=2)}")
+                logger.info("=" * 80)
+
             return result
 
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"API request failed: {str(e)}")
-        except (KeyError, json.JSONDecodeError) as e:
+        except (KeyError, json.JSONDecodeError, ValueError) as e:
             raise RuntimeError(f"Invalid API response: {str(e)}")
 
     return openai_api_handle
@@ -213,6 +334,19 @@ def create_openai_api_handle_async(
             "Content-Type": "application/json"
         }
 
+        # Debug logging for input
+        if is_debug_enabled():
+            logger.info("=" * 80)
+            logger.info("LLM API Request (async):")
+            logger.info(f"Model: {model}")
+            logger.info(f"URL: {url}")
+            if use_completion:
+                logger.info(f"Prompt: {payload.get('prompt', '')}")
+            else:
+                logger.info(f"Messages: {json.dumps(messages, indent=2, ensure_ascii=False)}")
+            logger.info(f"Parameters: temperature={payload['temperature']}, max_tokens={payload['max_tokens']}, top_p={payload['top_p']}")
+            logger.info("=" * 80)
+
         try:
             timeout = aiohttp.ClientTimeout(total=kwargs.get('timeout', 120))
             async with session.post(
@@ -222,10 +356,14 @@ def create_openai_api_handle_async(
                 timeout=timeout
             ) as response:
                 response.raise_for_status()
-                data = await response.json(content_type=None)
+                # Get response text first to handle PD separated responses
+                response_text = await response.text()
+
+            # Parse response text to handle PD separated responses (multiple JSONs)
+            data = parse_pd_separated_response(response_text)
 
             choice = data['choices'][0]
-            
+
             # Parse response based on endpoint type
             if use_completion:
                 # Completion endpoint returns 'text' field
@@ -246,6 +384,16 @@ def create_openai_api_handle_async(
 
             if 'usage' in data:
                 result['usage'] = data['usage']
+
+            # Debug logging for output
+            if is_debug_enabled():
+                logger.info("=" * 80)
+                logger.info("LLM API Response (async):")
+                logger.info(f"Model: {result.get('model', 'unknown')}")
+                logger.info(f"Content: {result.get('content', '')}")
+                if 'usage' in result:
+                    logger.info(f"Usage: {json.dumps(result['usage'], indent=2)}")
+                logger.info("=" * 80)
 
             return result
 

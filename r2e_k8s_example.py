@@ -58,6 +58,11 @@ class TaskProgress:
     tool_parse_fail: int = 0
     tool_exec_fail: int = 0
     status: str = "running"  # running, success, failed, max_iter
+    # Token usage statistics
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
     def elapsed_time(self) -> float:
         """Get elapsed time in seconds."""
@@ -119,6 +124,16 @@ class ProgressTracker:
         with self.lock:
             if task_id in self.tasks:
                 self.tasks[task_id].tool_exec_fail += 1
+
+    def add_token_usage(self, task_id: int, usage: Dict) -> None:
+        """Add token usage from LLM response."""
+        with self.lock:
+            if task_id in self.tasks:
+                # Support both OpenAI and Bedrock format
+                self.tasks[task_id].input_tokens += usage.get('input_tokens', usage.get('prompt_tokens', 0))
+                self.tasks[task_id].output_tokens += usage.get('output_tokens', usage.get('completion_tokens', 0))
+                self.tasks[task_id].cache_read_tokens += usage.get('cache_read_tokens', usage.get('cacheReadInputTokens', 0))
+                self.tasks[task_id].cache_write_tokens += usage.get('cache_write_tokens', usage.get('cacheWriteInputTokens', 0))
 
     def set_status(self, task_id: int, status: str) -> None:
         """Set task status."""
@@ -530,7 +545,7 @@ async def process_single_instance(
                             )
 
                         log(f"LLM Response: {llm_response.get('content', '')[:200]}...")
-                        
+
                         # Print raw LLM response for debugging
                         if debug:
                             print(f"\n🤖 Task {task_id} iter {iteration} - LLM Response (FULL):")
@@ -538,6 +553,10 @@ async def process_single_instance(
                             print("-" * 80)
 
                         progress_tracker.increment_llm_success(task_id)
+
+                        # Track token usage if available
+                        if 'usage' in llm_response:
+                            progress_tracker.add_token_usage(task_id, llm_response['usage'])
                     except asyncio.TimeoutError:
                         progress_tracker.increment_llm_timeout(task_id)
                         error_msg = f"LLM call timeout after {llm_timeout}s"
@@ -954,6 +973,23 @@ async def main(
     print(f"⏭️  Skipped (patch exists): {skipped}")
     print(f"🔥 Exceptions: {exceptions}")
     print(f"📊 Total: {len(results)}")
+
+    # Print token usage statistics
+    print("\n" + "="*60)
+    print("TOKEN USAGE STATISTICS")
+    print("="*60)
+
+    snapshot = progress_tracker.get_snapshot()
+    total_input_tokens = sum(t.input_tokens for t in snapshot)
+    total_output_tokens = sum(t.output_tokens for t in snapshot)
+    total_cache_read_tokens = sum(t.cache_read_tokens for t in snapshot)
+    total_cache_write_tokens = sum(t.cache_write_tokens for t in snapshot)
+
+    print(f"📥 Total Input Tokens: {total_input_tokens:,}")
+    print(f"📤 Total Output Tokens: {total_output_tokens:,}")
+    print(f"💾 Total Cache Read Tokens (Cached Input): {total_cache_read_tokens:,}")
+    print(f"💾 Total Cache Write Tokens (Cached Output): {total_cache_write_tokens:,}")
+    print(f"📊 Total Tokens: {total_input_tokens + total_output_tokens + total_cache_read_tokens + total_cache_write_tokens:,}")
 
     # Print detailed results
     print("\n" + "="*60)

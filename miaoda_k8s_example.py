@@ -112,9 +112,7 @@ Required parameter of `insert` command. The `new_str` will be inserted AFTER the
   •    Setting `[start_line, -1]` shows all lines from `start_line` to the end of the file.
 
 ### think
-Description: Use the tool to think about something. It will not obtain new information or make any changes to the repository, but just log the thought. Use it when complex reasoning or brainstorming is needed.
-
-Common use cases:
+Description: Use the tool to think about something. It will not obtain new information or make any changes to the repository, but just log the thought. Use it when complex reasoning or brainstorming is needed. Common use cases:
   •    When exploring a repository and discovering the source of a bug, call this tool to brainstorm several unique ways of fixing the bug, and assess which change(s) are likely to be simplest and most effective.
   •    After receiving test results, use this tool to brainstorm ways to fix failing tests.
   •    When planning a complex refactoring, use this tool to outline different approaches and their tradeoffs.
@@ -126,13 +124,16 @@ Parameters:
 The thought to log.
 
 ### image_search
-Description: Search for images by keyword using MCP server. Supports single query to search images based on the provided description, and returns a set of image URLs that may meet the requirements.
+Description: Search for images by keyword using MCP server. Supports inputting multiple queries, each query searches images based on the provided description, and returns a set of image URLs that may meet the requirements.
 
 Parameters:
-  1.    query (string, required)
-Search keyword, required
-  2.    limit (string, optional)
-Number of results to return (default: 10)
+  1.    inputs (array, required)
+Array of image descriptions, maximum 30 items. Each item is a string (1-200 characters) describing the image to search for. 
+Example of tool call:
+<function=image_search>
+<parameter=inputs>["cat", "dog"]</parameter>
+</function>
+
 
 ### api_rag
 Description: Query API information using RAG (Retrieval-Augmented Generation) based on user query. Retrieves relevant APIs and generates a prompt containing API usage instructions.
@@ -283,7 +284,6 @@ def create_miaoda_parser():
             }
             
             tool_calls.append(tool_call)
-        print(tool_calls)
         
         return tool_calls
     
@@ -304,6 +304,11 @@ class TaskProgress:
     tool_parse_fail: int = 0
     tool_exec_fail: int = 0
     status: str = "running"
+    # Token usage statistics
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
     def elapsed_time(self) -> float:
         """Get elapsed time in seconds."""
@@ -363,6 +368,16 @@ class ProgressTracker:
         with self.lock:
             if task_id in self.tasks:
                 self.tasks[task_id].tool_exec_fail += 1
+
+    def add_token_usage(self, task_id: int, usage: Dict) -> None:
+        """Add token usage from LLM response."""
+        with self.lock:
+            if task_id in self.tasks:
+                # Support both OpenAI and Bedrock format
+                self.tasks[task_id].input_tokens += usage.get('input_tokens', usage.get('prompt_tokens', 0))
+                self.tasks[task_id].output_tokens += usage.get('output_tokens', usage.get('completion_tokens', 0))
+                self.tasks[task_id].cache_read_tokens += usage.get('cache_read_tokens', usage.get('cacheReadInputTokens', 0))
+                self.tasks[task_id].cache_write_tokens += usage.get('cache_write_tokens', usage.get('cacheWriteInputTokens', 0))
 
     def set_status(self, task_id: int, status: str) -> None:
         """Set task status."""
@@ -433,19 +448,26 @@ class ProgressTracker:
         total_parse_fails = sum(t.tool_parse_fail for t in snapshot)
         total_exec_fails = sum(t.tool_exec_fail for t in snapshot)
 
+        # Calculate token totals
+        total_input = sum(t.input_tokens for t in snapshot)
+        total_output = sum(t.output_tokens for t in snapshot)
+        total_cache_in = sum(t.cache_read_tokens for t in snapshot)
+        total_cache_out = sum(t.cache_write_tokens for t in snapshot)
+
         print(f"Total: {total} | Initializing: {initializing} | Running: {running} | Completed: {completed} | Total LLM calls: {total_llm_calls} | Parse fails: {total_parse_fails} | Exec fails: {total_exec_fails}")
+        print(f"Token Summary: Input={total_input:,} | Output={total_output:,} | CacheIn={total_cache_in:,} | CacheOut={total_cache_out:,} | Total={total_input+total_output+total_cache_in+total_cache_out:,}")
         print("=" * 175)
-        
+
         # Calculate total program runtime
         program_runtime = time.time() - self.program_start_time
         hours = int(program_runtime // 3600)
         minutes = int((program_runtime % 3600) // 60)
         seconds = int(program_runtime % 60)
-        
+
         runtime_str = f"{hours}h {minutes}m {seconds}s" if hours > 0 else f"{minutes}m {seconds}s"
-        
+
         print(f"Last update: {time.strftime('%Y-%m-%d %H:%M:%S')} | Program runtime: {runtime_str}")
-        print(f"TPF=Tool Parse Fail | TEF=Tool Exec Fail")
+        print(f"TPF=Tool Parse Fail | TEF=Tool Exec Fail | CacheIn=Cached Input Tokens | CacheOut=Cached Output Tokens")
 
     def start_display(self, interval: float = 2.0) -> None:
         """Start background thread to display progress."""
@@ -506,7 +528,9 @@ async def process_single_instance(
     """
     instance_id = instance_data.get("qid", instance_data.get("instance_id", "unknown"))
     extra_info = instance_data.get("extra_info", {})
-    app_id = extra_info.get("app_id", f"app-{instance_id}")
+    #app_id = extra_info.get("app_id", f"app-{instance_id}")
+    app_id = f"app-{instance_id}"
+
     requirement_type = extra_info.get("requirement_type", "Web")
     
     # Check if patch file already exists
@@ -534,7 +558,6 @@ async def process_single_instance(
         os.makedirs(output_dir, exist_ok=True)
         log_file_path = os.path.join(output_dir, f"{instance_id}.log")
         log_file = open(log_file_path, 'w', encoding='utf-8')
-
     # Derive pod name using app_id
     import random
     import uuid
@@ -592,7 +615,7 @@ async def process_single_instance(
             function_handle=llm_handle,
             model_config={
                 "temperature": 0.7,
-                "max_tokens": 4000
+                "max_tokens": 32000
             },
             timeline_enabled=enable_timeline,
             timeout=llm_timeout
@@ -671,12 +694,14 @@ async def process_single_instance(
 
             k8s_executor.register_tool(
                 "miaoda_finish",
-                "src/tools/miaoda/finish.py"
+                "src/tools/miaoda/finish.py",
+                execution_mode="local"  # Pure logic tool - execute locally
             )
 
             k8s_executor.register_tool(
                 "miaoda_think",
-                "src/tools/miaoda/think.py"
+                "src/tools/miaoda/think.py",
+                execution_mode="local"  # Pure logic tool - execute locally
             )
 
             k8s_executor.register_tool(
@@ -696,17 +721,20 @@ async def process_single_instance(
 
             k8s_executor.register_tool(
                 "miaoda_supabase_init",
-                "src/tools/miaoda/supabase_init.py"
+                "src/tools/miaoda/supabase_init.py",
+                execution_mode="local"  # Mock tool - execute locally for better performance
             )
 
             k8s_executor.register_tool(
                 "miaoda_supabase_migration",
-                "src/tools/miaoda/supabase_migration.py"
+                "src/tools/miaoda/supabase_migration.py",
+                execution_mode="local"  # Mock tool - execute locally for better performance
             )
 
             k8s_executor.register_tool(
                 "miaoda_supabase_sql",
-                "src/tools/miaoda/supabase_sql_execution.py"
+                "src/tools/miaoda/supabase_sql_execution.py",
+                execution_mode="local"  # Mock tool - execute locally for better performance
             )
 
             # Build system prompt
@@ -816,6 +844,7 @@ You are only allowed to call **ONE** function each time!"""
                         log(f"Calling LLM with timeout={llm_timeout}s...")
                         
                         messages = context.get_llm_context()
+                        log(str(messages))
                         
                         if enable_timeline:
                             llm_response = await asyncio.wait_for(
@@ -829,13 +858,17 @@ You are only allowed to call **ONE** function each time!"""
                             )
 
                         log(f"LLM Response: {llm_response.get('content', '')}...")
-                        
+
                         if debug:
                             print(f"\n🤖 Task {task_id} iter {iteration} - LLM Response (FULL):")
                             print(f"{llm_response.get('content', '')}")
                             print("-" * 80)
 
                         progress_tracker.increment_llm_success(task_id)
+
+                        # Track token usage if available
+                        if 'usage' in llm_response:
+                            progress_tracker.add_token_usage(task_id, llm_response['usage'])
                     except asyncio.TimeoutError:
                         progress_tracker.increment_llm_timeout(task_id)
                         error_msg = f"LLM call timeout after {llm_timeout}s"
@@ -866,6 +899,7 @@ You are only allowed to call **ONE** function each time!"""
                         if not tool_calls or len(tool_calls) == 0:
                             # No tool call, task is complete
                             log(f"No tool calls parsed - treating as completion")
+                            log(llm_content)
                             print(f"\n✅ Task {task_id} ({instance_id}): Completed without tool call")
                             
                             context.add_message(
@@ -881,6 +915,7 @@ You are only allowed to call **ONE** function each time!"""
                     except Exception as e:
                         progress_tracker.increment_tool_parse_fail(task_id)
                         log(f"Tool parse error: {str(e)}")
+                        print(llm_content)
                         print(f"\n❌ Task {task_id} ({instance_id}): Tool parse error: {str(e)}")
                         
                         result["status"] = "failed"
@@ -948,9 +983,13 @@ You are only allowed to call **ONE** function each time!"""
                     elif not isinstance(formatted_result, str):
                         formatted_result = str(formatted_result)
 
+                    # Add steps remaining
+                    steps_remaining = max_iterations - iteration
+                    steps_remaining_content = f"Steps Remaining: {steps_remaining}"
+
                     # Add tool result to context
                     context.add_message(
-                        message_content=formatted_result,
+                        message_content=formatted_result + "\n" + steps_remaining_content,
                         message_role="user",
                         message_type="tool_result"
                     )
@@ -978,6 +1017,13 @@ You are only allowed to call **ONE** function each time!"""
                     await k8s_executor._execute_kubectl_async(f"cd /workspace/{app_id} && git add -A")
                     
                     base_commit = extra_info.get('base_commit', None)
+
+                    #413c2a93c661f4896acc1a35e59233e02bf9c924
+                    #9b0ed8ea29ec81a8b563360928b164f25161acac
+                    if requirement_type == "Mini Program":
+                        base_commit = "9b0ed8ea29ec81a8b563360928b164f25161acac"
+                    else:
+                        base_commit = "413c2a93c661f4896acc1a35e59233e02bf9c924"
                     
                     if base_commit:
                         log(f"Generating patch against base_commit: {base_commit}")
@@ -1296,6 +1342,23 @@ async def main(
     print(f"⏭️  Skipped (patch exists): {skipped}")
     print(f"🔥 Exceptions: {exceptions}")
     print(f"📊 Total: {len(results)}")
+
+    # Print token usage statistics
+    print("\n" + "="*60)
+    print("TOKEN USAGE STATISTICS")
+    print("="*60)
+
+    snapshot = progress_tracker.get_snapshot()
+    total_input_tokens = sum(t.input_tokens for t in snapshot)
+    total_output_tokens = sum(t.output_tokens for t in snapshot)
+    total_cache_read_tokens = sum(t.cache_read_tokens for t in snapshot)
+    total_cache_write_tokens = sum(t.cache_write_tokens for t in snapshot)
+
+    print(f"📥 Total Input Tokens: {total_input_tokens:,}")
+    print(f"📤 Total Output Tokens: {total_output_tokens:,}")
+    print(f"💾 Total Cache Read Tokens (Cached Input): {total_cache_read_tokens:,}")
+    print(f"💾 Total Cache Write Tokens (Cached Output): {total_cache_write_tokens:,}")
+    print(f"📊 Total Tokens: {total_input_tokens + total_output_tokens + total_cache_read_tokens + total_cache_write_tokens:,}")
 
     # Print detailed results
     print("\n" + "="*60)
