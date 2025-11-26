@@ -29,11 +29,13 @@ def parse_pd_separated_response(response_text: str) -> Dict:
 
     The final content should be the concatenation of first JSON's content + second JSON's content.
 
+    This function also handles Claude Opus 4.5 format which returns content as an array directly.
+
     Args:
         response_text: Raw response text that may contain one or more JSON objects
 
     Returns:
-        Merged JSON response with combined content
+        Merged JSON response with combined content, normalized to OpenAI format
 
     Raises:
         ValueError: If no valid JSON found or if error response is returned
@@ -83,9 +85,9 @@ def parse_pd_separated_response(response_text: str) -> Dict:
             # Use only normal objects for further processing
             json_objects = normal_objects
 
-    # If only one JSON, return it as is
+    # If only one JSON, normalize and return it
     if len(json_objects) == 1:
-        return json_objects[0]
+        return _normalize_response_format(json_objects[0])
 
     # If two or more JSONs (PD separated), merge them
     # Use the last JSON as base and prepend content from previous JSONs
@@ -104,7 +106,70 @@ def parse_pd_separated_response(response_text: str) -> Dict:
         final_content = final_message.get('content', '')
         final_json['choices'][0]['message']['content'] = first_content + final_content
 
-    return final_json
+    return _normalize_response_format(final_json)
+
+
+def _normalize_response_format(response: Dict) -> Dict:
+    """
+    Normalize different response formats to OpenAI-compatible format.
+
+    Handles:
+    1. OpenAI format: {"choices": [{"message": {"role": "assistant", "content": "..."}}]}
+    2. Claude Opus 4.5 format: {"type": "message", "role": "assistant", "content": [{"type": "text", "text": "..."}]}
+
+    Args:
+        response: Raw response dictionary
+
+    Returns:
+        Normalized response in OpenAI format
+    """
+    # Check if it's already in OpenAI format
+    if 'choices' in response:
+        return response
+
+    # Check if it's Claude Opus 4.5 format
+    if response.get('type') == 'message' and 'content' in response and isinstance(response['content'], list):
+        # Extract text content from content array
+        text_content = ""
+        for content_block in response['content']:
+            if isinstance(content_block, dict) and content_block.get('type') == 'text':
+                text_content += content_block.get('text', '')
+
+        # Convert to OpenAI format
+        normalized = {
+            'id': response.get('id', ''),
+            'object': 'chat.completion',
+            'created': 0,
+            'model': response.get('model', ''),
+            'choices': [{
+                'index': 0,
+                'message': {
+                    'role': response.get('role', 'assistant'),
+                    'content': text_content
+                },
+                'finish_reason': response.get('stop_reason', 'stop')
+            }]
+        }
+
+        # Add usage information if present
+        if 'usage' in response:
+            # Map Claude usage format to OpenAI format
+            claude_usage = response['usage']
+            normalized['usage'] = {
+                'prompt_tokens': claude_usage.get('input_tokens', 0) +
+                                claude_usage.get('cache_creation_input_tokens', 0) +
+                                claude_usage.get('cache_read_input_tokens', 0),
+                'completion_tokens': claude_usage.get('output_tokens', 0),
+                'total_tokens': (claude_usage.get('input_tokens', 0) +
+                               claude_usage.get('cache_creation_input_tokens', 0) +
+                               claude_usage.get('cache_read_input_tokens', 0) +
+                               claude_usage.get('output_tokens', 0))
+            }
+
+        return normalized
+
+    # If format is unknown, return as-is and let error handling deal with it
+    return response
 
 
 def create_openai_api_handle(
@@ -157,7 +222,10 @@ def create_openai_api_handle(
         Raises:
             RuntimeError: If API request fails or response is invalid
         """
-        url = f"{base_url.rstrip('/')}/chat/completions"
+        if "messages" in base_url:
+            url = base_url
+        else:
+            url = f"{base_url.rstrip('/')}/chat/completions"
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
@@ -168,7 +236,7 @@ def create_openai_api_handle(
             "messages": messages,
             "temperature": kwargs.get("temperature", 0.7),
             "max_tokens": kwargs.get("max_tokens", 4000),
-            "top_p": kwargs.get("top_p", 0.95),
+            #"top_p": kwargs.get("top_p", 0.95),
             "stream": False
         }
 
@@ -319,13 +387,16 @@ def create_openai_api_handle_async(
                 "stream": False
             }
         else:
-            url = f"{base_url.rstrip('/')}/chat/completions"
+            if "messages" in base_url:
+                url = base_url
+            else:
+                url = f"{base_url.rstrip('/')}/chat/completions"
             payload = {
                 "model": model,
                 "messages": messages,
                 "temperature": kwargs.get("temperature", 0.7),
                 "max_tokens": kwargs.get("max_tokens", 4000),
-                "top_p": kwargs.get("top_p", 0.95),
+                #"top_p": kwargs.get("top_p", 0.95),
                 "stream": False
             }
 
@@ -333,6 +404,7 @@ def create_openai_api_handle_async(
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
+
 
         # Debug logging for input
         if is_debug_enabled():
