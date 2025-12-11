@@ -20,8 +20,8 @@ def read_jsonl(file_path):
 
 def get_response(messages):
     config = {
-        'location': 'http://211.23.3.237:27544/v1/chat/completions',
-        'header': 'Authorization: Bearer sk-qq7xJtnAdB1Gv6IkHTQhDAPuUAT700vF3CMmGinILsmP2HuY'
+        'location': 'your api',
+        'header': 'Authorization: Bearer ... (your key)'
     }
     data_dict = {
         "model": "deepseek-v3-2-251201",
