@@ -257,7 +257,7 @@ def create_miaoda_parser():
             
             # Map Miaoda tool names to internal tool names
             internal_tool_name = tool_name
-            if tool_name == "bash":
+            if tool_name == "bash" or tool_name == "bash_executor" or tool_name == "execute_bash":
                 internal_tool_name = "miaoda_bash_executor"
             elif tool_name == "str_replace_editor":
                 internal_tool_name = "miaoda_file_editor"
