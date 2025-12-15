@@ -19,7 +19,8 @@ from typing import Dict, Any
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
 
-SERVER_URL = "http://aos-mcp-sandbox.miaoda-bj-offline.baidu-int.com/v1/agentos/mcp/sse"
+#SERVER_URL = "http://aos-mcp-sandbox.miaoda-bj-offline.baidu-int.com/v1/agentos/mcp/sse"
+SERVER_URL = "http://aos-mcp-test.miaoda-bj-offline.baidu-int.com/v1/agentos/mcp/sse"
 
 
 def api_rag_func(query: str, app_id: str = "1111") -> Dict[str, Any]:
