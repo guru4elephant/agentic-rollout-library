@@ -228,15 +228,15 @@ def create_openai_api_handle(
             url = f"{base_url.rstrip('/')}/chat/completions"
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json; charset=utf-8"
         }
-
+        
         payload = {
             "model": model,
             "messages": messages,
             "temperature": kwargs.get("temperature", 0.7),
             "max_tokens": kwargs.get("max_tokens", 4000),
-            #"top_p": kwargs.get("top_p", 0.95),
+            "top_p": kwargs.get("top_p", 0.95),
             "stream": False
         }
 
@@ -261,6 +261,7 @@ def create_openai_api_handle(
             response.raise_for_status()
 
             # Parse response text to handle PD separated responses (multiple JSONs)
+            response.encoding("utf-8")
             response_text = response.text
             data = parse_pd_separated_response(response_text)
 
@@ -334,9 +335,6 @@ def create_openai_api_handle_async(
         os.environ.pop('ALL_PROXY', None)
         os.environ.pop('all_proxy', None)
 
-    # Shared session for connection pooling (lazy initialization)
-    session = None
-
     async def openai_api_handle_async(messages: List[Dict], **kwargs) -> Dict:
         """
         Handle OpenAI-compatible API requests asynchronously.
@@ -354,20 +352,14 @@ def create_openai_api_handle_async(
         """
         import aiohttp
 
-        nonlocal session
-
-        # Create shared session if not exists
-        if session is None or session.closed:
-            # Increase connection pool limits for high concurrency
-            # limit: total connection limit across all hosts
-            # limit_per_host: connection limit per single host (critical for 500+ concurrent tasks)
-            connector = aiohttp.TCPConnector(
-                limit=1000,              # Support up to 1000 concurrent connections
-                limit_per_host=600,      # Support 600 connections to same host (for 500+ concurrent)
-                force_close=False,       # Reuse connections (HTTP Keep-Alive)
-                enable_cleanup_closed=True
-            )
-            session = aiohttp.ClientSession(connector=connector)
+        # Create a new session for each request to avoid unclosed session warnings
+        # Increase connection pool limits for high concurrency
+        connector = aiohttp.TCPConnector(
+            limit=1000,              # Support up to 1000 concurrent connections
+            limit_per_host=600,      # Support 600 connections to same host (for 500+ concurrent)
+            force_close=False,       # Reuse connections (HTTP Keep-Alive)
+            enable_cleanup_closed=True
+        )
 
         # Choose endpoint based on use_completion flag
         if use_completion:
@@ -396,7 +388,7 @@ def create_openai_api_handle_async(
                 "messages": messages,
                 "temperature": kwargs.get("temperature", 0.7),
                 "max_tokens": kwargs.get("max_tokens", 4000),
-                #"top_p": kwargs.get("top_p", 0.95),
+                "top_p": kwargs.get("top_p", 0.95),
                 "stream": False
             }
 
@@ -419,60 +411,69 @@ def create_openai_api_handle_async(
             logger.info(f"Parameters: temperature={payload['temperature']}, max_tokens={payload['max_tokens']}, top_p={payload['top_p']}")
             logger.info("=" * 80)
 
-        try:
-            timeout = aiohttp.ClientTimeout(total=kwargs.get('timeout', 120))
-            async with session.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=timeout
-            ) as response:
-                response.raise_for_status()
-                # Get response text first to handle PD separated responses
-                response_text = await response.text()
+        # Use async context manager to ensure session is properly closed
+        async with aiohttp.ClientSession(connector=connector) as session:
+            try:
+                timeout = aiohttp.ClientTimeout(total=kwargs.get('timeout', 120))
+                async with session.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=timeout
+                ) as response:
+                    # Check status code before reading response
+                    if response.status >= 400:
+                        error_text = await response.text()
+                        raise RuntimeError(
+                            f"API request failed: {response.status}, "
+                            f"message='{response.reason}', url='{url}'"
+                        )
 
-            # Parse response text to handle PD separated responses (multiple JSONs)
-            data = parse_pd_separated_response(response_text)
+                    # Get response text first to handle PD separated responses
+                    response_text = await response.text()
 
-            choice = data['choices'][0]
+                # Parse response text to handle PD separated responses (multiple JSONs)
+                data = parse_pd_separated_response(response_text)
 
-            # Parse response based on endpoint type
-            if use_completion:
-                # Completion endpoint returns 'text' field
-                content = choice.get('text', '')
-                result = {
-                    "role": "assistant",
-                    "content": content,
-                    "model": data.get('model', model)
-                }
-            else:
-                # Chat endpoint returns 'message' object
-                message = choice['message']
-                result = {
-                    "role": message.get('role', 'assistant'),
-                    "content": message.get('content', ''),
-                    "model": data.get('model', model)
-                }
+                choice = data['choices'][0]
 
-            if 'usage' in data:
-                result['usage'] = data['usage']
+                # Parse response based on endpoint type
+                if use_completion:
+                    # Completion endpoint returns 'text' field
+                    content = choice.get('text', '')
+                    result = {
+                        "role": "assistant",
+                        "content": content,
+                        "model": data.get('model', model)
+                    }
+                else:
+                    # Chat endpoint returns 'message' object
+                    message = choice['message']
+                    result = {
+                        "role": message.get('role', 'assistant'),
+                        "content": message.get('content', ''),
+                        "model": data.get('model', model)
+                    }
 
-            # Debug logging for output
-            if is_debug_enabled():
-                logger.info("=" * 80)
-                logger.info("LLM API Response (async):")
-                logger.info(f"Model: {result.get('model', 'unknown')}")
-                logger.info(f"Content: {result.get('content', '')}")
-                if 'usage' in result:
-                    logger.info(f"Usage: {json.dumps(result['usage'], indent=2)}")
-                logger.info("=" * 80)
+                if 'usage' in data:
+                    result['usage'] = data['usage']
 
-            return result
+                # Debug logging for output
+                if is_debug_enabled():
+                    logger.info("=" * 80)
+                    logger.info("LLM API Response (async):")
+                    logger.info(f"Model: {result.get('model', 'unknown')}")
+                    logger.info(f"Content: {result.get('content', '')}")
+                    if 'usage' in result:
+                        logger.info(f"Usage: {json.dumps(result['usage'], indent=2)}")
+                    logger.info("=" * 80)
 
-        except aiohttp.ClientError as e:
-            raise RuntimeError(f"API request failed: {str(e)}")
-        except (KeyError, ValueError) as e:
-            raise RuntimeError(f"Invalid API response: {str(e)}")
+                return result
+
+            except aiohttp.ClientError as e:
+                raise RuntimeError(f"API request failed: {str(e)}")
+            except (KeyError, ValueError) as e:
+                raise RuntimeError(f"Invalid API response: {str(e)}")
 
     return openai_api_handle_async
 
