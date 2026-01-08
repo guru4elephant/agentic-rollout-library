@@ -332,7 +332,8 @@ class K8SToolExecutionNode(ToolExecutionNode):
                 "pod": self.pod_name,
                 "stdout": stdout,
                 "stderr": stderr,
-                "exit_code": exit_code
+                "exit_code": exit_code,
+                "command": command  # 添加执行的命令，方便日志记录
             }
 
             if exit_code != 0:
@@ -427,6 +428,7 @@ class K8SToolExecutionNode(ToolExecutionNode):
 
             # Build command to execute (returns JSON with stdout/stderr/exit_code)
             command = self._build_tool_command(tool_name, arguments)
+            self.logger.info(f"***** Tool Command ***** {command}")
 
             # Execute command using kodo directly
             # kodo's execute_command returns (stdout, exit_code_str)
@@ -1543,6 +1545,11 @@ class K8SToolExecutionNode(ToolExecutionNode):
 
             tool_func = getattr(module, func_name)
 
+            # Build a pseudo-command string for logging (similar to K8S execution)
+            import json
+            args_str = ", ".join(f"{k}={repr(v)[:100]}" for k, v in arguments.items())
+            command = f"[LOCAL] {func_name}({args_str})"
+
             # Execute the function
             self.logger.info(f"Executing tool '{tool_name}' locally: {func_name}(**{arguments})")
             result = tool_func(**arguments)
@@ -1553,9 +1560,10 @@ class K8SToolExecutionNode(ToolExecutionNode):
 
             # Parse result through the tool's result parser
             # For local execution, wrap the result in a format similar to subprocess output
+            stdout_str = json.dumps(result, ensure_ascii=False, indent=2) if isinstance(result, dict) else str(result)
             raw_result = {
                 "output": result,
-                "stdout": str(result),
+                "stdout": stdout_str,
                 "stderr": "",
                 "exit_code": 0,
                 "returncode": 0,
@@ -1564,12 +1572,16 @@ class K8SToolExecutionNode(ToolExecutionNode):
 
             parsed_result = tool.parse_result(raw_result)
 
+            # Return format consistent with K8S execution for unified logging
             return {
                 "tool": tool_name,
                 "result": parsed_result if parsed_result else result,
                 "status": result.get("status", "success"),
                 "execution_mode": "local",
-                "exit_code": 0
+                "exit_code": 0,
+                "command": command,  # Add command for logging
+                "stdout": stdout_str,  # Add stdout for logging
+                "stderr": ""  # Add stderr for logging
             }
 
         except Exception as e:
@@ -1578,14 +1590,42 @@ class K8SToolExecutionNode(ToolExecutionNode):
             self.logger.error(f"Error executing tool {tool_name} locally: {str(e)}")
             self.logger.error(f"Full traceback: {error_detail}")
 
+            # Build command string for error logging
+            args_str = ", ".join(f"{k}={repr(v)[:100]}" for k, v in arguments.items())
+            command = f"[LOCAL] {func_name}({args_str})" if 'func_name' in locals() else f"[LOCAL] {tool_name}({args_str})"
+
             return {
                 "tool": tool_name,
+                "result": "",
                 "error": str(e),
                 "error_type": type(e).__name__,
                 "traceback": error_detail,
                 "status": "error",
-                "execution_mode": "local"
+                "execution_mode": "local",
+                "exit_code": 1,
+                "command": command,  # Add command for logging
+                "stdout": "",  # Add stdout for logging
+                "stderr": f"Error: {str(e)}\n{error_detail}"  # Add stderr for logging
             }
+
+    def _needs_base64_encoding(self, value: str) -> bool:
+        """
+        Check if a string value needs base64 encoding.
+
+        Returns True if the string contains characters that may cause
+        shell parsing issues (newlines, quotes, backslashes, etc.)
+        or if it's longer than a threshold.
+        """
+        if not isinstance(value, str):
+            return False
+        # Encode if: contains newlines, is very long, or contains problematic characters
+        problematic_chars = ['\n', '\r', '"', "'", '\\', '$', '`', '!', '(', ')', '{', '}', '[', ']', '<', '>', '|', '&', ';']
+        if len(value) > 500:
+            return True
+        for char in problematic_chars:
+            if char in value:
+                return True
+        return False
 
     def _build_tool_command(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """
@@ -1593,6 +1633,9 @@ class K8SToolExecutionNode(ToolExecutionNode):
 
         All R2E tools are executable Python scripts that can be run via command line.
         We execute them directly and let kubectl capture stdout/stderr.
+
+        For long strings or strings with special characters, base64 encoding is used
+        with a 'base64:' prefix to avoid shell escaping issues.
 
         Args:
             tool_name: Name of the tool
@@ -1602,6 +1645,7 @@ class K8SToolExecutionNode(ToolExecutionNode):
             Command string to execute the tool
         """
         import json
+        import base64
 
         # Get the tool to access its script_path
         tool = self.tools.get(tool_name)
@@ -1635,9 +1679,21 @@ class K8SToolExecutionNode(ToolExecutionNode):
                 if value:
                     cmd_parts.append(f'--{key}')
             elif isinstance(value, (list, dict)):
-                cmd_parts.extend([f'--{key}', json.dumps(value)])
+                # JSON encode for complex types
+                json_str = json.dumps(value)
+                if self._needs_base64_encoding(json_str):
+                    encoded = base64.b64encode(json_str.encode('utf-8')).decode('ascii')
+                    cmd_parts.extend([f'--{key}', f'base64:{encoded}'])
+                else:
+                    cmd_parts.extend([f'--{key}', json_str])
             else:
-                cmd_parts.extend([f'--{key}', str(value)])
+                str_value = str(value)
+                # Use base64 encoding for problematic strings
+                if self._needs_base64_encoding(str_value):
+                    encoded = base64.b64encode(str_value.encode('utf-8')).decode('ascii')
+                    cmd_parts.extend([f'--{key}', f'base64:{encoded}'])
+                else:
+                    cmd_parts.extend([f'--{key}', str_value])
 
         # Join command parts with proper shell escaping
         import shlex

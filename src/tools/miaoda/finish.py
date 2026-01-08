@@ -49,14 +49,28 @@ def finish_func(**kwargs) -> Dict[str, Any]:
 if __name__ == "__main__":
     # Test the function
     import argparse
+    import sys
+    import os
+
+    # Add parent directory to path for importing arg_utils
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from arg_utils import decode_arg
 
     parser = argparse.ArgumentParser(description="Submit/Finish tool")
     parser.add_argument("command", help="Subcommand (only 'submit' is supported)")
     parser.add_argument("--result", default="", help="Result text to submit (optional)")
+    parser.add_argument("--app_id", default=None, help="Application ID")
+    parser.add_argument("--user_id", default=None, help="User ID")
+    parser.add_argument("--session_id", default=None, help="Session ID")
+    parser.add_argument("--trace_id", default=None, help="Trace ID")
+    parser.add_argument("--app_type", default=None, help="Application type")
 
     args = parser.parse_args()
 
-    result = finish_func(command=args.command, result=args.result)
+    # Decode base64-encoded result if needed
+    result_text = decode_arg(args.result)
+
+    result = finish_func(command=args.command, result=result_text)
 
     if result.get("status") == "error":
         print(f"ERROR: {result.get('error', 'Unknown error')}")

@@ -13,18 +13,21 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import uuid
 from typing import Dict, Any
 
 
-def supabase_migration_func(name: str, query: str) -> Dict[str, Any]:
+def supabase_migration_func(name: str, query: str, **kwargs) -> Dict[str, Any]:
     """
     Apply database migration to Supabase.
 
     Args:
         name: Migration name (use snake_case)
         query: SQL query to apply (DDL operations)
+        **kwargs: Additional context parameters (app_id, user_id, session_id, trace_id, app_type)
+                  These are accepted for compatibility but not used in this mock implementation.
 
     Returns:
         Dictionary containing:
@@ -32,7 +35,9 @@ def supabase_migration_func(name: str, query: str) -> Dict[str, Any]:
             - status: Status of the operation (success/error)
             - error: Error message if failed
     """
-    app_id = f"app-{uuid.uuid4().hex[:6]}"
+    # Note: kwargs may contain app_id, user_id, session_id, trace_id, app_type
+    # These are accepted for compatibility with the tool execution framework
+    app_id = kwargs.get('app_id') or f"app-{uuid.uuid4().hex[:6]}"
     success_message = f"Migration '{name}' (app_id: {app_id}) applied successfully. Database schema updated."
     
     return {
@@ -111,7 +116,31 @@ Examples:
         required=True,
         help="SQL query to apply"
     )
-
+    parser.add_argument(
+        "--app_id",
+        default=None,
+        help="Application ID"
+    )
+    parser.add_argument(
+        "--user_id",
+        default=None,
+        help="User ID"
+    )
+    parser.add_argument(
+        "--session_id",
+        default=None,
+        help="Session ID"
+    )
+    parser.add_argument(
+        "--trace_id",
+        default=None,
+        help="Trace ID"
+    )
+    parser.add_argument(
+        "--app_type",
+        default=None,
+        help="Application type"
+    )
     parser.add_argument(
         "--json",
         action="store_true",
@@ -120,15 +149,23 @@ Examples:
 
     args = parser.parse_args()
 
+    # Add parent directory to path for importing arg_utils
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from arg_utils import decode_arg
+
+    # Decode base64-encoded arguments if needed
+    name = decode_arg(args.name)
+    query = decode_arg(args.query)
+
     # Handle None values (shouldn't happen with required=True, but just in case)
-    if not args.name or not args.query:
+    if not name or not query:
         print(json.dumps({
             "status": "error",
             "error": "Missing required parameters: name and query are required"
         }, ensure_ascii=False))
         sys.exit(1)
 
-    result = supabase_migration_func(args.name, args.query)
+    result = supabase_migration_func(name, query)
 
     if args.json:
         print(json.dumps(result, indent=2, ensure_ascii=False))

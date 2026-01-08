@@ -19,9 +19,7 @@ from typing import Dict, Any
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
 
-#SERVER_URL = "http://aos-mcp-sandbox.miaoda-bj-offline.baidu-int.com/v1/agentos/mcp/sse"
-SERVER_URL = "http://aos-mcp-test.miaoda-bj-offline.baidu-int.com/v1/agentos/mcp/sse"
-
+SERVER_URL = "http://aos-mcp-sandbox.miaoda-bj-offline.baidu-int.com/v1/agentos/mcp/sse"
 
 def api_rag_func(query: str, app_id: str = "1111") -> Dict[str, Any]:
     """
@@ -37,9 +35,13 @@ def api_rag_func(query: str, app_id: str = "1111") -> Dict[str, Any]:
             - status: Status of the query (success/error)
             - error: Error message if failed
     """
+    # 构建 headers
+    headers = {}
+    headers["x-miaoda-app-id"] = app_id
+
     try:
         async def _call():
-            async with sse_client(SERVER_URL) as streams:
+            async with sse_client(SERVER_URL, headers=headers) as streams:
                 async with ClientSession(streams[0], streams[1]) as session:
                     await session.initialize()
                     result = await session.call_tool(
@@ -141,6 +143,26 @@ Examples:
         "--app_id",
         default="1111",
         help="Application ID (default: 1111)"
+    )
+    parser.add_argument(
+        "--user_id",
+        default=None,
+        help="User ID"
+    )
+    parser.add_argument(
+        "--session_id",
+        default=None,
+        help="Session ID"
+    )
+    parser.add_argument(
+        "--trace_id",
+        default=None,
+        help="Trace ID"
+    )
+    parser.add_argument(
+        "--app_type",
+        default=None,
+        help="Application type"
     )
     parser.add_argument(
         "--json",

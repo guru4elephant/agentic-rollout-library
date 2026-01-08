@@ -13,6 +13,9 @@ import time
 import threading
 import warnings
 import re
+import uuid
+import hashids
+import logging
 from pathlib import Path
 from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -218,6 +221,24 @@ Where:
 - For multiple tool calls, you can only call one tool at a time - complete one before starting the next"""
 
 
+def generate_session_id() -> str:
+    """Generate a unique session ID using hashids."""
+    miaoda_session_hashids = hashids.Hashids("miaoda-mock-session-hashids", min_length=12)
+    _id = "conv-" + miaoda_session_hashids.encode(int(time.time() * 100000))
+    time.sleep(0.001)  # 防止生成重复id
+    return _id
+
+
+def generate_user_id() -> str:
+    """Generate a random user ID."""
+    return f"user-{uuid.uuid4().hex[:12]}"
+
+
+def generate_trace_id() -> str:
+    """Generate a unique trace ID for the current request."""
+    return f"trace-{uuid.uuid4().hex}"
+
+
 def create_miaoda_parser():
     """
     Create Miaoda-style parser for tool calls.
@@ -231,13 +252,16 @@ def create_miaoda_parser():
     """
     def parse_tool_calls(llm_response: Dict) -> List[Dict]:
         content = llm_response.get("content", "")
-        
+
+        # Remove <think>...</think> blocks before parsing tool calls
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+
         # Check if content contains function calls
         if "<function=" not in content or "</function>" not in content:
             return []
-        
+
         tool_calls = []
-        
+
         # Pattern to match function blocks
         pattern = r'<function=([^>]+)>(.*?)</function>'
         matches = re.findall(pattern, content, re.DOTALL)
@@ -245,12 +269,23 @@ def create_miaoda_parser():
         for tool_name, params_block in matches:
             ool_name = tool_name.strip()
             
-            # Parse parameters
-            param_pattern = r'<parameter=([^>]+)>(.*?)</parameter>'
-            param_matches = re.findall(param_pattern, params_block, re.DOTALL)
-            
+            # Parse parameters - 兼容两种格式:
+            # 1. 正确格式: <parameter=command>value</parameter>
+            # 2. 错误格式: <parameter name="command">value</parameter>
             parameters = {}
-            for param_name, param_value in param_matches:
+
+            # 格式1: <parameter=name>value</parameter>
+            param_pattern1 = r'<parameter=([^>]+)>(.*?)</parameter>'
+            param_matches1 = re.findall(param_pattern1, params_block, re.DOTALL)
+            for param_name, param_value in param_matches1:
+                param_name = param_name.strip()
+                param_value = param_value.strip()
+                parameters[param_name] = param_value
+
+            # 格式2: <parameter name="name">value</parameter> 或 <parameter name='name'>value</parameter>
+            param_pattern2 = r'<parameter\s+name\s*=\s*["\']([^"\']+)["\']\s*>(.*?)</parameter>'
+            param_matches2 = re.findall(param_pattern2, params_block, re.DOTALL)
+            for param_name, param_value in param_matches2:
                 param_name = param_name.strip()
                 param_value = param_value.strip()
                 parameters[param_name] = param_value
@@ -271,7 +306,7 @@ def create_miaoda_parser():
                 internal_tool_name = "miaoda_api_desc"
             elif tool_name == "supabase_init":
                 internal_tool_name = "miaoda_supabase_init"
-            elif tool_name == "supabase_apply_migration":
+            elif tool_name == "supabase_migration":
                 internal_tool_name = "miaoda_supabase_migration"
             elif tool_name == "supabase_execute_sql":
                 internal_tool_name = "miaoda_supabase_sql"
@@ -532,7 +567,17 @@ async def process_single_instance(
     app_id = f"app-{instance_id}"
 
     requirement_type = extra_info.get("requirement_type", "Web")
-    
+
+    # Generate ID information for tool execution tracking
+    tool_context_ids = {
+        "app_id": extra_info.get("app_id", "1111"),
+        "user_id": extra_info.get("user_id") or generate_user_id(),
+        "session_id": extra_info.get("session_id") or generate_session_id(),
+        "trace_id": extra_info.get("trace_id") or generate_trace_id(),
+        "app_type": extra_info.get("app_type", requirement_type)
+    }
+    print(f"📋 Task {task_id} ({instance_id}): Generated tool context IDs - session_id={tool_context_ids['session_id']}, user_id={tool_context_ids['user_id']}")
+
     # Check if patch file already exists
     if output_dir:
         import os
@@ -553,6 +598,7 @@ async def process_single_instance(
     
     # Setup output files
     log_file = None
+    log_file_path = None
     if output_dir:
         import os
         os.makedirs(output_dir, exist_ok=True)
@@ -900,17 +946,39 @@ You are only allowed to call **ONE** function each time!"""
                             # No tool call, task is complete
                             log(f"No tool calls parsed - treating as completion")
                             log(llm_content)
-                            print(f"\n✅ Task {task_id} ({instance_id}): Completed without tool call")
+                            #
+                            if str(llm_content).strip() == "":
+                                print(f"\n✅ Task {task_id} ({instance_id}): Completed withouany llm response")
+                                result["status"] = "success"
+                                progress_tracker.set_status(task_id, "success")
+                                break
                             
                             context.add_message(
                                 message_content=llm_content,
                                 message_role="assistant",
-                                message_type="completion"
+                                message_type="tool_call"
                             )
                             
-                            result["status"] = "success"
-                            progress_tracker.set_status(task_id, "success")
-                            break
+                            # add continue to rollout without stop
+                            steps_remaining = max_iterations - iteration
+                            steps_remaining_content = f"Steps Remaining: {steps_remaining}"
+
+                            format_remind = '''IMPORTANT: ALWAYS adhere to this exact format for tool use:
+<function=tool_name>
+<parameter=param1>value1</parameter>
+<parameter=param2>value2</parameter>
+</function>'''
+
+                            context.add_message(
+                                message_content=format_remind + "\n" + steps_remaining_content,
+                                message_role="user",
+                                message_type="tool_result"
+                            )
+
+                            #result["status"] = "success"
+                            #progress_tracker.set_status(task_id, "success")
+                            #break
+                            continue
 
                     except Exception as e:
                         progress_tracker.increment_tool_parse_fail(task_id)
@@ -932,6 +1000,12 @@ You are only allowed to call **ONE** function each time!"""
                     # Execute tool
                     tool_call = tool_calls[0]
                     tool_name = tool_call.get('tool', 'unknown')
+
+                    # Add context IDs to tool parameters for tracking
+                    if 'parameters' not in tool_call:
+                        tool_call['parameters'] = {}
+                    tool_call['parameters'].update(tool_context_ids)
+
                     log(f"Executing tool: {tool_name}")
                     log(f"Tool parameters: {json.dumps(tool_call.get('parameters', {}), indent=2)}")
 
@@ -949,7 +1023,11 @@ You are only allowed to call **ONE** function each time!"""
                         else:
                             results = await k8s_executor.process_async([tool_call])
                         tool_result = results[0] if results else {}
-                        
+
+                        # 记录执行的命令
+                        if 'command' in tool_result:
+                            log(f"***** Tool Command ***** {tool_result.get('command', '')}")
+
                         log(f"Tool execution status: {tool_result.get('status', 'unknown')}")
                         if 'stdout' in tool_result:
                             log(f"Tool stdout:\n{tool_result.get('stdout', '')}")

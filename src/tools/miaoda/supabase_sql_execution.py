@@ -15,17 +15,20 @@ Note: For DDL operations (CREATE TABLE, ALTER TABLE, etc.), use supabase_migrati
 
 import argparse
 import json
+import os
 import sys
 from typing import Dict, Any, Optional
 
 
-def supabase_sql_func(query: str, app_id: Optional[str] = None) -> Dict[str, Any]:
+def supabase_sql_func(query: str, app_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
     """
     Execute raw SQL query in Supabase Postgres database.
 
     Args:
         query: SQL query to execute
         app_id: Application ID (optional)
+        **kwargs: Additional context parameters (user_id, session_id, trace_id, app_type)
+                  These are accepted for compatibility but not used in this mock implementation.
 
     Returns:
         Dictionary containing:
@@ -33,6 +36,8 @@ def supabase_sql_func(query: str, app_id: Optional[str] = None) -> Dict[str, Any
             - status: Status of the operation (success/error)
             - error: Error message if failed
     """
+    # Note: kwargs may contain user_id, session_id, trace_id, app_type
+    # These are accepted for compatibility with the tool execution framework
     app_info = f" (app_id: {app_id})" if app_id else ""
     success_message = f"SQL query{app_info} executed successfully. Query completed."
     
@@ -114,6 +119,26 @@ Note: For DDL operations, use supabase_migration.py instead.
         help="Application ID (optional)"
     )
     parser.add_argument(
+        "--user_id",
+        default=None,
+        help="User ID"
+    )
+    parser.add_argument(
+        "--session_id",
+        default=None,
+        help="Session ID"
+    )
+    parser.add_argument(
+        "--trace_id",
+        default=None,
+        help="Trace ID"
+    )
+    parser.add_argument(
+        "--app_type",
+        default=None,
+        help="Application type"
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Output result as JSON"
@@ -121,15 +146,23 @@ Note: For DDL operations, use supabase_migration.py instead.
 
     args = parser.parse_args()
 
+    # Add parent directory to path for importing arg_utils
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from arg_utils import decode_arg
+
+    # Decode base64-encoded arguments if needed
+    query = decode_arg(args.query)
+    app_id = decode_arg(args.app_id)
+
     # Validate required parameters
-    if not args.query:
+    if not query:
         print(json.dumps({
             "status": "error",
             "error": "Missing required parameter: query"
         }, ensure_ascii=False))
         sys.exit(1)
 
-    result = supabase_sql_func(args.query, args.app_id)
+    result = supabase_sql_func(query, app_id)
 
     if args.json:
         print(json.dumps(result, indent=2, ensure_ascii=False))

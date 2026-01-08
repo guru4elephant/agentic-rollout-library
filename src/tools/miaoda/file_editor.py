@@ -308,6 +308,12 @@ if __name__ == "__main__":
     # Test the function
     import argparse
     import json
+    import sys
+    import os
+
+    # Add parent directory to path for importing arg_utils
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from arg_utils import decode_arg
 
     parser = argparse.ArgumentParser(description="File editor tool")
     parser.add_argument("command", help="Command: view, create, str_replace, insert, undo_edit")
@@ -318,25 +324,36 @@ if __name__ == "__main__":
     parser.add_argument("--insert_line", type=int, default=None, help="Line number for insert")
     parser.add_argument("--view_range", default=None, help="View range [start, end], e.g., '[1, 50]'")
     parser.add_argument("--concise", action="store_true", help="Use concise view for Python files")
+    parser.add_argument("--app_id", default=None, help="Application ID")
+    parser.add_argument("--user_id", default=None, help="User ID")
+    parser.add_argument("--session_id", default=None, help="Session ID")
+    parser.add_argument("--trace_id", default=None, help="Trace ID")
+    parser.add_argument("--app_type", default=None, help="Application type")
 
     args = parser.parse_args()
 
+    # Decode base64-encoded arguments
+    file_text = decode_arg(args.file_text)
+    old_str = decode_arg(args.old_str)
+    new_str = decode_arg(args.new_str)
+    path = decode_arg(args.path)
+
     # Parse view_range if provided
     view_range = None
-    if args.view_range:
+    view_range_str = decode_arg(args.view_range)
+    if view_range_str:
         try:
-            view_range = json.loads(args.view_range)
+            view_range = json.loads(view_range_str)
         except:
             print(f"Error: Invalid view_range format. Use [start, end], e.g., '[1, 50]'")
-            import sys
             sys.exit(1)
 
     result = file_editor_func(
         command=args.command,
-        path=args.path,
-        file_text=args.file_text,
-        old_str=args.old_str,
-        new_str=args.new_str,
+        path=path,
+        file_text=file_text,
+        old_str=old_str,
+        new_str=new_str,
         insert_line=args.insert_line,
         view_range=view_range,
         concise=args.concise

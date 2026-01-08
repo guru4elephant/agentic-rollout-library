@@ -180,6 +180,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Search tool for files and directories")
     parser.add_argument("--search_term", required=True, help="Term to search for")
     parser.add_argument("--path", default=".", help="Path to search in")
+    parser.add_argument("--app_id", default=None, help="Application ID")
+    parser.add_argument("--user_id", default=None, help="User ID")
+    parser.add_argument("--session_id", default=None, help="Session ID")
+    parser.add_argument("--trace_id", default=None, help="Trace ID")
+    parser.add_argument("--app_type", default=None, help="Application type")
 
     args = parser.parse_args()
 

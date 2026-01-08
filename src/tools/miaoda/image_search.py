@@ -20,9 +20,7 @@ from typing import Dict, Any
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
 
-#SERVER_URL = "http://aos-mcp-sandbox.miaoda-bj-offline.baidu-int.com/v1/agentos/mcp/sse"
-SERVER_URL = "http://aos-mcp-test.miaoda-bj-offline.baidu-int.com/v1/agentos/mcp/sse"
-
+SERVER_URL = "http://aos-mcp-sandbox.miaoda-bj-offline.baidu-int.com/v1/agentos/mcp/sse"
 
 def image_search_func(query: str, limit: int = 10, app_id: str = "demo_app") -> Dict[str, Any]:
     """
@@ -43,9 +41,12 @@ def image_search_func(query: str, limit: int = 10, app_id: str = "demo_app") -> 
     if not isinstance(inputs, list):
         inputs = [query]
 
+    headers = {}
+    headers["x-miaoda-app-id"] = app_id    
+
     try:
         async def _call():
-            async with sse_client(SERVER_URL) as streams:
+            async with sse_client(SERVER_URL, headers=headers) as streams:
                 async with ClientSession(streams[0], streams[1]) as session:
                     await session.initialize()
                     result = await session.call_tool(
@@ -156,6 +157,26 @@ Examples:
         "--app_id",
         default="demo_app",
         help="Application ID (default: demo_app)"
+    )
+    parser.add_argument(
+        "--user_id",
+        default=None,
+        help="User ID"
+    )
+    parser.add_argument(
+        "--session_id",
+        default=None,
+        help="Session ID"
+    )
+    parser.add_argument(
+        "--trace_id",
+        default=None,
+        help="Trace ID"
+    )
+    parser.add_argument(
+        "--app_type",
+        default=None,
+        help="Application type"
     )
     parser.add_argument(
         "--json",

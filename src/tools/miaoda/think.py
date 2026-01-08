@@ -15,12 +15,14 @@ import sys
 from typing import Dict, Any
 
 
-def think_func(thought: str) -> Dict[str, Any]:
+def think_func(thought: str, **kwargs) -> Dict[str, Any]:
     """
     Log the agent's thought process and reasoning.
 
     Args:
         thought: The agent's explanation of its actions and reasoning
+        **kwargs: Additional context parameters (app_id, user_id, session_id, trace_id, app_type)
+                  These are accepted for compatibility but not used in this mock implementation.
 
     Returns:
         Dictionary containing:
@@ -28,6 +30,8 @@ def think_func(thought: str) -> Dict[str, Any]:
             - status: Status of the action (always 'success')
             - message: Brief description
     """
+    # Note: kwargs may contain app_id, user_id, session_id, trace_id, app_type
+    # These are accepted for compatibility with the tool execution framework
     if not thought:
         return {
             "output": "",
@@ -77,6 +81,11 @@ def build_k8s_command(thought: str) -> str:
 
 def main():
     """Main entry point for CLI usage."""
+    import os
+    # Add parent directory to path for importing arg_utils
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from arg_utils import decode_arg
+
     parser = argparse.ArgumentParser(
         description="Log agent's thinking process.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -92,6 +101,31 @@ Examples:
         help="The agent's thought or reasoning (positional argument)"
     )
     parser.add_argument(
+        "--app_id",
+        default=None,
+        help="Application ID"
+    )
+    parser.add_argument(
+        "--user_id",
+        default=None,
+        help="User ID"
+    )
+    parser.add_argument(
+        "--session_id",
+        default=None,
+        help="Session ID"
+    )
+    parser.add_argument(
+        "--trace_id",
+        default=None,
+        help="Trace ID"
+    )
+    parser.add_argument(
+        "--app_type",
+        default=None,
+        help="Application type"
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Output result as JSON"
@@ -99,7 +133,10 @@ Examples:
 
     args = parser.parse_args()
 
-    result = think_func(args.thought)
+    # Decode base64-encoded thought if needed
+    thought = decode_arg(args.thought)
+
+    result = think_func(thought)
 
     if args.json:
         import json

@@ -238,6 +238,7 @@ def create_openai_api_handle(
             "max_tokens": kwargs.get("max_tokens", 4000),
             "top_p": kwargs.get("top_p", 0.95),
             "stream": False
+            #"tool_choice": "none"
         }
 
         # Debug logging for input
@@ -261,9 +262,11 @@ def create_openai_api_handle(
             response.raise_for_status()
 
             # Parse response text to handle PD separated responses (multiple JSONs)
-            response.encoding("utf-8")
+            response.encoding = "utf-8"
             response_text = response.text
             data = parse_pd_separated_response(response_text)
+
+            print(data)
 
             choice = data['choices'][0]
             message = choice['message']
@@ -377,6 +380,7 @@ def create_openai_api_handle_async(
                 "max_tokens": kwargs.get("max_tokens", 8000),
                 "top_p": kwargs.get("top_p", 0.95),
                 "stream": False
+                #"tool_choice": "none"
             }
         else:
             if "messages" in base_url:
@@ -390,6 +394,7 @@ def create_openai_api_handle_async(
                 "max_tokens": kwargs.get("max_tokens", 4000),
                 "top_p": kwargs.get("top_p", 0.95),
                 "stream": False
+                #"tool_choice": "none"
             }
 
         headers = {

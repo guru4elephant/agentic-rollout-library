@@ -127,6 +127,11 @@ def build_k8s_command(command: str) -> str:
 
 def main():
     """Main entry point for CLI usage."""
+    import os
+    # Add parent directory to path for importing arg_utils
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from arg_utils import decode_arg
+
     parser = argparse.ArgumentParser(
         description="Execute a bash command.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -142,6 +147,31 @@ Examples:
         help="The bash command to execute (positional argument)"
     )
     parser.add_argument(
+        "--app_id",
+        default=None,
+        help="Application ID"
+    )
+    parser.add_argument(
+        "--user_id",
+        default=None,
+        help="User ID"
+    )
+    parser.add_argument(
+        "--session_id",
+        default=None,
+        help="Session ID"
+    )
+    parser.add_argument(
+        "--trace_id",
+        default=None,
+        help="Trace ID"
+    )
+    parser.add_argument(
+        "--app_type",
+        default=None,
+        help="Application type"
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Output result as JSON"
@@ -149,8 +179,11 @@ Examples:
 
     args = parser.parse_args()
 
+    # Decode base64-encoded command if needed
+    command = decode_arg(args.command)
+
     # Execute the command
-    result = bash_func(args.command)
+    result = bash_func(command)
 
     if args.json:
         # Output as JSON for programmatic use
