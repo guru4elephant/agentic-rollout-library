@@ -8,6 +8,7 @@ similar to how they are used in production (miaoda_k8s_example.py).
 import sys
 import asyncio
 import uuid
+import os
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -37,10 +38,10 @@ class MiaodaToolTestBase:
         "PYTHONIOENCODING": "utf-8",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
-        "http_proxy": "http://mt:mtstudio@10.224.65.111:8234",
-        "https_proxy": "http://mt:mtstudio@10.224.65.111:8234",
-        "PIP_INDEX_URL": "http://pip.baidu.com/pypi/simple",
-        "PIP_TRUSTED_HOST": "pip.baidu.com"
+        "http_proxy": os.getenv("HTTP_PROXY", ""),
+        "https_proxy": os.getenv("HTTPS_PROXY", ""),
+        "PIP_INDEX_URL": os.getenv("PIP_INDEX_URL", "https://pypi.org/simple"),
+        "PIP_TRUSTED_HOST": os.getenv("PIP_TRUSTED_HOST", "")
     }
 
     @staticmethod

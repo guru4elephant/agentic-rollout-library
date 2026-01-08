@@ -16,11 +16,12 @@ import argparse
 import asyncio
 import json
 import sys
+import os
 from typing import Dict, Any
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
 
-SERVER_URL = "http://aos-mcp-sandbox.miaoda-bj-offline.baidu-int.com/v1/agentos/mcp/sse"
+SERVER_URL = os.getenv("MIAODA_MCP_SERVER_URL", "http://aos-mcp-sandbox.miaoda-bj-offline.baidu-int.com/v1/agentos/mcp/sse")
 
 def image_search_func(query: str, limit: int = 10, app_id: str = "demo_app") -> Dict[str, Any]:
     """
