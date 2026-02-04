@@ -34,7 +34,8 @@ BASE_URL = os.getenv("LLM_BASE_URL", "your-base-url-here")
 MODEL_NAME = os.getenv("LLM_MODEL_NAME", "claude-3-sonnet")
 
 
-def process_single_instance(instance_data_file: str, output_file: str, model_name: str = None, log_file: str = None, base_url: str = None) -> None:
+def process_single_instance(instance_data_file: str, output_file: str, model_name: str = None, log_file: str = None, base_url: str = None, 
+                           replay_trajectory: str = None, replay_steps: int = 0) -> None:
     """
     Process a single instance in a subprocess.
     This function will be called by subprocess.run().
@@ -45,6 +46,8 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
         model_name: Model name to use (with index if load balancing)
         log_file: Path to save the subprocess logs
         base_url: LLM base URL to use (overrides environment variable)
+        replay_trajectory: Path to trajectory file to replay (optional)
+        replay_steps: Number of steps to replay (0 means replay all)
     """
     import sys
     import os
@@ -133,7 +136,7 @@ def process_single_instance(instance_data_file: str, output_file: str, model_nam
     kubeconfig_path = data['kubeconfig_path']
     output_dir = data['output_dir']
     enable_profiling = data['enable_profiling']
-    max_tokens = data.get('max_tokens', 16000)  # Get max_tokens from data
+    max_tokens = data.get('max_tokens', 8192)  # Get max_tokens from data
     provided_base_url = data.get('base_url', None)  # Get base_url from data
     
     instance_id = instance.get("instance_id", "unknown")
@@ -595,11 +598,49 @@ Follow these steps to resolve the issue:
                 
                 agent.run_trajectory = logged_run_trajectory
                 
-                result = await agent.run_trajectory(
-                    prompt=prompt,
-                    llm_generate_func=llm_generate_func,
-                    request_id=f"swe_{instance_id}"
-                )
+                # Check if we should replay a trajectory
+                if replay_trajectory and os.path.exists(replay_trajectory):
+                    logger.info(f"\n{'*'*80}")
+                    logger.info(f"* TRAJECTORY REPLAY MODE")
+                    logger.info(f"* Replay file: {replay_trajectory}")
+                    logger.info(f"* Replay steps: {replay_steps if replay_steps > 0 else 'ALL'}")
+                    logger.info(f"{'*'*80}\n")
+                    
+                    # Import replay functionality
+                    from workers.agents.trajectory_replay import ReplayConfig, replay_and_continue
+                    
+                    # Create replay configuration
+                    replay_config = ReplayConfig(
+                        trajectory_file=replay_trajectory,
+                        replay_steps=replay_steps,
+                        strict_validation=False,  # R2E environments may have slight variations
+                        allow_partial_match=True,
+                        continue_on_mismatch=True,  # Continue even if observations don't match exactly
+                        verbose=True,
+                        execute_actions=False  # Don't execute actions, just use trajectory results
+                    )
+                    
+                    # Replay and continue
+                    result, replay_summary = await replay_and_continue(
+                        agent=agent,
+                        replay_config=replay_config,
+                        llm_generate_func=llm_generate_func,
+                        request_id=f"swe_{instance_id}_replay"
+                    )
+                    
+                    logger.info(f"\n{'*'*80}")
+                    logger.info(f"* REPLAY SUMMARY")
+                    logger.info(f"* Replayed steps: {replay_summary['replayed_steps']}")
+                    logger.info(f"* Total original steps: {replay_summary['total_steps']}")
+                    logger.info(f"* Final trajectory steps: {replay_summary['final_steps']}")
+                    logger.info(f"{'*'*80}\n")
+                else:
+                    # Normal execution without replay
+                    result = await agent.run_trajectory(
+                        prompt=prompt,
+                        llm_generate_func=llm_generate_func,
+                        request_id=f"swe_{instance_id}"
+                    )
             except Exception as traj_error:
                 logger.error(f"\n{'!'*80}")
                 logger.error(f"! TRAJECTORY EXECUTION FAILED")
@@ -902,17 +943,23 @@ class SubprocessSWEBenchRunner:
                  enable_profiling: bool = False, model_name: str = None,
                  model_index_range: Optional[Tuple[int, int]] = None,
                  timeout_seconds: int = 600,  # Default 10 minutes timeout
-                 max_tokens: int = 16000,  # Maximum tokens for model output
+                 max_tokens: int = 8192,  # Maximum tokens for model output
                  base_url: str = None,  # LLM base URL
                  api_key: str = "",
-                 local_mode: bool = False):  # Local mode for debugging
+                 local_mode: bool = False,  # Local mode for debugging
+                 replay_trajectory: str = None,  # Path to trajectory file to replay
+                 replay_steps: int = 0,  # Number of steps to replay
+                 replay_dir: str = None):  # Directory with per-instance replay files
         """Initialize the runner.
         
         Args:
             timeout_seconds: Maximum time in seconds for each instance (default: 600 = 10 minutes)
-            max_tokens: Maximum tokens for model output (default: 16000)
+            max_tokens: Maximum tokens for model output (default: 8192)
             base_url: LLM base URL (optional, overrides environment variable)
             local_mode: If True, run instances locally instead of in subprocess
+            replay_trajectory: Path to trajectory file to replay for all instances
+            replay_steps: Number of steps to replay (0 means replay all)
+            replay_dir: Directory containing per-instance trajectory files for replay
         """
         self.namespace = namespace
         self.kubeconfig_path = kubeconfig_path
@@ -926,6 +973,9 @@ class SubprocessSWEBenchRunner:
         self.base_url = base_url
         self.api_key = api_key
         self.local_mode = local_mode
+        self.replay_trajectory = replay_trajectory
+        self.replay_steps = replay_steps
+        self.replay_dir = replay_dir
         self.patches = {}
     
     def _has_existing_trajectory(self, instance_id: str) -> bool:
@@ -1326,9 +1376,25 @@ class SubprocessSWEBenchRunner:
             data = pickle.load(f)
         instance_id = data['instance'].get('instance_id', f'instance_{index}')
         
+        # Determine replay trajectory file for this instance
+        replay_trajectory = self.replay_trajectory  # Use global replay file if set
+        if not replay_trajectory and self.replay_dir:
+            # Look for instance-specific replay file
+            file_safe_id = instance_id.replace('/', '__')
+            import glob
+            pattern = os.path.join(self.replay_dir, f"{file_safe_id}_*.jsonl")
+            existing_files = glob.glob(pattern)
+            if existing_files:
+                # Use the most recent trajectory file
+                existing_files.sort()
+                replay_trajectory = existing_files[-1]
+                logger.info(f"  Found replay trajectory for {instance_id}: {os.path.basename(replay_trajectory)}")
+        
         logger.info(f"[{index+1}/{total}] Starting subprocess for {instance_id} with model {model_name} (timeout: {self.timeout_seconds}s)")
         if log_file:
             logger.info(f"  Log file: {log_file}")
+        if replay_trajectory:
+            logger.info(f"  Replay trajectory: {replay_trajectory} (steps: {self.replay_steps if self.replay_steps > 0 else 'ALL'})")
         
         # Prepare subprocess command
         cmd = [
@@ -1338,7 +1404,7 @@ class SubprocessSWEBenchRunner:
 import sys
 sys.path.insert(0, '{os.path.dirname(os.path.dirname(__file__))}')
 from tests.test_r2e_general_agent_on_swe_subprocess import process_single_instance
-process_single_instance('{instance_data_file}', '{output_file}', '{model_name}', '{log_file if log_file else ""}', '{base_url if base_url else ""}')
+process_single_instance('{instance_data_file}', '{output_file}', '{model_name}', '{log_file if log_file else ""}', '{base_url if base_url else ""}', '{replay_trajectory if replay_trajectory else ""}', {self.replay_steps})
 """
         ]
         
@@ -1483,14 +1549,22 @@ async def main():
                        help="Model index range for load balancing, format: 'start,end'")
     parser.add_argument("--timeout", type=int, default=600,
                        help="Timeout in seconds for each instance (default: 600 = 10 minutes)")
-    parser.add_argument("--max-tokens", type=int, default=16000,
-                       help="Maximum tokens for model output (default: 16000)")
+    parser.add_argument("--max-tokens", type=int, default=8192,
+                        help="Maximum tokens for model output (default: 8192)")
     parser.add_argument("--base-url", type=str, default=None,
                        help="LLM base URL (overrides environment variable)")
     parser.add_argument("--api-key", type=str, default=None,
                        help="LLM API key (overrides environment variable)")
     parser.add_argument("--local-mode", action="store_true",
                        help="Run in local mode without subprocess for debugging")
+    
+    # Replay options
+    parser.add_argument("--replay-trajectory", type=str, default=None,
+                       help="Path to trajectory file to replay (applies to all instances)")
+    parser.add_argument("--replay-steps", type=int, default=0,
+                       help="Number of steps to replay (0 means replay all)")
+    parser.add_argument("--replay-dir", type=str, default=None,
+                       help="Directory with trajectory files for per-instance replay")
     
     args = parser.parse_args()
     
@@ -1529,7 +1603,10 @@ async def main():
         max_tokens=args.max_tokens,
         base_url=args.base_url,
         api_key=args.api_key,
-        local_mode=args.local_mode
+        local_mode=args.local_mode,
+        replay_trajectory=args.replay_trajectory,
+        replay_steps=args.replay_steps,
+        replay_dir=args.replay_dir
     )
     
     # Process instances
